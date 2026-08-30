@@ -1,8 +1,9 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
 import json
+import os
 import unittest
 
-import ccwho
+import ccwho_engine as ccwho
 
 
 class TestParseSessions(unittest.TestCase):
@@ -119,6 +120,65 @@ class TestBoilerplate(unittest.TestCase):
         self.assertFalse(ccwho.is_boilerplate("run the gate"))
 
 
+class TestTitle(unittest.TestCase):
+    def test_reads_ai_title(self):
+        lines = [json.dumps({"type": "ai-title", "aiTitle": "PR review workflow redesign"})]
+        self.assertEqual(ccwho.extract_title(lines), "PR review workflow redesign")
+
+    def test_last_ai_title_wins(self):
+        lines = [json.dumps({"type": "ai-title", "aiTitle": "old"}),
+                 json.dumps({"type": "ai-title", "aiTitle": "new"})]
+        self.assertEqual(ccwho.extract_title(lines), "new")
+
+    def test_no_title_is_empty(self):
+        self.assertEqual(ccwho.extract_title([json.dumps({"type": "user"})]), "")
+
+    def test_bad_lines_do_not_crash(self):
+        self.assertEqual(ccwho.extract_title(["{oops"]), "")
+
+
+class TestDoing(unittest.TestCase):
+    def _tool(self, name, **inp):
+        return json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": name, "input": inp}]}})
+
+    def test_prefers_bash_description_over_raw_command(self):
+        got = ccwho.extract_doing([self._tool("Bash", command="rm -rf /x", description="Record evidence")])
+        self.assertEqual(got, "Bash: Record evidence")
+
+    def test_falls_back_to_command_when_no_description(self):
+        got = ccwho.extract_doing([self._tool("Bash", command="pytest -x")])
+        self.assertEqual(got, "Bash: pytest -x")
+
+    def test_file_tools_show_the_file(self):
+        got = ccwho.extract_doing([self._tool("Edit", file_path="/a/b/ccwho.py")])
+        self.assertEqual(got, "Edit: ccwho.py")
+
+    def test_last_tool_wins(self):
+        got = ccwho.extract_doing([self._tool("Read", file_path="/a.py"), self._tool("Grep", pattern="foo")])
+        self.assertTrue(got.startswith("Grep"))
+
+    def test_collapses_multiline_commands(self):
+        got = ccwho.extract_doing([self._tool("Bash", command="line one\nline two")])
+        self.assertEqual(got, "Bash: line one line two")
+
+    def test_no_tools_is_empty(self):
+        self.assertEqual(ccwho.extract_doing([]), "")
+
+
+class TestSince(unittest.TestCase):
+    def test_seconds_then_minutes(self):
+        self.assertEqual(ccwho.since(100.0, now=105.0), "5s")
+        self.assertEqual(ccwho.since(0.0, now=300.0), "5m")
+
+    def test_hours_and_days(self):
+        self.assertEqual(ccwho.since(0.0, now=7200.0), "2h")
+        self.assertEqual(ccwho.since(0.0, now=172800.0), "2d")
+
+    def test_missing_is_question_mark(self):
+        self.assertEqual(ccwho.since(None, now=1.0), "?")
+
+
 class TestOrphans(unittest.TestCase):
     PS = "\n".join([
         "  PID  PPID COMMAND",
@@ -195,3 +255,22 @@ class TestTruncate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGateLine(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+
+    def test_empty_when_no_slots_held(self):
+        self.assertEqual(ccwho.gate_line(self.dir), "")
+
+    def test_names_holders_and_count(self):
+        import ccgate
+        ccgate.claim_slot(self.dir, 2, pid=os.getpid(), label="liveapp gate")
+        got = ccwho.gate_line(self.dir)
+        self.assertIn("1 gate", got)
+        self.assertIn("liveapp gate", got)
+
+    def test_missing_dir_is_not_an_error(self):
+        self.assertEqual(ccwho.gate_line("/nonexistent/path/xyz"), "")

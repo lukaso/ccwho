@@ -459,6 +459,47 @@ def topic_for(session_id, tail_bytes=4 * 1024 * 1024, head_lines=400):
     return {"first": first, "last": last}
 
 
+def parse_tty_map(ps_output):
+    """pid -> controlling terminal. `??` means no terminal, so it is omitted."""
+    out = {}
+    for line in (ps_output or "").splitlines():
+        f = line.strip().split()
+        if len(f) < 2 or not f[0].isdigit():
+            continue
+        if f[1] in ("??", "?", "-"):
+            continue
+        out[int(f[0])] = f[1]
+    return out
+
+
+def short_tty(tty):
+    """ttys032 -> s032. Short enough for a column, still unambiguous."""
+    t = (tty or "").rsplit("/", 1)[-1]
+    return t[3:] if t.startswith("tty") and len(t) > 3 else t
+
+
+def match_rows(rows, query):
+    """Rows matching a pid, a tty (long or short), or a title/project substring."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    hits = []
+    for r in rows:
+        if q == str(r.get("pid")) or q in (r.get("tty", ""), short_tty(r.get("tty", ""))):
+            hits.append(r)
+        elif q in (r.get("title") or "").lower() or q in (r.get("project") or "").lower():
+            hits.append(r)
+    return hits
+
+
+def tty_snapshot():
+    try:
+        return subprocess.run(["ps", "-eo", "pid,tty"], capture_output=True,
+                              text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def ps_snapshot():
     try:
         return subprocess.run(
@@ -482,7 +523,7 @@ def agents_json():
 
 # -------------------------------------------------------------------- assemble
 
-def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0):
+def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=""):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -496,8 +537,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0):
     ask = extract_ask(tail)
     if status == "waiting":
         attention = waiting_kind(tail)
-        if attention == "ready" and ask:
-            attention = "asks"
+        if attention == "ready":
+            # not a state of its own: decided like any other non-busy session
+            attention = "asks" if ask else ("running" if work else "stopped")
     elif status != "busy" and ask:
         attention = "asks"
     elif status == "busy":
@@ -522,6 +564,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0):
         "age": age(session.get("startedAt"), now=None if now is None else int(now * 1000)),
         "orphans": orphan_count,
         "work": work,
+        "tty": tty,
         "pid": session.get("pid"),
         "sessionId": session.get("sessionId", ""),
         "cwd": session.get("cwd", ""),
@@ -531,6 +574,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0):
 def collect(cache=None):
     sessions = parse_sessions(agents_json())
     ps_out = ps_snapshot()
+    ttys = parse_tty_map(tty_snapshot())
     ids = [s.get("sessionId", "") for s in sessions]
     orphans = attribute_orphans(ps_out, ids)
     rows = []
@@ -538,7 +582,8 @@ def collect(cache=None):
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
-                              work=work_descendants(ps_out, s.get("pid"))))
+                              work=work_descendants(ps_out, s.get("pid")),
+                              tty=ttys.get(s.get("pid"), "")))
     rows.sort(key=sort_key)
     if cache is not None:                       # drop rows for sessions that ended
         for gone in set(cache) - set(ids):
@@ -563,7 +608,8 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
         return "no Claude Code sessions found\n"
     width = width or shutil.get_terminal_size((150, 24)).columns
     w_proj = min(13, max(len(r["project"]) for r in rows))
-    fixed = w_proj + 12 + 7 + 6
+    w_tty = max(4, min(7, max(len(short_tty(r.get("tty", ""))) for r in rows)))
+    fixed = w_proj + w_tty + 14 + 7 + 6
     w_title = max(18, min(34, (width - fixed) // 2))
     w_doing = max(18, width - fixed - w_title)
 
@@ -589,16 +635,20 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
         doing = (r.get("ask") if att == "asks" else r["doing"]) or "-"
         if att == "running" and r.get("work"):
             doing = f"[{r['work']} bg] {doing}"
-        line = (f"{r['project']:<{w_proj}}  {_paint(f'{label:<10}', r['status'], color)}  "
+        where = short_tty(r.get("tty", "")) or "-"
+        shown_doing = truncate(doing, w_doing)
+        line = (f"{r['project']:<{w_proj}}  "
+                f"{_paint(f'{where:<{w_tty}}', 'dim', color)}  "
+                f"{_paint(f'{label:<10}', att, color)}  "
                 f"{truncate(title, w_title):<{w_title}}  "
-                f"{_paint(truncate(doing, w_doing), 'dim', color)}"
-                f"{' ' * max(0, w_doing - len(truncate(doing, w_doing)))}  "
+                f"{_paint(shown_doing, 'dim', color)}"
+                f"{' ' * max(0, w_doing - len(shown_doing))}  "
                 f"{r['since']:>5}")
         if r["orphans"]:
             line += _paint(f"  +{r['orphans']} detached", "waiting", color)
         out.append(line)
         if show_prompt and r["topic"]:
-            out.append(_paint(f"{' ' * (w_proj + 14)}\u21b3 {truncate(r['topic'], width - w_proj - 18)}", "dim", color))
+            out.append(_paint(f"{' ' * (w_proj + w_tty + 16)}\u21b3 {truncate(r['topic'], width - w_proj - 18)}", "dim", color))
     return "\n".join(out) + "\n"
 
 

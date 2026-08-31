@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -90,11 +91,42 @@ def unknown_flags(argv):
     return bad
 
 
+def jump(argv):
+    """Focus the terminal window holding a session. Needs iTerm2."""
+    query = " ".join(a for a in argv if not a.startswith("-"))
+    rows, _ = engine.collect(cache={})
+    hits = engine.match_rows(rows, query)
+    if not hits:
+        print(f"ccwho: no session matches {query!r}", file=sys.stderr)
+        return 1
+    if len(hits) > 1:
+        print(f"ccwho: {query!r} matches {len(hits)} sessions - be more specific:",
+              file=sys.stderr)
+        for r in hits:
+            print(f"  {engine.short_tty(r.get('tty','')):<6} {r.get('title') or r.get('name')}",
+                  file=sys.stderr)
+        return 2
+    row = hits[0]
+    tty = row.get("tty", "")
+    if not tty:
+        print(f"ccwho: {row.get('title')} has no controlling terminal", file=sys.stderr)
+        return 1
+    script = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jump.applescript")
+    res = subprocess.run(["osascript", script, f"/dev/{tty}"],
+                         capture_output=True, text=True)
+    out = (res.stdout or res.stderr).strip()
+    print(out)
+    return 0 if out.startswith("focused") else 1
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "jump":
+        return jump(argv[1:])
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
+        print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2)")
         return 0
 
     bad = unknown_flags(argv)

@@ -648,3 +648,98 @@ class TestStoppedVsRunning(unittest.TestCase):
         rows = [{"attention": "running", "ts": 9, "project": "a", "name": "r"},
                 {"attention": "busy", "ts": 1, "project": "a", "name": "b"}]
         self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["b", "r"])
+
+
+class TestTtyMap(unittest.TestCase):
+    PS = "\n".join([
+        "  PID TTY",
+        "19576 ttys032",
+        "26581 ttys062",
+        " 1234 ??",
+    ])
+
+    def test_maps_pid_to_tty(self):
+        self.assertEqual(ccwho.parse_tty_map(self.PS)[19576], "ttys032")
+
+    def test_no_controlling_terminal_is_omitted(self):
+        self.assertNotIn(1234, ccwho.parse_tty_map(self.PS))
+
+    def test_header_is_skipped(self):
+        self.assertNotIn("PID", ccwho.parse_tty_map(self.PS))
+
+    def test_empty_input(self):
+        self.assertEqual(ccwho.parse_tty_map(""), {})
+
+
+class TestShortTty(unittest.TestCase):
+    def test_strips_dev_and_tty(self):
+        self.assertEqual(ccwho.short_tty("/dev/ttys032"), "s032")
+
+    def test_bare_form(self):
+        self.assertEqual(ccwho.short_tty("ttys032"), "s032")
+
+    def test_empty(self):
+        self.assertEqual(ccwho.short_tty(""), "")
+
+    def test_unknown_shape_passes_through(self):
+        self.assertEqual(ccwho.short_tty("console"), "console")
+
+
+class TestMatchRows(unittest.TestCase):
+    ROWS = [
+        {"pid": 19576, "tty": "ttys032", "title": "Liveapp temp directory leak", "project": "liveapp"},
+        {"pid": 26581, "tty": "ttys062", "title": "Managing multiple Claude Code shells", "project": "liveapp"},
+        {"pid": 73336, "tty": "ttys147", "title": "Vitest cleanup", "project": "liveapp"},
+    ]
+
+    def test_matches_by_pid(self):
+        self.assertEqual(ccwho.match_rows(self.ROWS, "19576")[0]["pid"], 19576)
+
+    def test_matches_by_tty_short_form(self):
+        self.assertEqual(ccwho.match_rows(self.ROWS, "s062")[0]["pid"], 26581)
+
+    def test_matches_by_title_substring_case_insensitive(self):
+        self.assertEqual(ccwho.match_rows(self.ROWS, "vitest")[0]["pid"], 73336)
+
+    def test_returns_all_matches_when_ambiguous(self):
+        self.assertEqual(len(ccwho.match_rows(self.ROWS, "liveapp")), 3)
+
+    def test_no_match_is_empty(self):
+        self.assertEqual(ccwho.match_rows(self.ROWS, "zzzz"), [])
+
+    def test_empty_query_matches_nothing(self):
+        self.assertEqual(ccwho.match_rows(self.ROWS, ""), [])
+
+
+class TestReadyCollapsesIntoStopped(unittest.TestCase):
+    """`waiting` with nothing pending is not a separate state: it is stopped or
+    running like any other non-busy session, decided by what is in flight."""
+
+    SESSION = {"sessionId": "s1", "cwd": "/Users/x/projects/liveapp",
+               "status": "waiting", "name": "n", "startedAt": 1788000000000}
+
+    def _turn(self, text="done."):
+        return {"type": "assistant", "timestamp": "2026-08-31T12:00:00.000Z",
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def test_waiting_with_nothing_pending_and_no_work_is_stopped(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
+                              now=1788177600.0, work=0)
+        self.assertEqual(row["attention"], "stopped")
+
+    def test_waiting_with_nothing_pending_but_work_is_running(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
+                              now=1788177600.0, work=2)
+        self.assertEqual(row["attention"], "running")
+
+    def test_waiting_with_a_pending_tool_is_still_blocked(self):
+        tail = [{"type": "assistant", "timestamp": "2026-08-31T12:00:00.000Z",
+                 "message": {"content": [{"type": "tool_use", "id": "t1",
+                                          "name": "Bash", "input": {}}]}}]
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0, work=0)
+        self.assertEqual(row["attention"], "blocked")
+
+    def test_ready_is_no_longer_produced(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
+                              now=1788177600.0, work=0)
+        self.assertNotEqual(row["attention"], "ready")

@@ -73,6 +73,25 @@ in the project's CLAUDE.md:
 
 Env: `CCGATE_SLOTS`, `CCGATE_LOAD_FACTOR` (0 disables the ceiling), `CCGATE_DIR`.
 
+## Finding the window
+
+Sessions get lost, not ended. A session can look gone while its process is alive,
+attached to a terminal you cannot find among thirty windows - and the title is no
+help, because Claude Code renames sessions as the work moves on (one here went
+`Restart from disk` -> `update-landing-page-whatsapp-faq`). Only `sessionId` is
+stable.
+
+So every row carries its **tty**, and:
+
+```sh
+ccwho jump s032           # focus that window
+ccwho jump 19576          # ...by pid
+ccwho jump "vitest"       # ...by title substring
+```
+
+An ambiguous query lists the candidates rather than guessing. Needs iTerm2; the
+lookup is `tty of session` over its windows.
+
 ## Install
 
 ```sh
@@ -127,6 +146,9 @@ So `ccwho` derives the state instead:
 | stopped | not busy, and **nothing running under it** | STOPPED |
 | busy | harness says busy | busy |
 | running | not busy, but background work is in flight | running |
+
+`waiting` with nothing pending is not a state of its own - it is decided the same
+way as any other non-busy session, by what is in flight.
 
 ### Stopped, or waiting on a machine
 
@@ -234,5 +256,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-153 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+171 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

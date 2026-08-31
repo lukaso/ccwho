@@ -25,7 +25,15 @@ import sys
 import time
 
 # Status order: what needs you first, what is working next, what is parked last.
-_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "busy": 2, "ready": 3, "shell": 4, "idle": 5}
+# stopped outranks busy: a stopped session will not progress without you, while a
+# busy one is fine. `running` is not busy but has background work in flight - it is
+# waiting on a machine, not on you, so it sorts last.
+_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "stopped": 2, "busy": 3,
+         "ready": 4, "shell": 5, "idle": 6, "running": 7}
+
+# Descendants that are session infrastructure rather than work. An idle session
+# keeps its MCP servers alive; counting them would make every session look busy.
+_INFRA = re.compile(r"(npm exec\s+\S*mcp|\S*-mcp\b|mcp-server|mcp_server)|_npx/", re.I)
 
 # Closing-line requests that hand the decision back without a question mark.
 # Deliberately short: every entry was validated against a live fleet, and a false
@@ -323,6 +331,32 @@ def gate_line(gate_dir=None):
     return f"{len(held)} gate slot(s) held: {who}"
 
 
+def work_descendants(ps_output, pid):
+    """How many non-infrastructure processes this session has running under it.
+
+    Zero means the session has stopped: nothing is in flight, so it will not move
+    again without you. Non-zero means it is waiting on a machine, not on a human.
+    """
+    if not pid:
+        return 0
+    kids = {}
+    for cpid, ppid, cmd in _ps_rows(ps_output):
+        try:
+            kids.setdefault(ppid, []).append((int(cpid), cmd))
+        except (TypeError, ValueError):
+            continue
+    count, stack, seen = 0, [int(pid)], {int(pid)}
+    while stack:
+        for cpid, cmd in kids.get(stack.pop(), []):
+            if cpid in seen:
+                continue
+            seen.add(cpid)
+            stack.append(cpid)
+            if not _INFRA.search(cmd):
+                count += 1
+    return count
+
+
 def sort_key(row):
     """Rank first, then most-recent-first so a fresh ask surfaces above parked ones."""
     key = row.get("attention") or row.get("status")
@@ -448,7 +482,7 @@ def agents_json():
 
 # -------------------------------------------------------------------- assemble
 
-def build_row(session, head, tail, mtime, now=None, orphan_count=0):
+def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -466,8 +500,11 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0):
             attention = "asks"
     elif status != "busy" and ask:
         attention = "asks"
+    elif status == "busy":
+        attention = "busy"
     else:
-        attention = status
+        # Not busy and not asking: either it stopped, or it is waiting on work.
+        attention = "running" if work else "stopped"
     ts = last_turn_ts(tail)
     return {
         "project": project_of(session.get("cwd", "")),
@@ -484,6 +521,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0):
         "first": first,
         "age": age(session.get("startedAt"), now=None if now is None else int(now * 1000)),
         "orphans": orphan_count,
+        "work": work,
         "pid": session.get("pid"),
         "sessionId": session.get("sessionId", ""),
         "cwd": session.get("cwd", ""),
@@ -499,7 +537,8 @@ def collect(cache=None):
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
-        rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0)))
+        rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
+                              work=work_descendants(ps_out, s.get("pid"))))
     rows.sort(key=sort_key)
     if cache is not None:                       # drop rows for sessions that ended
         for gone in set(cache) - set(ids):
@@ -509,8 +548,8 @@ def collect(cache=None):
 
 # --------------------------------------------------------------------- display
 
-_C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "ready": "\033[32m",
-      "waiting": "\033[33;1m",
+_C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[33m",
+      "running": "\033[2m", "ready": "\033[33m", "waiting": "\033[33;1m",
       "busy": "\033[36m", "idle": "\033[2m",
       "shell": "\033[35m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
@@ -544,9 +583,12 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
 
     for r in rows:
         att = r.get("attention") or r["status"]
-        label = {"blocked": "NEEDS YOU", "asks": "ASKED YOU", "ready": "ready"}.get(att, att)
+        label = {"blocked": "NEEDS YOU", "asks": "ASKED YOU",
+                 "stopped": "STOPPED", "ready": "stopped"}.get(att, att)
         title = r["title"] or r["name"]
         doing = (r.get("ask") if att == "asks" else r["doing"]) or "-"
+        if att == "running" and r.get("work"):
+            doing = f"[{r['work']} bg] {doing}"
         line = (f"{r['project']:<{w_proj}}  {_paint(f'{label:<10}', r['status'], color)}  "
                 f"{truncate(title, w_title):<{w_title}}  "
                 f"{_paint(truncate(doing, w_doing), 'dim', color)}"

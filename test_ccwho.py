@@ -492,10 +492,10 @@ class TestBuildRow(unittest.TestCase):
         self.assertEqual(row["attention"], "asks")
         self.assertEqual(row["ask"], "Want me to build S2a?")
 
-    def test_plain_finish_stays_idle(self):
+    def test_plain_finish_with_no_background_work_is_stopped(self):
         tail = [self._turn("2026-08-31T12:00:00.000Z", "234 tests green.")]
-        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0)
-        self.assertEqual(row["attention"], "idle")
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0, work=0)
+        self.assertEqual(row["attention"], "stopped")
         self.assertEqual(row["ask"], "")
 
     def test_busy_is_never_reclassified_as_asks(self):
@@ -567,3 +567,84 @@ class TestWindowCache(unittest.TestCase):
 
     def test_incomplete_entry_invalidates(self):
         self.assertFalse(ccwho.cache_valid({"mtime": 5.0}, 5.0, 100))
+
+
+class TestWorkDescendants(unittest.TestCase):
+    """A session that is not busy has either stopped, or is waiting on background
+    work. Only the first needs you. MCP servers are infrastructure, not work."""
+
+    PS = "\n".join([
+        "  PID  PPID COMMAND",
+        " 100     1 claude",
+        " 101   100 npm exec chrome-devtools-mcp@latest --isolated",
+        " 102   101 chrome-devtools-mcp",
+        " 103   102 /Users/me/.npm/_npx/15c6/node/mcp.js",
+        " 200     1 claude",
+        " 201   200 /bin/zsh -c source /Users/me/.claude/shell-snapshots/x",
+        " 202   201 node vitest",
+    ])
+
+    def test_session_with_only_mcp_has_no_work(self):
+        self.assertEqual(ccwho.work_descendants(self.PS, 100), 0)
+
+    def test_session_running_a_command_has_work(self):
+        self.assertEqual(ccwho.work_descendants(self.PS, 200), 2)
+
+    def test_grandchildren_count(self):
+        ps = "\n".join(["  PID  PPID COMMAND", " 300     1 claude",
+                        " 301   300 bash x", " 302   301 node y"])
+        self.assertEqual(ccwho.work_descendants(ps, 300), 2)
+
+    def test_unknown_pid_is_zero(self):
+        self.assertEqual(ccwho.work_descendants(self.PS, 999), 0)
+
+    def test_none_pid_is_zero(self):
+        self.assertEqual(ccwho.work_descendants(self.PS, None), 0)
+
+    def test_a_parent_cycle_terminates(self):
+        ps = "\n".join(["  PID  PPID COMMAND", " 400   401 a", " 401   400 b"])
+        self.assertEqual(ccwho.work_descendants(ps, 400), 1)
+
+
+class TestStoppedVsRunning(unittest.TestCase):
+    SESSION = {"sessionId": "s1", "cwd": "/Users/x/projects/liveapp",
+               "status": "idle", "name": "n", "startedAt": 1788000000000}
+
+    def _turn(self, text):
+        return {"type": "assistant", "timestamp": "2026-08-31T12:00:00.000Z",
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def test_not_busy_with_no_work_is_stopped(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn("All done.")],
+                              mtime=0, now=1788177600.0, work=0)
+        self.assertEqual(row["attention"], "stopped")
+
+    def test_not_busy_with_background_work_is_running(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn("All done.")],
+                              mtime=0, now=1788177600.0, work=3)
+        self.assertEqual(row["attention"], "running")
+
+    def test_an_ask_still_wins_over_stopped(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn("Want me to land it?")],
+                              mtime=0, now=1788177600.0, work=0)
+        self.assertEqual(row["attention"], "asks")
+
+    def test_an_ask_while_background_work_runs_still_asks(self):
+        row = ccwho.build_row(self.SESSION, [], [self._turn("Want me to land it?")],
+                              mtime=0, now=1788177600.0, work=5)
+        self.assertEqual(row["attention"], "asks")
+
+    def test_busy_is_untouched_by_work_count(self):
+        s = dict(self.SESSION, status="busy")
+        row = ccwho.build_row(s, [], [self._turn("x")], mtime=0, now=1788177600.0, work=0)
+        self.assertEqual(row["attention"], "busy")
+
+    def test_stopped_outranks_busy(self):
+        rows = [{"attention": "busy", "ts": 9, "project": "a", "name": "b"},
+                {"attention": "stopped", "ts": 1, "project": "a", "name": "s"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["s", "b"])
+
+    def test_running_sorts_last(self):
+        rows = [{"attention": "running", "ts": 9, "project": "a", "name": "r"},
+                {"attention": "busy", "ts": 1, "project": "a", "name": "b"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["b", "r"])

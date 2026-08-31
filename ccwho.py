@@ -39,14 +39,15 @@ def tick(state, argv, color):
     if "--blocked" in argv:
         rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
     out = eng.render(rows, total_orphans, color=color,
-                     show_prompt="--prompt" in argv or "-p" in argv)
+                     show_prompt="--prompt" in argv or "-p" in argv,
+                     links=state.get("links", False))
     state["ticks"] += 1
     return out, rows
 
 
 WATCH_FLAGS = ("--watch", "-w")
 KNOWN_FLAGS = {"--watch", "-w", "--blocked", "--prompt", "-p", "--json",
-               "--no-color", "--help", "-h"}
+               "--no-color", "--no-links", "--help", "-h"}
 MIN_INTERVAL = 1.0
 
 
@@ -127,6 +128,8 @@ def main(argv=None):
         print(__doc__.strip())
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
         print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2)")
+        print("\nThe tty column is a clickable link when stdout is a terminal.")
+        print("Run install-handler.sh once to register the ccwho:// scheme; --no-links opts out.")
         return 0
 
     bad = unknown_flags(argv)
@@ -137,7 +140,11 @@ def main(argv=None):
         return 2
 
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    state = {"ticks": 0, "engine_error": "", "watch": watch_requested(argv)}
+    # Links are on for a terminal unless refused: a terminal that cannot render
+    # OSC 8 shows the label anyway, so the downside is nil.
+    links = sys.stdout.isatty() and "--no-links" not in argv
+    state = {"ticks": 0, "engine_error": "", "watch": watch_requested(argv),
+             "links": links}
 
     if "--json" in argv:
         rows, _ = engine.collect(cache={})

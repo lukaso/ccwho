@@ -743,3 +743,56 @@ class TestReadyCollapsesIntoStopped(unittest.TestCase):
         row = ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
                               now=1788177600.0, work=0)
         self.assertNotEqual(row["attention"], "ready")
+
+
+class TestOsc8(unittest.TestCase):
+    """OSC 8 makes the tty column a real hyperlink. iTerm2 renders it; clicking
+    hands the URL to LaunchServices, where a tiny applet turns it into a jump."""
+
+    def test_wraps_label_in_an_osc8_sequence(self):
+        got = ccwho.osc8("s032", "ccwho://jump/s032", enabled=True)
+        self.assertEqual(got, "\033]8;;ccwho://jump/s032\033\\s032\033]8;;\033\\")
+
+    def test_disabled_returns_the_bare_label(self):
+        self.assertEqual(ccwho.osc8("s032", "ccwho://jump/s032", enabled=False), "s032")
+
+    def test_empty_url_returns_the_bare_label(self):
+        self.assertEqual(ccwho.osc8("s032", "", enabled=True), "s032")
+
+    def test_label_length_is_what_gets_padded(self):
+        # the escape must not count toward column width
+        self.assertEqual(ccwho.visible_len(ccwho.osc8("s032", "ccwho://jump/s032", True)), 4)
+
+    def test_visible_len_of_plain_text(self):
+        self.assertEqual(ccwho.visible_len("s032"), 4)
+
+    def test_visible_len_ignores_colour_codes(self):
+        self.assertEqual(ccwho.visible_len("\033[2ms032\033[0m"), 4)
+
+
+class TestJumpUrl(unittest.TestCase):
+    def test_prefers_tty(self):
+        self.assertEqual(ccwho.jump_url({"tty": "ttys032", "pid": 19576}),
+                         "ccwho://jump/s032")
+
+    def test_falls_back_to_pid(self):
+        self.assertEqual(ccwho.jump_url({"tty": "", "pid": 19576}),
+                         "ccwho://jump/19576")
+
+    def test_empty_when_neither(self):
+        self.assertEqual(ccwho.jump_url({"tty": "", "pid": None}), "")
+
+    def test_parse_round_trip(self):
+        self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032"), "s032")
+
+    def test_parse_tolerates_trailing_slash(self):
+        self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032/"), "s032")
+
+    def test_parse_rejects_other_schemes(self):
+        self.assertEqual(ccwho.parse_jump_url("http://evil/jump/s032"), "")
+
+    def test_parse_rejects_shell_metacharacters(self):
+        self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032;rm -rf /"), "")
+
+    def test_parse_empty(self):
+        self.assertEqual(ccwho.parse_jump_url(""), "")

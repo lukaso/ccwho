@@ -472,6 +472,37 @@ def parse_tty_map(ps_output):
     return out
 
 
+_ANSI = re.compile(r"\033(?:\][^\007\033]*(?:\007|\033\\)|\[[0-9;]*[A-Za-z])")
+# A jump target is a tty like s032 or a bare pid. Nothing else is accepted, so a
+# crafted URL cannot smuggle anything into the handler.
+_JUMP_TARGET = re.compile(r"^[A-Za-z]?[0-9]{1,8}$")
+
+
+def visible_len(text):
+    """Length as rendered: escape sequences occupy no columns."""
+    return len(_ANSI.sub("", text or ""))
+
+
+def osc8(label, url, enabled=True):
+    """Wrap a label as an OSC 8 hyperlink. iTerm2 renders it clickable."""
+    if not enabled or not url:
+        return label
+    return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
+
+
+def jump_url(row):
+    target = short_tty(row.get("tty", "")) or (str(row.get("pid")) if row.get("pid") else "")
+    return f"ccwho://jump/{target}" if target else ""
+
+
+def parse_jump_url(url):
+    """Extract the target from ccwho://jump/<target>, or "" if it is not one."""
+    if not isinstance(url, str) or not url.startswith("ccwho://jump/"):
+        return ""
+    target = url[len("ccwho://jump/"):].strip().rstrip("/")
+    return target if _JUMP_TARGET.match(target) else ""
+
+
 def short_tty(tty):
     """ttys032 -> s032. Short enough for a column, still unambiguous."""
     t = (tty or "").rsplit("/", 1)[-1]
@@ -603,7 +634,7 @@ def _paint(text, key, color):
     return f"{_C.get(key, '')}{text}{_C['reset']}" if color else text
 
 
-def render(rows, total_orphans, color=True, width=None, show_prompt=False):
+def render(rows, total_orphans, color=True, width=None, show_prompt=False, links=False):
     if not rows:
         return "no Claude Code sessions found\n"
     width = width or shutil.get_terminal_size((150, 24)).columns
@@ -636,9 +667,11 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
         if att == "running" and r.get("work"):
             doing = f"[{r['work']} bg] {doing}"
         where = short_tty(r.get("tty", "")) or "-"
+        where_cell = _paint(f"{where:<{w_tty}}", "dim", color)
+        where_cell = osc8(where_cell, jump_url(r), enabled=links and where != "-")
         shown_doing = truncate(doing, w_doing)
         line = (f"{r['project']:<{w_proj}}  "
-                f"{_paint(f'{where:<{w_tty}}', 'dim', color)}  "
+                f"{where_cell}  "
                 f"{_paint(f'{label:<10}', att, color)}  "
                 f"{truncate(title, w_title):<{w_title}}  "
                 f"{_paint(shown_doing, 'dim', color)}"

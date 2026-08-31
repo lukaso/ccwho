@@ -43,14 +43,51 @@ def tick(state, argv, color):
     return out, rows
 
 
+WATCH_FLAGS = ("--watch", "-w")
+KNOWN_FLAGS = {"--watch", "-w", "--blocked", "--prompt", "-p", "--json",
+               "--no-color", "--help", "-h"}
+MIN_INTERVAL = 1.0
+
+
+def watch_requested(argv):
+    return any(a in WATCH_FLAGS or a.startswith("--watch=") for a in argv)
+
+
 def parse_interval(argv, default=5.0):
+    """Accepts --watch N, --watch=N and -w N. A missing or unparseable value is
+    the default, never a silent no-op."""
     for i, a in enumerate(argv):
-        if a == "--watch" and i + 1 < len(argv):
-            try:
-                return max(1.0, float(argv[i + 1].rstrip("s")))
-            except ValueError:
-                return default
+        if a.startswith("--watch="):
+            raw = a.split("=", 1)[1]
+        elif a in WATCH_FLAGS and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+            raw = argv[i + 1]
+        else:
+            continue
+        try:
+            return max(MIN_INTERVAL, float(raw.rstrip("s")))
+        except ValueError:
+            return default
     return default
+
+
+def unknown_flags(argv):
+    """Anything dash-prefixed we do not recognise. Silently ignoring a flag is how
+    `--watch=3` used to run one-shot and look like a broken loop."""
+    bad, skip = [], False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if not a.startswith("-"):
+            continue
+        if a.startswith("--watch="):
+            continue
+        if a in KNOWN_FLAGS:
+            if a in WATCH_FLAGS and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                skip = True
+            continue
+        bad.append(a)
+    return bad
 
 
 def main(argv=None):
@@ -60,8 +97,15 @@ def main(argv=None):
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
         return 0
 
+    bad = unknown_flags(argv)
+    if bad:
+        print(f"ccwho: unknown option(s): {' '.join(bad)}", file=sys.stderr)
+        print("usage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]",
+              file=sys.stderr)
+        return 2
+
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    state = {"ticks": 0, "engine_error": "", "watch": "--watch" in argv}
+    state = {"ticks": 0, "engine_error": "", "watch": watch_requested(argv)}
 
     if "--json" in argv:
         rows, _ = engine.collect()
@@ -71,6 +115,10 @@ def main(argv=None):
     if not state["watch"]:
         out, _ = tick(state, argv, color)
         sys.stdout.write(out)
+        if sys.stdout.isatty():
+            hint = "\033[2mone shot. `ccwho --watch` to keep it live.\033[0m\n" if color \
+                else "one shot. `ccwho --watch` to keep it live.\n"
+            sys.stdout.write(hint)
         return 0
 
     interval = parse_interval(argv)

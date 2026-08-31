@@ -86,7 +86,7 @@ ln -s ~/projects/ccwho/ccgate.py ~/.local/bin/ccgate
 ```sh
 ccwho                 # one shot, needs-you first
 ccwho --watch         # live, redraws every 5s
-ccwho --watch 2       # ...every 2s
+ccwho --watch 2       # ...every 2s  (also -w 2, --watch=2)
 ccwho --blocked       # only what needs you or holds detached work
 ccwho --prompt        # add the last thing you said, under each row
 ccwho --json          # machine-readable, for a status line or key binding
@@ -97,13 +97,29 @@ ccwho --json          # machine-readable, for a status line or key binding
 | Column | Where it comes from |
 |---|---|
 | project | cwd, with worktrees reported under their parent repo |
-| status | `claude agents --json` - NEEDS YOU sorts to the top |
+| status | derived, see below - NEEDS YOU sorts to the top |
 | title | Claude Code's own `ai-title` entry, not the auto-generated session name |
 | doing | the last tool call, using Bash's human `description` when present |
 | since | time since the transcript was last written - real activity, not session age |
 
 The session *name* is deliberately not a column. `liveapp-4e` told you nothing,
 which is what started this.
+
+### NEEDS YOU vs ready
+
+`claude agents --json` reports one status, `waiting`, with `waitingFor: "input
+needed"`. That covers two very different states, and conflating them cries wolf:
+
+- **blocked** - a tool call is outstanding with no result. It genuinely needs you.
+- **ready** - the last turn ended normally and it is sitting at the prompt.
+
+`ccwho` splits them by looking for an unanswered `tool_use` in the transcript. Only
+blocked sessions get NEEDS YOU; ready sorts below busy.
+
+Measured on a live fleet: the one session Claude Code called `waiting` had nothing
+pending and `stop_reason: end_turn` - the same shape as every `idle` session. It did
+not need anything. The blocked case is covered by constructed tests, since a live
+fleet may go days without producing one.
 
 ## Hot reload
 
@@ -136,5 +152,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-66 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+94 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

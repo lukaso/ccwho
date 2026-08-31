@@ -23,7 +23,7 @@ import sys
 import time
 
 # Status order: what needs you first, what is working next, what is parked last.
-_RANK = {"waiting": 0, "busy": 1, "shell": 2, "idle": 3}
+_RANK = {"blocked": 0, "waiting": 0, "busy": 1, "ready": 2, "shell": 3, "idle": 4}
 _UNKNOWN_RANK = 4
 
 
@@ -198,6 +198,36 @@ def _ps_rows(ps_output):
         yield fields[0], int(fields[1]), fields[2]
 
 
+def waiting_kind(lines):
+    """Split Claude Code's `waiting` into what it actually means.
+
+    `waitingFor: "input needed"` covers two very different states: a session
+    genuinely blocked on a permission prompt or question, and one that simply
+    finished its turn and is sitting at the prompt. Only the first needs you.
+    The tell is an unanswered tool_use - a tool call with no matching tool_result.
+    """
+    pending = set()
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        content = d.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        if d.get("type") == "assistant":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    pending.add(b.get("id"))
+        elif d.get("type") == "user":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    pending.discard(b.get("tool_use_id"))
+    return "blocked" if pending else "ready"
+
+
 def gate_line(gate_dir=None):
     """One line naming who currently holds a ccgate slot, if anyone does."""
     try:
@@ -214,7 +244,8 @@ def gate_line(gate_dir=None):
 
 
 def sort_key(row):
-    return (_RANK.get(row.get("status"), _UNKNOWN_RANK), row.get("project", ""), row.get("name", ""))
+    key = row.get("attention") or row.get("status")
+    return (_RANK.get(key, _UNKNOWN_RANK), row.get("project", ""), row.get("name", ""))
 
 
 def age(started_ms, now=None):
@@ -331,9 +362,12 @@ def collect():
                 or extract_topic(head, strict=True)["last"] or first
                 or extract_topic(tail)["last"])
         title = extract_title(tail) or extract_title(head)
+        status = s.get("status", "?")
+        attention = waiting_kind(tail) if status == "waiting" else status
         rows.append({
             "project": project_of(s.get("cwd", "")),
-            "status": s.get("status", "?"),
+            "status": status,
+            "attention": attention,
             "waitingFor": s.get("waitingFor", ""),
             "name": s.get("name", "?"),
             "title": title,
@@ -353,7 +387,8 @@ def collect():
 
 # --------------------------------------------------------------------- display
 
-_C = {"waiting": "\033[33;1m", "busy": "\033[36m", "idle": "\033[2m",
+_C = {"blocked": "\033[33;1m", "ready": "\033[32m", "waiting": "\033[33;1m",
+      "busy": "\033[36m", "idle": "\033[2m",
       "shell": "\033[35m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
 
@@ -372,7 +407,8 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
 
     counts = {}
     for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        k = r.get("attention") or r["status"]
+        counts[k] = counts.get(k, 0) + 1
     summary = " · ".join(f"{n} {s}" for s, n in sorted(counts.items(), key=lambda kv: _RANK.get(kv[0], 9)))
 
     out = [_paint(f"{len(rows)} sessions: {summary}", "bold", color)]
@@ -384,7 +420,8 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
     out.append("")
 
     for r in rows:
-        label = "NEEDS YOU" if r["status"] == "waiting" else r["status"]
+        att = r.get("attention") or r["status"]
+        label = {"blocked": "NEEDS YOU", "ready": "ready"}.get(att, att)
         title = r["title"] or r["name"]
         doing = r["doing"] or "-"
         line = (f"{r['project']:<{w_proj}}  {_paint(f'{label:<10}', r['status'], color)}  "

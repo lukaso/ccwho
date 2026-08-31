@@ -274,3 +274,63 @@ class TestGateLine(unittest.TestCase):
 
     def test_missing_dir_is_not_an_error(self):
         self.assertEqual(ccwho.gate_line("/nonexistent/path/xyz"), "")
+
+
+class TestWaitingKind(unittest.TestCase):
+    """A session Claude Code calls `waiting` may be blocked on a prompt, or may
+    simply have finished its turn. Only the first deserves NEEDS YOU."""
+
+    def _assistant(self, stop_reason, tool_id=None):
+        content = [{"type": "text", "text": "hi"}]
+        if tool_id:
+            content = [{"type": "tool_use", "id": tool_id, "name": "Bash", "input": {}}]
+        return json.dumps({"type": "assistant",
+                           "message": {"stop_reason": stop_reason, "content": content}})
+
+    def _result(self, tool_id):
+        return json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}})
+
+    def test_end_turn_with_nothing_pending_is_ready(self):
+        self.assertEqual(ccwho.waiting_kind([self._assistant("end_turn")]), "ready")
+
+    def test_unanswered_tool_use_is_blocked(self):
+        lines = [self._assistant("tool_use", tool_id="t1")]
+        self.assertEqual(ccwho.waiting_kind(lines), "blocked")
+
+    def test_answered_tool_use_is_ready(self):
+        lines = [self._assistant("tool_use", tool_id="t1"), self._result("t1")]
+        self.assertEqual(ccwho.waiting_kind(lines), "ready")
+
+    def test_one_of_two_answered_is_still_blocked(self):
+        lines = [self._assistant("tool_use", tool_id="t1"),
+                 self._assistant("tool_use", tool_id="t2"), self._result("t1")]
+        self.assertEqual(ccwho.waiting_kind(lines), "blocked")
+
+    def test_empty_transcript_is_ready_not_blocked(self):
+        self.assertEqual(ccwho.waiting_kind([]), "ready")
+
+    def test_bad_lines_do_not_crash(self):
+        self.assertEqual(ccwho.waiting_kind(["{bad"]), "ready")
+
+
+class TestAttentionSort(unittest.TestCase):
+    def test_blocked_outranks_busy(self):
+        rows = [{"attention": "busy", "status": "busy", "project": "a", "name": "b"},
+                {"attention": "blocked", "status": "waiting", "project": "z", "name": "w"}]
+        self.assertEqual(sorted(rows, key=ccwho.sort_key)[0]["name"], "w")
+
+    def test_ready_sorts_below_busy(self):
+        rows = [{"attention": "ready", "status": "waiting", "project": "a", "name": "r"},
+                {"attention": "busy", "status": "busy", "project": "a", "name": "b"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["b", "r"])
+
+    def test_ready_sorts_above_idle(self):
+        rows = [{"attention": "idle", "status": "idle", "project": "a", "name": "i"},
+                {"attention": "ready", "status": "waiting", "project": "a", "name": "r"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["r", "i"])
+
+    def test_falls_back_to_status_when_attention_absent(self):
+        rows = [{"status": "idle", "project": "a", "name": "i"},
+                {"status": "busy", "project": "a", "name": "b"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["b", "i"])

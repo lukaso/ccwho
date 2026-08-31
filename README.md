@@ -92,6 +92,27 @@ ccwho jump "vitest"       # ...by title substring
 An ambiguous query lists the candidates rather than guessing. Needs iTerm2; the
 lookup is `tty of session` over its windows.
 
+### Clickable, without a new UI
+
+The tty column is emitted as an **OSC 8 hyperlink** when stdout is a terminal, so in
+iTerm2 (3.x) it is genuinely clickable. Clicking hands `ccwho://jump/s032` to
+LaunchServices, where a small applet turns it back into `ccwho jump s032`.
+
+```sh
+bash install-handler.sh      # once; builds ~/Applications/ccwho-jump.app
+```
+
+The applet is ~10 lines of AppleScript, has no Dock icon (`LSUIElement`), and runs
+no daemon. `--no-links` opts out; a terminal that cannot render OSC 8 shows the
+plain label, so there is no downside to leaving it on.
+
+**On trusting the URL.** A `ccwho://` URL can be handed to the applet by anything on
+the machine, so the target is validated against `^[A-Za-z]?[0-9]{1,8}$` before use -
+a tty or a pid, nothing else. The applet also swallows failures, because a non-zero
+`do shell script` raises a modal dialog. The scheme prefix is checked as well as the
+target shape: `https://evil/s032` is exactly as long as `ccwho://jump/`, so without
+that check it would slice to a valid-looking target.
+
 ## Install
 
 ```sh
@@ -256,5 +277,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-171 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+186 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

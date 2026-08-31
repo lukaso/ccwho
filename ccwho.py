@@ -136,9 +136,29 @@ def parse_age(text, default=3600):
         return default
 
 
+VALUE_FLAGS = ("--older-than",)
+
+
+def positional(argv, value_flags, default):
+    """First real positional. A flag's VALUE is not one - taking it as the pattern
+    is how `reap --older-than 1h` came to match PeopleViewService."""
+    skip = False
+    for a in argv:
+        if skip:
+            skip = False
+            continue
+        if a in value_flags:
+            skip = True
+            continue
+        if a.startswith("-"):
+            continue
+        return a
+    return default
+
+
 def reap(argv):
     """Kill leaked helper processes older than a threshold. Dry run by default."""
-    pattern = next((a for a in argv if not a.startswith("-")), "liveapp-pty-guards")
+    pattern = positional(argv, VALUE_FLAGS, "liveapp-pty-guards")
     age = parse_age(_arg(argv, "--older-than", "1h"))
     ps = engine.ps_snapshot_elapsed()
     hits = engine.reap_candidates(ps, pattern, min_age=age)

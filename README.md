@@ -113,6 +113,33 @@ a tty or a pid, nothing else. The applet also swallows failures, because a non-z
 target shape: `https://evil/s032` is exactly as long as `ccwho://jump/`, so without
 that check it would slice to a valid-looking target.
 
+## ccwho reap - killing only the stale ones
+
+Leaked helper processes accumulate: liveapp's vitest PTY-guard tests spawn a
+`script` holding a real pseudo-terminal per run and never reap it. After a few days
+that is hundreds of processes and a large share of the machine's ptys.
+
+Killing them by name is dangerous, because a current test run looks identical to a
+two-day-old one. `reap` filters by age and is a **dry run by default**:
+
+```sh
+ccwho reap                          # what would go, older than 1h
+ccwho reap --older-than 6h          # be stricter
+ccwho reap --older-than 6h --kill   # actually do it
+ccwho reap somepattern --older-than 1d
+```
+
+Orphaned roots (ppid 1) are signalled first so their children die with them.
+
+**Why the age parsing has its own tests.** `ps` ELAPSED has four shapes - `SS`,
+`MM:SS`, `HH:MM:SS`, `DD-HH:MM:SS` - and getting the day field wrong means reaping
+live work. Anything unparseable returns 0, so the "older than N" filter spares it
+rather than killing it. An empty pattern matches nothing, deliberately.
+
+The dry-run default earned itself immediately: the first version took `1h` as the
+*pattern* (a flag's value is not a positional argument) and matched
+`PeopleViewService`. It printed that instead of killing it.
+
 ## Install
 
 ```sh
@@ -277,5 +304,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-186 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+208 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

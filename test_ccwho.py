@@ -1042,3 +1042,47 @@ class ItermOpenScript(unittest.TestCase):
 
     def test_nothing_to_open_yields_no_script(self):
         self.assertEqual(ccwho.iterm_open_script([]), "")
+
+
+class RestoreLabelling(unittest.TestCase):
+    """A restore list whose rows read '/compact' and 'go ahead' identifies nothing.
+    Measured on the real fleet: 3 of 17 rows were useless with `topic` alone, and 1
+    of 17 would be useless with `first` alone ('restart from disk'). So: both."""
+
+    def man(self, first, topic):
+        return {"version": 1, "savedAt": 1, "count": 1, "skipped": 0, "sessions": [
+            {"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/p",
+             "project": "p", "first": first, "topic": topic, "ask": ""}]}
+
+    def test_shows_both_when_they_differ_and_says_which_is_which(self):
+        out = ccwho.render_restore(self.man("something is wrong with docker", "/compact"),
+                                   color=False)
+        self.assertIn("something is wrong with docker", out)
+        self.assertIn("/compact", out)
+        self.assertIn("opened", out.lower())
+        self.assertIn("latest", out.lower())
+
+    def test_the_useful_half_survives_when_the_opening_line_is_junk(self):
+        out = ccwho.render_restore(self.man("restart from disk", "Daily engagement scan"),
+                                   color=False)
+        self.assertIn("Daily engagement scan", out)
+
+    def test_one_line_when_they_are_the_same(self):
+        out = ccwho.render_restore(self.man("same thing", "same thing"), color=False)
+        self.assertEqual(out.count("same thing"), 1)
+
+    def test_a_session_with_neither_half_prints_no_stray_blank_line(self):
+        """Found by mutation, not by review: `elif opened or latest:` -> `elif True:`
+        stayed green, because nothing asserted the both-empty case."""
+        out = ccwho.render_restore(self.man("", ""), color=False)
+        body = [ln for ln in out.splitlines() if ln.startswith("      ")]
+        self.assertEqual([ln for ln in body if not ln.strip()], [],
+                         "a session with no topic must not emit an empty indented line")
+
+    def test_an_empty_half_is_not_printed_as_a_blank_label(self):
+        out = ccwho.render_restore(self.man("", "only this"), color=False)
+        self.assertIn("only this", out)
+        self.assertNotIn("opened:", out)
+        out2 = ccwho.render_restore(self.man("only that", ""), color=False)
+        self.assertIn("only that", out2)
+        self.assertNotIn("latest:", out2)

@@ -140,6 +140,62 @@ The dry-run default earned itself immediately: the first version took `1h` as th
 *pattern* (a flag's value is not a positional argument) and matched
 `PeopleViewService`. It printed that instead of killing it.
 
+## ccwho save / restore - a reboot stops being a one-way door
+
+The sessions always survived a reboot. `~/.claude/projects/<slug>/<sessionId>.jsonl`
+is still there and `claude --resume <id>` reopens it. What did not survive was
+knowing **which** sessions were open, so a fleet of seventeen was unrecoverable in
+practice - and the machine therefore never got rebooted. That is how swap reached
+**32.4 GB of 33.8 GB used**, which is what suspends every app, and what makes the
+timing suites in liveapp fail their bounds and report a red gate that is really a
+red machine.
+
+```sh
+ccwho save                 # capture the live fleet
+ccwho restore              # ...what was open, about what, how to reopen it
+ccwho restore --open       # ...actually reopen them, one iTerm2 window each
+ccwho restore --from PATH  # an older manifest
+```
+
+```
+17 sessions to restore (saved Mon 31 Aug 22:28)
+ 1. liveapp  was ttys071
+      opened: I've updated the LIVEAPP_BOT_GH_TOKEN in blabberate, but for some reason...
+      latest: does this still need a review? If not, land it.
+      ASKED YOU: Tell me which and I'll finish it and land. Or say land as-is...
+      claude --resume a1acd3cd-848b-...
+```
+
+**Both halves, because neither identifies a session alone.** Measured on the real
+fleet: `latest` read `/compact`, `go ahead` and `let's fix 1-3` for three of the
+seventeen, while `opened` read `restart from disk` for another. Rows are in
+dashboard order, so what was waiting on you is at the top and still carries its ask.
+
+**It saves itself.** `ccwho --watch` writes a manifest every 5 minutes
+(`CCWHO_AUTOSAVE` seconds, `0` disables), because the reboot this exists for is
+usually the one you did not plan. Manifests live in `~/.ccwho/restore/` - under
+`$HOME`, never a temp dir, since outliving the reboot is the entire point - and the
+newest 20 are kept, because a tool built for a full disk does not get to fill one.
+
+### What it is careful about
+
+The write goes through `os.replace`. A half-written manifest read after a reboot is
+worse than none, and a reboot is exactly when a partial write happens; a failed save
+leaves the last good manifest intact.
+
+`cwd` arrives from `claude agents --json`, off the machine rather than from us, and
+both consumers build a command from it. The shell line quotes it; the reopen path
+escapes it into an AppleScript literal, where an unescaped `"` **ends the string and
+the rest is parsed as code**, and where backslash must be escaped first or it eats
+the quote escape. Both are asserted by checking the payload survives as ONE argument
+- a substring check would pass vacuously.
+
+Two of these assertions only exist because the mutation battery caught them passing
+for the wrong reason: an empty-topic case that no test covered, and a `keep=0` guard
+that was invisible because `found[:-0]` is `found[:0]`. The battery carries a control
+cell that must stay green - a run where every cell agrees is a broken harness, not a
+result.
+
 ## Install
 
 ```sh
@@ -152,9 +208,11 @@ ln -s ~/projects/ccwho/ccgate.py ~/.local/bin/ccgate
 
 ```sh
 ccwho                 # one shot, needs-you first
-ccwho --watch         # live, redraws every 5s
+ccwho --watch         # live, redraws every 5s (and saves a restore manifest)
 ccwho --watch 2       # ...every 2s  (also -w 2, --watch=2)
 ccwho --blocked       # only what needs you or holds detached work
+ccwho save            # record the live fleet (before a reboot)
+ccwho restore [--open]  # list it back, or reopen the windows
 ccwho --prompt        # add the last thing you said, under each row
 ccwho --json          # machine-readable, for a status line or key binding
 ```

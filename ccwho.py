@@ -9,7 +9,9 @@ between iterations rather than held inside the engine.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib
+import io
 import json
 import os
 import signal
@@ -186,6 +188,33 @@ def reap(argv):
     return 0
 
 
+AUTOSAVE_SECS = float(os.environ.get("CCWHO_AUTOSAVE", "300"))
+KEEP_MANIFESTS = 20
+
+
+def should_autosave(last, now, interval):
+    """True when a watch should refresh the restore manifest.
+
+    Fires on the FIRST tick (last is None) so a watch is useful straight away, and
+    treats a backwards clock as due rather than never-due: an ntp step must not
+    wedge the one file that makes an unplanned reboot survivable.
+    """
+    if not interval or interval <= 0:
+        return False
+    if last is None:
+        return True
+    return not (0 <= now - last < interval)
+
+
+def prune_manifests(names, keep=KEEP_MANIFESTS):
+    """Which manifests to delete. This tool exists because a disk filled up; it
+    does not get to fill one. keep<=0 deletes NOTHING - fail safe, not empty."""
+    if keep <= 0:
+        return []
+    found = sorted(n for n in (names or []) if n and engine._MANIFEST_NAME.match(n))
+    return found[:-keep] if len(found) > keep else []
+
+
 def ccwho_dir():
     """Under $HOME, never a temp dir: the whole point is to outlive the reboot."""
     return os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho")
@@ -220,6 +249,12 @@ def save(argv):
             pass
         print(f"ccwho save: could not write {out}: {ex}", file=sys.stderr)
         return 1
+    d = os.path.dirname(out)
+    try:
+        for stale in prune_manifests(os.listdir(d)):
+            os.unlink(os.path.join(d, stale))
+    except OSError:
+        pass                      # housekeeping never fails the save it follows
     note = f", {man['skipped']} not capturable" if man["skipped"] else ""
     print(f"saved {man['count']} session(s){note} -> {out}")
     print("after the reboot:  ccwho restore        (add --open to reopen them)")
@@ -339,7 +374,15 @@ def main(argv=None):
                 banner = f"{RED if color else ''}engine reload failed: {state['engine_error']}{RESET if color else ''}\n"
             footer = (f"{DIM if color else ''}tick {state['ticks']} · every {interval:g}s · "
                       f"{time.strftime('%H:%M:%S')} · ctrl-c to stop{RESET if color else ''}\n")
-            sys.stdout.write(CLEAR_HOME + banner + out + "\n" + footer)
+            saved = ""
+            if should_autosave(state.get("last_save"), time.time(), AUTOSAVE_SECS):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    if save([]) == 0:
+                        state["last_save"] = time.time()
+                saved = (f"{DIM if color else ''} · restore manifest saved"
+                         f"{RESET if color else ''}")
+            sys.stdout.write(CLEAR_HOME + banner + out + "\n" + footer.rstrip("\n") + saved + "\n")
             sys.stdout.flush()
             time.sleep(max(0.0, interval - (time.time() - started)))
     except KeyboardInterrupt:

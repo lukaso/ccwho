@@ -699,9 +699,17 @@ def render_restore(manifest, color=True, width=None):
         head = "%s%2d. %s%s" % (c["bold"], i, s_.get("project") or "?", c["reset"])
         was = s_.get("tty") or ""
         out.append("%s  %s%s%s\n" % (head, c["dim"], ("was " + was) if was else "", c["reset"]))
-        topic = s_.get("topic") or s_.get("first") or ""
-        if topic:
-            out.append("      %s\n" % truncate(topic, (width or 100) - 6))
+        # BOTH halves, because neither alone identifies a session. Measured on a real
+        # 17-session fleet: `topic` (the latest turn) read "/compact", "go ahead" and
+        # "let's fix 1-3" for 3 of them, while `first` read "restart from disk" for 1.
+        opened = (s_.get("first") or "").strip()
+        latest = (s_.get("topic") or "").strip()
+        w = (width or 100) - 14
+        if opened and latest and opened != latest:
+            out.append("      %sopened:%s %s\n" % (c["dim"], c["reset"], truncate(opened, w)))
+            out.append("      %slatest:%s %s\n" % (c["dim"], c["reset"], truncate(latest, w)))
+        elif opened or latest:
+            out.append("      %s\n" % truncate(latest or opened, (width or 100) - 6))
         ask = s_.get("ask") or ""
         if ask:
             out.append("      %sASKED YOU: %s%s\n" % (

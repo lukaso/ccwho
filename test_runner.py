@@ -280,3 +280,53 @@ class TestSaveAndRestore(unittest.TestCase):
             self.assertEqual(calls, [], "printing must not launch anything")
         finally:
             runner.subprocess.run = real
+
+
+class TestAutosave(unittest.TestCase):
+    """`ccwho save` only helps if you remember it. The reboot this exists for is
+    often the one you did not plan, so a running watch keeps the manifest fresh."""
+
+    def test_saves_on_the_first_tick_so_a_watch_is_immediately_useful(self):
+        self.assertTrue(runner.should_autosave(None, now=1000, interval=300))
+
+    def test_does_not_save_again_until_the_interval_has_passed(self):
+        self.assertFalse(runner.should_autosave(1000, now=1299, interval=300))
+
+    def test_saves_once_the_interval_has_passed(self):
+        self.assertTrue(runner.should_autosave(1000, now=1300, interval=300))
+
+    def test_an_interval_of_zero_turns_it_off(self):
+        self.assertFalse(runner.should_autosave(None, now=1000, interval=0))
+        self.assertFalse(runner.should_autosave(1, now=99999, interval=0))
+
+    def test_a_clock_that_went_backwards_does_not_wedge_it_forever(self):
+        # ntp step, or a laptop waking with a stale monotonic-ish value
+        self.assertTrue(runner.should_autosave(9999, now=1000, interval=300))
+
+
+class TestPruneManifests(unittest.TestCase):
+    """A tool built because the disk filled up must not fill the disk."""
+
+    def names(self, n):
+        return ["2026-08-%02dT0900.json" % (i + 1) for i in range(n)]
+
+    def test_keeps_the_newest_n(self):
+        doomed = runner.prune_manifests(self.names(25), keep=20)
+        self.assertEqual(len(doomed), 5)
+        self.assertEqual(sorted(doomed), sorted(self.names(25))[:5])
+
+    def test_nothing_to_do_under_the_limit(self):
+        self.assertEqual(runner.prune_manifests(self.names(3), keep=20), [])
+
+    def test_ignores_files_that_are_not_manifests(self):
+        doomed = runner.prune_manifests(self.names(25) + ["notes.md", "keep.txt"], keep=20)
+        self.assertNotIn("notes.md", doomed)
+        self.assertNotIn("keep.txt", doomed)
+
+    def test_a_nonpositive_keep_deletes_nothing(self):
+        """keep=0 alone is a VACUOUS check: `found[:-0]` is `found[:0]` == [], so it
+        passes with the guard deleted. keep=-1 is where the guard earns its place -
+        `found[:-(-1)]` is `found[:1]`, which deletes. Found by mutation."""
+        self.assertEqual(runner.prune_manifests(self.names(25), keep=0), [])
+        self.assertEqual(runner.prune_manifests(self.names(25), keep=-1), [])
+        self.assertEqual(runner.prune_manifests(self.names(25), keep=-5), [])

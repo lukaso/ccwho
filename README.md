@@ -100,7 +100,7 @@ ccwho --json          # machine-readable, for a status line or key binding
 | status | derived, see below - NEEDS YOU sorts to the top |
 | title | Claude Code's own `ai-title` entry, not the auto-generated session name |
 | doing | the last tool call, using Bash's human `description` when present |
-| since | time since the transcript was last written - real activity, not session age |
+| since | time since the last real **turn**, from its `timestamp` - see below |
 
 The session *name* is deliberately not a column. `liveapp-4e` told you nothing,
 which is what started this.
@@ -129,7 +129,31 @@ So `ccwho` derives the state instead:
 | idle | everything else | idle |
 
 An ASKED YOU row shows **the question itself** in place of its last tool call, so
-the list answers "what does it want" without opening the session.
+the list answers "what does it want" without opening the session. Within each state,
+rows sort **most recent first**, so a fresh ask lands above ones you have already
+seen and parked.
+
+### Why `since` does not use file mtime
+
+Idle transcripts keep receiving metadata writes - `atis-latch`, `bridge-session`,
+`mode` - roughly every four minutes. File mtime therefore reports "4m" for a session
+whose last actual turn was six days ago, and it is wrong on exactly the parked
+sessions where recency matters. Measured skew on a live fleet:
+
+    status   mtime   last turn
+    idle     4m      6d          Add second email account function
+    idle     12h     2d          Docker high CPU usage
+    busy     7s      7s          (accurate only while active)
+
+`since` reads the `timestamp` of the last `assistant`/`user` entry instead, falling
+back to mtime only when no turn carries one.
+
+### Known gap: announced-then-stopped
+
+A session can need you without asking anything. One closed with "Gate next, then
+land." and simply stopped - no question, no request phrase, reported `idle`. That
+pattern is **not** detected. It is a third shape after the question and the
+request, and no rule for it has been validated yet.
 
 Only the closing line is considered - a question earlier in a long report is
 usually one the message goes on to answer. The phrase list ("tell me", "your call",
@@ -183,5 +207,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-111 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+126 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

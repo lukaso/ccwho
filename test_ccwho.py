@@ -406,3 +406,105 @@ class TestAsksRanking(unittest.TestCase):
         rows = [{"attention": "idle", "project": "a", "name": "i"},
                 {"attention": "asks", "project": "a", "name": "q"}]
         self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["q", "i"])
+
+
+class TestLastTurnTs(unittest.TestCase):
+    """File mtime is not activity: idle transcripts get metadata writes every few
+    minutes, so mtime reported 4m for a session last worked on six days ago."""
+
+    def _entry(self, typ, ts):
+        return json.dumps({"type": typ, "timestamp": ts,
+                           "message": {"content": [{"type": "text", "text": "x"}]}})
+
+    def test_parses_iso_z(self):
+        got = ccwho.last_turn_ts([self._entry("assistant", "2026-08-31T12:00:00.000Z")])
+        self.assertAlmostEqual(got, 1788177600.0, places=0)
+
+    def test_last_turn_wins(self):
+        lines = [self._entry("assistant", "2026-08-30T12:00:00.000Z"),
+                 self._entry("user", "2026-08-31T12:00:00.000Z")]
+        self.assertAlmostEqual(ccwho.last_turn_ts(lines), 1788177600.0, places=0)
+
+    def test_ignores_metadata_entries(self):
+        lines = [self._entry("assistant", "2026-08-30T12:00:00.000Z"),
+                 json.dumps({"type": "atis-latch", "timestamp": "2026-08-31T12:00:00.000Z"}),
+                 json.dumps({"type": "bridge-session", "timestamp": "2026-08-31T12:00:00.000Z"})]
+        self.assertAlmostEqual(ccwho.last_turn_ts(lines), 1788091200.0, places=0)
+
+    def test_none_when_no_timestamps(self):
+        self.assertIsNone(ccwho.last_turn_ts([json.dumps({"type": "assistant"})]))
+
+    def test_bad_timestamp_is_skipped(self):
+        lines = [self._entry("assistant", "2026-08-30T12:00:00.000Z"),
+                 self._entry("assistant", "not-a-date")]
+        self.assertAlmostEqual(ccwho.last_turn_ts(lines), 1788091200.0, places=0)
+
+    def test_empty(self):
+        self.assertIsNone(ccwho.last_turn_ts([]))
+
+
+class TestRecencySort(unittest.TestCase):
+    def test_newer_ask_sorts_above_older(self):
+        # names chosen so alphabetical order gives the WRONG answer
+        rows = [{"attention": "asks", "ts": 100, "project": "a", "name": "aaa-old"},
+                {"attention": "asks", "ts": 900, "project": "a", "name": "zzz-new"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)],
+                         ["zzz-new", "aaa-old"])
+
+    def test_rank_still_beats_recency(self):
+        rows = [{"attention": "asks", "ts": 100, "project": "a", "name": "ask"},
+                {"attention": "idle", "ts": 900, "project": "a", "name": "idle"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["ask", "idle"])
+
+    def test_missing_ts_sorts_last_within_rank(self):
+        rows = [{"attention": "asks", "project": "a", "name": "aaa-nots"},
+                {"attention": "asks", "ts": 900, "project": "a", "name": "zzz-has"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)],
+                         ["zzz-has", "aaa-nots"])
+
+
+class TestBuildRow(unittest.TestCase):
+    """Covers the wiring collect() used to hide: which clock `since` reads from."""
+
+    SESSION = {"sessionId": "s1", "cwd": "/Users/x/projects/liveapp",
+               "status": "idle", "name": "liveapp-4e", "startedAt": 1788000000000}
+
+    def _turn(self, ts, text="all done."):
+        return json.dumps({"type": "assistant", "timestamp": ts,
+                           "message": {"content": [{"type": "text", "text": text}]}})
+
+    def test_since_uses_the_last_turn_not_file_mtime(self):
+        # transcript last touched 6 days ago; file mtime is 60s old from metadata writes
+        old = 1788177600.0 - 6 * 86400
+        row = ccwho.build_row(self.SESSION, [], [self._turn("2026-08-25T12:00:00.000Z")],
+                              mtime=1788177600.0 - 60, now=1788177600.0)
+        self.assertEqual(row["since"], "6d")
+        self.assertAlmostEqual(row["ts"], old, places=0)
+
+    def test_falls_back_to_mtime_when_no_timestamps(self):
+        row = ccwho.build_row(self.SESSION, [], [json.dumps({"type": "assistant"})],
+                              mtime=1788177600.0 - 300, now=1788177600.0)
+        self.assertEqual(row["since"], "5m")
+
+    def test_ask_promotes_an_idle_session(self):
+        tail = [self._turn("2026-08-31T12:00:00.000Z", "Want me to build S2a?")]
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0)
+        self.assertEqual(row["attention"], "asks")
+        self.assertEqual(row["ask"], "Want me to build S2a?")
+
+    def test_plain_finish_stays_idle(self):
+        tail = [self._turn("2026-08-31T12:00:00.000Z", "234 tests green.")]
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0)
+        self.assertEqual(row["attention"], "idle")
+        self.assertEqual(row["ask"], "")
+
+    def test_busy_is_never_reclassified_as_asks(self):
+        s = dict(self.SESSION, status="busy")
+        tail = [self._turn("2026-08-31T12:00:00.000Z", "Want me to build S2a?")]
+        self.assertEqual(ccwho.build_row(s, [], tail, mtime=0, now=1788177600.0)["attention"], "busy")
+
+    def test_project_and_title_are_carried(self):
+        tail = [json.dumps({"type": "ai-title", "aiTitle": "Gate red triage"})]
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0)
+        self.assertEqual(row["project"], "liveapp")
+        self.assertEqual(row["title"], "Gate red triage")

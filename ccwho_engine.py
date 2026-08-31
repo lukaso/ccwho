@@ -17,6 +17,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import datetime
 import re
 import shutil
 import subprocess
@@ -153,6 +154,33 @@ def extract_doing(lines):
                 hint = " ".join(str(_tool_hint(name, b.get("input", {}) or {})).split())
                 doing = f"{name}: {hint}" if hint else name
     return doing
+
+
+# Only real turns. Idle transcripts keep receiving metadata writes (atis-latch,
+# bridge-session, mode), so file mtime says "4m" for a session last worked six days
+# ago - wrong on exactly the parked sessions where recency matters.
+_TURN_TYPES = ("assistant", "user")
+
+
+def last_turn_ts(lines):
+    """Epoch seconds of the last real turn, from its `timestamp` field."""
+    latest = None
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict) or d.get("type") not in _TURN_TYPES:
+            continue
+        raw = d.get("timestamp")
+        if not raw:
+            continue
+        try:
+            latest = datetime.datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError):
+            continue
+    return latest
 
 
 def since(mtime, now=None):
@@ -295,8 +323,11 @@ def gate_line(gate_dir=None):
 
 
 def sort_key(row):
+    """Rank first, then most-recent-first so a fresh ask surfaces above parked ones."""
     key = row.get("attention") or row.get("status")
-    return (_RANK.get(key, _UNKNOWN_RANK), row.get("project", ""), row.get("name", ""))
+    ts = row.get("ts")
+    return (_RANK.get(key, _UNKNOWN_RANK), -(ts if ts is not None else 0),
+            row.get("project", ""), row.get("name", ""))
 
 
 def age(started_ms, now=None):
@@ -399,6 +430,48 @@ def agents_json():
 
 # -------------------------------------------------------------------- assemble
 
+def build_row(session, head, tail, mtime, now=None, orphan_count=0):
+    """One display row from one session's data. Pure: no disk, no subprocess.
+
+    collect() used to inline this, which hid the wiring - notably which clock
+    `since` reads from - behind functions that only run against a live machine.
+    """
+    first = extract_topic(head, strict=True)["first"] or extract_topic(head)["first"]
+    last = (extract_topic(tail, strict=True)["last"]
+            or extract_topic(head, strict=True)["last"] or first
+            or extract_topic(tail)["last"])
+    status = session.get("status", "?")
+    ask = extract_ask(tail)
+    if status == "waiting":
+        attention = waiting_kind(tail)
+        if attention == "ready" and ask:
+            attention = "asks"
+    elif status != "busy" and ask:
+        attention = "asks"
+    else:
+        attention = status
+    ts = last_turn_ts(tail)
+    return {
+        "project": project_of(session.get("cwd", "")),
+        "status": status,
+        "attention": attention,
+        "waitingFor": session.get("waitingFor", ""),
+        "name": session.get("name", "?"),
+        "title": extract_title(tail) or extract_title(head),
+        "doing": extract_doing(tail),
+        "ask": ask,
+        "since": since(ts if ts is not None else mtime, now=now),
+        "ts": ts,
+        "topic": last,
+        "first": first,
+        "age": age(session.get("startedAt"), now=None if now is None else int(now * 1000)),
+        "orphans": orphan_count,
+        "pid": session.get("pid"),
+        "sessionId": session.get("sessionId", ""),
+        "cwd": session.get("cwd", ""),
+    }
+
+
 def collect():
     sessions = parse_sessions(agents_json())
     ps_out = ps_snapshot()
@@ -408,39 +481,7 @@ def collect():
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid)
-        first = extract_topic(head, strict=True)["first"] or extract_topic(head)["first"]
-        last = (extract_topic(tail, strict=True)["last"]
-                or extract_topic(head, strict=True)["last"] or first
-                or extract_topic(tail)["last"])
-        title = extract_title(tail) or extract_title(head)
-        status = s.get("status", "?")
-        ask = extract_ask(tail)
-        if status == "waiting":
-            attention = waiting_kind(tail)
-            if attention == "ready" and ask:
-                attention = "asks"
-        elif status != "busy" and ask:
-            attention = "asks"
-        else:
-            attention = status
-        rows.append({
-            "project": project_of(s.get("cwd", "")),
-            "status": status,
-            "attention": attention,
-            "waitingFor": s.get("waitingFor", ""),
-            "name": s.get("name", "?"),
-            "title": title,
-            "doing": extract_doing(tail),
-            "since": since(mtime),
-            "ask": ask,
-            "topic": last,
-            "first": first,
-            "age": age(s.get("startedAt")),
-            "orphans": orphans.get(sid, 0),
-            "pid": s.get("pid"),
-            "sessionId": sid,
-            "cwd": s.get("cwd", ""),
-        })
+        rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0)))
     rows.sort(key=sort_key)
     return rows, count_orphans(ps_out, home=os.path.expanduser("~"))
 

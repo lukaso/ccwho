@@ -791,6 +791,11 @@ class TestJumpUrl(unittest.TestCase):
     def test_parse_rejects_other_schemes(self):
         self.assertEqual(ccwho.parse_jump_url("http://evil/jump/s032"), "")
 
+    def test_parse_rejects_a_scheme_crafted_to_survive_the_slice(self):
+        # "https://evil/" is exactly as long as "ccwho://jump/", so without the
+        # scheme check this yields a perfectly valid-looking target
+        self.assertEqual(ccwho.parse_jump_url("https://evil/s032"), "")
+
     def test_parse_rejects_shell_metacharacters(self):
         self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032;rm -rf /"), "")
 

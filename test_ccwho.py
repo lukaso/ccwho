@@ -1,6 +1,7 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
 import json
 import os
+import shlex
 import unittest
 
 import ccwho_engine as ccwho
@@ -860,3 +861,184 @@ class TestReapCandidates(unittest.TestCase):
         r = [x for x in got if x["pid"] == 100][0]
         self.assertEqual(r["age"], 161339)
         self.assertIn("ptyrun", r["command"])
+
+
+# ------------------------------------------------------------ restore manifest
+# A reboot is a one-way door today: the sessions survive on disk but nothing says
+# which was which. These cover the capture, the resume line, and the read-back.
+
+class ManifestFromRows(unittest.TestCase):
+    def row(self, **kw):
+        base = dict(sessionId="4f2b91ac-1111-4222-8333-abcdefabcdef",
+                    cwd="/Users/x/projects/liveapp", project="liveapp",
+                    topic="the reaper", first="reap leaked ptys", ask="",
+                    attention="stopped", tty="s032", pid=4242, since="2h",
+                    status="waiting", work=0)
+        base.update(kw)
+        return base
+
+    def test_carries_what_a_restore_needs(self):
+        m = ccwho.manifest_from_rows([self.row()], now=1788196525)
+        s = m["sessions"][0]
+        for k in ("sessionId", "cwd", "project", "topic", "attention", "tty", "pid", "since"):
+            self.assertIn(k, s, f"{k} is needed to identify or reopen the session")
+        self.assertEqual(s["cwd"], "/Users/x/projects/liveapp")
+
+    def test_stamps_version_and_time_and_count(self):
+        m = ccwho.manifest_from_rows([self.row(), self.row(sessionId="a" * 8 + "-b" * 4)], now=1788196525)
+        self.assertEqual(m["version"], ccwho.MANIFEST_VERSION)
+        self.assertEqual(m["savedAt"], 1788196525)
+        self.assertEqual(m["count"], len(m["sessions"]))
+
+    def test_drops_a_session_with_no_id_because_it_cannot_be_resumed(self):
+        m = ccwho.manifest_from_rows([self.row(sessionId=""), self.row()], now=1)
+        self.assertEqual(len(m["sessions"]), 1)
+        self.assertEqual(m["skipped"], 1)
+
+    def test_drops_a_session_with_no_cwd_because_resume_must_cd_first(self):
+        m = ccwho.manifest_from_rows([self.row(cwd=""), self.row()], now=1)
+        self.assertEqual(len(m["sessions"]), 1)
+        self.assertEqual(m["skipped"], 1)
+
+    def test_keeps_the_order_it_was_given(self):
+        rows = [self.row(project="a", sessionId="1" * 8 + "-2222-4333-8444-" + "5" * 12),
+                self.row(project="b")]
+        m = ccwho.manifest_from_rows(rows, now=1)
+        self.assertEqual([s["project"] for s in m["sessions"]], ["a", "b"])
+
+
+class RestoreCommand(unittest.TestCase):
+    def test_cds_then_resumes_by_id(self):
+        c = ccwho.restore_command({"cwd": "/Users/x/p", "sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef"})
+        self.assertEqual(c, "cd /Users/x/p && claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef")
+
+    def test_quotes_a_path_with_a_space(self):
+        c = ccwho.restore_command({"cwd": "/Users/x/my code", "sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef"})
+        self.assertIn("'/Users/x/my code'", c)
+
+    def test_a_cwd_carrying_shell_metacharacters_cannot_execute(self):
+        # cwd comes from `claude agents --json`, i.ccwho. off the machine, not from us.
+        evil = "/tmp/x'; touch /tmp/pwned; echo '"
+        sid = "a1b2c3d4-1111-4222-8333-abcdefabcdef"
+        c = ccwho.restore_command({"cwd": evil, "sessionId": sid})
+        # The only assertion that means anything: the shell parses it as ONE argument
+        # to cd, so the payload is data. A substring check would pass vacuously.
+        self.assertEqual(shlex.split(c), ["cd", evil, "&&", "claude", "--resume", sid])
+
+    def test_a_session_id_that_is_not_id_shaped_is_refused(self):
+        for bad in ("", "a b", "id;rm -rf /", "../../etc/passwd", "$(whoami)", "-"):
+            self.assertIsNone(ccwho.restore_command({"cwd": "/tmp", "sessionId": bad}), bad)
+
+    def test_missing_cwd_is_refused(self):
+        self.assertIsNone(ccwho.restore_command({"cwd": "", "sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef"}))
+
+
+class ManifestReadBack(unittest.TestCase):
+    def test_entries_of_a_well_formed_manifest(self):
+        m = {"version": 1, "sessions": [{"sessionId": "x"}, {"sessionId": "y"}]}
+        self.assertEqual([s["sessionId"] for s in ccwho.manifest_entries(m)], ["x", "y"])
+
+    def test_a_manifest_with_no_sessions_key_is_empty_not_a_crash(self):
+        self.assertEqual(ccwho.manifest_entries({"version": 1}), [])
+
+    def test_junk_is_empty_not_a_crash(self):
+        for junk in (None, [], "nope", 7, {"sessions": "nope"}, {"sessions": [1, 2]}):
+            self.assertEqual(ccwho.manifest_entries(junk), [], repr(junk))
+
+
+class NewestManifest(unittest.TestCase):
+    def test_iso_names_sort_chronologically(self):
+        names = ["2026-08-30T0900.json", "2026-08-31T2230.json", "2026-08-31T0100.json"]
+        self.assertEqual(ccwho.newest_manifest(names), "2026-08-31T2230.json")
+
+    def test_ignores_anything_not_a_json_manifest(self):
+        self.assertEqual(ccwho.newest_manifest(["notes.md", "2026-08-30T0900.json", "zzz.txt"]),
+                         "2026-08-30T0900.json")
+
+    def test_nothing_saved_yet_is_none(self):
+        self.assertIsNone(ccwho.newest_manifest([]))
+        self.assertIsNone(ccwho.newest_manifest(["readme.md"]))
+
+
+class RenderRestore(unittest.TestCase):
+    def man(self, **kw):
+        base = dict(version=1, savedAt=1788196525, count=2, skipped=1, sessions=[
+            {"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/liveapp",
+             "project": "liveapp", "topic": "the worktree reaper", "ask": "Want me to land it?",
+             "attention": "asks", "tty": "s032", "since": "2h"},
+            {"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/football",
+             "project": "football", "topic": "fix the probe", "ask": "",
+             "attention": "stopped", "tty": "s041", "since": "20m"},
+        ])
+        base.update(kw)
+        return base
+
+    def test_shows_each_session_with_its_resume_line(self):
+        out = ccwho.render_restore(self.man(), color=False)
+        self.assertIn("liveapp", out)
+        self.assertIn("the worktree reaper", out)
+        self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+        self.assertIn("claude --resume a1b2c3d4-1111-4222-8333-abcdefabcdef", out)
+
+    def test_surfaces_what_was_waiting_on_you(self):
+        out = ccwho.render_restore(self.man(), color=False)
+        self.assertIn("Want me to land it?", out)
+
+    def test_reports_sessions_it_could_not_capture(self):
+        self.assertIn("1", ccwho.render_restore(self.man(skipped=1), color=False))
+        self.assertNotIn("skipped", ccwho.render_restore(self.man(skipped=0), color=False).lower())
+
+    def test_an_empty_manifest_says_so_rather_than_printing_nothing(self):
+        out = ccwho.render_restore({"version": 1, "savedAt": 1, "count": 0,
+                                    "skipped": 0, "sessions": []}, color=False)
+        self.assertTrue(out.strip(), "an empty restore must still say something")
+        self.assertIn("no sessions", out.lower())
+
+    def test_junk_does_not_crash(self):
+        for junk in (None, [], "nope", {"sessions": "nope"}):
+            self.assertTrue(ccwho.render_restore(junk, color=False).strip(), repr(junk))
+
+
+class AppleScriptQuoting(unittest.TestCase):
+    def test_a_plain_string_round_trips(self):
+        self.assertEqual(ccwho.applescript_str("cd /tmp"), '"cd /tmp"')
+
+    def test_a_double_quote_cannot_close_the_literal(self):
+        # AppleScript has no \' escape; an unescaped " ends the string and the rest
+        # becomes code. This is the whole reason the helper exists.
+        self.assertEqual(ccwho.applescript_str('say "hi"'), '"say \\"hi\\""')
+
+    def test_a_backslash_is_escaped_first_so_it_cannot_eat_the_quote_escape(self):
+        self.assertEqual(ccwho.applescript_str('a\\"b'), '"a\\\\\\"b"')
+
+    def test_a_newline_cannot_inject_a_second_statement(self):
+        self.assertNotIn("\n", ccwho.applescript_str("a\nb"))
+
+
+class ItermOpenScript(unittest.TestCase):
+    entries = [{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/liveapp"},
+               {"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/football"}]
+
+    def test_one_window_per_session(self):
+        s = ccwho.iterm_open_script(self.entries)
+        self.assertEqual(s.count("create window with default profile"), 2)
+
+    def test_each_window_runs_that_session_s_resume_line(self):
+        s = ccwho.iterm_open_script(self.entries)
+        self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", s)
+        self.assertIn("claude --resume a1b2c3d4-1111-4222-8333-abcdefabcdef", s)
+
+    def test_a_cwd_with_a_quote_is_escaped_into_the_applescript_literal(self):
+        s = ccwho.iterm_open_script([{"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef",
+                                      "cwd": '/tmp/a"; do shell script "touch /tmp/pwned'}])
+        for line in s.splitlines():
+            if "write text" in line:
+                self.assertEqual(line.count('"') % 2, 0, "unbalanced quotes: literal escaped early")
+                self.assertNotIn('do shell script "touch', line.replace('\\"', "'"))
+
+    def test_a_session_that_cannot_build_a_command_is_dropped_not_emitted_broken(self):
+        s = ccwho.iterm_open_script([{"sessionId": "", "cwd": "/tmp"}] + self.entries)
+        self.assertEqual(s.count("create window with default profile"), 2)
+
+    def test_nothing_to_open_yields_no_script(self):
+        self.assertEqual(ccwho.iterm_open_script([]), "")

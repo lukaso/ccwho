@@ -3,6 +3,12 @@
 A flag that is silently ignored is the failure mode these cover: --watch=3 and -w
 both used to fall through to one-shot with no complaint.
 """
+import contextlib
+import io
+import json
+import os
+import shutil
+import tempfile
 import unittest
 
 import ccwho as runner
@@ -116,3 +122,161 @@ class TestParseAge(unittest.TestCase):
 
     def test_empty_uses_the_default(self):
         self.assertEqual(runner.parse_age("", default=99), 99)
+
+
+class TestRestoreDir(unittest.TestCase):
+    def test_defaults_under_home_because_it_must_outlive_a_reboot(self):
+        old = os.environ.pop("CCWHO_DIR", None)
+        try:
+            d = runner.restore_dir()
+            self.assertTrue(d.startswith(os.path.expanduser("~")), d)
+            self.assertNotIn("/tmp", d, "a temp dir does not survive the reboot it exists for")
+        finally:
+            if old is not None:
+                os.environ["CCWHO_DIR"] = old
+
+    def test_env_override(self):
+        os.environ["CCWHO_DIR"] = "/somewhere/else"
+        try:
+            self.assertTrue(runner.restore_dir().startswith("/somewhere/else"))
+        finally:
+            os.environ.pop("CCWHO_DIR", None)
+
+
+class TestSaveAndRestore(unittest.TestCase):
+    ROWS = [{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/liveapp",
+             "project": "liveapp", "topic": "the reaper", "ask": "Land it?", "attention": "asks",
+             "tty": "s032", "since": "2h", "status": "waiting", "first": "", "pid": 1},
+            {"sessionId": "", "cwd": "/Users/x/p/nope", "project": "nope", "topic": "t",
+             "ask": "", "attention": "stopped", "tty": "", "since": "1h", "status": "waiting",
+             "first": "", "pid": 2}]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.real_collect = runner.engine.collect
+        runner.engine.collect = lambda cache=None: (list(self.ROWS), 0)
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _save(self, argv=()):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = runner.save(list(argv))
+        return rc, buf.getvalue()
+
+    def _restore(self, argv=()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.restore(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_save_writes_a_manifest_that_restore_reads_back(self):
+        rc, _ = self._save()
+        self.assertEqual(rc, 0)
+        rc, out = self._restore()
+        self.assertEqual(rc, 0)
+        self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+
+    def test_save_records_the_session_it_could_not_capture(self):
+        self._save()
+        path = os.path.join(runner.restore_dir(),
+                            os.listdir(runner.restore_dir())[0])
+        with open(path) as fh:
+            man = json.load(fh)
+        self.assertEqual(man["count"], 1)
+        self.assertEqual(man["skipped"], 1)
+
+    def test_save_leaves_no_partial_file_behind(self):
+        self._save()
+        self.assertEqual([n for n in os.listdir(runner.restore_dir()) if n.endswith(".tmp")], [])
+
+    def test_a_write_that_dies_midway_leaves_no_half_manifest(self):
+        """The vacuous version of this checked only that no .tmp survives - which a
+        direct, non-atomic write also satisfies. The assertion that bites is that the
+        TARGET is never a partial file, which only os.replace can give you."""
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        target = os.path.join(d, "2026-01-01T0000.json")
+        real_dump = runner.json.dump
+
+        def dies(obj, fh, **kw):
+            fh.write('{"version": 1, "sessi')      # a plausible partial write
+            raise OSError("disk full")
+
+        runner.json.dump = dies
+        try:
+            rc, _ = self._save(["--out", target])
+        finally:
+            runner.json.dump = real_dump
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(target),
+                         "a partially written manifest is worse than none after a reboot")
+
+    def test_a_failed_write_does_not_destroy_the_manifest_already_there(self):
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        target = os.path.join(d, "2026-01-01T0000.json")
+        self._save(["--out", target])
+        good = open(target).read()
+        real_dump = runner.json.dump
+
+        def dies(obj, fh, **kw):
+            fh.write("{ruined")
+            raise OSError("disk full")
+
+        runner.json.dump = dies
+        try:
+            self._save(["--out", target])
+        finally:
+            runner.json.dump = real_dump
+        self.assertEqual(open(target).read(), good, "the last good manifest must survive")
+
+    def test_restore_with_nothing_saved_says_what_to_do_and_fails(self):
+        rc, out = self._restore()
+        self.assertEqual(rc, 1)
+        self.assertIn("ccwho save", out)
+
+    def test_restore_from_an_explicit_path(self):
+        self._save()
+        d = runner.restore_dir()
+        path = os.path.join(d, os.listdir(d)[0])
+        rc, out = self._restore(["--from", path])
+        self.assertEqual(rc, 0)
+        self.assertIn("liveapp", out)
+
+    def test_restore_from_a_corrupt_manifest_fails_loudly_not_with_a_traceback(self):
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        bad = os.path.join(d, "2026-01-01T0000.json")
+        with open(bad, "w") as fh:
+            fh.write("{not json")
+        rc, out = self._restore()
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot read", out)
+
+    def test_restore_picks_the_newest_manifest(self):
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        for name, proj in (("2026-01-01T0000.json", "old"), ("2026-09-09T2359.json", "new")):
+            with open(os.path.join(d, name), "w") as fh:
+                json.dump({"version": 1, "savedAt": 1, "count": 1, "skipped": 0, "sessions": [
+                    {"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
+                     "cwd": "/p", "project": proj, "topic": "t", "ask": ""}]}, fh)
+        rc, out = self._restore()
+        self.assertIn("new", out)
+        self.assertNotIn("old", out)
+
+    def test_restore_does_not_open_windows_unless_asked(self):
+        self._save()
+        calls = []
+        real = runner.subprocess.run
+        runner.subprocess.run = lambda *a, **k: calls.append(a) or real(["true"])
+        try:
+            self._restore()
+            self.assertEqual(calls, [], "printing must not launch anything")
+        finally:
+            runner.subprocess.run = real

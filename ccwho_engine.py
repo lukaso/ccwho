@@ -19,6 +19,7 @@ import json
 import os
 import datetime
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -600,6 +601,157 @@ def agents_json():
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return "[]"
+
+
+# ------------------------------------------------------------ restore manifest
+#
+# A reboot is a ONE-WAY DOOR today. The sessions themselves survive - the transcript
+# is ~/.claude/projects/<slug>/<sessionId>.jsonl and `claude --resume <id>` reopens
+# it - but nothing on disk records WHICH sessions were open, so a fleet of eleven is
+# unrecoverable in practice and the machine never gets rebooted. That is how the swap
+# file reached 96% full.
+#
+# `ccwho save` writes what is live to ~/.ccwho/restore/ (under $HOME: it must outlive
+# the reboot, which is why it is not in a temp dir). `ccwho restore` reads it back.
+
+MANIFEST_VERSION = 1
+
+# A session id has to be safe in a shell line AND look like an id. shlex.quote alone
+# would already make injection impossible; refusing a malformed id as well means the
+# user is TOLD it was skipped instead of getting a command that fails obscurely.
+_SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}$")
+_MANIFEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}\.json$")
+
+_MANIFEST_KEYS = ("sessionId", "cwd", "project", "topic", "first", "ask",
+                  "attention", "status", "tty", "pid", "since")
+
+
+def manifest_from_rows(rows, now=None):
+    """Capture the live fleet. Pure: the caller supplies the rows and the clock.
+
+    Order is the caller's (collect() sorts needs-you first), so the restore list
+    reads in the same order as the dashboard the user was looking at.
+    """
+    now = int(time.time() if now is None else now)
+    kept, skipped = [], 0
+    for r in rows or []:
+        if not r.get("sessionId") or not r.get("cwd"):
+            skipped += 1          # no id to resume, or nowhere to cd: not restorable
+            continue
+        kept.append({k: r.get(k, "") for k in _MANIFEST_KEYS})
+    return {"version": MANIFEST_VERSION, "savedAt": now,
+            "count": len(kept), "skipped": skipped, "sessions": kept}
+
+
+def restore_command(entry):
+    """The shell line that reopens one session, or None if it cannot be built.
+
+    cwd matters: the transcript lives under a slug derived from it, so `--resume`
+    is run from the project directory, not from wherever the user happens to be.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    sid = str(entry.get("sessionId", "") or "")
+    cwd = str(entry.get("cwd", "") or "")
+    if not cwd or not _SESSION_ID.match(sid):
+        return None
+    return "cd %s && claude --resume %s" % (shlex.quote(cwd), shlex.quote(sid))
+
+
+def manifest_entries(manifest):
+    """Sessions out of a manifest read off disk. Tolerates anything: a file that
+    predates a format change must degrade to 'nothing saved', never a traceback."""
+    if not isinstance(manifest, dict):
+        return []
+    sessions = manifest.get("sessions")
+    if not isinstance(sessions, list):
+        return []
+    return [s for s in sessions if isinstance(s, dict)]
+
+
+def manifest_name(now=None):
+    """ISO-ish and lexicographically sortable, so newest_manifest needs no stat."""
+    return time.strftime("%Y-%m-%dT%H%M.json",
+                         time.localtime(time.time() if now is None else now))
+
+
+def newest_manifest(names):
+    found = sorted(n for n in (names or []) if n and _MANIFEST_NAME.match(n))
+    return found[-1] if found else None
+
+
+def render_restore(manifest, color=True, width=None):
+    """The post-reboot view: what was open, what it was about, how to get it back."""
+    c = _C if color else {k: "" for k in _C}
+    entries = manifest_entries(manifest)
+    m = manifest if isinstance(manifest, dict) else {}
+    when = m.get("savedAt")
+    stamp = ""
+    if isinstance(when, (int, float)):
+        stamp = time.strftime(" (saved %a %d %b %H:%M)", time.localtime(when))
+    out = []
+    if not entries:
+        return "ccwho restore: no sessions in the manifest%s\n" % stamp
+
+    out.append("%s%d session%s to restore%s%s\n" % (
+        c["bold"], len(entries), "" if len(entries) == 1 else "s", stamp, c["reset"]))
+    for i, s_ in enumerate(entries, 1):
+        cmd = restore_command(s_)
+        head = "%s%2d. %s%s" % (c["bold"], i, s_.get("project") or "?", c["reset"])
+        was = s_.get("tty") or ""
+        out.append("%s  %s%s%s\n" % (head, c["dim"], ("was " + was) if was else "", c["reset"]))
+        topic = s_.get("topic") or s_.get("first") or ""
+        if topic:
+            out.append("      %s\n" % truncate(topic, (width or 100) - 6))
+        ask = s_.get("ask") or ""
+        if ask:
+            out.append("      %sASKED YOU: %s%s\n" % (
+                c["asks"], truncate(ask, (width or 100) - 17), c["reset"]))
+        if cmd:
+            out.append("      %s%s%s\n" % (c["dim"], cmd, c["reset"]))
+        else:
+            # kept visible rather than dropped: a session you cannot reopen from here
+            # is exactly the one you would otherwise spend an hour hunting for.
+            out.append("      %sno resume line (bad id or no cwd) - find it with: claude --resume%s\n"
+                       % (c["dim"], c["reset"]))
+    skipped = m.get("skipped") or 0
+    if skipped:
+        out.append("\n%s%d live session(s) could not be captured (no id or no cwd)%s\n"
+                   % (c["dim"], skipped, c["reset"]))
+    return "".join(out)
+
+
+def applescript_str(text):
+    """Quote a Python string as an AppleScript literal.
+
+    AppleScript has no alternative quoting: an unescaped `"` ends the literal and
+    everything after it is parsed as CODE. Backslash is escaped FIRST, or the
+    backslash we add for the quote could itself be eaten by a trailing backslash
+    in the input. Newlines are dropped - a literal cannot span lines, and a
+    newline is how a second statement would be smuggled in.
+    """
+    t = str(text).replace("\\", "\\\\").replace('"', '\\"')
+    t = t.replace("\n", " ").replace("\r", " ")
+    return '"%s"' % t
+
+
+def iterm_open_script(entries):
+    """AppleScript that reopens one iTerm2 window per restorable session.
+
+    An entry whose resume line cannot be built is DROPPED rather than emitted
+    broken: a window that opens onto a failed command is worse than no window.
+    """
+    lines = []
+    for e_ in entries or []:
+        cmd = restore_command(e_)
+        if not cmd:
+            continue
+        lines.append("  create window with default profile")
+        lines.append("  tell current session of current window")
+        lines.append("    write text %s" % applescript_str(cmd))
+        lines.append("  end tell")
+    if not lines:
+        return ""
+    return 'tell application "iTerm2"\n  activate\n%s\nend tell\n' % "\n".join(lines)
 
 
 # -------------------------------------------------------------------- assemble

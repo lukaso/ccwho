@@ -186,6 +186,93 @@ def reap(argv):
     return 0
 
 
+def ccwho_dir():
+    """Under $HOME, never a temp dir: the whole point is to outlive the reboot."""
+    return os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho")
+
+
+def restore_dir():
+    return os.path.join(ccwho_dir(), "restore")
+
+
+def save(argv):
+    """Capture the live fleet so a reboot stops being a one-way door."""
+    rows, _ = engine.collect(cache={})
+    man = engine.manifest_from_rows(rows)
+    out = _arg(argv, "--out", None)
+    if not out:
+        d = restore_dir()
+        os.makedirs(d, exist_ok=True)
+        out = os.path.join(d, engine.manifest_name())
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    # Atomic: a half-written manifest read after a reboot is worse than none, and
+    # the reboot is exactly when a partial write would happen.
+    tmp = out + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(man, fh, indent=2)
+        os.replace(tmp, out)
+    except OSError as ex:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        print(f"ccwho save: could not write {out}: {ex}", file=sys.stderr)
+        return 1
+    note = f", {man['skipped']} not capturable" if man["skipped"] else ""
+    print(f"saved {man['count']} session(s){note} -> {out}")
+    print("after the reboot:  ccwho restore        (add --open to reopen them)")
+    return 0
+
+
+def restore(argv):
+    """Read the manifest back: what was open, what it was about, how to reopen it."""
+    path = _arg(argv, "--from", None)
+    if not path:
+        d = restore_dir()
+        try:
+            names = os.listdir(d)
+        except OSError:
+            names = []
+        newest = engine.newest_manifest(names)
+        if not newest:
+            print("ccwho restore: nothing saved yet - run `ccwho save` BEFORE you reboot.",
+                  file=sys.stderr)
+            return 1
+        path = os.path.join(d, newest)
+
+    try:
+        with open(path) as fh:
+            man = json.load(fh)
+    except (OSError, ValueError) as ex:
+        print(f"ccwho restore: cannot read {path}: {ex}", file=sys.stderr)
+        return 1
+
+    if "--open" in argv:
+        script = engine.iterm_open_script(engine.manifest_entries(man))
+        if not script:
+            print("ccwho restore: nothing in that manifest can be reopened", file=sys.stderr)
+            return 1
+        n = script.count("create window with default profile")
+        print(f"opening {n} iTerm2 window(s)...")
+        try:
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError) as ex:
+            print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
+            return 1
+        if r.returncode != 0:
+            print(f"ccwho restore: iTerm2 refused: {r.stderr.strip()}", file=sys.stderr)
+            return r.returncode
+        print(f"opened {n} window(s). each is at its project, resuming its own session.")
+        return 0
+
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
+    sys.stdout.write(engine.render_restore(man, color=color))
+    sys.stdout.write("\nadd --open to reopen these as iTerm2 windows.\n")
+    return 0
+
+
 def _arg(argv, flag, default):
     if flag in argv:
         i = argv.index(flag)
@@ -200,10 +287,16 @@ def main(argv=None):
         return jump(argv[1:])
     if argv and argv[0] == "reap":
         return reap(argv[1:])
+    if argv and argv[0] == "save":
+        return save(argv[1:])
+    if argv and argv[0] == "restore":
+        return restore(argv[1:])
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
         print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2)")
+        print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
+        print("       ccwho restore [--open] [--from PATH]       list it back / reopen the windows")
         print("\nThe tty column is a clickable link when stdout is a terminal.")
         print("Run install-handler.sh once to register the ccwho:// scheme; --no-links opts out.")
         return 0

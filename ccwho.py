@@ -34,7 +34,7 @@ def reload_engine(state):
 
 def tick(state, argv, color):
     eng = reload_engine(state) if state["watch"] else engine
-    rows, total_orphans = eng.collect()
+    rows, total_orphans = eng.collect(cache=state.setdefault("cache", {}))
     if "--blocked" in argv:
         rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
     out = eng.render(rows, total_orphans, color=color,
@@ -108,7 +108,7 @@ def main(argv=None):
     state = {"ticks": 0, "engine_error": "", "watch": watch_requested(argv)}
 
     if "--json" in argv:
-        rows, _ = engine.collect()
+        rows, _ = engine.collect(cache={})
         print(json.dumps(rows, indent=2))
         return 0
 

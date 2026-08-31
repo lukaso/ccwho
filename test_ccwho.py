@@ -508,3 +508,62 @@ class TestBuildRow(unittest.TestCase):
         row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0)
         self.assertEqual(row["project"], "liveapp")
         self.assertEqual(row["title"], "Gate red triage")
+
+
+class TestRecordsAcceptBoth(unittest.TestCase):
+    """Extractors must accept pre-parsed dicts, so a tail is parsed once per tick
+    instead of once per extractor. They took 5.2 passes over every line."""
+
+    def test_as_records_parses_strings(self):
+        got = ccwho.as_records([json.dumps({"type": "user"})])
+        self.assertEqual(got[0]["type"], "user")
+
+    def test_as_records_passes_dicts_through(self):
+        d = {"type": "user"}
+        self.assertIs(ccwho.as_records([d])[0], d)
+
+    def test_as_records_skips_junk(self):
+        self.assertEqual(ccwho.as_records(["{bad", None, 7]), [])
+
+    def test_as_records_skips_valid_json_that_is_not_an_object(self):
+        # "123" and "[1,2]" parse fine but are not records; without the dict
+        # guard they reach the extractors and blow up on .get()
+        self.assertEqual(ccwho.as_records(["123", "[1,2]", '"str"', "null"]), [])
+
+    def test_title_from_dicts(self):
+        self.assertEqual(ccwho.extract_title([{"type": "ai-title", "aiTitle": "T"}]), "T")
+
+    def test_doing_from_dicts(self):
+        recs = [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"description": "go"}}]}}]
+        self.assertEqual(ccwho.extract_doing(recs), "Bash: go")
+
+    def test_topic_from_dicts(self):
+        recs = [{"type": "user", "message": {"content": "hello there"}}]
+        self.assertEqual(ccwho.extract_topic(recs)["last"], "hello there")
+
+    def test_last_turn_ts_from_dicts(self):
+        recs = [{"type": "assistant", "timestamp": "2026-08-31T12:00:00.000Z"}]
+        self.assertAlmostEqual(ccwho.last_turn_ts(recs), 1788177600.0, places=0)
+
+    def test_waiting_kind_from_dicts(self):
+        recs = [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}}]
+        self.assertEqual(ccwho.waiting_kind(recs), "blocked")
+
+
+class TestWindowCache(unittest.TestCase):
+    def test_fresh_entry_is_valid(self):
+        self.assertTrue(ccwho.cache_valid({"mtime": 5.0, "size": 100}, 5.0, 100))
+
+    def test_changed_mtime_invalidates(self):
+        self.assertFalse(ccwho.cache_valid({"mtime": 5.0, "size": 100}, 6.0, 100))
+
+    def test_changed_size_invalidates(self):
+        self.assertFalse(ccwho.cache_valid({"mtime": 5.0, "size": 100}, 5.0, 101))
+
+    def test_missing_entry_invalidates(self):
+        self.assertFalse(ccwho.cache_valid(None, 5.0, 100))
+
+    def test_incomplete_entry_invalidates(self):
+        self.assertFalse(ccwho.cache_valid({"mtime": 5.0}, 5.0, 100))

@@ -88,12 +88,8 @@ def is_boilerplate(text):
 def extract_topic(lines, strict=False):
     """First and last real user prompt. Skips tool noise and system reminders."""
     real, any_prompt = [], []
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(d, dict) or d.get("type") != "user":
+    for d in as_records(lines):
+        if d.get("type") != "user":
             continue
         text = " ".join(_text_of(d.get("message", {}).get("content")).split())
         if not text:
@@ -110,15 +106,38 @@ def extract_topic(lines, strict=False):
     return {"first": pool[0] if pool else "", "last": pool[-1] if pool else ""}
 
 
+def as_records(lines):
+    """Accept raw JSONL strings or already-parsed dicts. Parsing a tail once per
+    tick instead of once per extractor was a 5x cut; the extractors took 5.2
+    passes over every line."""
+    out = []
+    for item in lines or ():
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        if not isinstance(item, str):
+            continue
+        try:
+            d = json.loads(item)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def cache_valid(entry, mtime, size):
+    """A cached window is reusable only while the file is byte-for-byte unchanged."""
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("mtime") == mtime and entry.get("size") == size
+
+
 def extract_title(lines):
     """Claude Code's own generated session title (`ai-title` entries)."""
     title = ""
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(d, dict) and d.get("type") == "ai-title" and d.get("aiTitle"):
+    for d in as_records(lines):
+        if d.get("type") == "ai-title" and d.get("aiTitle"):
             title = str(d["aiTitle"]).strip()
     return title
 
@@ -138,12 +157,8 @@ def _tool_hint(name, inp):
 def extract_doing(lines):
     """What the session last actually did - the final tool call, human-readable."""
     doing = ""
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(d, dict) or d.get("type") != "assistant":
+    for d in as_records(lines):
+        if d.get("type") != "assistant":
             continue
         content = d.get("message", {}).get("content")
         if not isinstance(content, list):
@@ -165,12 +180,8 @@ _TURN_TYPES = ("assistant", "user")
 def last_turn_ts(lines):
     """Epoch seconds of the last real turn, from its `timestamp` field."""
     latest = None
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(d, dict) or d.get("type") not in _TURN_TYPES:
+    for d in as_records(lines):
+        if d.get("type") not in _TURN_TYPES:
             continue
         raw = d.get("timestamp")
         if not raw:
@@ -256,12 +267,8 @@ def asks_user(text):
 
 def last_assistant_text(lines):
     text = ""
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(d, dict) or d.get("type") != "assistant":
+    for d in as_records(lines):
+        if d.get("type") != "assistant":
             continue
         content = d.get("message", {}).get("content")
         if isinstance(content, list):
@@ -286,13 +293,7 @@ def waiting_kind(lines):
     The tell is an unanswered tool_use - a tool call with no matching tool_result.
     """
     pending = set()
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(d, dict):
-            continue
+    for d in as_records(lines):
         content = d.get("message", {}).get("content")
         if not isinstance(content, list):
             continue
@@ -357,11 +358,24 @@ def transcript_path(session_id):
     return hits[0] if hits else None
 
 
-def read_windows(session_id, tail_bytes=4 * 1024 * 1024, head_lines=400):
-    """Head and tail of a transcript, plus its mtime. One read, several extractors."""
+def read_windows(session_id, tail_bytes=1024 * 1024, head_lines=400, cache=None):
+    """Head and tail of a transcript as PARSED records, plus its mtime.
+
+    `cache` is owned by the runner (it survives hot reload) and keyed on
+    sessionId, holding (mtime, size). An unchanged transcript is not re-read or
+    re-parsed - which is most of them, most ticks.
+    """
     path = transcript_path(session_id)
     if not path:
         return [], [], None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return [], [], None
+    if cache is not None:
+        hit = cache.get(session_id)
+        if cache_valid(hit, st.st_mtime, st.st_size):
+            return hit["head"], hit["tail"], hit["mtime"]
     try:
         head = []
         with open(path, "r", errors="ignore") as fh:
@@ -374,7 +388,11 @@ def read_windows(session_id, tail_bytes=4 * 1024 * 1024, head_lines=400):
             fh.seek(0, os.SEEK_END)
             fh.seek(max(0, fh.tell() - tail_bytes))
             tail = fh.read().decode("utf-8", "ignore").splitlines()[1:]
-        return head, tail, os.path.getmtime(path)
+        head, tail = as_records(head), as_records(tail)
+        if cache is not None:
+            cache[session_id] = {"mtime": st.st_mtime, "size": st.st_size,
+                                 "head": head, "tail": tail}
+        return head, tail, st.st_mtime
     except OSError:
         return [], [], None
 
@@ -472,7 +490,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0):
     }
 
 
-def collect():
+def collect(cache=None):
     sessions = parse_sessions(agents_json())
     ps_out = ps_snapshot()
     ids = [s.get("sessionId", "") for s in sessions]
@@ -480,9 +498,12 @@ def collect():
     rows = []
     for s in sessions:
         sid = s.get("sessionId", "")
-        head, tail, mtime = read_windows(sid)
+        head, tail, mtime = read_windows(sid, cache=cache)
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0)))
     rows.sort(key=sort_key)
+    if cache is not None:                       # drop rows for sessions that ended
+        for gone in set(cache) - set(ids):
+            cache.pop(gone, None)
     return rows, count_orphans(ps_out, home=os.path.expanduser("~"))
 
 

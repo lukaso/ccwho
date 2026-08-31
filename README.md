@@ -148,6 +148,19 @@ sessions where recency matters. Measured skew on a live fleet:
 `since` reads the `timestamp` of the last `assistant`/`user` entry instead, falling
 back to mtime only when no turn carries one.
 
+### Cost
+
+A tick costs **~0.05s warm, ~0.26s cold** over 15 sessions. Two things make that so,
+and both were regressions I had to fix after `--watch` burned half a core:
+
+- **One parse per tick, not per extractor.** The extractors took 5.2 full JSON
+  passes over every tail line. They now accept pre-parsed records.
+- **A window cache keyed on (mtime, size).** An unchanged transcript is not re-read
+  or re-parsed. The cache lives in the *runner's* state, not the engine, because the
+  engine is reloaded every tick and module globals would be discarded.
+
+Before: 48 MB parsed per tick, 5.09s of work on a 5s interval - a full core.
+
 ### Known gap: announced-then-stopped
 
 A session can need you without asking anything. One closed with "Gate next, then
@@ -207,5 +220,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-126 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+140 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

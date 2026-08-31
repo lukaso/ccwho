@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -120,10 +121,65 @@ def jump(argv):
     return 0 if out.startswith("focused") else 1
 
 
+def parse_age(text, default=3600):
+    """--older-than 90m / 2h / 3d / 600 (seconds)."""
+    t = (text or "").strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if t and t[-1] in mult:
+        try:
+            return int(float(t[:-1]) * mult[t[-1]])
+        except ValueError:
+            return default
+    try:
+        return int(t)
+    except ValueError:
+        return default
+
+
+def reap(argv):
+    """Kill leaked helper processes older than a threshold. Dry run by default."""
+    pattern = next((a for a in argv if not a.startswith("-")), "liveapp-pty-guards")
+    age = parse_age(_arg(argv, "--older-than", "1h"))
+    ps = engine.ps_snapshot_elapsed()
+    hits = engine.reap_candidates(ps, pattern, min_age=age)
+    if not hits:
+        print(f"nothing matching {pattern!r} older than {age}s")
+        return 0
+    roots = [h for h in hits if h["ppid"] == 1]
+    print(f"{len(hits)} processes match {pattern!r} and are older than {age}s "
+          f"({len(roots)} orphaned roots)")
+    for h in sorted(hits, key=lambda x: -x["age"])[:5]:
+        print(f"  {h['pid']:<8} {h['age'] // 3600}h  {h['command'][:88]}")
+    if len(hits) > 5:
+        print(f"  ... and {len(hits) - 5} more")
+    if "--kill" not in argv:
+        print("\ndry run. add --kill to actually terminate them.")
+        return 0
+    killed = 0
+    for h in sorted(hits, key=lambda x: x["ppid"] != 1):   # orphan roots first
+        try:
+            os.kill(h["pid"], signal.SIGTERM)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    print(f"sent SIGTERM to {killed} processes")
+    return 0
+
+
+def _arg(argv, flag, default):
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "jump":
         return jump(argv[1:])
+    if argv and argv[0] == "reap":
+        return reap(argv[1:])
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")

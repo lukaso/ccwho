@@ -459,6 +459,48 @@ def topic_for(session_id, tail_bytes=4 * 1024 * 1024, head_lines=400):
     return {"first": first, "last": last}
 
 
+_ETIME = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$|^(\d+)$")
+
+
+def etime_seconds(etime):
+    """ps ELAPSED -> seconds. Shapes: SS, MM:SS, HH:MM:SS, DD-HH:MM:SS.
+
+    Anything unparseable is 0, so a filter of "older than N" spares it rather
+    than reaping it. Wrong here means killing live work.
+    """
+    m = _ETIME.match((etime or "").strip())
+    if not m:
+        return 0
+    if m.group(5):
+        return int(m.group(5))
+    days = int(m.group(1) or 0)
+    hours = int(m.group(2) or 0)
+    return ((days * 24 + hours) * 60 + int(m.group(3))) * 60 + int(m.group(4))
+
+
+def reap_candidates(ps_output, pattern, min_age=0):
+    """Processes whose command contains `pattern` and that are at least min_age old.
+
+    An empty pattern matches nothing - a reaper that defaults to everything is a
+    footgun, not a convenience.
+    """
+    if not pattern:
+        return []
+    out = []
+    for line in (ps_output or "").splitlines():
+        f = line.strip().split(None, 3)
+        if len(f) < 4 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        pid, ppid, etime, cmd = int(f[0]), int(f[1]), f[2], f[3]
+        if pattern not in cmd:
+            continue
+        age = etime_seconds(etime)
+        if age < min_age:
+            continue
+        out.append({"pid": pid, "ppid": ppid, "age": age, "command": cmd})
+    return out
+
+
 def parse_tty_map(ps_output):
     """pid -> controlling terminal. `??` means no terminal, so it is omitted."""
     out = {}
@@ -527,6 +569,14 @@ def tty_snapshot():
     try:
         return subprocess.run(["ps", "-eo", "pid,tty"], capture_output=True,
                               text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def ps_snapshot_elapsed():
+    try:
+        return subprocess.run(["ps", "-eo", "pid,ppid,etime,command"],
+                              capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
 

@@ -801,3 +801,62 @@ class TestJumpUrl(unittest.TestCase):
 
     def test_parse_empty(self):
         self.assertEqual(ccwho.parse_jump_url(""), "")
+
+
+class TestEtimeSeconds(unittest.TestCase):
+    """ps etime has four shapes and getting it wrong silently kills live work."""
+
+    def test_seconds_only(self):
+        self.assertEqual(ccwho.etime_seconds("39"), 39)
+
+    def test_mm_ss(self):
+        self.assertEqual(ccwho.etime_seconds("02:30"), 150)
+
+    def test_hh_mm_ss(self):
+        self.assertEqual(ccwho.etime_seconds("01:00:00"), 3600)
+
+    def test_days_hh_mm_ss(self):
+        self.assertEqual(ccwho.etime_seconds("01-20:48:59"), 161339)
+
+    def test_multi_digit_days(self):
+        self.assertEqual(ccwho.etime_seconds("11-00:00:00"), 950400)
+
+    def test_garbage_is_zero_so_nothing_is_reaped_by_accident(self):
+        self.assertEqual(ccwho.etime_seconds("nonsense"), 0)
+        self.assertEqual(ccwho.etime_seconds(""), 0)
+
+
+class TestReapCandidates(unittest.TestCase):
+    PS = "\n".join([
+        "  PID  PPID ELAPSED COMMAND",
+        " 100     1 01-20:48:59 script -q /dev/null /tmp/vr-A/liveapp-pty-guards-x/ptyrun.1",
+        " 101   100 01-20:48:59 bash /tmp/vr-A/liveapp-pty-guards-x/ptyrun.1",
+        " 200     1 00:30 script -q /dev/null /tmp/vr-B/liveapp-pty-guards-y/ptyrun.2",
+        " 300   999 05:00:00 node vitest",
+        " 400     1 03:00:00 claude",
+    ])
+
+    def test_matches_only_the_pattern(self):
+        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=0)
+        self.assertEqual({r["pid"] for r in got}, {100, 101, 200})
+
+    def test_age_filter_spares_the_recent_one(self):
+        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=3600)
+        self.assertEqual({r["pid"] for r in got}, {100, 101})
+
+    def test_age_filter_can_spare_everything(self):
+        self.assertEqual(ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=10**9), [])
+
+    def test_never_matches_unrelated_work(self):
+        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=0)
+        self.assertNotIn(300, {r["pid"] for r in got})
+        self.assertNotIn(400, {r["pid"] for r in got})
+
+    def test_empty_pattern_matches_nothing(self):
+        self.assertEqual(ccwho.reap_candidates(self.PS, "", min_age=0), [])
+
+    def test_candidates_carry_age_and_command(self):
+        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=3600)
+        r = [x for x in got if x["pid"] == 100][0]
+        self.assertEqual(r["age"], 161339)
+        self.assertIn("ptyrun", r["command"])

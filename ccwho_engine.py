@@ -17,13 +17,21 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 
 # Status order: what needs you first, what is working next, what is parked last.
-_RANK = {"blocked": 0, "waiting": 0, "busy": 1, "ready": 2, "shell": 3, "idle": 4}
+_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "busy": 2, "ready": 3, "shell": 4, "idle": 5}
+
+# Closing-line requests that hand the decision back without a question mark.
+# Deliberately short: every entry was validated against a live fleet, and a false
+# positive costs a glance while a false negative loses the session entirely.
+_ASK_PHRASES = ("tell me", "let me know", "your call", "say the word",
+                "which do you want", "shall i", "want me to", "should i",
+                "do you want", "confirm whether")
 _UNKNOWN_RANK = 4
 
 
@@ -198,6 +206,49 @@ def _ps_rows(ps_output):
         yield fields[0], int(fields[1]), fields[2]
 
 
+def _closing_line(text):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    return re.sub(r"[*_`#>]", "", lines[-1]).strip()
+
+
+def asks_user(text):
+    """Does this message hand the decision back to the human?
+
+    The harness reports `idle` for a session that ended its turn with a question,
+    so status alone loses them. Only the closing line is considered: a question
+    earlier in a long report is usually one the message goes on to answer.
+    """
+    closing = _closing_line(text).lower()
+    if not closing:
+        return False
+    return "?" in closing or any(p in closing for p in _ASK_PHRASES)
+
+
+def last_assistant_text(lines):
+    text = ""
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict) or d.get("type") != "assistant":
+            continue
+        content = d.get("message", {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                    text = b["text"]
+    return text
+
+
+def extract_ask(lines):
+    """The closing line, when it is a request. Empty when the session is not asking."""
+    text = last_assistant_text(lines)
+    return _closing_line(text) if asks_user(text) else ""
+
+
 def waiting_kind(lines):
     """Split Claude Code's `waiting` into what it actually means.
 
@@ -363,7 +414,15 @@ def collect():
                 or extract_topic(tail)["last"])
         title = extract_title(tail) or extract_title(head)
         status = s.get("status", "?")
-        attention = waiting_kind(tail) if status == "waiting" else status
+        ask = extract_ask(tail)
+        if status == "waiting":
+            attention = waiting_kind(tail)
+            if attention == "ready" and ask:
+                attention = "asks"
+        elif status != "busy" and ask:
+            attention = "asks"
+        else:
+            attention = status
         rows.append({
             "project": project_of(s.get("cwd", "")),
             "status": status,
@@ -373,6 +432,7 @@ def collect():
             "title": title,
             "doing": extract_doing(tail),
             "since": since(mtime),
+            "ask": ask,
             "topic": last,
             "first": first,
             "age": age(s.get("startedAt")),
@@ -387,7 +447,8 @@ def collect():
 
 # --------------------------------------------------------------------- display
 
-_C = {"blocked": "\033[33;1m", "ready": "\033[32m", "waiting": "\033[33;1m",
+_C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "ready": "\033[32m",
+      "waiting": "\033[33;1m",
       "busy": "\033[36m", "idle": "\033[2m",
       "shell": "\033[35m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
@@ -421,9 +482,9 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False):
 
     for r in rows:
         att = r.get("attention") or r["status"]
-        label = {"blocked": "NEEDS YOU", "ready": "ready"}.get(att, att)
+        label = {"blocked": "NEEDS YOU", "asks": "ASKED YOU", "ready": "ready"}.get(att, att)
         title = r["title"] or r["name"]
-        doing = r["doing"] or "-"
+        doing = (r.get("ask") if att == "asks" else r["doing"]) or "-"
         line = (f"{r['project']:<{w_proj}}  {_paint(f'{label:<10}', r['status'], color)}  "
                 f"{truncate(title, w_title):<{w_title}}  "
                 f"{_paint(truncate(doing, w_doing), 'dim', color)}"

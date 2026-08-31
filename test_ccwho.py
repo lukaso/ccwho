@@ -334,3 +334,75 @@ class TestAttentionSort(unittest.TestCase):
         rows = [{"status": "idle", "project": "a", "name": "i"},
                 {"status": "busy", "project": "a", "name": "b"}]
         self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["b", "i"])
+
+
+class TestAsksUser(unittest.TestCase):
+    """The harness reports `idle` for a session that ended its turn with a
+    question. Whether it needs you is in the closing line, not the status field."""
+
+    def test_closing_question_mark(self):
+        self.assertTrue(ccwho.asks_user("Did the work.\n\nWant me to build S2a?"))
+
+    def test_markdown_is_stripped_before_matching(self):
+        self.assertTrue(ccwho.asks_user("**Want me to build S2a?**"))
+
+    def test_imperative_request_without_a_question_mark(self):
+        self.assertTrue(ccwho.asks_user("Tell me which and I'll finish it and land."))
+
+    def test_say_the_word(self):
+        self.assertTrue(ccwho.asks_user("Outside this change's scope - say the word and it's a one-liner."))
+
+    def test_your_call(self):
+        self.assertTrue(ccwho.asks_user("It's your machine and your call; I'm not killing anything."))
+
+    def test_plain_statement_is_not_an_ask(self):
+        self.assertFalse(ccwho.asks_user("Idle and ready."))
+
+    def test_report_of_results_is_not_an_ask(self):
+        self.assertFalse(ccwho.asks_user("234 tests green, typecheck clean."))
+
+    def test_the_word_question_alone_is_not_an_ask(self):
+        self.assertFalse(ccwho.asks_user("Still open, not blocking: the spend labelling question."))
+
+    def test_only_the_closing_line_counts(self):
+        self.assertFalse(ccwho.asks_user("Should I do X?\n\nDone, all landed."))
+
+    def test_empty_text(self):
+        self.assertFalse(ccwho.asks_user(""))
+
+
+class TestExtractAsk(unittest.TestCase):
+    def _msg(self, text):
+        return json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": text}]}})
+
+    def test_returns_the_closing_line(self):
+        got = ccwho.extract_ask([self._msg("Did work.\n\nWant me to build S2a?")])
+        self.assertEqual(got, "Want me to build S2a?")
+
+    def test_empty_when_not_asking(self):
+        self.assertEqual(ccwho.extract_ask([self._msg("All done.")]), "")
+
+    def test_uses_the_last_assistant_message(self):
+        lines = [self._msg("Want me to do X?"), self._msg("Never mind, finished.")]
+        self.assertEqual(ccwho.extract_ask(lines), "")
+
+    def test_no_messages(self):
+        self.assertEqual(ccwho.extract_ask([]), "")
+
+
+class TestAsksRanking(unittest.TestCase):
+    def test_asks_outranks_busy(self):
+        rows = [{"attention": "busy", "project": "a", "name": "b"},
+                {"attention": "asks", "project": "z", "name": "q"}]
+        self.assertEqual(sorted(rows, key=ccwho.sort_key)[0]["name"], "q")
+
+    def test_blocked_still_outranks_asks(self):
+        rows = [{"attention": "asks", "project": "a", "name": "q"},
+                {"attention": "blocked", "project": "z", "name": "x"}]
+        self.assertEqual(sorted(rows, key=ccwho.sort_key)[0]["name"], "x")
+
+    def test_asks_outranks_idle(self):
+        rows = [{"attention": "idle", "project": "a", "name": "i"},
+                {"attention": "asks", "project": "a", "name": "q"}]
+        self.assertEqual([r["name"] for r in sorted(rows, key=ccwho.sort_key)], ["q", "i"])

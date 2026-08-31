@@ -105,7 +105,38 @@ ccwho --json          # machine-readable, for a status line or key binding
 The session *name* is deliberately not a column. `liveapp-4e` told you nothing,
 which is what started this.
 
-### NEEDS YOU vs ready
+### What actually needs you
+
+The harness status field cannot answer this on its own, in either direction.
+
+**It over-reports.** `claude agents --json` has one status, `waiting`, with
+`waitingFor: "input needed"`. That covers a session blocked on an outstanding tool
+call *and* one that simply finished its turn. Only the first needs you.
+
+**It under-reports, which is worse.** A session that ends its turn with a direct
+question is reported `idle`, indistinguishable from one that finished and went
+quiet. Measured on a live fleet of 15: six sessions were parked awaiting a decision
+and *every one of them* was reported `idle`.
+
+So `ccwho` derives the state instead:
+
+| state | how it is decided | label |
+|---|---|---|
+| blocked | an unanswered `tool_use` in the transcript | NEEDS YOU |
+| asks | the closing line is a question or a request | ASKED YOU |
+| busy | harness says busy | busy |
+| ready | `waiting`, nothing pending, no question | ready |
+| idle | everything else | idle |
+
+An ASKED YOU row shows **the question itself** in place of its last tool call, so
+the list answers "what does it want" without opening the session.
+
+Only the closing line is considered - a question earlier in a long report is
+usually one the message goes on to answer. The phrase list ("tell me", "your call",
+"say the word", ...) is deliberately short and every entry was validated against a
+live fleet: 6 flagged, 6 genuine, 9 correctly quiet.
+
+### The older NEEDS YOU vs ready split
 
 `claude agents --json` reports one status, `waiting`, with `waitingFor: "input
 needed"`. That covers two very different states, and conflating them cries wolf:
@@ -152,5 +183,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-94 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+111 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

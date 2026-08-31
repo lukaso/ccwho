@@ -124,9 +124,23 @@ So `ccwho` derives the state instead:
 |---|---|---|
 | blocked | an unanswered `tool_use` in the transcript | NEEDS YOU |
 | asks | the closing line is a question or a request | ASKED YOU |
+| stopped | not busy, and **nothing running under it** | STOPPED |
 | busy | harness says busy | busy |
-| ready | `waiting`, nothing pending, no question | ready |
-| idle | everything else | idle |
+| running | not busy, but background work is in flight | running |
+
+### Stopped, or waiting on a machine
+
+The signal that matters most is not what the last message said - it is whether
+anything is still in flight. A session that is not busy and has no work under it has
+**stopped**: it will not progress without you. One with background work is waiting
+on a machine, not on a human, so it sorts last and shows its count as `[3 bg]`.
+
+`work_descendants()` walks the process tree from the session pid and excludes
+infrastructure. Measured on a live fleet: every non-busy session had exactly three
+descendants and all three were `chrome-devtools-mcp`; every busy session had 4-21
+real ones. Counting MCP servers would make every session look busy forever.
+
+STOPPED outranks busy, because a stopped session is the one that needs a human.
 
 An ASKED YOU row shows **the question itself** in place of its last tool call, so
 the list answers "what does it want" without opening the session. Within each state,
@@ -220,5 +234,5 @@ Pure functions and plain dicts only.
 python3 -m unittest -v
 ```
 
-140 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+153 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

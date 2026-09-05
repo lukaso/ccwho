@@ -592,15 +592,24 @@ def ps_snapshot():
 
 
 def agents_json():
+    """The live session list as JSON text, or None when the SOURCE is unavailable.
+
+    None and "[]" are different answers and must never be collapsed together.
+    "[]" is claude saying you have nothing open; None is us being unable to ask
+    - binary off PATH (a launchd job's minimal environment does exactly this),
+    a non-zero exit, a timeout. Returning "[]" for both is how a save writes
+    "you had nothing open" over the record of what you did.
+    """
     exe = shutil.which("claude")
     if not exe:
-        return "[]"
+        return None
     try:
-        return subprocess.run(
+        done = subprocess.run(
             [exe, "agents", "--json"], capture_output=True, text=True, timeout=30
-        ).stdout
+        )
     except (OSError, subprocess.SubprocessError):
-        return "[]"
+        return None
+    return done.stdout if done.returncode == 0 else None
 
 
 # ------------------------------------------------------------ restore manifest
@@ -840,8 +849,14 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     }
 
 
-def collect(cache=None):
-    sessions = parse_sessions(agents_json())
+def collect(cache=None, status=None):
+    """`status` is a caller-owned dict, same idiom as `cache`. It carries out the
+    one fact a caller cannot recover from the rows: whether the session source
+    could be reached at all. An empty row list means nothing without it."""
+    raw = agents_json()
+    if status is not None:
+        status["source_ok"] = raw is not None
+    sessions = parse_sessions(raw)
     ps_out = ps_snapshot()
     ttys = parse_tty_map(tty_snapshot())
     ids = [s.get("sessionId", "") for s in sessions]

@@ -226,8 +226,22 @@ def restore_dir():
 
 def save(argv):
     """Capture the live fleet so a reboot stops being a one-way door."""
-    rows, _ = engine.collect(cache={})
+    status = {}
+    rows, _ = engine.collect(cache={}, status=status)
+    if not status.get("source_ok", True):
+        print("ccwho save: cannot reach `claude agents` - nothing written.", file=sys.stderr)
+        print("  A save that cannot ask must not answer: an empty manifest would be",
+              file=sys.stderr)
+        print("  kept as the newest and would evict the record of what you had open.",
+              file=sys.stderr)
+        print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
+        return 1
     man = engine.manifest_from_rows(rows)
+    if man["count"] == 0:
+        # Writing this would only push a manifest that HAS something out of the
+        # keep-20 window. Nothing to restore is not something to record.
+        print("no restorable sessions - nothing written.")
+        return 0
     out = _arg(argv, "--out", None)
     if not out:
         d = restore_dir()

@@ -1148,3 +1148,59 @@ class CheckManifest(unittest.TestCase):
             ok, problems = ccwho.check_manifest(junk, cwd_exists=lambda p: True,
                                                 transcript_for=lambda s: "/tx")
             self.assertFalse(ok, repr(junk))
+
+
+class TestSessionSourceAvailability(unittest.TestCase):
+    """`[]` and "could not ask" are DIFFERENT answers.
+
+    Conflating them is how a scheduled save writes "you had nothing open" over the
+    record of what you did have open. agents_json must say which one it is.
+    """
+
+    def setUp(self):
+        self.real_which = ccwho.shutil.which
+        self.real_run = ccwho.subprocess.run
+
+    def tearDown(self):
+        ccwho.shutil.which = self.real_which
+        ccwho.subprocess.run = self.real_run
+
+    class _Done:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout = rc, out
+
+    def test_binary_missing_is_none_not_empty_list(self):
+        ccwho.shutil.which = lambda name: None
+        self.assertIsNone(ccwho.agents_json())
+
+    def test_nonzero_exit_is_none(self):
+        ccwho.shutil.which = lambda name: "/bin/claude"
+        ccwho.subprocess.run = lambda *a, **k: self._Done(1, "")
+        self.assertIsNone(ccwho.agents_json())
+
+    def test_launch_failure_is_none(self):
+        ccwho.shutil.which = lambda name: "/bin/claude"
+
+        def boom(*a, **k):
+            raise OSError("no exec")
+
+        ccwho.subprocess.run = boom
+        self.assertIsNone(ccwho.agents_json())
+
+    def test_a_genuine_empty_answer_is_still_empty_list(self):
+        ccwho.shutil.which = lambda name: "/bin/claude"
+        ccwho.subprocess.run = lambda *a, **k: self._Done(0, "[]")
+        self.assertEqual(ccwho.agents_json(), "[]")
+
+    def test_collect_reports_the_source_to_its_caller(self):
+        ccwho.shutil.which = lambda name: None
+        st = {}
+        ccwho.collect(cache={}, status=st)
+        self.assertIs(st.get("source_ok"), False)
+
+    def test_collect_reports_a_working_source(self):
+        ccwho.shutil.which = lambda name: "/bin/claude"
+        ccwho.subprocess.run = lambda *a, **k: self._Done(0, "[]")
+        st = {}
+        ccwho.collect(cache={}, status=st)
+        self.assertIs(st.get("source_ok"), True)

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.lukaso.ccwho.save</string>
+
+  <!-- Explicit interpreter + PATH: launchd gives a minimal environment, and
+       ccwho shells out to `ps` AND to `claude agents --json`. ~/.local/bin is
+       where `claude` lives and is NOT on launchd's default PATH: without it the
+       save runs, finds no sessions, and reports success. Nothing here may
+       depend on a login shell. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/lukasoberhuber/projects/ccwho/ccwho.py</string>
+    <string>save</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/lukasoberhuber/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!-- StartInterval fires only while the Mac is AWAKE; it never wakes it, and
+       after a sleep launchd runs the job once if the interval elapsed. That is
+       exactly "every 15 minutes when awake". -->
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <!-- A manifest at login, before you have had time to open anything worth
+       losing. The save is idempotent and cheap. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/lukasoberhuber/.ccwho/autosave.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lukasoberhuber/.ccwho/autosave.log</string>
+</dict>
+</plist>

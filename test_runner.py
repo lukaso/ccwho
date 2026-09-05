@@ -155,7 +155,12 @@ class TestSaveAndRestore(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         self.real_collect = runner.engine.collect
-        runner.engine.collect = lambda cache=None: (list(self.ROWS), 0)
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True      # this class tests a REACHABLE source
+            return (list(self.ROWS), 0)
+
+        runner.engine.collect = fake_collect
 
     def tearDown(self):
         runner.engine.collect = self.real_collect
@@ -389,3 +394,78 @@ class TestRestoreCheck(unittest.TestCase):
         finally:
             runner.subprocess.run = real
         self.assertEqual(calls, [], "--check must never launch anything, even with --open")
+
+
+class TestSaveRefusesAnUnsourcedManifest(unittest.TestCase):
+    """A save that cannot ASK must not answer.
+
+    This is not academic once the save is on a 15-minute timer: `claude` off PATH
+    (a launchd job's minimal environment does exactly this) makes every tick write
+    a 0-session manifest, and retention keeps only the newest 20. Twenty ticks is
+    five hours to evict every manifest that had anything in it. The tool would
+    delete precisely the record it exists to keep.
+    """
+
+    ROWS = [{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/liveapp",
+             "project": "liveapp", "topic": "t", "ask": "", "attention": "asks",
+             "tty": "s032", "since": "2h", "status": "waiting", "first": "", "pid": 1}]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.real_collect = runner.engine.collect
+        self.source_ok = True
+        self.rows = list(self.ROWS)
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = self.source_ok
+            return (list(self.rows), 0)
+
+        runner.engine.collect = fake_collect
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _save(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.save([])
+        return rc, out.getvalue() + err.getvalue()
+
+    def _manifests(self):
+        d = runner.restore_dir()
+        return sorted(n for n in os.listdir(d)) if os.path.isdir(d) else []
+
+    def test_an_unreachable_source_fails_loudly_and_writes_nothing(self):
+        self.source_ok = False
+        rc, out = self._save()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self._manifests(), [])
+        self.assertIn("claude", out.lower())
+
+    def test_an_unreachable_source_never_evicts_a_good_manifest(self):
+        # 20 good manifests, then 20 blind ticks: every one must survive.
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        good = ["2026-08-01T00%02d.json" % i for i in range(1, 21)]
+        for n in good:
+            with open(os.path.join(d, n), "w") as fh:
+                fh.write("{}")
+        self.source_ok = False
+        for _ in range(20):
+            self.assertEqual(self._save()[0], 1)
+        self.assertEqual(self._manifests(), good)
+
+    def test_a_working_source_with_nothing_open_writes_nothing_and_succeeds(self):
+        self.rows = []
+        rc, _ = self._save()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._manifests(), [], "an empty manifest has no restore value")
+
+    def test_a_working_source_with_sessions_still_saves(self):
+        rc, _ = self._save()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self._manifests()), 1)

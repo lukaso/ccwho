@@ -284,6 +284,23 @@ def restore(argv):
         print(f"ccwho restore: cannot read {path}: {ex}", file=sys.stderr)
         return 1
 
+    if "--check" in argv:
+        # Deliberately BEFORE --open: a check must never launch anything, even if
+        # both flags are given. Answering "would this work?" cannot be the thing
+        # that opens seventeen windows.
+        ok, problems = engine.check_manifest(
+            man, cwd_exists=os.path.isdir, transcript_for=engine.transcript_path)
+        n = len(engine.manifest_entries(man))
+        if ok:
+            print(f"restorable: {n} session(s) in {path}")
+            print("every cwd exists, every transcript is on disk, every resume line builds.")
+            return 0
+        print(f"NOT fully restorable: {len(problems)} of {n} session(s) in {path}",
+              file=sys.stderr)
+        for who, why in problems:
+            print(f"  {who}: {why}", file=sys.stderr)
+        return 1
+
     if "--open" in argv:
         script = engine.iterm_open_script(engine.manifest_entries(man))
         if not script:
@@ -332,6 +349,7 @@ def main(argv=None):
         print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2)")
         print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
         print("       ccwho restore [--open] [--from PATH]       list it back / reopen the windows")
+        print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("\nThe tty column is a clickable link when stdout is a terminal.")
         print("Run install-handler.sh once to register the ccwho:// scheme; --no-links opts out.")
         return 0

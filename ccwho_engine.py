@@ -646,8 +646,10 @@ def manifest_from_rows(rows, now=None):
 def restore_command(entry):
     """The shell line that reopens one session, or None if it cannot be built.
 
-    cwd matters: the transcript lives under a slug derived from it, so `--resume`
-    is run from the project directory, not from wherever the user happens to be.
+    The `cd` is NOT needed to FIND the session - measured 2026-08-31, `claude
+    --resume <id>` resolves globally, from any directory. It is needed so the
+    resumed session operates in its own project: relative paths, the repo it edits,
+    the CLAUDE.md it loads. Getting that wrong is silent, not an error.
     """
     entry = entry if isinstance(entry, dict) else {}
     sid = str(entry.get("sessionId", "") or "")
@@ -677,6 +679,32 @@ def manifest_name(now=None):
 def newest_manifest(names):
     found = sorted(n for n in (names or []) if n and _MANIFEST_NAME.match(n))
     return found[-1] if found else None
+
+
+def check_manifest(manifest, cwd_exists, transcript_for):
+    """Would this manifest actually restore? Returns (ok, [(project, reason), ...]).
+
+    Pure: the caller injects the two disk predicates. Answers the only question
+    that matters before a reboot, and answers it while you can still fix it.
+
+    An EMPTY manifest fails. "Nothing to restore" is the exact shape of the bug
+    this tool exists to prevent, so it must never read as a clean bill of health.
+    """
+    entries = manifest_entries(manifest)
+    if not entries:
+        return False, [("(manifest)", "no sessions in it - run `ccwho save` while they are open")]
+    problems = []
+    for e_ in entries:
+        who = e_.get("project") or e_.get("sessionId", "?")[:8] or "?"
+        if not restore_command(e_):
+            problems.append((who, "no resume line can be built (bad session id, or no cwd)"))
+            continue
+        if not cwd_exists(e_.get("cwd", "")):
+            problems.append((who, "cwd is gone: %s" % e_.get("cwd", "")))
+            continue
+        if not transcript_for(e_.get("sessionId", "")):
+            problems.append((who, "transcript is gone - nothing left to resume"))
+    return (not problems), problems
 
 
 def render_restore(manifest, color=True, width=None):

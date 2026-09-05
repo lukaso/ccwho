@@ -1086,3 +1086,65 @@ class RestoreLabelling(unittest.TestCase):
         out2 = ccwho.render_restore(self.man("only that", ""), color=False)
         self.assertIn("only that", out2)
         self.assertNotIn("latest:", out2)
+
+
+class CheckManifest(unittest.TestCase):
+    """The point of a restore manifest is that you find out it works BEFORE the
+    reboot, not after. --check answers that without opening anything."""
+
+    GOOD = {"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/p/liveapp",
+            "project": "liveapp", "first": "f", "topic": "t", "ask": ""}
+
+    def check(self, sessions, dirs=("/p/liveapp",), transcripts=("4f2b91ac-1111-4222-8333-abcdefabcdef",)):
+        return ccwho.check_manifest({"version": 1, "sessions": list(sessions)},
+                                    cwd_exists=lambda p: p in dirs,
+                                    transcript_for=lambda sid: "/tx" if sid in transcripts else None)
+
+    def test_a_healthy_manifest_has_no_problems(self):
+        ok, problems = self.check([self.GOOD])
+        self.assertTrue(ok)
+        self.assertEqual(problems, [])
+
+    def test_a_cwd_that_no_longer_exists_is_reported(self):
+        # a reaped worktree is the realistic case: 56 of them under ~/.liveapp-wt
+        gone = dict(self.GOOD, cwd="/p/reaped-worktree", project="wt")
+        ok, problems = self.check([gone])
+        self.assertFalse(ok)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("wt", problems[0][0])
+        self.assertIn("cwd", problems[0][1].lower())
+
+    def test_a_transcript_that_is_gone_is_reported(self):
+        orphan = dict(self.GOOD, sessionId="ffffffff-1111-4222-8333-abcdefabcdef", project="ghost")
+        ok, problems = self.check([orphan], dirs=("/p/liveapp",))
+        self.assertFalse(ok)
+        self.assertIn("transcript", problems[0][1].lower())
+
+    def test_an_unbuildable_resume_line_is_reported(self):
+        """The cwd exists AND the transcript resolves, so ONLY the resume-line check
+        can fire. The first version let the cwd and transcript checks catch this one
+        instead, and matched on the word "resume" - which the TRANSCRIPT message also
+        contains ("nothing left to resume"), so deleting the guard stayed green.
+        Found by mutation."""
+        bad = dict(self.GOOD, sessionId="not a valid id", project="bad")
+        ok, problems = self.check([bad], transcripts=("not a valid id",))
+        self.assertFalse(ok)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no resume line", problems[0][1].lower())
+
+    def test_it_reports_every_problem_not_just_the_first(self):
+        a = dict(self.GOOD, cwd="/gone", project="a")
+        b = dict(self.GOOD, sessionId="zzzzzzzz-1111-4222-8333-abcdefabcdef", project="b")
+        ok, problems = self.check([a, b, self.GOOD])
+        self.assertFalse(ok)
+        self.assertEqual(len(problems), 2, "a partial report hides the session you would lose")
+
+    def test_an_empty_manifest_is_not_a_pass(self):
+        ok, problems = self.check([])
+        self.assertFalse(ok, "nothing to restore is a failed check, not a clean bill of health")
+
+    def test_junk_does_not_crash(self):
+        for junk in (None, [], "nope", {"sessions": "nope"}):
+            ok, problems = ccwho.check_manifest(junk, cwd_exists=lambda p: True,
+                                                transcript_for=lambda s: "/tx")
+            self.assertFalse(ok, repr(junk))

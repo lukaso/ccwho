@@ -330,3 +330,62 @@ class TestPruneManifests(unittest.TestCase):
         self.assertEqual(runner.prune_manifests(self.names(25), keep=0), [])
         self.assertEqual(runner.prune_manifests(self.names(25), keep=-1), [])
         self.assertEqual(runner.prune_manifests(self.names(25), keep=-5), [])
+
+
+class TestRestoreCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+
+    def tearDown(self):
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, sessions):
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "2026-01-01T0000.json")
+        with open(path, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1, "count": len(sessions),
+                       "skipped": 0, "sessions": sessions}, fh)
+        return path
+
+    def run_check(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.restore(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_manifest_pointing_at_a_live_session_passes(self):
+        # this very test's own cwd exists, and we let the transcript check see it
+        self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
+                     "cwd": self.tmp, "project": "self", "first": "f", "topic": "t", "ask": ""}])
+        real = runner.engine.transcript_path
+        runner.engine.transcript_path = lambda sid: "/tx"
+        try:
+            rc, out = self.run_check(["--check"])
+        finally:
+            runner.engine.transcript_path = real
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1", out)
+
+    def test_a_gone_cwd_fails_the_check_and_is_named(self):
+        self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
+                     "cwd": "/definitely/not/here", "project": "reaped",
+                     "first": "f", "topic": "t", "ask": ""}])
+        rc, out = self.run_check(["--check"])
+        self.assertEqual(rc, 1)
+        self.assertIn("reaped", out)
+        self.assertIn("/definitely/not/here", out)
+
+    def test_check_opens_nothing(self):
+        self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
+                     "cwd": self.tmp, "project": "self", "first": "f", "topic": "t", "ask": ""}])
+        calls = []
+        real = runner.subprocess.run
+        runner.subprocess.run = lambda *a, **k: calls.append(a)
+        try:
+            self.run_check(["--check", "--open"])
+        finally:
+            runner.subprocess.run = real
+        self.assertEqual(calls, [], "--check must never launch anything, even with --open")

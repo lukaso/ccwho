@@ -154,7 +154,10 @@ red machine.
 ccwho save                 # capture the live fleet
 ccwho restore              # ...what was open, about what, how to reopen it
 ccwho restore --open       # ...actually reopen them, one iTerm2 window each
+ccwho restore --check      # would it restore? run this BEFORE you reboot
+ccwho restore --list       # every saved manifest and what it holds
 ccwho restore --from PATH  # an older manifest
+ccwho open <session-id>    # focus that session, or reopen it if its window is gone
 ```
 
 ```
@@ -171,11 +174,58 @@ fleet: `latest` read `/compact`, `go ahead` and `let's fix 1-3` for three of the
 seventeen, while `opened` read `restart from disk` for another. Rows are in
 dashboard order, so what was waiting on you is at the top and still carries its ask.
 
-**It saves itself.** `ccwho --watch` writes a manifest every 5 minutes
-(`CCWHO_AUTOSAVE` seconds, `0` disables), because the reboot this exists for is
-usually the one you did not plan. Manifests live in `~/.ccwho/restore/` - under
-`$HOME`, never a temp dir, since outliving the reboot is the entire point - and the
-newest 20 are kept, because a tool built for a full disk does not get to fill one.
+**It saves itself.** Two ways, because the reboot this exists for is usually the one
+you did not plan. `ccwho --watch` writes a manifest every 5 minutes
+(`CCWHO_AUTOSAVE` seconds, `0` disables) - but only while a watch is open in some
+window, which on 2026-09-05 meant a crash found a manifest five days old. So
+`com.lukaso.ccwho.save.plist` puts it on a 15-minute launchd timer as well:
+
+```sh
+cp com.lukaso.ccwho.save.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lukaso.ccwho.save.plist
+```
+
+`StartInterval` fires only while the Mac is awake and never wakes it, and after a
+sleep launchd runs the job once if the interval elapsed. Manifests live in
+`~/.ccwho/restore/` - under `$HOME`, never a temp dir, since outliving the reboot is
+the entire point - and the newest 20 are kept, because a tool built for a full disk
+does not get to fill one.
+
+**A save that cannot ask must not answer.** Scheduling the save is what exposed
+this. `agents_json()` used to return `"[]"` both when claude reported no sessions
+and when it could not be reached at all - and launchd's minimal `PATH` has no
+`~/.local/bin`, so every timed run found no binary, captured nothing, wrote a
+0-session manifest and printed success. At 20 kept, twenty ticks is five hours to
+evict every manifest that had anything in it: the tool would have deleted the exact
+record it exists to keep. Now an unreachable source is `None`, distinct from a
+genuine `[]`; `save` exits 1 and writes nothing, and it names `PATH` as the thing to
+check. A working source with nothing open writes nothing either - an empty manifest
+has no restore value and can only push out one that has.
+
+### The links resolve when you click them, not when the list was printed
+
+Each project name in `ccwho restore` is an OSC 8 link to `ccwho://open/<sessionId>`,
+and the verb is decided against the world at click time:
+
+- running, with a window -> **focus it** (reopening a live session would fork the
+  conversation into two processes)
+- not running, or running with no window -> **reopen it** in a new iTerm2 window
+- in neither the live fleet nor any manifest -> say so, do nothing
+
+So after a reboot every link in the list reopens, and ten minutes later the same
+link focuses the window it just made. The lookup spans **every** saved manifest,
+newest record of each session winning, because a link is clicked from whatever list
+is on screen - with 20 kept, often not the newest one.
+
+`ccwho://jump/<tty>` (the tty column) answers "where is this window", which is a
+different question the moment the window is gone - and after a reboot every window
+is gone, which is exactly when the restore list is what you are reading.
+
+The registered handler forwards the **whole** URL to `ccwho url`, so adding a verb
+never means rebuilding the applet. Both targets are pattern validated on the far
+side - a session id must be a UUID, a jump target a tty or pid - because the URL
+arrives from LaunchServices and anything on the machine can hand you one. Nothing
+unrecognised reaches a verb.
 
 ### What it is careful about
 

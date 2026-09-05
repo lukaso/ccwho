@@ -1,5 +1,6 @@
 #!/bin/bash
-# Registers a ccwho:// URL handler so the tty column in ccwho output is clickable.
+# Registers a ccwho:// URL handler: the tty column in `ccwho` output and the
+# project names in `ccwho restore` become clickable.
 # Builds a tiny AppleScript applet; no daemon, no login item.
 set -euo pipefail
 APP="${1:-$HOME/Applications/ccwho-jump.app}"
@@ -8,15 +9,13 @@ mkdir -p "$(dirname "$APP")"
 tmp=$(mktemp -d)
 cat > "$tmp/handler.applescript" <<APPLESCRIPT
 on open location this_URL
-  set AppleScript's text item delimiters to "ccwho://jump/"
-  set parts to text items of this_URL
-  if (count of parts) < 2 then return
-  set target to item 2 of parts
-  set AppleScript's text item delimiters to ""
-  -- validated again by ccwho itself before use. Swallow failures: a non-zero
-  -- exit from do shell script raises a modal dialog, which is worse than silence.
+  -- Forwards the WHOLE url and lets ccwho decide the verb, so adding one never
+  -- means rebuilding this applet. Every target is pattern validated on the far
+  -- side; anything unrecognised reaches no verb at all. Swallow failures: a
+  -- non-zero exit from do shell script raises a modal dialog, which is worse
+  -- than silence.
   try
-    do shell script quoted form of "$CCWHO" & " jump " & quoted form of target
+    do shell script quoted form of "$CCWHO" & " url " & quoted form of this_URL
   end try
 end open location
 APPLESCRIPT
@@ -34,4 +33,4 @@ PL="$APP/Contents/Info.plist"
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 rm -rf "$tmp"
 echo "registered: $APP"
-echo "ccwho --links now emits clickable ttys (iTerm2 renders OSC 8)."
+echo "clickable ttys in \`ccwho\`, clickable projects in \`ccwho restore\` (OSC 8)."

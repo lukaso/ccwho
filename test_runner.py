@@ -469,3 +469,227 @@ class TestSaveRefusesAnUnsourcedManifest(unittest.TestCase):
         rc, _ = self._save()
         self.assertEqual(rc, 0)
         self.assertEqual(len(self._manifests()), 1)
+
+
+class TestUrlDispatch(unittest.TestCase):
+    """One registered handler, every verb decided here.
+
+    The URL arrives from LaunchServices, so anything on the machine can hand us
+    one. Nothing unrecognised may reach a shell.
+    """
+
+    def setUp(self):
+        self.calls = []
+        self.real_jump, self.real_open = runner.jump, runner.open_session
+        runner.jump = lambda argv: self.calls.append(("jump", list(argv))) or 0
+        runner.open_session = lambda argv: self.calls.append(("open", list(argv))) or 0
+
+    def tearDown(self):
+        runner.jump, runner.open_session = self.real_jump, self.real_open
+
+    def _url(self, u):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = runner.main(["url", u])
+        return rc, err.getvalue()
+
+    def test_an_open_url_reaches_open_session(self):
+        sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+        rc, _ = self._url("ccwho://open/" + sid)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls, [("open", [sid])])
+
+    def test_a_jump_url_still_reaches_jump(self):
+        rc, _ = self._url("ccwho://jump/s032")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls, [("jump", ["s032"])])
+
+    def test_an_unrecognised_url_runs_nothing(self):
+        for bad in ("https://evil.example/x", "ccwho://delete/all",
+                    "ccwho://open/$(whoami)", "ccwho://jump/; rm -rf /", "nonsense"):
+            self.calls = []
+            rc, err = self._url(bad)
+            self.assertEqual(rc, 1, bad)
+            self.assertEqual(self.calls, [], "unrecognised URL must reach no verb: " + bad)
+
+
+class TestOpenSession(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        d = os.path.join(self.tmp, "restore")
+        os.makedirs(d)
+        with open(os.path.join(d, "2026-08-01T0001.json"), "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 1,
+                       "skipped": 0, "sessions": [self.ENTRY]}, fh)
+        self.live = []
+        self.real_collect = runner.engine.collect
+        runner.engine.collect = lambda cache=None, status=None: (list(self.live), 0)
+        self.runs = []
+        self.real_run = runner.subprocess.run
+
+        class Done:
+            returncode, stdout, stderr = 0, "focused s032", ""
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.subprocess.run = self.real_run
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _open(self, sid):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.open_session([sid])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_dead_session_is_reopened_in_a_new_window(self):
+        rc, _ = self._open(self.SID)
+        self.assertEqual(rc, 0)
+        script = " ".join(" ".join(c) for c in self.runs)
+        self.assertIn("claude --resume " + self.SID, script)
+        self.assertIn("create window", script)
+
+    def test_a_live_session_is_focused_not_reopened(self):
+        self.live = [{"sessionId": self.SID, "tty": "ttys032", "pid": 7}]
+        rc, _ = self._open(self.SID)
+        self.assertEqual(rc, 0)
+        joined = " ".join(" ".join(c) for c in self.runs)
+        self.assertIn("jump.applescript", joined)
+        self.assertNotIn("claude --resume", joined,
+                         "reopening a live session would fork the conversation")
+
+    def test_an_unknown_session_says_so_and_runs_nothing(self):
+        rc, out = self._open("deadbeef-0000-0000-0000-000000000000")
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [])
+
+
+class TestManifestList(unittest.TestCase):
+    """With 20 kept, you need to see them before you can choose one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.d = os.path.join(self.tmp, "restore")
+        os.makedirs(self.d)
+
+    def tearDown(self):
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, n, saved=1788213090):
+        with open(os.path.join(self.d, name), "w") as fh:
+            json.dump({"version": 1, "savedAt": saved, "count": n, "skipped": 0,
+                       "sessions": [{"sessionId": "%08d-1111-4222-8333-abcdefabcdef" % i,
+                                     "cwd": "/Users/x/p/a", "project": "a"}
+                                    for i in range(n)]}, fh)
+
+    def _list(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.restore(["--list"])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_lists_every_manifest_with_its_session_count(self):
+        self._write("2026-08-01T0001.json", 3)
+        self._write("2026-08-02T0002.json", 7)
+        rc, out = self._list()
+        self.assertEqual(rc, 0)
+        self.assertIn("2026-08-01T0001.json", out)
+        self.assertIn("2026-08-02T0002.json", out)
+        self.assertIn("3", out)
+        self.assertIn("7", out)
+
+    def test_marks_the_one_a_bare_restore_would_use(self):
+        self._write("2026-08-01T0001.json", 3)
+        self._write("2026-08-02T0002.json", 7)
+        rc, out = self._list()
+        newest_line = [l for l in out.splitlines() if "2026-08-02T0002" in l][0]
+        older_line = [l for l in out.splitlines() if "2026-08-01T0001" in l][0]
+        self.assertIn("newest", newest_line.lower())
+        self.assertNotIn("newest", older_line.lower())
+
+    def test_nothing_saved_is_not_an_empty_success(self):
+        rc, out = self._list()
+        self.assertEqual(rc, 1)
+        self.assertIn("save", out.lower())
+
+    def test_list_never_opens_anything(self):
+        self._write("2026-08-01T0001.json", 2)
+        real = runner.subprocess.run
+        calls = []
+        runner.subprocess.run = lambda *a, **k: calls.append(a)
+        try:
+            self._list()
+        finally:
+            runner.subprocess.run = real
+        self.assertEqual(calls, [])
+
+
+class TestOpenLooksAcrossManifests(unittest.TestCase):
+    """A link is clicked from whatever list is on screen, not from the newest one.
+
+    `ccwho restore --from <an older manifest>` prints links for sessions that the
+    newest manifest may never have seen - the newest is a snapshot of a later
+    moment, and the whole reason to keep 20 is to read the older ones.
+    """
+
+    OLD = "11111111-1111-4222-8333-abcdefabcdef"
+    NEW = "22222222-1111-4222-8333-abcdefabcdef"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.d = os.path.join(self.tmp, "restore")
+        os.makedirs(self.d)
+        self._write("2026-08-01T0001.json", [(self.OLD, "/Users/x/p/old")])
+        self._write("2026-08-02T0002.json", [(self.NEW, "/Users/x/p/new")])
+        self.real_collect = runner.engine.collect
+        runner.engine.collect = lambda cache=None, status=None: ([], 0)
+        self.runs = []
+        self.real_run = runner.subprocess.run
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.subprocess.run = self.real_run
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, pairs):
+        with open(os.path.join(self.d, name), "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": len(pairs),
+                       "skipped": 0,
+                       "sessions": [{"sessionId": s, "cwd": c, "project": "p"}
+                                    for s, c in pairs]}, fh)
+
+    def _open(self, sid):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.open_session([sid])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_session_only_in_an_older_manifest_still_reopens(self):
+        rc, _ = self._open(self.OLD)
+        self.assertEqual(rc, 0)
+        self.assertIn("claude --resume " + self.OLD,
+                      " ".join(" ".join(c) for c in self.runs))
+
+    def test_the_newest_record_of_a_session_wins(self):
+        # Same session saved twice; the later cwd is the one that is still true.
+        self._write("2026-08-03T0003.json", [(self.OLD, "/Users/x/p/moved")])
+        rc, _ = self._open(self.OLD)
+        self.assertEqual(rc, 0)
+        joined = " ".join(" ".join(c) for c in self.runs)
+        self.assertIn("cd /Users/x/p/moved", joined)
+        self.assertNotIn("/Users/x/p/old", joined)

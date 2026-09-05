@@ -123,6 +123,77 @@ def jump(argv):
     return 0 if out.startswith("focused") else 1
 
 
+def manifest_names():
+    """Saved manifests, oldest first. Missing directory reads as none, never raises."""
+    try:
+        return sorted(n for n in os.listdir(restore_dir())
+                      if engine._MANIFEST_NAME.match(n))
+    except OSError:
+        return []
+
+
+def known_entries():
+    """Every session any saved manifest remembers, the newest record of each winning.
+
+    Not just the newest manifest: a link is clicked from whatever list is on
+    screen, and the point of keeping 20 is that you read the older ones. A later
+    record wins because it holds the cwd that is still true. Unreadable files are
+    skipped, never raised - a click must not fail at the user.
+    """
+    seen, d = {}, restore_dir()
+    for n in reversed(manifest_names()):
+        try:
+            with open(os.path.join(d, n)) as fh:
+                man = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for e_ in engine.manifest_entries(man):
+            sid = e_.get("sessionId")
+            if sid and sid not in seen:
+                seen[sid] = e_
+    return list(seen.values())
+
+
+def open_session(argv):
+    """Get me to this session: focus its window if it is up, reopen it if not.
+
+    The verb is decided HERE, against the world at click time, not baked into the
+    link when the list was printed. After a reboot every link in a restore list
+    resolves to "reopen"; ten minutes later the same link focuses the window it
+    just made.
+    """
+    sid = (argv[0] if argv else "").strip()
+    rows, _ = engine.collect(cache={})
+    action, value = engine.resolve_open(sid, rows, known_entries())
+    if action == "jump":
+        return jump([value])
+    if action == "resume":
+        res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            print("ccwho open: could not open a window: %s"
+                  % (res.stderr or "").strip(), file=sys.stderr)
+            return 1
+        print("reopened %s" % sid)
+        return 0
+    print("ccwho open: %s is neither running nor in any saved manifest" % (sid or "?"),
+          file=sys.stderr)
+    return 1
+
+
+def url(argv):
+    """Dispatch a ccwho:// URL. The registered handler forwards them all here, so
+    it never needs updating for a new verb - and nothing it does not recognise
+    reaches a verb at all."""
+    verb, target = engine.parse_ccwho_url(argv[0] if argv else "")
+    if verb == "open":
+        return open_session([target])
+    if verb == "jump":
+        return jump([target])
+    print("ccwho url: not a ccwho:// link I understand", file=sys.stderr)
+    return 1
+
+
 def parse_age(text, default=3600):
     """--older-than 90m / 2h / 3d / 600 (seconds)."""
     t = (text or "").strip().lower()
@@ -275,8 +346,37 @@ def save(argv):
     return 0
 
 
+def list_manifests():
+    """The saved manifests, oldest first, with what each one holds.
+
+    Reads only - it is the picker for --from, and a picker that could launch
+    something would be the same mistake --check was written to avoid.
+    """
+    names = manifest_names()
+    if not names:
+        print("ccwho restore: nothing saved yet - run `ccwho save` BEFORE you reboot.",
+              file=sys.stderr)
+        return 1
+    d = restore_dir()
+    print("%d manifest(s) in %s" % (len(names), d))
+    for i, n in enumerate(names, 1):
+        try:
+            with open(os.path.join(d, n)) as fh:
+                man = json.load(fh)
+            count = len(engine.manifest_entries(man))
+        except (OSError, ValueError):
+            count = -1
+        held = "unreadable" if count < 0 else "%2d session%s" % (count, "" if count == 1 else "s")
+        tag = "   <- newest, the one a bare `ccwho restore` reads" if n == names[-1] else ""
+        print("  %2d. %s  %s%s" % (i, n, held, tag))
+    print("\nread one:  ccwho restore --from %s" % os.path.join(d, names[-1]))
+    return 0
+
+
 def restore(argv):
     """Read the manifest back: what was open, what it was about, how to reopen it."""
+    if "--list" in argv:
+        return list_manifests()
     path = _arg(argv, "--from", None)
     if not path:
         d = restore_dir()
@@ -334,7 +434,8 @@ def restore(argv):
         return 0
 
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    sys.stdout.write(engine.render_restore(man, color=color))
+    links = sys.stdout.isatty() and "--no-links" not in argv
+    sys.stdout.write(engine.render_restore(man, color=color, links=links))
     sys.stdout.write("\nadd --open to reopen these as iTerm2 windows.\n")
     return 0
 
@@ -357,6 +458,10 @@ def main(argv=None):
         return save(argv[1:])
     if argv and argv[0] == "restore":
         return restore(argv[1:])
+    if argv and argv[0] == "open":
+        return open_session(argv[1:])
+    if argv and argv[0] == "url":
+        return url(argv[1:])
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
@@ -364,7 +469,12 @@ def main(argv=None):
         print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
         print("       ccwho restore [--open] [--from PATH]       list it back / reopen the windows")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
-        print("\nThe tty column is a clickable link when stdout is a terminal.")
+        print("       ccwho restore --list                       every saved manifest, and what it holds")
+        print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
+        print("       ccwho url  <ccwho://...>                   what the clickable links call")
+        print("\nThe tty column is a clickable link when stdout is a terminal, and so is")
+        print("each project name in `ccwho restore` - that one reopens the session if")
+        print("its window is gone, and focuses it if it is still up.")
         print("Run install-handler.sh once to register the ccwho:// scheme; --no-links opts out.")
         return 0
 

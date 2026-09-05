@@ -538,6 +538,60 @@ def jump_url(row):
     return f"ccwho://jump/{target}" if target else ""
 
 
+_SESSION_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                         r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def open_url(entry):
+    """ccwho://open/<sessionId> - "get me to this session", verb decided on click.
+
+    Deliberately NOT ccwho://jump/: a jump names a window, and the restore list is
+    read after a reboot, when no window exists. The id is validated here so a
+    manifest can never talk the handler into a shell argument of its choosing.
+    """
+    sid = str((entry or {}).get("sessionId", "") or "")
+    return "ccwho://open/" + sid if _SESSION_ID.match(sid) else ""
+
+
+def parse_ccwho_url(url):
+    """(verb, target) for a ccwho:// URL we understand, else ("", "").
+
+    One dispatcher for every verb, so the registered handler never has to learn a
+    new one - it forwards the whole URL and this decides. Both targets are pattern
+    validated: the URL arrives from LaunchServices, which anyone can call.
+    """
+    if not isinstance(url, str):
+        return ("", "")
+    for verb, pattern in (("open", _SESSION_ID), ("jump", _JUMP_TARGET)):
+        prefix = "ccwho://%s/" % verb
+        if url.startswith(prefix):
+            target = url[len(prefix):].strip().rstrip("/")
+            return (verb, target) if pattern.match(target) else ("", "")
+    return ("", "")
+
+
+def resolve_open(session_id, live_rows, entries):
+    """What a click on an open-link should DO, decided against the world right now.
+
+    ("jump", tty)      it is running and has a window - focus it. Reopening a live
+                       session would fork the conversation into two processes.
+    ("resume", cmd)    it is not running (or has no window) - reopen it.
+    ("missing", "")    neither the live fleet nor the manifest has ever heard of it.
+    """
+    for r in live_rows or []:
+        if r.get("sessionId") == session_id:
+            tty = short_tty(r.get("tty", ""))
+            if tty:
+                return ("jump", tty)
+            break                 # live but windowless: reopening is the only move
+    for e_ in entries or []:
+        if e_.get("sessionId") == session_id:
+            cmd = restore_command(e_)
+            if cmd:
+                return ("resume", cmd)
+    return ("missing", "")
+
+
 def parse_jump_url(url):
     """Extract the target from ccwho://jump/<target>, or "" if it is not one."""
     if not isinstance(url, str) or not url.startswith("ccwho://jump/"):
@@ -716,7 +770,7 @@ def check_manifest(manifest, cwd_exists, transcript_for):
     return (not problems), problems
 
 
-def render_restore(manifest, color=True, width=None):
+def render_restore(manifest, color=True, width=None, links=False):
     """The post-reboot view: what was open, what it was about, how to get it back."""
     c = _C if color else {k: "" for k in _C}
     entries = manifest_entries(manifest)
@@ -733,7 +787,8 @@ def render_restore(manifest, color=True, width=None):
         c["bold"], len(entries), "" if len(entries) == 1 else "s", stamp, c["reset"]))
     for i, s_ in enumerate(entries, 1):
         cmd = restore_command(s_)
-        head = "%s%2d. %s%s" % (c["bold"], i, s_.get("project") or "?", c["reset"])
+        name = s_.get("project") or "?"
+        head = "%s%2d. %s%s" % (c["bold"], i, osc8(name, open_url(s_), links), c["reset"])
         was = s_.get("tty") or ""
         out.append("%s  %s%s%s\n" % (head, c["dim"], ("was " + was) if was else "", c["reset"]))
         # BOTH halves, because neither alone identifies a session. Measured on a real
@@ -777,6 +832,17 @@ def applescript_str(text):
     t = str(text).replace("\\", "\\\\").replace('"', '\\"')
     t = t.replace("\n", " ").replace("\r", " ")
     return '"%s"' % t
+
+
+def iterm_run_script(cmd):
+    """One iTerm2 window running one command. The single-session case of the
+    restore script, used when a click lands on a session that is no longer up."""
+    if not cmd:
+        return ""
+    return ('tell application "iTerm2"\n  activate\n'
+            '  create window with default profile\n'
+            '  tell current session of current window\n'
+            '    write text %s\n  end tell\nend tell\n' % applescript_str(cmd))
 
 
 def iterm_open_script(entries):

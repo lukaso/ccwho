@@ -1204,3 +1204,93 @@ class TestSessionSourceAvailability(unittest.TestCase):
         st = {}
         ccwho.collect(cache={}, status=st)
         self.assertIs(st.get("source_ok"), True)
+
+
+class TestOpenUrls(unittest.TestCase):
+    """A link in the restore list has to survive the session it points at.
+
+    The tty link answers "where is this window". This one answers "get me to this
+    session", which is a different question the moment the window is gone - and
+    after a reboot every window is gone, which is exactly when the restore list is
+    the thing you are reading.
+    """
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def test_builds_an_open_url_for_a_session(self):
+        self.assertEqual(ccwho.open_url({"sessionId": self.SID}),
+                         "ccwho://open/" + self.SID)
+
+    def test_no_url_without_a_session_id(self):
+        self.assertEqual(ccwho.open_url({"sessionId": ""}), "")
+        self.assertEqual(ccwho.open_url({}), "")
+
+    def test_a_bogus_session_id_gets_no_url(self):
+        for junk in ("../../etc/passwd", "a b", "'; rm -rf /", "short"):
+            self.assertEqual(ccwho.open_url({"sessionId": junk}), "", junk)
+
+    def test_parses_both_verbs(self):
+        self.assertEqual(ccwho.parse_ccwho_url("ccwho://open/" + self.SID),
+                         ("open", self.SID))
+        self.assertEqual(ccwho.parse_ccwho_url("ccwho://jump/s032"), ("jump", "s032"))
+
+    def test_rejects_anything_else(self):
+        for bad in ("https://example.com", "ccwho://delete/all", "ccwho://open/nope",
+                    "", None, "ccwho://open/", "file:///etc/passwd"):
+            self.assertEqual(ccwho.parse_ccwho_url(bad), ("", ""), repr(bad))
+
+
+class TestResolveOpen(unittest.TestCase):
+    """Live -> focus the window. Dead -> reopen it. Unknown -> say so."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    LIVE = [{"sessionId": SID, "tty": "ttys032", "pid": 4242}]
+    ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
+
+    def test_a_live_session_is_a_jump(self):
+        action, value = ccwho.resolve_open(self.SID, self.LIVE, [])
+        self.assertEqual(action, "jump")
+        self.assertEqual(value, "s032")
+
+    def test_a_dead_session_in_the_manifest_is_a_resume(self):
+        action, value = ccwho.resolve_open(self.SID, [], [self.ENTRY])
+        self.assertEqual(action, "resume")
+        self.assertIn("claude --resume " + self.SID, value)
+        self.assertTrue(value.startswith("cd /Users/x/p/liveapp"))
+
+    def test_live_beats_the_manifest(self):
+        # Reopening a session that is already running would fork the conversation.
+        action, _ = ccwho.resolve_open(self.SID, self.LIVE, [self.ENTRY])
+        self.assertEqual(action, "jump")
+
+    def test_a_session_nobody_knows_is_missing(self):
+        action, value = ccwho.resolve_open("deadbeef-0000-0000-0000-000000000000",
+                                           self.LIVE, [self.ENTRY])
+        self.assertEqual(action, "missing")
+
+    def test_a_live_session_with_no_tty_falls_back_to_reopening(self):
+        live = [{"sessionId": self.SID, "tty": "", "pid": 0}]
+        action, value = ccwho.resolve_open(self.SID, live, [self.ENTRY])
+        self.assertEqual(action, "resume", "no window to focus - reopen instead")
+
+
+class TestRestoreListLinks(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    MAN = {"version": 1, "savedAt": 1788213090, "count": 1, "skipped": 0,
+           "sessions": [{"sessionId": SID, "cwd": "/Users/x/p/liveapp",
+                         "project": "liveapp", "topic": "the reaper", "first": "",
+                         "ask": "", "tty": "s032", "since": "2h",
+                         "status": "waiting", "attention": "asks", "pid": 1}]}
+
+    def test_links_off_emits_no_escape(self):
+        out = ccwho.render_restore(self.MAN, color=False, links=False)
+        self.assertNotIn("\033]8;;", out)
+        self.assertNotIn("ccwho://open/", out)
+
+    def test_links_on_emits_a_clickable_open_url(self):
+        out = ccwho.render_restore(self.MAN, color=False, links=True)
+        self.assertIn("\033]8;;ccwho://open/" + self.SID, out)
+        self.assertIn("liveapp", out)
+
+    def test_links_default_off_so_piped_output_stays_plain(self):
+        self.assertNotIn("\033]8;;", ccwho.render_restore(self.MAN, color=False))

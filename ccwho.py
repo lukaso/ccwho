@@ -123,6 +123,71 @@ def jump(argv):
     return 0 if out.startswith("focused") else 1
 
 
+KEEP_LOG_LINES = int(os.environ.get("CCWHO_KEEP_LOG_LINES", "1000"))
+LOG_TRIM_EVERY = 86400.0        # once a day: 96 runs a day need not each rewrite it
+
+
+def autosave_log():
+    """Where the launchd job's stdout lands. Nothing else writes here."""
+    return os.path.join(ccwho_dir(), "autosave.log")
+
+
+def log_trim_marker():
+    return os.path.join(ccwho_dir(), ".log-trimmed")
+
+
+def trim_log(path, keep=KEEP_LOG_LINES):
+    """Keep the newest `keep` lines. Bounded the same way the manifests are.
+
+    keep<=0 bounds NOTHING, exactly as prune_manifests does - fail safe, never
+    "empty it". The rewrite is a temp + os.replace, so a log read while this runs
+    is either the old file or the new one and never a half of each.
+    """
+    if keep <= 0:
+        return
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return                    # no log yet, or unreadable: nothing to bound
+    if len(lines) <= keep:
+        return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.writelines(lines[-keep:])
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def maybe_trim_log(keep=KEEP_LOG_LINES):
+    """Trim at most once a day. True when this call did the pass.
+
+    Runs AFTER the save that wrote to the log, never before: os.replace leaves the
+    caller's already-open stdout pointing at the replaced inode, so anything still
+    to be printed would go nowhere.
+    """
+    marker = log_trim_marker()
+    try:
+        last = os.path.getmtime(marker)
+    except OSError:
+        last = None
+    if not should_autosave(last, time.time(), LOG_TRIM_EVERY):
+        return False
+    trim_log(autosave_log(), keep=keep)
+    try:
+        os.makedirs(ccwho_dir(), exist_ok=True)
+        with open(marker, "w") as fh:
+            fh.write("")
+    except OSError:
+        pass                      # housekeeping never fails the run it follows
+    return True
+
+
 def manifest_names():
     """Saved manifests, oldest first. Missing directory reads as none, never raises."""
     try:
@@ -455,7 +520,9 @@ def main(argv=None):
     if argv and argv[0] == "reap":
         return reap(argv[1:])
     if argv and argv[0] == "save":
-        return save(argv[1:])
+        rc = save(argv[1:])
+        maybe_trim_log()          # after, so the save's own output is in what we bound
+        return rc
     if argv and argv[0] == "restore":
         return restore(argv[1:])
     if argv and argv[0] == "open":

@@ -191,6 +191,13 @@ sleep launchd runs the job once if the interval elapsed. Manifests live in
 the entire point - and the newest 20 are kept, because a tool built for a full disk
 does not get to fill one.
 
+The job's own log, `~/.ccwho/autosave.log`, is bounded the same way: newest
+`CCWHO_KEEP_LOG_LINES` lines (default 1000), `keep<=0` meaning no bound rather than
+"empty it", rewritten through a temp + `os.replace`. Checked once a day, not once a
+run - 96 runs a day need not each rewrite the file to decide it is already short
+enough - and always AFTER the save, because `os.replace` leaves the caller's open
+stdout pointing at the replaced inode and anything still to print would go nowhere.
+
 **A save that cannot ask must not answer.** Scheduling the save is what exposed
 this. `agents_json()` used to return `"[]"` both when claude reported no sessions
 and when it could not be reached at all - and launchd's minimal `PATH` has no

@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 import ccwho as runner
@@ -693,3 +694,72 @@ class TestOpenLooksAcrossManifests(unittest.TestCase):
         joined = " ".join(" ".join(c) for c in self.runs)
         self.assertIn("cd /Users/x/p/moved", joined)
         self.assertNotIn("/Users/x/p/old", joined)
+
+
+class TestLogTrim(unittest.TestCase):
+    """The autosave log is the one thing under ~/.ccwho that nothing bounded.
+
+    Same shape as the manifests: keep the newest N, prune on a schedule. Checked
+    once a day rather than every run - 96 runs a day do not each need to rewrite
+    the file to decide it is already short enough.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.log = os.path.join(self.tmp, "autosave.log")
+
+    def tearDown(self):
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, n):
+        with open(self.log, "w") as fh:
+            fh.write("".join("line %d\n" % i for i in range(n)))
+
+    def test_keeps_the_newest_lines_and_drops_the_rest(self):
+        self._write(100)
+        runner.trim_log(self.log, keep=10)
+        lines = open(self.log).read().splitlines()
+        self.assertEqual(len(lines), 10)
+        self.assertEqual(lines[0], "line 90")
+        self.assertEqual(lines[-1], "line 99")
+
+    def test_a_short_log_is_left_alone(self):
+        self._write(5)
+        before = open(self.log).read()
+        runner.trim_log(self.log, keep=10)
+        self.assertEqual(open(self.log).read(), before)
+
+    def test_leaves_no_temp_file_behind(self):
+        self._write(100)
+        runner.trim_log(self.log, keep=10)
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])
+
+    def test_a_missing_log_is_not_an_error(self):
+        runner.trim_log(os.path.join(self.tmp, "nope.log"), keep=10)   # must not raise
+
+    def test_keep_zero_deletes_nothing(self):
+        # Same fail-safe as prune_manifests: keep<=0 is "no bound", never "empty it".
+        self._write(50)
+        runner.trim_log(self.log, keep=0)
+        self.assertEqual(len(open(self.log).read().splitlines()), 50)
+
+    def test_checks_once_a_day_not_once_a_run(self):
+        self._write(100)
+        self.assertTrue(runner.maybe_trim_log(keep=10), "first check must run")
+        self.assertEqual(len(open(self.log).read().splitlines()), 10)
+        self._write(100)
+        self.assertFalse(runner.maybe_trim_log(keep=10), "same day: no second pass")
+        self.assertEqual(len(open(self.log).read().splitlines()), 100,
+                         "an untrimmed log is the proof the check was skipped")
+
+    def test_a_day_later_it_checks_again(self):
+        self._write(100)
+        runner.maybe_trim_log(keep=10)
+        marker = runner.log_trim_marker()
+        old = time.time() - 86400 - 60
+        os.utime(marker, (old, old))
+        self._write(100)
+        self.assertTrue(runner.maybe_trim_log(keep=10))
+        self.assertEqual(len(open(self.log).read().splitlines()), 10)

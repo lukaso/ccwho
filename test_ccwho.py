@@ -21,7 +21,9 @@ class TestParseSessions(unittest.TestCase):
         self.assertEqual(ccwho.parse_sessions("[]"), [])
 
     def test_malformed_json_returns_empty(self):
-        self.assertEqual(ccwho.parse_sessions("not json"), [])
+        # None, not []: output we cannot parse is "we do not know", and a caller
+        # that reads it as "nothing is running" reopens sessions that are alive.
+        self.assertIsNone(ccwho.parse_sessions("not json"))
 
 
 class TestProject(unittest.TestCase):
@@ -1268,10 +1270,13 @@ class TestResolveOpen(unittest.TestCase):
                                            self.LIVE, [self.ENTRY])
         self.assertEqual(action, "missing")
 
-    def test_a_live_session_with_no_tty_falls_back_to_reopening(self):
-        live = [{"sessionId": self.SID, "tty": "", "pid": 0}]
+    def test_a_live_session_with_no_tty_is_not_reopened(self):
+        # It used to fall back to "resume", which forks a session that is running.
+        # No window to focus is not the same fact as no session to open.
+        live = [{"sessionId": self.SID, "tty": "", "pid": 91}]
         action, value = ccwho.resolve_open(self.SID, live, [self.ENTRY])
-        self.assertEqual(action, "resume", "no window to focus - reopen instead")
+        self.assertEqual(action, "live-no-window")
+        self.assertEqual(value, "91")
 
 
 class TestRestoreListLinks(unittest.TestCase):
@@ -1294,3 +1299,129 @@ class TestRestoreListLinks(unittest.TestCase):
 
     def test_links_default_off_so_piped_output_stays_plain(self):
         self.assertNotIn("\033]8;;", ccwho.render_restore(self.MAN, color=False))
+
+
+class TestParseSessionsSaysWhenItCouldNotParse(unittest.TestCase):
+    """A feed we could not parse is NOT "you have nothing open".
+
+    `agents_json()` already draws the line between "claude said []" and "we could
+    not ask". That line was undone one layer down: parse_sessions() turned every
+    malformed answer into [], so garbage on stdout - a partial write, a `{}`, a
+    prompt leaking into the output - reached the callers as an empty fleet. The
+    callers act on an empty fleet: `save` records it, `open` reopens what it finds
+    in a manifest. Reopening a session that is running forks the conversation.
+    """
+
+    def test_a_valid_list_parses(self):
+        raw = json.dumps([{"sessionId": "a-1", "pid": 1}])
+        self.assertEqual(ccwho.parse_sessions(raw), [{"sessionId": "a-1", "pid": 1}])
+
+    def test_empty_list_is_a_real_answer(self):
+        self.assertEqual(ccwho.parse_sessions("[]"), [])   # control: genuinely nothing open
+
+    def test_not_json_is_unparseable(self):
+        self.assertIsNone(ccwho.parse_sessions("not json"))
+
+    def test_an_object_is_not_a_session_list(self):
+        self.assertIsNone(ccwho.parse_sessions("{}"))
+
+    def test_a_feed_of_nothing_usable_is_unparseable(self):
+        self.assertIsNone(ccwho.parse_sessions("[1]"))
+        self.assertIsNone(ccwho.parse_sessions(json.dumps([{"pid": 1}])))
+
+    def test_one_unreadable_record_does_not_hide_the_readable_ones(self):
+        # A future claude may add a record shape we do not know. Blanking the
+        # dashboard over it is the wrong trade: SHOW what parsed. Acting on a
+        # partial picture is the part that is unsafe, and that is a second fact.
+        raw = json.dumps([{"sessionId": "a-1", "pid": 1}, {"pid": 2}])
+        self.assertEqual(ccwho.parse_sessions(raw), [{"sessionId": "a-1", "pid": 1}])
+        self.assertFalse(ccwho.read_is_complete(raw), "we did not understand all of it")
+
+    def test_a_feed_we_understood_entirely_is_complete(self):
+        raw = json.dumps([{"sessionId": "a-1", "pid": 1}])
+        self.assertTrue(ccwho.read_is_complete(raw))          # control
+
+    def test_none_in_none_out(self):
+        self.assertIsNone(ccwho.parse_sessions(None))
+
+
+class TestResolveOpenNeverForksALiveSession(unittest.TestCase):
+    """Reopening a session that is alive forks the conversation into two processes.
+
+    Two ways in. A live session with no tty used to fall through to "resume" - but
+    "I cannot see a window" is not "it is not running". And a caller whose source
+    was unreachable sees an empty live list, which looks exactly like "nothing is
+    running" unless it is told otherwise.
+    """
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    LIVE = [{"sessionId": SID, "tty": "ttys032", "pid": 4242}]
+    LIVE_NO_TTY = [{"sessionId": SID, "tty": "", "pid": 4242}]
+    ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
+
+    def test_live_with_a_window_is_still_a_jump(self):
+        self.assertEqual(ccwho.resolve_open(self.SID, self.LIVE, []),
+                         ("jump", "s032"))
+
+    def test_dead_and_in_a_manifest_is_still_a_resume(self):
+        # control: the one case where reopening IS right must stay green
+        action, value = ccwho.resolve_open(self.SID, [], [self.ENTRY])
+        self.assertEqual(action, "resume")
+        self.assertIn("claude --resume " + self.SID, value)
+
+    def test_live_without_a_window_is_not_a_resume(self):
+        action, value = ccwho.resolve_open(self.SID, self.LIVE_NO_TTY, [self.ENTRY])
+        self.assertEqual(action, "live-no-window")
+        self.assertEqual(value, "4242", "the pid, so the caller can name it")
+
+    def test_an_unreadable_source_is_unknown_not_dead(self):
+        action, why = ccwho.resolve_open(self.SID, [], [self.ENTRY], source_ok=False)
+        self.assertEqual(action, "unknown")
+        self.assertTrue(why, "the caller has to be able to say WHY it did nothing")
+
+    def test_an_unreadable_source_does_not_even_jump(self):
+        # rows from a failed read are not evidence of anything, in either direction
+        action, _ = ccwho.resolve_open(self.SID, self.LIVE, [], source_ok=False)
+        self.assertEqual(action, "unknown")
+
+    def test_unknown_session_with_a_good_source_is_still_missing(self):
+        action, _ = ccwho.resolve_open("deadbeef-0000-0000-0000-000000000000",
+                                       self.LIVE, [self.ENTRY])
+        self.assertEqual(action, "missing")
+
+
+class TestCollectReportsAnUnparseableSource(unittest.TestCase):
+    def test_a_partly_understood_feed_still_renders_but_blocks_launching(self):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: json.dumps(
+            [{"sessionId": "aaa", "pid": 1, "cwd": "/x", "status": "idle"}, {"pid": 2}])
+        try:
+            status = {}
+            rows, _ = ccwho.collect(cache={}, status=status)
+        finally:
+            ccwho.agents_json = real
+        self.assertEqual(len(rows), 1, "the session we understood is still shown")
+        self.assertIs(status["source_ok"], False,
+                      "an incomplete picture must not authorise opening anything")
+
+    def test_garbage_from_the_feed_is_not_an_empty_fleet(self):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: "{}"
+        try:
+            status = {}
+            rows, _ = ccwho.collect(cache={}, status=status)
+        finally:
+            ccwho.agents_json = real
+        self.assertEqual(rows, [])
+        self.assertIs(status["source_ok"], False)
+
+    def test_an_empty_feed_is_a_reachable_source(self):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        try:
+            status = {}
+            rows, _ = ccwho.collect(cache={}, status=status)
+        finally:
+            ccwho.agents_json = real
+        self.assertEqual(rows, [])
+        self.assertIs(status["source_ok"], True)      # control

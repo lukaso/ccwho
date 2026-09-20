@@ -219,6 +219,60 @@ def known_entries():
     return list(seen.values())
 
 
+LAUNCH_CLAIM_SECONDS = 90.0       # long enough for a session to appear in the feed
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
+    """Claim the right to start THIS session, across processes. True if we got it.
+
+    resolve_open() reads the world and then the caller launches. Another ccwho -
+    a second click, a `restore --open` in another window - can read the same world
+    in between and launch the same session, which is the fork the whole guard
+    exists to prevent. A new session also takes a moment to appear in
+    `claude agents --json`, so the window is real even for one hurried human.
+
+    Same idiom as ccgate's slots: O_CREAT|O_EXCL under $HOME, no daemon. A claim
+    whose owner died, whose record is unreadable, or that is older than the launch
+    itself could take is reclaimed - a crashed launcher must not lock a session
+    out forever.
+    """
+    now = time.time() if now is None else now
+    pid = os.getpid() if pid is None else pid
+    d = os.path.join(ccwho_dir(), "launching")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{session_id}.json")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            with open(path) as fh:
+                rec = json.load(fh)
+            held = alive(rec.get("pid")) and (now - float(rec.get("since", 0))
+                                              < LAUNCH_CLAIM_SECONDS)
+        except (OSError, ValueError, TypeError):
+            held = False          # unreadable claim is no claim
+        if held:
+            return False
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return claim_launch(session_id, pid=pid, now=now, alive=alive)
+    except OSError:
+        return True               # cannot claim at all: do not block the user
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"pid": pid, "since": now, "sessionId": session_id}, fh)
+    return True
+
+
 def open_session(argv):
     """Get me to this session: focus its window if it is up, reopen it if not.
 
@@ -228,11 +282,27 @@ def open_session(argv):
     just made.
     """
     sid = (argv[0] if argv else "").strip()
-    rows, _ = engine.collect(cache={})
-    action, value = engine.resolve_open(sid, rows, known_entries())
+    status = {}
+    rows, _ = engine.collect(cache={}, status=status)
+    action, value = engine.resolve_open(sid, rows, known_entries(),
+                                        source_ok=status.get("source_ok", False))
     if action == "jump":
         return jump([value])
+    if action == "live-no-window":
+        print(f"ccwho open: {sid} is running (pid {value or '?'}) but has no iTerm2"
+              " window - not reopening it, that would fork the conversation.",
+              file=sys.stderr)
+        return 1
+    if action == "unknown":
+        print(f"ccwho open: {value} - not reopening anything.", file=sys.stderr)
+        print("  Check that `claude` is on PATH and `claude agents --json` answers.",
+              file=sys.stderr)
+        return 1
     if action == "resume":
+        if not claim_launch(sid):
+            print(f"ccwho open: {sid} is already starting in another window"
+                  " - not launching it twice.", file=sys.stderr)
+            return 1
         res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
                              capture_output=True, text=True)
         if res.returncode != 0:
@@ -481,7 +551,50 @@ def restore(argv):
         return 1
 
     if "--open" in argv:
-        script = engine.iterm_open_script(engine.manifest_entries(man))
+        # Bulk reopen is the worst place to be blind: "open everything in this
+        # manifest" run while some of it is still up starts a second process on
+        # each live transcript. Every entry goes through the same guard a single
+        # click does, and an unreadable fleet opens nothing at all.
+        entries = engine.manifest_entries(man)
+        status = {}
+        live, _ = engine.collect(cache={}, status=status)
+        source_ok = status.get("source_ok", False)
+        if not source_ok:
+            print("ccwho restore: cannot read the live session list - not reopening"
+                  " anything.", file=sys.stderr)
+            print("  Reopening a session that is still running forks its conversation,"
+                  " and here it would be every one of them.", file=sys.stderr)
+            return 1
+        openable, running, unusable, starting, seen = [], [], [], [], set()
+        for e_ in entries:
+            sid = e_.get("sessionId", "")
+            if sid in seen:
+                continue          # one process per transcript, however the manifest got two
+            seen.add(sid)
+            action, _v = engine.resolve_open(sid, live, [e_], source_ok=True)
+            if action in ("jump", "live-no-window"):
+                running.append(e_)
+            elif action == "resume":
+                if claim_launch(sid):
+                    openable.append(e_)
+                else:
+                    starting.append(e_)   # another ccwho is already opening this one
+            else:
+                unusable.append(e_)   # no resume line builds from it - say so, don't drop it
+        for e_ in running:
+            print(f"already open: {e_.get('project') or e_.get('sessionId')}"
+                  f" - focus it with `ccwho open {e_.get('sessionId', '')}`")
+        for e_ in starting:
+            print(f"already starting: {e_.get('project') or e_.get('sessionId')}"
+                  " - another ccwho is opening it")
+        for e_ in unusable:
+            print(f"ccwho restore: {e_.get('project') or e_.get('sessionId') or '?'}"
+                  " cannot be reopened from this manifest", file=sys.stderr)
+        script = engine.iterm_open_script(openable)
+        if not script and (running or starting) and not unusable:
+            print(f"all {len(running) + len(starting)} session(s) in that manifest"
+                  " are already running or starting.")
+            return 0
         if not script:
             print("ccwho restore: nothing in that manifest can be reopened", file=sys.stderr)
             return 1

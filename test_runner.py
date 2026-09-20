@@ -528,7 +528,14 @@ class TestOpenSession(unittest.TestCase):
                        "skipped": 0, "sessions": [self.ENTRY]}, fh)
         self.live = []
         self.real_collect = runner.engine.collect
-        runner.engine.collect = lambda cache=None, status=None: (list(self.live), 0)
+        # a reachable, parseable source: these cases are about WHAT is running,
+        # not about whether we could find out
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True
+            return (list(self.live), 0)
+
+        runner.engine.collect = fake_collect
         self.runs = []
         self.real_run = runner.subprocess.run
 
@@ -652,7 +659,12 @@ class TestOpenLooksAcrossManifests(unittest.TestCase):
         self._write("2026-08-01T0001.json", [(self.OLD, "/Users/x/p/old")])
         self._write("2026-08-02T0002.json", [(self.NEW, "/Users/x/p/new")])
         self.real_collect = runner.engine.collect
-        runner.engine.collect = lambda cache=None, status=None: ([], 0)
+        def fake_collect(cache=None, status=None):      # reachable, and nothing live
+            if status is not None:
+                status["source_ok"] = True
+            return ([], 0)
+
+        runner.engine.collect = fake_collect
         self.runs = []
         self.real_run = runner.subprocess.run
 
@@ -763,3 +775,297 @@ class TestLogTrim(unittest.TestCase):
         self._write(100)
         self.assertTrue(runner.maybe_trim_log(keep=10))
         self.assertEqual(len(open(self.log).read().splitlines()), 10)
+
+
+class TestOpenNeverForksALiveSession(unittest.TestCase):
+    """`ccwho open` is one of three ways to start `claude --resume`. All three
+    have to agree that a session we can SEE running, or a fleet we could not read
+    at all, is not something to reopen."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        d = os.path.join(self.tmp, "restore")
+        os.makedirs(d)
+        with open(os.path.join(d, "2026-08-01T0001.json"), "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 1,
+                       "skipped": 0, "sessions": [self.ENTRY]}, fh)
+        self.live, self.source_ok = [], True
+        self.real_collect = runner.engine.collect
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = self.source_ok
+            return (list(self.live), 0)
+
+        runner.engine.collect = fake_collect
+        self.runs = []
+        self.real_run = runner.subprocess.run
+
+        class Done:
+            returncode, stdout, stderr = 0, "focused s032", ""
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.subprocess.run = self.real_run
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _open(self, sid):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.open_session([sid])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_dead_session_is_still_reopened(self):
+        rc, _ = self._open(self.SID)            # control: the case reopening is FOR
+        self.assertEqual(rc, 0)
+        self.assertIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+    def test_a_live_session_without_a_window_is_named_not_reopened(self):
+        self.live = [{"sessionId": self.SID, "tty": "", "pid": 90266}]
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [], "a running session must not be resumed")
+        self.assertIn("90266", out)
+        self.assertIn("not reopening", out)
+
+    def test_an_unreadable_fleet_opens_nothing(self):
+        self.source_ok = False
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [], "an empty list we could not trust is not 'dead'")
+        self.assertIn("not reopening", out)
+
+
+class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
+    """`restore --open` launched every entry in the manifest, blind. Run it while
+    some of those sessions are still up - after iTerm2 crashed but claude did not,
+    or just out of habit - and each live one gets a second process on its
+    transcript."""
+
+    LIVE_SID = "11111111-1111-4111-8111-111111111111"
+    DEAD_SID = "22222222-2222-4222-8222-222222222222"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        d = os.path.join(self.tmp, "restore")
+        os.makedirs(d)
+        self.man = os.path.join(d, "2026-08-01T0001.json")
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 2, "skipped": 0,
+                       "sessions": [
+                           {"sessionId": self.LIVE_SID, "cwd": "/Users/x/p/a",
+                            "project": "a"},
+                           {"sessionId": self.DEAD_SID, "cwd": "/Users/x/p/b",
+                            "project": "b"}]}, fh)
+        self.live, self.source_ok = [], True
+        self.real_collect = runner.engine.collect
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = self.source_ok
+            return (list(self.live), 0)
+
+        runner.engine.collect = fake_collect
+        self.runs = []
+        self.real_run = runner.subprocess.run
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a) or Done()
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.subprocess.run = self.real_run
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _restore_open(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.restore(["--open"])
+        return rc, out.getvalue() + err.getvalue()
+
+    def _script(self):
+        return " ".join(str(a) for run in self.runs for a in run[0])
+
+    def test_all_dead_opens_all_of_them(self):
+        rc, out = self._restore_open()          # control
+        self.assertEqual(rc, 0)
+        script = self._script()
+        self.assertIn("claude --resume " + self.LIVE_SID, script)
+        self.assertIn("claude --resume " + self.DEAD_SID, script)
+
+    def test_a_running_session_is_skipped_and_named(self):
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7}]
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0)
+        script = self._script()
+        self.assertNotIn(self.LIVE_SID, script, "it is already running: opening forks it")
+        self.assertIn("claude --resume " + self.DEAD_SID, script)
+        self.assertIn("already open", out)
+
+    def test_a_running_session_without_a_window_is_also_skipped(self):
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "", "pid": 8}]
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.LIVE_SID, self._script())
+
+    def test_an_unreadable_fleet_opens_nothing_at_all(self):
+        self.source_ok = False
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [], "17 windows on a guess is the worst outcome")
+        self.assertIn("not reopening", out)
+
+    def test_the_same_session_twice_in_a_manifest_opens_once(self):
+        # a hand-edited or double-written manifest must not start two processes
+        # on one transcript - the exact harm this guard exists to prevent
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 2, "skipped": 0,
+                       "sessions": [
+                           {"sessionId": self.DEAD_SID, "cwd": "/Users/x/p/b",
+                            "project": "b"},
+                           {"sessionId": self.DEAD_SID, "cwd": "/Users/x/p/b",
+                            "project": "b"}]}, fh)
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._script().count("claude --resume " + self.DEAD_SID), 1)
+        # and the duplicate is simply not a second entry: it is the same session,
+        # not another process starting it, so it must not be reported as one
+        self.assertNotIn("already starting", out)
+
+    def test_an_entry_that_cannot_be_rebuilt_is_reported_not_swallowed(self):
+        # one running + one unusable is not "all of them are already running"
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 2, "skipped": 0,
+                       "sessions": [
+                           {"sessionId": self.LIVE_SID, "cwd": "/Users/x/p/a",
+                            "project": "a"},
+                           {"sessionId": "not a session id", "cwd": "/Users/x/p/c",
+                            "project": "c"}]}, fh)
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7}]
+        rc, out = self._restore_open()
+        self.assertEqual(self.runs, [])
+        self.assertEqual(rc, 1, "nothing opened and something was unusable")
+        self.assertIn("cannot be reopened", out)
+
+    def test_every_session_live_opens_nothing_and_says_so(self):
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7},
+                     {"sessionId": self.DEAD_SID, "tty": "ttys010", "pid": 8}]
+        rc, out = self._restore_open()
+        self.assertEqual(self.runs, [])
+        self.assertIn("already open", out)
+
+
+class TestLaunchClaim(unittest.TestCase):
+    """The guard reads the world, then launches. Between those two moments another
+    ccwho - a second click, a restore running in another window - reads the same
+    world and launches too. A new session also takes a moment to show up in
+    `claude agents`, so the window is real even for one caller in a hurry.
+
+    Same idiom as ccgate's slots: O_CREAT|O_EXCL, and a claim whose holder is gone
+    is reclaimed rather than blocking forever.
+    """
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+
+    def tearDown(self):
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_first_caller_gets_the_claim(self):
+        self.assertTrue(runner.claim_launch(self.SID))
+
+    def test_a_second_caller_is_refused_while_it_is_held(self):
+        self.assertTrue(runner.claim_launch(self.SID))
+        self.assertFalse(runner.claim_launch(self.SID),
+                         "two launches on one transcript is the fork we are preventing")
+
+    def test_a_different_session_is_not_blocked(self):
+        runner.claim_launch(self.SID)
+        self.assertTrue(runner.claim_launch("99999999-9999-4999-8999-999999999999"))
+
+    def test_a_claim_whose_owner_died_is_reclaimed(self):
+        runner.claim_launch(self.SID, pid=999999)      # a pid that is not alive
+        self.assertTrue(runner.claim_launch(self.SID),
+                        "a crashed launcher must not lock a session out forever")
+
+    def test_an_expired_claim_is_reclaimed_even_if_the_owner_lives(self):
+        runner.claim_launch(self.SID, now=1000.0)
+        self.assertFalse(runner.claim_launch(self.SID, now=1000.0 + 30))
+        self.assertTrue(runner.claim_launch(self.SID, now=1000.0 + 600),
+                        "the claim covers the launch, not the session's lifetime")
+
+    def test_a_corrupt_claim_file_does_not_wedge_the_session(self):
+        runner.claim_launch(self.SID)
+        path = os.path.join(runner.ccwho_dir(), "launching",
+                            self.SID + ".json")
+        with open(path, "w") as fh:
+            fh.write("{ not json")
+        self.assertTrue(runner.claim_launch(self.SID))
+
+
+class TestOpenUsesTheLaunchClaim(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        d = os.path.join(self.tmp, "restore")
+        os.makedirs(d)
+        with open(os.path.join(d, "2026-08-01T0001.json"), "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 1,
+                       "skipped": 0, "sessions": [self.ENTRY]}, fh)
+        self.real_collect = runner.engine.collect
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True
+            return ([], 0)
+
+        runner.engine.collect = fake_collect
+        self.runs = []
+        self.real_run = runner.subprocess.run
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.subprocess.run = self.real_run
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _open(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.open_session([self.SID])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_the_first_open_launches(self):
+        rc, _ = self._open()                       # control
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_a_second_open_while_the_first_is_starting_does_not_launch_again(self):
+        self._open()
+        rc, out = self._open()
+        self.assertEqual(len(self.runs), 1, "the session is already being started")
+        self.assertEqual(rc, 1)
+        self.assertIn("already starting", out)

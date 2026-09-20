@@ -48,12 +48,45 @@ _UNKNOWN_RANK = 4
 # ---------------------------------------------------------------- pure helpers
 
 def parse_sessions(raw):
-    """Parse `claude agents --json`. A broken feed is empty, never an exception."""
+    """Parse `claude agents --json`. None when it could not be parsed, never an exception.
+
+    None and [] are different answers, one layer deeper than `agents_json()` draws
+    the same line. "[]" is claude saying nothing is open; None is us not knowing -
+    truncated output, a `{}`, anything that is not a list of sessions. Collapsing
+    the two is how a caller decides a RUNNING session is closed and reopens it,
+    which forks the conversation into two processes.
+    """
+    data = _agents_payload(raw)
+    if data is None:
+        return None
+    usable = [d for d in data if isinstance(d, dict) and d.get("sessionId")]
+    if data and not usable:
+        return None               # a list of things that are not sessions tells us nothing
+    return usable
+
+
+def _agents_payload(raw):
+    """The feed as a list, or None if it is not one."""
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        return []
-    return data if isinstance(data, list) else []
+        return None
+    return data if isinstance(data, list) else None
+
+
+def read_is_complete(raw):
+    """Did we understand ALL of it? Separate from "what did we understand".
+
+    A record shape we do not know (a future claude, a new kind of agent) must not
+    blank the dashboard - the sessions we did parse are still worth showing. But a
+    partial picture cannot authorise LAUNCHING anything: the session we skipped may
+    be the very one a caller is about to reopen, and reopening a live session forks
+    it. So display uses the rows; `open`, `restore --open` and `save` use this.
+    """
+    data = _agents_payload(raw)
+    if data is None:
+        return False
+    return all(isinstance(d, dict) and d.get("sessionId") for d in data)
 
 
 def project_of(cwd):
@@ -570,20 +603,32 @@ def parse_ccwho_url(url):
     return ("", "")
 
 
-def resolve_open(session_id, live_rows, entries):
+def resolve_open(session_id, live_rows, entries, source_ok=True):
     """What a click on an open-link should DO, decided against the world right now.
 
-    ("jump", tty)      it is running and has a window - focus it. Reopening a live
-                       session would fork the conversation into two processes.
-    ("resume", cmd)    it is not running (or has no window) - reopen it.
-    ("missing", "")    neither the live fleet nor the manifest has ever heard of it.
+    ("jump", tty)             it is running and has a window - focus it.
+    ("live-no-window", pid)   it is running with no window we can find. NOT a resume:
+                              "I cannot see a window" is not "it is not running", and
+                              resuming a live session forks the conversation into two
+                              processes writing one transcript.
+    ("resume", cmd)           it is not running - reopen it.
+    ("unknown", why)          we could not read the live fleet at all. An empty list
+                              from a failed read looks exactly like "nothing is
+                              running"; every caller that can launch must be told
+                              the difference. Nothing is opened on a guess.
+    ("missing", "")           neither the live fleet nor the manifest has heard of it.
+
+    Every caller that can start `claude --resume` - `open`, the url handler,
+    `restore --open` - goes through here, so the guard is written once.
     """
+    if not source_ok:
+        return ("unknown", "cannot read the live session list")
     for r in live_rows or []:
         if r.get("sessionId") == session_id:
             tty = short_tty(r.get("tty", ""))
             if tty:
                 return ("jump", tty)
-            break                 # live but windowless: reopening is the only move
+            return ("live-no-window", str(r.get("pid") or ""))
     for e_ in entries or []:
         if e_.get("sessionId") == session_id:
             cmd = restore_command(e_)
@@ -920,9 +965,12 @@ def collect(cache=None, status=None):
     one fact a caller cannot recover from the rows: whether the session source
     could be reached at all. An empty row list means nothing without it."""
     raw = agents_json()
+    parsed = parse_sessions(raw) if raw is not None else None
     if status is not None:
-        status["source_ok"] = raw is not None
-    sessions = parse_sessions(raw)
+        # reachable AND fully readable. Rows we understood are still rendered; a
+        # picture with a hole in it is what must not reach a caller that launches.
+        status["source_ok"] = parsed is not None and read_is_complete(raw)
+    sessions = parsed or []
     ps_out = ps_snapshot()
     ttys = parse_tty_map(tty_snapshot())
     ids = [s.get("sessionId", "") for s in sessions]

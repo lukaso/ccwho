@@ -404,10 +404,15 @@ class TestTheHotkeyProfile(unittest.TestCase):
         self.assertFalse(self.profile()["HotKey Window AutoHides"],
                          "it goes away when you ask it to, not by itself")
 
-    def test_the_window_comes_back_over_whatever_you_are_in(self):
-        p = self.profile()
-        self.assertTrue(p["HotKey Window Floats"])
-        self.assertEqual(p["Space"], -1, "all spaces, or it is useless on space 2")
+    def test_it_does_not_sit_on_top_of_the_session_it_just_opened(self):
+        # Floats pins the panel above every other window. With AutoHides off it
+        # would then cover the session ccwho had just put you in: reported as
+        # "it raises for a flash and then another window pops on top".
+        self.assertFalse(self.profile()["HotKey Window Floats"])
+
+    def test_it_is_on_whichever_space_you_are_on(self):
+        self.assertEqual(self.profile()["Space"], -1,
+                         "all spaces, or it is useless on space 2")
 
     def test_what_the_key_used_to_type_is_stated(self):
         self.assertEqual(setup.HOTKEYS["option-slash"]["instead_of"], "÷")

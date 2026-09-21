@@ -419,7 +419,10 @@ def hotkey_profile(command, hotkey=DEFAULT_HOTKEY, name=PROFILE_NAME,
         "HotKey Characters Ignoring Modifiers": key["plain"],
         "HotKey Modifier Flags": OPTION,
         "HotKey Activated By Modifier": False,
-        "HotKey Window Floats": True,          # over whatever you were reading
+        # False: floating pins it above every window, so the session you
+        # just opened comes up and the panel drops straight back on top
+        # of it. The key brings it forward; it does not need to hover.
+        "HotKey Window Floats": False,
         # False: this is a control panel. Enter takes you to a session's
         # window, and AutoHides would close the list at exactly that
         # moment - every time you used it. It goes when you press the key

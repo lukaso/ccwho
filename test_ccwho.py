@@ -1953,67 +1953,80 @@ class TestTheCheapQuestion(unittest.TestCase):
     """"Does anything need me?" must be answerable far more often than "tell me
     everything about every session".
 
-    Measured on a live fleet of sixteen: a full scan is 0.50s warm, of which
-    `ps` and iTerm2 are most; asking claude for the session list is 0.15s and
-    stat-ing every transcript is 0.005s. So the list can notice a session that
-    starts needing you in a second or two, at a third of the cost of scanning.
+    Measured on a live fleet of sixteen: a full scan is 0.57s of CPU. Asking
+    claude for the session list is 0.23s of CPU - it starts a Node process, and
+    that is nearly all of it - so a check built on it could not run often
+    without costing more than the scans it saved. Stat-ing every transcript and
+    every project directory is 0.3ms and starts nothing at all.
+
+    A session that needs you has just written to its transcript: the question is
+    IN the transcript. A session that has only just started appears as a new
+    file, which moves the mtime of the directory holding it.
     """
 
-    def sessions(self, *pairs):
-        return [{"sessionId": sid, "status": status} for sid, status in pairs]
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.projects = os.path.join(self.tmp, "projects", "liveapp")
+        os.makedirs(self.projects)
+        self.real_roots = ccwho.ccwho_index.config_roots
+        ccwho.ccwho_index.config_roots = lambda *a, **k: [self.tmp]
+        self.addCleanup(setattr, ccwho.ccwho_index, "config_roots", self.real_roots)
 
-    def test_the_same_world_gives_the_same_answer(self):              # control
-        a = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "busy")),
-                            {"a": 100.0, "b": 200.0})
-        b = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "busy")),
-                            {"a": 100.0, "b": 200.0})
-        self.assertEqual(a, b)
+    def transcript(self, sid, text="{}\n", when=None):
+        path = os.path.join(self.projects, f"{sid}.jsonl")
+        with open(path, "a") as fh:
+            fh.write(text)
+        if when:
+            os.utime(path, (when, when))
+        return path
 
-    def test_a_session_that_starts_waiting_changes_it(self):
-        before = ccwho.digest_of(self.sessions(("a", "busy")), {"a": 100.0})
-        after = ccwho.digest_of(self.sessions(("a", "waiting")), {"a": 100.0})
-        self.assertNotEqual(before, after)
+    def test_the_same_files_give_the_same_answer(self):               # control
+        self.transcript("a", when=1000.0)
+        first = ccwho.watch_digest(["a"])
+        self.assertEqual(first, ccwho.watch_digest(["a"]))
 
-    def test_a_session_that_says_something_changes_it(self):
-        # A session can start asking you something without its status moving:
-        # the question is in the transcript, and the transcript grew.
-        before = ccwho.digest_of(self.sessions(("a", "idle")), {"a": 100.0})
-        after = ccwho.digest_of(self.sessions(("a", "idle")), {"a": 101.0})
-        self.assertNotEqual(before, after)
+    def test_a_session_writing_something_changes_it(self):
+        self.transcript("a", when=1000.0)
+        before = ccwho.watch_digest(["a"])
+        self.transcript("a", text="{\"q\": 1}\n", when=1001.0)
+        self.assertNotEqual(before, ccwho.watch_digest(["a"]),
+                            "a question it just asked you is a write")
 
-    def test_a_session_appearing_or_ending_changes_it(self):
-        one = ccwho.digest_of(self.sessions(("a", "idle")), {"a": 100.0})
-        two = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "idle")),
-                              {"a": 100.0, "b": 100.0})
-        self.assertNotEqual(one, two)
+    def test_a_session_that_did_not_exist_yet_changes_it(self):
+        self.transcript("a", when=1000.0)
+        before = ccwho.watch_digest(["a"])
+        os.utime(self.projects, (2000.0, 2000.0))   # a new file landed here
+        self.assertNotEqual(before, ccwho.watch_digest(["a"]),
+                            "a session that has only just started is not in the"
+                            " list of ids we were given")
 
-    def test_the_order_it_came_in_does_not_matter(self):
-        a = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "busy")),
-                            {"a": 1.0, "b": 2.0})
-        b = ccwho.digest_of(self.sessions(("b", "busy"), ("a", "idle")),
-                            {"a": 1.0, "b": 2.0})
-        self.assertEqual(a, b, "the feed's order is not a change")
-
-    def test_nothing_running_is_an_answer_not_a_blank(self):
-        self.assertEqual(ccwho.digest_of([], {}), ())
-
-    def test_being_unable_to_ask_is_not_an_answer(self):
+    def test_it_asks_nothing_of_any_program(self):
+        called = []
         real = ccwho.agents_json
-        ccwho.agents_json = lambda: None
+        ccwho.agents_json = lambda: called.append(1) or "[]"
         try:
-            self.assertIsNone(ccwho.fleet_digest(),
-                              "None means we could not ask - never 'nothing changed'")
+            self.transcript("a")
+            ccwho.watch_digest(["a"])
         finally:
             ccwho.agents_json = real
+        self.assertEqual(called, [], "starting Node to ask what changed is the"
+                                     " cost this exists to avoid")
+
+    def test_a_session_with_no_transcript_is_not_a_crash(self):
+        self.assertIsInstance(ccwho.watch_digest(["nothing-here"]), tuple)
+
+    def test_no_sessions_at_all_still_watches_the_directories(self):
+        digest = ccwho.watch_digest([])
+        self.assertTrue(digest, "a new session appearing must still show up")
 
     def test_a_full_scan_hands_back_the_same_answer(self):
-        # or the cheap check would fire again immediately after every scan
+        # or the cheap check fires again the moment a scan finishes
         real = ccwho.agents_json
         ccwho.agents_json = lambda: '[]'
         try:
             status = {}
             ccwho.collect(cache={}, status=status)
-            self.assertIn("digest", status)
-            self.assertEqual(status["digest"], ccwho.fleet_digest())
+            self.assertEqual(status.get("watch"), ccwho.watch_digest([]))
         finally:
             ccwho.agents_json = real

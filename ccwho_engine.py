@@ -1099,40 +1099,58 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     }
 
 
-def digest_of(sessions, mtimes):
-    """What the list would be built from, in one comparable value.
-
-    A session needs you either because claude says it is waiting, or because it
-    asked you something - and the question is in the transcript, which means the
-    transcript grew. Status and mtime together cover both.
-    """
-    return tuple(sorted((s.get("sessionId", ""), s.get("status", ""),
-                         mtimes.get(s.get("sessionId", ""), 0))
-                        for s in sessions))
-
-
-def fleet_digest():
-    """The cheap question, asked on its own: has anything changed?
-
-    Measured on sixteen live sessions: 0.15s to ask claude for the list and
-    0.005s to stat every transcript, against 0.50s for a warm full scan. That is
-    what lets the list notice a session needing you within a second or two
-    without spending a third of a core doing it.
-
-    None is "could not ask", which is not "nothing changed".
-    """
-    sessions = parse_sessions(agents_json() or "")
-    if sessions is None:
-        return None
-    mtimes = {}
-    for s in sessions:
-        sid = s.get("sessionId", "")
-        path = transcript_path(sid)
+def project_dirs(roots=None):
+    """Every directory a transcript can appear in, across every config root."""
+    out = []
+    for root in (roots or ccwho_index.config_roots()):
+        base = os.path.join(root, "projects")
         try:
-            mtimes[sid] = os.path.getmtime(path) if path else 0
+            out += [os.path.join(base, name) for name in os.listdir(base)]
         except OSError:
-            mtimes[sid] = 0
-    return digest_of(sessions, mtimes)
+            continue
+    return out
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def watch_digest(session_ids, cache=None, roots=None):
+    """What the files say, in one comparable value. Starts no program at all.
+
+    This is what lets the list notice a session needing you within a second.
+    Measured on sixteen live sessions: 0.3ms, against 0.23s of CPU to ask claude
+    for the session list (it starts a Node process) and 0.57s for a full scan.
+
+    A session that needs you has just written to its transcript - the question
+    IS the write. A session that has only just started has no id we know yet,
+    but its new file moves the mtime of the directory holding it.
+
+    A session ENDING is not visible here, and does not need to be: nothing that
+    has stopped is waiting for you. The scheduled scan picks that up.
+    """
+    parts = []
+    for sid in session_ids:
+        path = transcript_path_cached(sid, cache)
+        parts.append((sid, _mtime(path) if path else 0))
+    for directory in project_dirs(roots):
+        parts.append((directory, _mtime(directory)))
+    return tuple(sorted(parts))
+
+
+def transcript_path_cached(session_id, cache=None):
+    """transcript_path globs across every config root - 9.5ms for sixteen
+    sessions, which is most of a check that is otherwise free. A transcript does
+    not move once it exists, so the answer is worth keeping."""
+    if cache is None:
+        return transcript_path(session_id)
+    paths = cache.setdefault("_paths", {})
+    if session_id not in paths:
+        paths[session_id] = transcript_path(session_id)
+    return paths[session_id]
 
 
 def collect(cache=None, status=None):
@@ -1152,20 +1170,18 @@ def collect(cache=None, status=None):
     ids = [s.get("sessionId", "") for s in sessions]
     orphans = attribute_orphans(ps_out, ids)
     rows = []
-    mtimes = {}
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
-        mtimes[sid] = mtime or 0
         tty = ttys.get(s.get("pid"), "")
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), "")))
     rows.sort(key=sort_key)
     if status is not None:
-        # The same value the cheap check computes, from data already in hand -
-        # so a scan does not leave the cheap check thinking the world moved.
-        status["digest"] = digest_of(sessions, mtimes)
+        # The same value the cheap check computes, so finishing a scan never
+        # leaves the check thinking the world moved.
+        status["watch"] = watch_digest(ids, cache=cache)
     if cache is not None:                       # drop windows for sessions that ended
         # Keys that are not a session id belong to something else sharing this
         # dict (the tab names). Sweeping them out every tick is how a cache ends

@@ -68,8 +68,9 @@ WINDOW_NAME = "ccwho"
 
 # The cheap check runs often; the full scan is the floor under it. Seeing a
 # session start needing you is the whole point of the list, so that is the one
-# that gets the short interval.
-WATCH_EVERY = 1.5              # "has anything changed?" - 0.16s to answer
+# that gets the short interval - and it is file stats only, starting no program
+# at all, or it would cost more than the scans it saves.
+WATCH_EVERY = 1.0              # "has anything changed?" - 0.3ms to answer
 REFRESH_VISIBLE = 20.0         # a full scan even when nothing moved
 REFRESH_HIDDEN = 60.0          # nobody is looking: the terminal said so
 AFTER_A_JUMP = 2.0             # long enough for the session to notice you
@@ -259,9 +260,8 @@ class CcwhoUi(App):
     def sniff(self):
         """Off the UI thread like every other call out of this process.
 
-        It asks claude for the session list and stats the transcripts - 0.16s
-        against 0.50s for a full scan - and only then does the expensive thing,
-        and only if the answer moved.
+        It only stats files - 0.3ms, no program started - and only then does
+        the expensive thing, and only if the answer moved.
         """
         if self.collector.changed():
             self.call_from_thread(self.look_again)
@@ -678,7 +678,8 @@ class Collector:
         self.cache = {}
         self.last = 0.0
         self.reload_error = ""
-        self.digest = None      # the world as of the last look, cheap or full
+        self.digest = None      # what the files said at the last look
+        self.rows = []          # the ids the check watches, from the last scan
 
     def changed(self):
         """Has anything happened that could change the list?
@@ -687,8 +688,9 @@ class Collector:
         session started needing you", and firing a full scan on every failed
         call is how a broken `claude` turns into a busy loop.
         """
-        now = engine.fleet_digest()
-        if now is None or now == self.digest:
+        ids = [row.get("sessionId", "") for row in self.rows]
+        now = engine.watch_digest(ids, cache=self.cache)
+        if now == self.digest:
             return False
         self.digest = now
         return True
@@ -740,10 +742,11 @@ class Collector:
             return Fleet([], False, "", f"could not read the fleet: {ex}")
         # The scan's own answer to the cheap question, so the next cheap check
         # does not see a changed world and scan all over again.
-        if status.get("digest") is not None:
-            self.digest = status["digest"]
+        if status.get("watch") is not None:
+            self.digest = status["watch"]
         trouble = self.reload_error or ("" if status.get("source_ok") else
                                         "cannot read the session list - run `ccwho doctor`")
+        self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble)
 

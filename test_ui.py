@@ -1207,7 +1207,7 @@ class TestTheCheapCheckIsCheap(unittest.TestCase):
             @staticmethod
             def collect(cache=None, status=None):
                 status["source_ok"] = True
-                status["digest"] = ("a", "busy")
+                status["watch"] = ("a", 1.0)
                 return [], 0
 
         # fleet() re-imports the engine first, which would put the real
@@ -1219,15 +1219,16 @@ class TestTheCheapCheckIsCheap(unittest.TestCase):
             collector.fleet()
         finally:
             ui.engine.collect = real
-        self.assertEqual(collector.digest, ("a", "busy"),
+        self.assertEqual(collector.digest, ("a", 1.0),
                          "the scan's own answer, or the next check fires again")
 
-    def test_being_unable_to_ask_is_not_a_change(self):
+    def test_the_check_starts_no_program(self):
         collector = ui.Collector()
-        collector.digest = ("a", "busy")
-        real = ui.engine.fleet_digest
-        ui.engine.fleet_digest = lambda: None
+        called = []
+        real = ui.engine.agents_json
+        ui.engine.agents_json = lambda: called.append(1) or "[]"
         try:
-            self.assertFalse(collector.changed())
+            collector.changed()
         finally:
-            ui.engine.fleet_digest = real
+            ui.engine.agents_json = real
+        self.assertEqual(called, [], "0.23s of CPU per check is not a check")

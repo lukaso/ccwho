@@ -4,6 +4,7 @@ import os
 import shlex
 import unittest
 
+import ccwho_brief as brief
 import ccwho_engine as ccwho
 
 
@@ -121,6 +122,25 @@ class TestBoilerplate(unittest.TestCase):
     def test_is_boilerplate_predicate(self):
         self.assertTrue(ccwho.is_boilerplate("Base directory for this skill: /x"))
         self.assertFalse(ccwho.is_boilerplate("run the gate"))
+
+    def test_the_engine_and_the_brief_share_one_rule(self):
+        # Three places ask "did a human type this?": the topic column, the
+        # brief's "you said", and search. Two lists drift, and then the list and
+        # the brief disagree about the same session.
+        self.assertIs(ccwho.is_boilerplate("x"), not brief.is_human_prompt("x"))
+        for machine in ("Another Claude session sent a message: hi",
+                        "Your claude.ai usage limit has reset. Continue",
+                        "[Subagent report] done"):
+            self.assertTrue(ccwho.is_boilerplate(machine), machine[:30])
+
+    def test_the_topic_column_walks_back_past_machine_text(self):
+        lines = [json.dumps({"type": "user", "timestamp": "2026-09-18T10:00:00.000Z",
+                             "message": {"role": "user", "content": "rebase and land"}}),
+                 json.dumps({"type": "user", "timestamp": "2026-09-18T11:00:00.000Z",
+                             "message": {"role": "user",
+                                         "content": "Your claude.ai usage limit has"
+                                                    " reset. Continue the task"}})]
+        self.assertEqual(ccwho.extract_topic(lines, strict=True)["last"], "rebase and land")
 
 
 class TestTitle(unittest.TestCase):
@@ -1343,6 +1363,50 @@ class TestParseSessionsSaysWhenItCouldNotParse(unittest.TestCase):
 
     def test_none_in_none_out(self):
         self.assertIsNone(ccwho.parse_sessions(None))
+
+
+class TestMatchRowsFindsEveryNameASessionHas(unittest.TestCase):
+    """A session answers to five names: the tab title, a short id, the full
+    session id, the message name and a tty/pid. Any of them has to find it, or
+    the one you remember is the one that does not work - and `show` prints short
+    ids in its ambiguity list, which were not searchable at all."""
+
+    ROWS = [{"sessionId": "6c4c20f6-c6fb-46e5-bc8a-699f013cbe69", "tty": "ttys022",
+             "pid": 90266, "name": "liveapp-f0", "title": "Issue 362",
+             "project": "liveapp"},
+            {"sessionId": "87f12e97-36d3-45be-87af-1ff776601651", "tty": "ttys016",
+             "pid": 92723, "name": "ccwho-81", "title": "Session discovery",
+             "project": "ccwho"}]
+
+    def one(self, q):
+        hits = ccwho.match_rows(self.ROWS, q)
+        self.assertEqual(len(hits), 1, f"{q!r} -> {len(hits)} hits")
+        return hits[0]
+
+    def test_the_short_id_finds_it(self):
+        self.assertEqual(self.one("6c4c")["project"], "liveapp")
+
+    def test_the_full_session_id_finds_it(self):
+        self.assertEqual(self.one("87f12e97-36d3-45be-87af-1ff776601651")["project"],
+                         "ccwho")
+
+    def test_the_message_name_finds_it(self):
+        self.assertEqual(self.one("ccwho-81")["project"], "ccwho")
+
+    def test_the_tty_and_the_pid_still_find_it(self):      # control
+        self.assertEqual(self.one("s022")["project"], "liveapp")
+        self.assertEqual(self.one("92723")["project"], "ccwho")
+
+    def test_a_title_substring_still_finds_it(self):       # control
+        self.assertEqual(self.one("362")["project"], "liveapp")
+
+    def test_a_prefix_two_sessions_share_stays_ambiguous(self):
+        rows = self.ROWS + [dict(self.ROWS[0],
+                                 sessionId="6c4cffff-0000-4000-8000-000000000000",
+                                 tty="ttys044", pid=1, name="liveapp-zz",
+                                 title="something else")]
+        self.assertEqual(len(ccwho.match_rows(rows, "6c4c")), 2,
+                         "never guess between two sessions")
 
 
 class TestResolveOpenNeverForksALiveSession(unittest.TestCase):

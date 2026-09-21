@@ -1069,3 +1069,156 @@ class TestOpenUsesTheLaunchClaim(unittest.TestCase):
         self.assertEqual(len(self.runs), 1, "the session is already being started")
         self.assertEqual(rc, 1)
         self.assertIn("already starting", out)
+
+
+class TestHotReloadCoversTheBriefModule(unittest.TestCase):
+    """The engine is reloaded every tick so an edit lands in a running watch.
+    The brief moved half the extraction rules into a second module; if only the
+    engine reloads, a fix to those rules looks like it did nothing."""
+
+    def test_editing_the_brief_module_lands_on_the_next_tick(self):
+        import ccwho_brief
+        path = ccwho_brief.__file__
+        original = open(path).read()
+        marker = "def _hot_reload_probe():\n    return 'edited'\n"
+        try:
+            with open(path, "w") as fh:
+                fh.write(original + "\n\n" + marker)
+            runner.reload_engine({"engine_error": ""})
+            self.assertTrue(hasattr(runner.engine.brief, "_hot_reload_probe"),
+                            "the brief module was not re-read")
+        finally:
+            with open(path, "w") as fh:
+                fh.write(original)
+            runner.reload_engine({"engine_error": ""})
+
+    def test_an_edit_that_blows_up_at_import_leaves_the_old_rules_working(self):
+        """A syntax error is the easy case: nothing runs. The one that bites is an
+        edit that RUNS and then raises - half the module's new definitions are
+        already in place, and catching the error leaves that half live. The next
+        tick then extracts with a module that is neither version."""
+        import ccwho_brief
+        path = ccwho_brief.__file__
+        original = open(path).read()
+        state = {"engine_error": ""}
+        try:
+            with open(path, "w") as fh:
+                fh.write(original.replace(
+                    'MAX_PROGRESS = 5', 'MAX_PROGRESS = 5\nLOW_SIGNAL = set()\n'
+                    'raise RuntimeError("boom")'))
+            runner.reload_engine(state)
+            self.assertTrue(state["engine_error"], "the error has to reach the banner")
+            self.assertTrue(
+                runner.engine.brief.LOW_SIGNAL,
+                "the half-applied edit must not become the live rule set")
+            self.assertFalse(runner.engine.brief.is_substantive("continue"),
+                             "extraction still works, with the last good rules")
+        finally:
+            with open(path, "w") as fh:
+                fh.write(original)
+            runner.reload_engine({"engine_error": ""})
+
+    def test_a_broken_brief_edit_does_not_kill_the_loop(self):
+        import ccwho_brief
+        path = ccwho_brief.__file__
+        original = open(path).read()
+        state = {"engine_error": ""}
+        try:
+            with open(path, "w") as fh:
+                fh.write(original + "\nthis is not python(")
+            runner.reload_engine(state)
+            self.assertTrue(state["engine_error"], "the error has to reach the banner")
+        finally:
+            with open(path, "w") as fh:
+                fh.write(original)
+            runner.reload_engine({"engine_error": ""})
+
+
+class TestShowVerb(unittest.TestCase):
+    """`ccwho show <anything>` answers "what was this session doing" without
+    opening it."""
+
+    SID = "6c4c20f6-c6fb-46e5-bc8a-699f013cbe69"
+
+    def setUp(self):
+        self.real_collect = runner.engine.collect
+        self.rows = [{"sessionId": self.SID, "project": "liveapp", "tty": "ttys022",
+                      "pid": 90266, "name": "liveapp-f0", "title": "Issue 362",
+                      "attention": "stopped", "status": "idle", "since": "5h",
+                      "cwd": "/Users/x/projects/liveapp", "topic": "", "first": "",
+                      "ask": "", "doing": "", "orphans": 0, "work": 0}]
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True
+            return (list(self.rows), 0)
+
+        runner.engine.collect = fake_collect
+        self.real_windows = runner.engine.read_windows
+        head = [json.dumps({"type": "user", "timestamp": "2026-09-14T09:00:00.000Z",
+                            "message": {"role": "user",
+                                        "content": "fix issue 362, the memory bloat"}})]
+        tail = [json.dumps({"type": "system", "subtype": "away_summary",
+                            "content": "Goal: fix the loop's memory bloat (#362).",
+                            "timestamp": "2026-09-16T10:18:00.000Z"}),
+                json.dumps({"type": "assistant", "timestamp": "2026-09-18T15:48:00.000Z",
+                            "message": {"role": "assistant",
+                                        "content": [{"type": "text",
+                                                     "text": "Shall I land it?"}]}})]
+        runner.engine.read_windows = lambda sid, **kw: (head, tail, 1788213090)
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.engine.read_windows = self.real_windows
+
+    def _show(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.show(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_it_finds_a_session_by_a_word_in_its_title(self):
+        rc, out = self._show("362")
+        self.assertEqual(rc, 0)
+        self.assertIn("memory bloat", out, "the recap is the point of the brief")
+        self.assertIn("Shall I land it?", out)
+        self.assertIn("fix issue 362", out)
+
+    def test_it_shows_the_other_names_of_the_session(self):
+        _, out = self._show("362")
+        self.assertIn("6c4c", out)          # short id
+        self.assertIn("s022", out)          # same short tty the list column shows
+        self.assertIn(self.SID, out)
+
+    def test_the_recap_never_appears_without_its_age(self):
+        _, out = self._show("362")
+        lines = out.splitlines()
+        i = [n for n, x in enumerate(lines) if "memory bloat" in x][0]
+        self.assertRegex(lines[i - 1], r"recap \d+[smhd] old",
+                         "a recap with no age hides how stale it is")
+
+    def test_an_ambiguous_query_lists_the_candidates_instead_of_guessing(self):
+        self.rows.append(dict(self.rows[0], sessionId="9999", title="Issue 362 part two",
+                              tty="ttys099"))
+        rc, out = self._show("362")
+        self.assertEqual(rc, 2)
+        self.assertIn("matches 2 sessions", out)
+
+    def test_no_match_says_so(self):
+        rc, out = self._show("nothing-like-this")
+        self.assertEqual(rc, 1)
+        self.assertIn("no session matches", out)
+
+    def test_a_session_with_nothing_in_it_says_so(self):
+        # a session started but never used has no transcript at all: "(no recap
+        # yet)" reads as "it is working on something", which is not true
+        runner.engine.read_windows = lambda sid, **kw: ([], [], 0)
+        _, out = self._show("362")
+        self.assertIn("nothing typed in this session yet", out)
+
+    def test_json_output_carries_the_brief(self):
+        rc, out = self._show("362", "--json")
+        self.assertEqual(rc, 0)
+        got = json.loads(out)
+        self.assertEqual(got["aka"]["short_id"], "6c4c")
+        self.assertIn("memory bloat", got["recap"])

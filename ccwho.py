@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -26,10 +27,38 @@ CLEAR_HOME = "\033[H\033[2J"
 DIM, RESET, RED = "\033[2m", "\033[0m", "\033[31m"
 
 
+def _load_beside(module):
+    """Import a module's file into a NEW module object, leaving the live one alone.
+
+    importlib.reload() executes the new source INTO the module everyone is holding.
+    An edit that parses but raises half way through - a typo in a rule, a bad
+    constant - leaves half the new definitions live and half the old ones, and
+    catching the exception does not undo that. The watch then extracts with a
+    module that is neither version, which is worse than not reloading at all.
+    Building the candidate beside the old one means a failure changes nothing.
+    """
+    spec = importlib.util.spec_from_file_location(module.__name__, module.__file__)
+    candidate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(candidate)          # raises before anything is swapped
+    return candidate
+
+
 def reload_engine(state):
-    """Re-read the engine. A broken edit keeps the last good module and says so."""
+    """Re-read the engine. A broken edit keeps the last good module and says so.
+
+    ccwho_brief goes first: it holds half the extraction rules and the engine
+    imports it, so reloading only the engine would leave a running watch showing
+    the OLD rules while its file on disk says otherwise - a fix that looks like
+    it did nothing is worse than no hot reload at all.
+    """
     try:
-        importlib.reload(engine)
+        new_brief = _load_beside(engine.brief)
+        sys.modules[new_brief.__name__] = new_brief
+        try:
+            importlib.reload(engine)
+        except Exception:
+            sys.modules[engine.brief.__name__] = engine.brief   # put the old one back
+            raise
         state["engine_error"] = ""
     except Exception:
         state["engine_error"] = traceback.format_exc(limit=2).strip().splitlines()[-1]
@@ -121,6 +150,40 @@ def jump(argv):
     out = (res.stdout or res.stderr).strip()
     print(out)
     return 0 if out.startswith("focused") else 1
+
+
+def show(argv):
+    """What was this session working on? The answer without opening it.
+
+    The recap the harness already wrote leads, because it is the only line that
+    was written to answer this exact question - but never without its age and the
+    turns since, or a two-day-old recap reads as the current state of the work.
+    """
+    want_json = "--json" in argv
+    query = " ".join(a for a in argv if not a.startswith("-"))
+    rows, _ = engine.collect(cache={})
+    hits = engine.match_rows(rows, query) if query else rows
+    if not hits:
+        print(f"ccwho show: no session matches {query!r}", file=sys.stderr)
+        return 1
+    if len(hits) > 1:
+        print(f"ccwho show: {query!r} matches {len(hits)} sessions - be more specific:",
+              file=sys.stderr)
+        for r in hits:
+            print(f"  {engine.brief.short_id(r.get('sessionId','')):<6}"
+                  f" {engine.short_tty(r.get('tty','')):<6}"
+                  f" {r.get('title') or r.get('name')}", file=sys.stderr)
+        return 2
+    row = hits[0]
+    head, tail, _mtime = engine.read_windows(row.get("sessionId", ""))
+    b = engine.brief.build(head, tail, session=row,
+                           now=engine.now_iso(), as_records=engine.as_records)
+    if want_json:
+        print(json.dumps(b, indent=2))
+        return 0
+    print(engine.render_brief(b, row, color=sys.stdout.isatty()
+                              and "NO_COLOR" not in os.environ))
+    return 0
 
 
 KEEP_LOG_LINES = int(os.environ.get("CCWHO_KEEP_LOG_LINES", "1000"))
@@ -638,6 +701,8 @@ def main(argv=None):
         return rc
     if argv and argv[0] == "restore":
         return restore(argv[1:])
+    if argv and argv[0] == "show":
+        return show(argv[1:])
     if argv and argv[0] == "open":
         return open_session(argv[1:])
     if argv and argv[0] == "url":
@@ -650,6 +715,7 @@ def main(argv=None):
         print("       ccwho restore [--open] [--from PATH]       list it back / reopen the windows")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
+        print("       ccwho show <anything>                      what that session was working on")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")

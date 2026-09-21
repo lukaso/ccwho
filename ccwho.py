@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -213,6 +214,29 @@ def show(argv):
     print(engine.render_brief(b, row, color=sys.stdout.isatty()
                               and "NO_COLOR" not in os.environ))
     return 0
+
+
+UI_RESTART = 42             # what ccwho_ui exits with when you press R
+
+
+def run_ui():
+    """Hand over to the TUI. uv fetches Textual from the script's own header, so
+    there is no virtualenv to make - but if uv is missing, say that in one line
+    rather than dying in an import."""
+    ui = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ccwho_ui.py")
+    uv = shutil.which("uv")
+    if not uv:
+        print("ccwho: the live list needs uv (it fetches Textual for you):",
+              file=sys.stderr)
+        print("  brew install uv          # then run ccwho again", file=sys.stderr)
+        print("  ccwho ls                 # the one-shot table needs nothing",
+              file=sys.stderr)
+        return 1
+    while True:
+        done = subprocess.run([uv, "run", "--quiet", "--script", ui])
+        if done.returncode != UI_RESTART:
+            return done.returncode
+        # R: the code on disk changed under a window that stays open for days
 
 
 def index_path():
@@ -846,6 +870,11 @@ def _arg(argv, flag, default):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    # Bare `ccwho` on a terminal is the live list. Piped, redirected, or under
+    # launchd it is the one-shot table, which is what scripts and the autosave
+    # job read - and `ls` asks for the table by name.
+    if not argv and sys.stdout.isatty():
+        return run_ui()
     if argv and argv[0] == "jump":
         return jump(argv[1:])
     if argv and argv[0] == "reap":

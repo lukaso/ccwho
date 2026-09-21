@@ -1474,3 +1474,79 @@ class TestFindsSessionsThatAreNotRunning(unittest.TestCase):
         rc, out = self._run(runner.ls, "nothing-like-this")
         self.assertEqual(rc, 1)
         self.assertIn("no session", out.lower())
+
+
+class TestPlainCcwhoOpensTheUi(unittest.TestCase):
+    """`ccwho` on a terminal opens the list; piped or under launchd it prints the
+    table exactly as it always did. The one-shot output is what scripts, the
+    status line and the autosave job read."""
+
+    def setUp(self):
+        self.runs = []
+        self.real_run = runner.subprocess.run
+        self.real_collect = runner.engine.collect
+
+        class Done:
+            returncode = 0
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
+        runner.engine.collect = lambda cache=None, status=None: ([], 0)
+
+    def tearDown(self):
+        runner.subprocess.run = self.real_run
+        runner.engine.collect = self.real_collect
+
+    class _Captured(io.StringIO):
+        """redirect_stdout replaces stdout with a StringIO, whose isatty() is
+        always False - so the thing under test has to be told, here."""
+
+        tty = False
+
+        def isatty(self):
+            return self.tty
+
+    def _main(self, argv, tty):
+        out, err = self._Captured(), io.StringIO()
+        out.tty = tty
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.main(argv)
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_on_a_terminal_it_runs_the_ui(self):
+        self._main([], tty=True)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("ccwho_ui.py", " ".join(self.runs[0]))
+
+    def test_piped_it_prints_the_table(self):
+        self._main([], tty=False)
+        self.assertEqual(self.runs, [], "a pipe wants the table, not a full-screen app")
+
+    def test_ls_always_prints_the_table(self):
+        self._main(["ls"], tty=True)
+        self.assertEqual(self.runs, [])
+
+    def test_a_flag_still_means_the_one_shot(self):
+        for flag in ("--json", "--blocked", "--prompt"):
+            self.runs.clear()
+            self._main([flag], tty=True)
+            self.assertEqual(self.runs, [], flag)
+
+    def test_without_uv_it_says_what_to_install(self):
+        real_which = runner.shutil.which
+        runner.shutil.which = lambda name: None
+        try:
+            rc, out = self._main([], tty=True)
+        finally:
+            runner.shutil.which = real_which
+        self.assertEqual(rc, 1)
+        self.assertIn("uv", out)
+        self.assertEqual(self.runs, [], "no traceback, no half-started app")
+
+    def test_a_restart_from_the_ui_starts_it_again(self):
+        class Restart:
+            returncode = 42            # the ui asks to be re-executed
+
+        answers = [Restart(), type("Done", (), {"returncode": 0})()]
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or answers.pop(0)
+        self._main([], tty=True)
+        self.assertEqual(len(self.runs), 2, "R restarts it with the new code")

@@ -22,6 +22,7 @@ ROW_KEYS = {
     "project", "status", "attention", "waitingFor", "name", "title", "doing",
     "ask", "since", "ts", "topic", "first", "age", "orphans", "work", "tty",
     "pid", "sessionId", "cwd",
+    "tab_title",          # added 2026-09-21: the name iTerm2 shows for that tty
 }
 
 # Every key a manifest session entry has ever carried. Append only.

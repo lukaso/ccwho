@@ -1365,6 +1365,155 @@ class TestParseSessionsSaysWhenItCouldNotParse(unittest.TestCase):
         self.assertIsNone(ccwho.parse_sessions(None))
 
 
+class TestTerminalNames(unittest.TestCase):
+    """The name you can SEE is the one on the tab, and it is not the ai-title:
+    Claude Code puts a status glyph in front of it and iTerm2 adds "(claude)".
+    Matching by eye needs the same string, glyph and all.
+
+    Measured 2026-09-21: iTerm2's AppleScript cannot report a tab's own title
+    per session - both `current session of tab` and the `tab.title` variable
+    resolve to the WINDOW's current tab (10 sessions in 10 different tabs all
+    reported one title). A session's own `name` is correct, costs 0.18s in bulk
+    against 1.6s per-session, and is what the tab displays whenever that session
+    is the tab's active pane.
+    """
+
+    DUMP = ("/dev/ttys000\t\u25d1 Session discovery and management UX (claude)\n"
+            "/dev/ttys012\tChat (claude)\n"
+            "/dev/ttys017\t-zsh\n"
+            "\n"
+            "/dev/ttys099\n")           # a line with no name at all
+
+    def test_it_maps_a_tty_to_the_name_on_the_tab(self):
+        got = ccwho.parse_titles(self.DUMP)
+        self.assertEqual(got["ttys000"], "\u25d1 Session discovery and management UX (claude)")
+        self.assertEqual(got["ttys012"], "Chat (claude)")
+
+    def test_a_shell_tab_is_named_too(self):
+        self.assertEqual(ccwho.parse_titles(self.DUMP)["ttys017"], "-zsh")
+
+    def test_junk_lines_are_skipped_not_fatal(self):
+        got = ccwho.parse_titles(self.DUMP)
+        self.assertNotIn("ttys099", got)
+        self.assertEqual(len(got), 3)
+
+    def test_nothing_from_iterm_is_an_empty_map(self):
+        self.assertEqual(ccwho.parse_titles(""), {})
+        self.assertEqual(ccwho.parse_titles(None), {})
+
+    def test_the_script_asks_for_names_in_bulk(self):
+        # one round trip for every session: the per-session form takes 1.6s
+        script = ccwho.iterm_titles_script()
+        self.assertIn("name of sessions", script)
+        self.assertNotIn("variable named", script)
+
+
+class TestTitlesAreCachedBetweenTicks(unittest.TestCase):
+    """Asking iTerm2 costs ~0.5s of a 1.2s run, and tab names change far more
+    slowly than a 5s watch tick. `--watch` once burned a full core by re-doing
+    per-tick work; this is the same mistake waiting to happen."""
+
+    def setUp(self):
+        self.calls = []
+        self.real = ccwho.titles_snapshot
+
+        def counted(timeout=5.0):
+            self.calls.append(1)
+            return {"ttys022": "\u2733 Issue 362 (claude)"}
+
+        ccwho.titles_snapshot = counted
+
+    def tearDown(self):
+        ccwho.titles_snapshot = self.real
+
+    def test_a_second_call_inside_the_window_reuses_the_answer(self):
+        cache = {}
+        a = ccwho.titles_cached(cache, now=1000.0)
+        b = ccwho.titles_cached(cache, now=1000.0 + 5)
+        self.assertEqual(a, b)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_it_asks_again_once_the_window_has_passed(self):
+        cache = {}
+        ccwho.titles_cached(cache, now=1000.0)
+        ccwho.titles_cached(cache, now=1000.0 + ccwho.TITLES_TTL + 0.1)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_without_a_cache_it_always_asks(self):          # control
+        ccwho.titles_cached(None, now=1000.0)
+        ccwho.titles_cached(None, now=1000.0)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_collect_does_not_evict_the_titles_while_tidying_up(self):
+        # collect() drops cache entries for sessions that ended. The titles live
+        # in the same dict and are not a session id, so a careless sweep deletes
+        # them every tick and the cache never hits once.
+        real_agents, real_ps, real_ttys = (ccwho.agents_json, ccwho.ps_snapshot,
+                                           ccwho.tty_snapshot)
+        ccwho.agents_json = lambda: json.dumps(
+            [{"sessionId": "aaa", "pid": 1, "cwd": "/x", "status": "idle"}])
+        ccwho.ps_snapshot = lambda: ""
+        ccwho.tty_snapshot = lambda: ""
+        try:
+            cache = {}
+            ccwho.collect(cache=cache)
+            ccwho.collect(cache=cache)
+        finally:
+            (ccwho.agents_json, ccwho.ps_snapshot,
+             ccwho.tty_snapshot) = real_agents, real_ps, real_ttys
+        self.assertEqual(len(self.calls), 1, "iTerm2 was asked twice in two ticks")
+
+    def test_a_terminal_reused_by_another_session_is_not_given_the_old_name(self):
+        # close a tab, open another on the same tty inside the cache window: the
+        # new session would wear the old session's name for 15 seconds
+        cache = {}
+        ccwho.titles_cached(cache, ttys={"ttys022"}, now=1000.0)
+        ccwho.titles_cached(cache, ttys={"ttys022", "ttys044"}, now=1000.0 + 1)
+        self.assertEqual(len(self.calls), 2, "the set of terminals changed")
+
+    def test_the_same_terminals_still_reuse_the_answer(self):       # control
+        cache = {}
+        ccwho.titles_cached(cache, ttys={"ttys022"}, now=1000.0)
+        ccwho.titles_cached(cache, ttys={"ttys022"}, now=1000.0 + 1)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_an_empty_answer_is_not_cached_as_the_truth(self):
+        # iTerm2 starting up, or a timeout: retry on the next tick rather than
+        # showing "~" fallbacks for the next quarter minute
+        ccwho.titles_snapshot = lambda timeout=5.0: self.calls.append(1) or {}
+        cache = {}
+        ccwho.titles_cached(cache, now=1000.0)
+        ccwho.titles_cached(cache, now=1000.0 + 1)
+        self.assertEqual(len(self.calls), 2)
+
+
+class TestRowCarriesTheNameYouSee(unittest.TestCase):
+    SESSION = {"pid": 4242, "cwd": "/Users/x/projects/liveapp", "sessionId": "abc",
+               "name": "liveapp-4e", "status": "idle", "startedAt": 1788200000000}
+    TAIL = [json.dumps({"type": "ai-title", "aiTitle": "Issue 362"})]
+
+    def test_the_terminal_name_wins_over_the_ai_title(self):
+        row = ccwho.build_row(self.SESSION, [], self.TAIL, mtime=1788203600,
+                              tty="ttys022", tab_title="\u2733 Issue 362 (claude)")
+        self.assertEqual(row["tab_title"], "\u2733 Issue 362 (claude)")
+        self.assertEqual(row["title"], "Issue 362", "the ai-title is still there")
+
+    def test_without_a_terminal_name_the_row_says_so(self):
+        row = ccwho.build_row(self.SESSION, [], self.TAIL, mtime=1788203600, tty="")
+        self.assertEqual(row["tab_title"], "")
+
+    def test_the_list_shows_the_name_you_see_and_marks_a_fallback(self):
+        seen = ccwho.build_row(self.SESSION, [], self.TAIL, mtime=1788203600,
+                               tty="ttys022", tab_title="\u2733 Issue 362 (claude)")
+        out = ccwho.render([seen], 0, color=False, width=200)
+        self.assertIn("\u2733 Issue 362 (claude)", out)
+        self.assertNotIn("~Issue 362", out)
+        unseen = ccwho.build_row(self.SESSION, [], self.TAIL, mtime=1788203600, tty="")
+        out2 = ccwho.render([unseen], 0, color=False, width=200)
+        self.assertIn("~Issue 362", out2,
+                      "a title we could not read off the tab is marked, not faked")
+
+
 class TestMatchRowsFindsEveryNameASessionHas(unittest.TestCase):
     """A session answers to five names: the tab title, a short id, the full
     session id, the message name and a tty/pid. Any of them has to find it, or
@@ -1396,6 +1545,11 @@ class TestMatchRowsFindsEveryNameASessionHas(unittest.TestCase):
     def test_the_tty_and_the_pid_still_find_it(self):      # control
         self.assertEqual(self.one("s022")["project"], "liveapp")
         self.assertEqual(self.one("92723")["project"], "ccwho")
+
+    def test_the_name_on_the_tab_finds_it(self):
+        # the list shows the tab name, so that is the string you will type back
+        rows = [dict(self.ROWS[0], tab_title="\u2733 Release triage (claude)")]
+        self.assertEqual(len(ccwho.match_rows(rows, "release triage")), 1)
 
     def test_a_title_substring_still_finds_it(self):       # control
         self.assertEqual(self.one("362")["project"], "liveapp")

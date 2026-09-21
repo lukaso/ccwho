@@ -673,9 +673,102 @@ def match_rows(rows, query):
             hits.append(r)
         elif q in (r.get("name") or "").lower():
             hits.append(r)
+        elif q in (r.get("tab_title") or "").lower():
+            hits.append(r)          # the name on the tab is the one you can see
         elif q in (r.get("title") or "").lower() or q in (r.get("project") or "").lower():
             hits.append(r)
     return hits
+
+
+def iterm_titles_script():
+    """AppleScript for "what does each tab SAY", in one round trip.
+
+    Bulk on purpose. Asking each session for its `tab.title` variable costs a
+    round trip apiece - 1.6s for 25 sessions against 0.18s for this - and it does
+    not even answer the question: measured 2026-09-21, both `tab.title` and
+    `current session of tab` resolve to the WINDOW's current tab, so ten sessions
+    in ten different tabs all reported one title.
+
+    A session's own `name` is what the tab displays whenever that session is the
+    tab's active pane, which is every tab that was never split. In a split tab the
+    inactive pane reports its own name rather than the tab's - still the truth
+    about that session, just not the string painted on the tab.
+    """
+    return (
+        'tell application "iTerm2"\n'
+        '  set d to (ASCII character 9)\n'
+        '  set out to ""\n'
+        '  repeat with w in windows\n'
+        '    set ttyGroups to tty of sessions of every tab of w\n'
+        '    set nameGroups to name of sessions of every tab of w\n'
+        '    repeat with i from 1 to count of ttyGroups\n'
+        '      set ts to item i of ttyGroups\n'
+        '      set ns to item i of nameGroups\n'
+        '      repeat with j from 1 to count of ts\n'
+        '        set out to out & (item j of ts) & d & (item j of ns) & linefeed\n'
+        '      end repeat\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        '  return out\n'
+        'end tell\n'
+    )
+
+
+def parse_titles(dump):
+    """tty -> the name iTerm2 shows for it. Junk lines are skipped, never fatal:
+    this is another application's output, and a list must still render."""
+    out = {}
+    for line in (dump or "").splitlines():
+        tty, sep, name = line.partition("\t")
+        if not sep or not name.strip():
+            continue
+        out[short_tty_full(tty.strip())] = name.strip()
+    return out
+
+
+def short_tty_full(tty):
+    """`/dev/ttys022` -> `ttys022`. The form `ps` reports, so the two maps join."""
+    return (tty or "").rsplit("/", 1)[-1]
+
+
+def titles_snapshot(timeout=5.0):
+    """Ask iTerm2 once. Empty when it is not running, not scriptable, or slow -
+    the list is still worth showing without the names on the tabs."""
+    try:
+        done = subprocess.run(["osascript", "-e", iterm_titles_script()],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return parse_titles(done.stdout) if done.returncode == 0 else {}
+
+
+# Tab names change when you rename a tab or a session's title updates - minutes,
+# not seconds. The osascript round trip is ~0.5s of a 1.2s run, and --watch has
+# burned a core before by repeating per-tick work that did not need repeating.
+TITLES_TTL = 15.0
+
+
+def titles_cached(cache, ttys=None, now=None):
+    """The tab names, at most once per TITLES_TTL. `cache` is the runner's dict,
+    the same idiom as the transcript window cache; None means always ask.
+
+    An empty answer is never cached: iTerm2 starting up, or one slow call, would
+    otherwise show "~" fallbacks for the next quarter minute.
+    """
+    now = time.time() if now is None else now
+    if cache is None:
+        return titles_snapshot()
+    ts, titles, seen = cache.get("_titles", (0.0, {}, None))
+    # An empty map is never a hit: iTerm2 starting up, or one slow call, would
+    # otherwise show "~" fallbacks for the rest of the window.
+    # A changed set of terminals is never a hit either: a tty is reused when one
+    # tab closes and another opens, and the new session would wear the old
+    # session's name until the window expired.
+    if titles and now - ts < TITLES_TTL and (ttys is None or seen == ttys):
+        return titles
+    fresh = titles_snapshot()
+    cache["_titles"] = (now, fresh, set(ttys) if ttys is not None else None)
+    return fresh
 
 
 def tty_snapshot():
@@ -925,7 +1018,8 @@ def iterm_open_script(entries):
 
 # -------------------------------------------------------------------- assemble
 
-def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=""):
+def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
+              tab_title=""):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -967,6 +1061,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "orphans": orphan_count,
         "work": work,
         "tty": tty,
+        "tab_title": tab_title,
         "pid": session.get("pid"),
         "sessionId": session.get("sessionId", ""),
         "cwd": session.get("cwd", ""),
@@ -986,18 +1081,23 @@ def collect(cache=None, status=None):
     sessions = parsed or []
     ps_out = ps_snapshot()
     ttys = parse_tty_map(tty_snapshot())
+    titles = titles_cached(cache, ttys=set(ttys.values()))
     ids = [s.get("sessionId", "") for s in sessions]
     orphans = attribute_orphans(ps_out, ids)
     rows = []
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
+        tty = ttys.get(s.get("pid"), "")
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
                               work=work_descendants(ps_out, s.get("pid")),
-                              tty=ttys.get(s.get("pid"), "")))
+                              tty=tty, tab_title=titles.get(short_tty_full(tty), "")))
     rows.sort(key=sort_key)
-    if cache is not None:                       # drop rows for sessions that ended
-        for gone in set(cache) - set(ids):
+    if cache is not None:                       # drop windows for sessions that ended
+        # Keys that are not a session id belong to something else sharing this
+        # dict (the tab names). Sweeping them out every tick is how a cache ends
+        # up never hitting once while looking like it works.
+        for gone in set(k for k in cache if not k.startswith("_")) - set(ids):
             cache.pop(gone, None)
     return rows, count_orphans(ps_out, home=os.path.expanduser("~"))
 
@@ -1101,7 +1201,11 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False, links
         att = r.get("attention") or r["status"]
         label = {"blocked": "NEEDS YOU", "asks": "ASKED YOU",
                  "stopped": "STOPPED", "ready": "stopped"}.get(att, att)
-        title = r["title"] or r["name"]
+        # The name on the tab is the one you can see, so it is the one the list
+        # shows. When iTerm2 could not tell us (not running, not scriptable, a
+        # session with no window), fall back to Claude Code's own title and MARK
+        # it: a title we could not read off a tab must not pretend it came from one.
+        title = r.get("tab_title") or ("~" + (r["title"] or r["name"]))
         doing = (r.get("ask") if att == "asks" else r["doing"]) or "-"
         if att == "running" and r.get("work"):
             doing = f"[{r['work']} bg] {doing}"

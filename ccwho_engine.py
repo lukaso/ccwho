@@ -1045,6 +1045,10 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # Not busy and not asking: either it stopped, or it is waiting on work.
         attention = "running" if work else "stopped"
     ts = last_turn_ts(tail)
+    # The recap comes off the windows this function was already given: the list's
+    # second line is "what is this about", and the harness already answered it.
+    recs = as_records(head) + as_records(tail)
+    r = brief.recap(recs)
     return {
         "project": project_of(session.get("cwd", "")),
         "status": status,
@@ -1063,6 +1067,10 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "work": work,
         "tty": tty,
         "tab_title": tab_title,
+        "recap": r["text"],
+        "recap_ts": r["ts"],
+        "recap_age": brief.age_between(r["ts"], now_iso(now)) if r["ts"] else "",
+        "turns_since_recap": brief.turns_since(recs, r["ts"]),
         "pid": session.get("pid"),
         "sessionId": session.get("sessionId", ""),
         "cwd": session.get("cwd", ""),
@@ -1172,6 +1180,86 @@ def render_brief(b, row=None, color=True):
     out.append("  " + _paint(" · ".join(x for x in bits if x), "dim", color))
     out.append(f"  {_paint('resume', 'dim', color)}    claude --resume {aka['session_id']}")
     return "\n".join(out)
+
+
+# --------------------------------------------------------------- the ui's model
+#
+# The TUI is a thin shell over these. Which group a session belongs in, what its
+# two lines say, what a search matches: decided here, where it is testable
+# without a terminal, and hot-reloaded like everything else in this module.
+
+UI_GROUPS = (("NEEDS YOU / ASKED YOU", ("blocked", "waiting", "asks")),
+             ("STOPPED", ("stopped", "ready", "shell", "idle")),
+             ("BUSY", ("busy", "running")))
+
+UI_WIDE = 140            # below this, the detail replaces the list instead of
+                         # sitting beside it
+
+
+def ui_groups(rows):
+    """Rows under the heading that says what each one needs from you.
+
+    A heading over nothing is noise, so an empty group is left out entirely.
+    """
+    out = []
+    for heading, states in UI_GROUPS:
+        members = [r for r in rows if r.get("attention") in states]
+        if members:
+            out.append({"heading": heading, "rows": members})
+    return out
+
+
+def ui_row_lines(row, width=100):
+    """The two lines a session gets: what it is, and what it is about.
+
+    Line two is the recap - the harness's own summary, which is the only line
+    written to answer "what was this about" - never without its age. No recap
+    yet, and it says so and shows the last thing the session did instead.
+    """
+    sid = brief.short_id(row.get("sessionId", ""))
+    name = row.get("tab_title") or ("~" + (row.get("title") or row.get("name") or ""))
+    tail = f" · {row.get('since', '')}"
+    if row.get("tty"):
+        tail += f" · {short_tty(row['tty'])}"
+    head = f"{sid}  {row.get('project', '?')[:12]}  "
+    first = head + truncate(name, max(8, width - visible_len(head) - visible_len(tail))) + tail
+
+    # The age goes FIRST. At the end of a long recap it is the first thing
+    # truncation eats, and a recap whose age you cannot see reads as the current
+    # state of the work - which is exactly the mistake the age exists to prevent.
+    if row.get("recap"):
+        age = row.get("recap_age") or "?"
+        turns = row.get("turns_since_recap") or 0
+        mark = f"{age}" + (f", {turns} turns" if turns else "") + " · "
+        body = row["recap"]
+    else:
+        mark = ""
+        body = "(no recap yet) " + (row.get("doing") or "")
+    pad = "        "
+    second = pad + mark + truncate(body, max(8, width - len(pad) - visible_len(mark)))
+    return (truncate(first, width), truncate(second, width))
+
+
+_UI_SEARCHED = ("tab_title", "title", "name", "project", "recap", "doing", "ask",
+                "topic", "sessionId", "tty")
+
+
+def ui_filter(rows, query):
+    """Rows matching every word of a simple keyword search.
+
+    Every name a session has is searchable, and so is what it is about: the point
+    is that whichever one you remember is the one that works.
+    """
+    words = [w for w in (query or "").lower().split() if w]
+    if not words:
+        return list(rows)
+    out = []
+    for r in rows:
+        hay = " ".join(str(r.get(f, "")) for f in _UI_SEARCHED).lower()
+        hay += " " + short_tty(r.get("tty", "")).lower() + " " + str(r.get("pid", ""))
+        if all(w in hay for w in words):
+            out.append(r)
+    return out
 
 
 def render(rows, total_orphans, color=True, width=None, show_prompt=False, links=False):

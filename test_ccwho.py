@@ -1695,3 +1695,123 @@ class TestCollectReportsAnUnparseableSource(MachinelessCollect):
             ccwho.agents_json = real
         self.assertEqual(rows, [])
         self.assertIs(status["source_ok"], True)      # control
+
+
+class TestRowsCarryTheRecap(unittest.TestCase):
+    """The list's second line is the recap, so the row has to have one. It comes
+    from the windows the engine already read for that session - no extra work."""
+
+    SESSION = {"pid": 4242, "cwd": "/Users/x/projects/liveapp", "sessionId": "abc",
+               "name": "liveapp-4e", "status": "idle", "startedAt": 1788200000000}
+
+    def rows(self, tail):
+        return ccwho.build_row(self.SESSION, [], tail, mtime=1788203600,
+                               now=1788207200, tty="ttys022")
+
+    def test_the_recap_and_its_age_are_on_the_row(self):
+        tail = [json.dumps({"type": "system", "subtype": "away_summary",
+                            "content": "Goal: fix the gate flake.",
+                            "timestamp": "2026-09-18T10:00:00.000Z"}),
+                json.dumps({"type": "user", "timestamp": "2026-09-18T12:00:00.000Z",
+                            "message": {"role": "user", "content": "land it"}})]
+        row = self.rows(tail)
+        self.assertIn("gate flake", row["recap"])
+        self.assertEqual(row["recap_ts"], "2026-09-18T10:00:00.000Z")
+        self.assertTrue(row["recap_age"], "an age is not optional")
+        self.assertEqual(row["turns_since_recap"], 1)
+
+    def test_no_recap_is_empty_not_missing(self):          # control
+        row = self.rows([])
+        self.assertEqual(row["recap"], "")
+        self.assertEqual(row["turns_since_recap"], 0)
+
+
+class TestTheViewModelBehindTheUi(unittest.TestCase):
+    """The TUI is a thin shell. What belongs on the screen - which group a session
+    is in, what its two lines say, what a search matches - is decided here, where
+    it can be tested without a terminal."""
+
+    def rows(self):
+        return [
+            {"sessionId": "aaaa1111-0000-4000-8000-000000000001", "project": "liveapp",
+             "attention": "busy", "title": "Release queue", "tab_title": "✳ Release queue",
+             "tty": "ttys007", "since": "2m", "doing": "Bash: run the gate",
+             "recap": "", "name": "liveapp-a1", "pid": 1, "ask": "", "topic": ""},
+            {"sessionId": "bbbb2222-0000-4000-8000-000000000002", "project": "liveapp",
+             "attention": "asks", "title": "Issue 362", "tab_title": "✳ Issue 362",
+             "tty": "ttys022", "since": "5h", "doing": "Bash: read the verdict",
+             "recap": "", "name": "liveapp-b2", "pid": 2,
+             "ask": "Shall I land it?", "topic": ""},
+            {"sessionId": "cccc3333-0000-4000-8000-000000000003", "project": "ccwho",
+             "attention": "stopped", "title": "Session discovery", "tab_title": "",
+             "tty": "", "since": "1d", "doing": "Edit: engine.py", "recap": "",
+             "name": "ccwho-81", "pid": 3, "ask": "", "topic": ""},
+            {"sessionId": "dddd4444-0000-4000-8000-000000000004", "project": "liveapp",
+             "attention": "blocked", "title": "Docker", "tab_title": "✳ Docker",
+             "tty": "ttys009", "since": "10m", "doing": "AskUserQuestion", "recap": "",
+             "name": "liveapp-d4", "pid": 4, "ask": "", "topic": ""},
+        ]
+
+    def test_groups_are_what_each_one_needs_from_you(self):
+        groups = ccwho.ui_groups(self.rows())
+        self.assertEqual([g["heading"] for g in groups],
+                         ["NEEDS YOU / ASKED YOU", "STOPPED", "BUSY"])
+        self.assertEqual(len(groups[0]["rows"]), 2, "blocked and asks belong together")
+        self.assertEqual(len(groups[1]["rows"]), 1)
+        self.assertEqual(len(groups[2]["rows"]), 1)
+
+    def test_an_empty_group_is_not_a_heading_over_nothing(self):
+        groups = ccwho.ui_groups([r for r in self.rows() if r["attention"] == "busy"])
+        self.assertEqual([g["heading"] for g in groups], ["BUSY"])
+
+    def test_no_sessions_at_all_is_no_groups(self):
+        self.assertEqual(ccwho.ui_groups([]), [])
+
+    def test_the_first_line_is_what_you_see_on_the_tab(self):
+        line = ccwho.ui_row_lines(self.rows()[1], width=100)[0]
+        self.assertIn("bbbb", line)              # short id
+        self.assertIn("✳ Issue 362", line)       # the name on the tab
+        self.assertIn("5h", line)
+        self.assertIn("s022", line)
+
+    def test_the_second_line_is_the_recap_when_there_is_one(self):
+        row = dict(self.rows()[1], recap="the gate flake, finally understood",
+                   recap_age="2d", turns_since_recap=23)
+        second = ccwho.ui_row_lines(row, width=100)[1]
+        self.assertIn("gate flake", second)
+        self.assertIn("2d", second, "a recap without its age hides how stale it is")
+
+    def test_the_age_comes_before_the_recap_not_after_it(self):
+        # at the end of a long recap the age is the first thing truncation eats,
+        # and a recap whose age you cannot see reads as the current state
+        row = dict(self.rows()[1], recap="x" * 400, recap_age="2d",
+                   turns_since_recap=23)
+        second = ccwho.ui_row_lines(row, width=90)[1]
+        self.assertIn("2d", second)
+        self.assertIn("23 turns", second)
+        self.assertLess(second.index("2d"), second.index("xxx"))
+
+    def test_without_a_recap_it_says_so_and_shows_the_last_action(self):
+        second = ccwho.ui_row_lines(self.rows()[1], width=100)[1]
+        self.assertIn("no recap yet", second)
+        self.assertIn("read the verdict", second)
+
+    def test_lines_never_wrap(self):
+        row = dict(self.rows()[1], recap="x" * 500)
+        for line in ccwho.ui_row_lines(row, width=60):
+            self.assertLessEqual(ccwho.visible_len(line), 60, repr(line))
+
+    def test_search_matches_any_of_the_names_and_the_recap(self):
+        rows = self.rows()
+        rows[1]["recap"] = "the gate flake"
+        for q in ("bbbb", "issue 362", "s022", "liveapp-b2", "flake", "gate flake"):
+            got = ccwho.ui_filter(rows, q)
+            self.assertEqual([r["sessionId"] for r in got],
+                             [rows[1]["sessionId"]], q)
+
+    def test_every_word_has_to_match(self):
+        rows = self.rows()
+        self.assertEqual(ccwho.ui_filter(rows, "issue docker"), [])
+
+    def test_an_empty_search_is_everything(self):          # control
+        self.assertEqual(len(ccwho.ui_filter(self.rows(), "")), 4)

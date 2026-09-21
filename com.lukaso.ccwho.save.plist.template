@@ -6,21 +6,26 @@
   <string>com.lukaso.ccwho.save</string>
 
   <!-- Explicit interpreter + PATH: launchd gives a minimal environment, and
-       ccwho shells out to `ps` AND to `claude agents --json`. ~/.local/bin is
-       where `claude` lives and is NOT on launchd's default PATH: without it the
-       save runs, finds no sessions, and reports success. Nothing here may
-       depend on a login shell. -->
+       ccwho shells out to `ps` AND to `claude agents`. The directory `claude`
+       lives in is NOT on launchd's default PATH: without it the save runs,
+       finds no sessions, and reports success. Nothing here may depend on a
+       login shell.
+
+       This is a TEMPLATE: `ccwho setup` fills the placeholders in for the
+       machine it runs on. An earlier version of this file carried one
+       developer's home directory, which is a job that loads, runs, and finds
+       nothing on anybody else's Mac. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>/Users/lukasoberhuber/projects/ccwho/ccwho.py</string>
+    <string>{{PYTHON}}</string>
+    <string>{{CCWHO}}</string>
     <string>save</string>
   </array>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/lukasoberhuber/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>{{PATH}}</string>
   </dict>
 
   <!-- StartInterval fires only while the Mac is AWAKE; it never wakes it, and
@@ -35,8 +40,8 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/lukasoberhuber/.ccwho/autosave.log</string>
+  <string>{{LOG}}</string>
   <key>StandardErrorPath</key>
-  <string>/Users/lukasoberhuber/.ccwho/autosave.log</string>
+  <string>{{LOG}}</string>
 </dict>
 </plist>

@@ -1550,3 +1550,474 @@ class TestPlainCcwhoOpensTheUi(unittest.TestCase):
         runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or answers.pop(0)
         self._main([], tty=True)
         self.assertEqual(len(self.runs), 2, "R restarts it with the new code")
+
+
+class SetupHarness(unittest.TestCase):
+    """`ccwho setup` is the one command a new machine runs. Nothing here may
+    touch the real machine: every write goes to a temp home, and every
+    subprocess is recorded rather than run."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.dir = os.path.join(self.home, ".ccwho")
+        os.makedirs(self.dir, exist_ok=True)
+        os.environ[runner.TEST_HOME_VAR] = self.home
+        self.addCleanup(os.environ.pop, runner.TEST_HOME_VAR, None)
+        self.ran = []
+        self.real_run = runner.subprocess.run
+        self.real_gather = runner.setup.gather
+        self.real_which = runner.shutil.which
+        self.real_dir = runner.ccwho_dir
+        self.returns = {}
+
+        def fake_run(cmd, *a, **k):
+            self.ran.append(cmd)
+            rc = self.returns.get(cmd[0], 0)
+            return type("Done", (), {"returncode": rc, "stdout": "", "stderr": ""})()
+
+        runner.subprocess.run = fake_run
+        runner.ccwho_dir = lambda: self.dir
+        self.claude = os.path.join(self.home, ".local", "bin", "claude")
+        # ccwho itself, and the interpreter running these tests, live under the
+        # REAL home - which is another user's home as far as a temp home is
+        # concerned, and plist_problems is right to say so. Pin both.
+        self.real_bin = runner.ccwho_bin
+        self.real_exe = runner.sys.executable
+        runner.ccwho_bin = lambda: os.path.join(self.home, "src", "ccwho", "ccwho.py")
+        runner.sys.executable = "/usr/bin/python3"
+        runner.shutil.which = lambda n: {"uv": "/opt/homebrew/bin/uv",
+                                         "claude": self.claude,
+                                         "bash": "/bin/bash"}.get(n, "")
+        # The default machine is one where everything is installed AND current:
+        # the applet calls this ccwho, the loaded job is the one we would write.
+        self.real_script = runner.handler_script
+        self.real_render = runner.render_autosave
+        runner.handler_script = lambda: (
+            'do shell script quoted form of "%s" & " url "' % runner.ccwho_bin())
+        with open(os.path.join(runner.repo_dir(),
+                               runner.setup.PLIST_TEMPLATE_NAME)) as fh:
+            self.job_text = runner.setup.render_plist(
+                fh.read(), home=self.home, ccwho=runner.ccwho_bin(),
+                claude=self.claude, python="/usr/bin/python3")
+        runner.render_autosave = lambda home: self.job_text
+        self.seed_plist(self.job_text)
+        self.facts = {"claude": self.claude, "iterm_ok": True,
+                      "handler_registered": True, "launchd_loaded": True,
+                      "last_run_age": 60.0, "newest_manifest_age": 60.0,
+                      "cc_status_hook": True, "settings_path": "s.json"}
+        runner.setup.gather = lambda **k: dict(self.facts)
+
+    def tearDown(self):
+        runner.subprocess.run = self.real_run
+        runner.setup.gather = self.real_gather
+        runner.shutil.which = self.real_which
+        runner.ccwho_dir = self.real_dir
+        runner.ccwho_bin = self.real_bin
+        runner.sys.executable = self.real_exe
+        runner.handler_script = self.real_script
+        runner.render_autosave = self.real_render
+
+    def plist(self):
+        return os.path.join(self.home, "Library", "LaunchAgents",
+                            "com.lukaso.ccwho.save.plist")
+
+    def seed_plist(self, body):
+        os.makedirs(os.path.dirname(self.plist()), exist_ok=True)
+        with open(self.plist(), "w") as fh:
+            fh.write(body)
+
+    def run_setup(self, argv=()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.setup_cmd(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+
+class TestSetupSaysWhatItDidAndDoesItOnce(SetupHarness):
+    def test_on_a_finished_machine_it_writes_nothing(self):          # control
+        rc, out = self.run_setup(["--yes",
+                                  "--no-hotkey", "--no-list"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.ran, [], "a second run is not a second install")
+        self.assertIn("already", out.lower())
+
+    def test_without_claude_it_stops_before_writing_anything(self):
+        self.facts["claude"] = ""
+        rc, out = self.run_setup(["--yes"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.ran, [])
+        self.assertIn("claude", out.lower())
+
+    def test_it_registers_the_handler_when_it_is_missing(self):
+        self.facts["handler_registered"] = False
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertTrue(any("install-handler.sh" in " ".join(c) for c in self.ran),
+                        self.ran)
+
+    def test_a_failing_step_is_reported_not_swallowed(self):
+        self.facts["handler_registered"] = False
+        self.returns["/bin/bash"] = 3
+        rc, out = self.run_setup(["--yes",
+                                  "--no-hotkey", "--no-list"])
+        self.assertEqual(rc, 1)
+        self.assertIn("handler", out.lower())
+
+
+class TestSetupInstallsTheAutosaveJobForThisMachine(SetupHarness):
+    def test_it_renders_the_template_for_this_home(self):
+        self.facts["launchd_loaded"] = False
+        rc, out = self.run_setup(["--yes",
+                                  "--no-hotkey", "--no-list"])
+        with open(self.plist()) as fh:
+            body = fh.read()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("{{", body)
+        self.assertIn(self.home, body)
+        self.assertIn(os.path.dirname(self.claude), body, "PATH must find claude")
+
+    def test_it_loads_the_job_it_just_wrote(self):
+        self.facts["launchd_loaded"] = False
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        calls = [" ".join(c) for c in self.ran if "launchctl" in c[0]]
+        self.assertTrue(any("bootout" in c for c in calls), calls)
+        self.assertTrue(any("bootstrap" in c for c in calls), calls)
+        self.assertLess([i for i, c in enumerate(calls) if "bootout" in c][0],
+                        [i for i, c in enumerate(calls) if "bootstrap" in c][0],
+                        "bootstrap over a loaded job fails; replace it")
+
+    def test_a_plist_with_a_problem_is_never_loaded(self):
+        self.facts["launchd_loaded"] = False
+        self.seed_plist("<plist>the one that works</plist>")
+        real = runner.setup.plist_problems
+        runner.setup.plist_problems = lambda *a, **k: ["path belongs to someone else"]
+        try:
+            rc, out = self.run_setup(["--yes",
+                                      "--no-hotkey", "--no-list"])
+        finally:
+            runner.setup.plist_problems = real
+        self.assertEqual(rc, 1)
+        self.assertEqual([c for c in self.ran if "launchctl" in c[0]], [])
+        with open(self.plist()) as fh:
+            self.assertIn("the one that works", fh.read(),
+                          "and what was installed is untouched")
+
+
+class TestTheHotkeyIsWrittenAndProved(SetupHarness):
+    def profile(self):
+        return runner.setup.profile_path(self.home)
+
+    def read_profile(self):
+        with open(self.profile()) as fh:
+            return json.load(fh)["Profiles"][0]
+
+    def test_it_writes_the_profile_with_the_plain_command_when_not_proving(self):
+        self.run_setup(["--yes", "--no-list"])
+        p = self.read_profile()
+        self.assertTrue(p["Has Hotkey"])
+        self.assertNotIn("--proof", p["Command"], "no nonce left in the profile")
+
+    def test_proving_runs_the_nonce_command_and_then_cleans_it_out(self):
+        nonces = []
+
+        def prove(ccwho_dir, nonce, **k):
+            nonces.append(nonce)
+            return True
+
+        real = runner.setup.wait_for_proof
+        runner.setup.wait_for_proof = prove
+        try:
+            rc, out = self.run_setup(["--no-list"])
+        finally:
+            runner.setup.wait_for_proof = real
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(nonces), 1)
+        self.assertNotIn(nonces[0], json.dumps(self.read_profile()),
+                         "the proof command must not stay as the hotkey's job")
+        self.assertIn("⌥/", out)
+
+    def test_a_key_that_never_answers_puts_the_machine_back(self):
+        os.makedirs(os.path.dirname(self.profile()), exist_ok=True)
+        with open(self.profile(), "w") as fh:
+            fh.write('{"Profiles": [{"Guid": "mine", "Name": "kept"}]}')
+        real = runner.setup.wait_for_proof
+        runner.setup.wait_for_proof = lambda *a, **k: False
+        try:
+            rc, out = self.run_setup(["--no-list"])
+        finally:
+            runner.setup.wait_for_proof = real
+        with open(self.profile()) as fh:
+            self.assertIn("kept", fh.read(), "what was there before is back")
+        self.assertIn("did not", out.lower())
+        self.assertIn("--hotkey", out, "and it says how to pick another key")
+
+    def test_iterm2_not_running_installs_the_profile_without_proving_it(self):
+        self.facts["iterm_ok"] = False
+        rc, out = self.run_setup(["--no-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.exists(self.profile()),
+                        "the profile loads when iTerm2 next starts")
+        self.assertIn("start iterm2", out.lower())
+
+    def test_another_key_can_be_asked_for(self):
+        self.run_setup(["--yes", "--no-list",
+                        "--hotkey", "option-w"])
+        self.assertEqual(self.read_profile()["HotKey Key Code"],
+                         runner.setup.HOTKEYS["option-w"]["code"])
+
+    def test_a_key_nobody_has_heard_of_is_refused_with_the_list(self):
+        rc, out = self.run_setup(["--yes", "--no-list",
+                                  "--hotkey", "option-banana"])
+        self.assertEqual(rc, 2)
+        self.assertIn("option-slash", out)
+
+    def test_it_says_what_the_key_used_to_type(self):
+        _, out = self.run_setup(["--yes", "--no-list"])
+        self.assertIn("÷", out)
+
+
+class TestTheHotkeyWindowProvesItself(SetupHarness):
+    """The hotkey window's first job is to record the nonce setup is waiting
+    for; then it becomes the list, so the first press is already useful."""
+
+    def test_the_proof_run_records_the_nonce_and_opens_the_list(self):
+        opened = []
+        real = runner.run_ui
+        runner.run_ui = lambda: opened.append(True) or 0
+        try:
+            rc, _ = self.run_setup(["--proof", "n0m1"])
+        finally:
+            runner.run_ui = real
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(runner.setup.proof_path(self.dir, "n0m1")))
+        self.assertEqual(opened, [True])
+
+    def test_it_ends_in_the_live_list(self):
+        opened = []
+        real = runner.run_ui
+        runner.run_ui = lambda: opened.append(True) or 0
+        try:
+            self.run_setup(["--yes", "--no-hotkey"])
+        finally:
+            runner.run_ui = real
+        self.assertEqual(opened, [True], "setup ends where the user needs to be")
+
+
+class TestSetupIsReachableFromTheCommandLine(SetupHarness):
+    def test_the_verb_dispatches(self):
+        called = []
+        real = runner.setup_cmd
+        runner.setup_cmd = lambda argv: called.append(argv) or 0
+        try:
+            runner.main(["setup", "--yes"])
+        finally:
+            runner.setup_cmd = real
+        self.assertEqual(called, [["--yes"]])
+
+    def test_help_mentions_it(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["--help"])
+        self.assertIn("ccwho setup", out.getvalue())
+
+
+class TestSetupDoesNotPesterOrHalfWrite(SetupHarness):
+    """Everything a second run, a missing uv, or a crashed write would do."""
+
+    def profile(self):
+        return runner.setup.profile_path(self.home)
+
+    def test_an_installed_hotkey_is_not_asked_for_again(self):
+        asked = []
+        real = runner.setup.wait_for_proof
+        runner.setup.wait_for_proof = lambda *a, **k: asked.append(1) or True
+        try:
+            self.run_setup(["--yes", "--no-list"])   # install
+            rc, out = self.run_setup(["--no-list"])  # again
+        finally:
+            runner.setup.wait_for_proof = real
+        self.assertEqual(asked, [], "re-running setup must not grab the key again")
+        self.assertEqual(rc, 0, out)
+
+    def test_asking_for_a_different_key_does_replace_it(self):
+        asked = []
+        real = runner.setup.wait_for_proof
+        runner.setup.wait_for_proof = lambda *a, **k: asked.append(1) or True
+        try:
+            self.run_setup(["--yes", "--no-list"])
+            self.run_setup(["--no-list",
+                            "--hotkey", "option-w"])
+        finally:
+            runner.setup.wait_for_proof = real
+        self.assertEqual(len(asked), 1, "a new key is proved like any other")
+        with open(self.profile()) as fh:
+            self.assertEqual(json.load(fh)["Profiles"][0]["HotKey Key Code"],
+                             runner.setup.HOTKEYS["option-w"]["code"])
+
+    def test_without_uv_setup_still_finishes_and_says_what_is_missing(self):
+        runner.shutil.which = lambda n: "" if n == "uv" else "/bin/" + n
+        rc, out = self.run_setup(["--yes", "--no-hotkey"])
+        self.assertEqual(rc, 0, "the install worked; only the list cannot open")
+        self.assertIn("brew install uv", out)
+
+    def test_a_crash_mid_write_never_leaves_half_a_profile(self):
+        os.makedirs(os.path.dirname(self.profile()), exist_ok=True)
+        with open(self.profile(), "w") as fh:
+            fh.write('{"Profiles": [{"Guid": "mine"}]}')
+        real = runner.write_atomic
+
+        def explode(*a, **k):
+            raise OSError("no space left on device")
+
+        runner.write_atomic = explode
+        try:
+            with self.assertRaises(OSError):
+                self.run_setup(["--yes", "--no-list"])
+        finally:
+            runner.write_atomic = real
+        with open(self.profile()) as fh:
+            self.assertIn("mine", fh.read(),
+                          "the old profile survives a failed write")
+
+    def test_a_proof_with_no_nonce_is_refused_not_a_traceback(self):
+        rc, out = self.run_setup(["--proof"])
+        self.assertEqual(rc, 2)
+        self.assertIn("nonce", out.lower())
+
+
+class TestSetupLeavesNothingWorseThanItFoundIt(SetupHarness):
+    """Every way an install can fail half way through. The rule is the one the
+    old plist taught: never report success for something that does nothing, and
+    never take away what was working."""
+
+    def profile(self):
+        return runner.setup.profile_path(self.home)
+
+    def test_a_refused_bootstrap_puts_the_working_job_back(self):
+        self.facts["launchd_loaded"] = False
+        self.seed_plist("<plist>the one that works</plist>")
+        self.returns["launchctl"] = 1
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(rc, 1)
+        with open(self.plist()) as fh:
+            self.assertIn("the one that works", fh.read(),
+                          "the plist that was loaded is back on disk")
+        loads = [c for c in self.ran if c[0] == "launchctl" and "bootstrap" in c]
+        self.assertGreaterEqual(len(loads), 2, "and it is loaded again")
+
+    def test_a_loaded_job_that_runs_a_ccwho_that_moved_is_replaced(self):
+        # launchctl says loaded; the plist on disk runs a copy that is not here.
+        self.seed_plist("""<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.lukaso.ccwho.save</string>
+<key>ProgramArguments</key><array><string>/usr/bin/python3</string>
+<string>/Users/gone/ccwho/ccwho.py</string><string>save</string></array></dict></plist>""")
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("loaded, but", out)
+        with open(self.plist()) as fh:
+            self.assertNotIn("/Users/gone", fh.read())
+
+    def test_an_applet_calling_another_copy_is_rebuilt(self):
+        # registered, claims ccwho://, and calls a clone that was deleted
+        runner.handler_script = lambda: (
+            'do shell script quoted form of "/Users/sam/old/ccwho" & " url "')
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertTrue(any("install-handler.sh" in " ".join(c) for c in self.ran),
+                        self.ran)
+
+    def test_other_profiles_in_the_file_are_left_alone(self):
+        os.makedirs(os.path.dirname(self.profile()), exist_ok=True)
+        with open(self.profile(), "w") as fh:
+            json.dump({"Profiles": [{"Guid": "someone-elses", "Name": "mine"},
+                                    {"Guid": runner.setup.PROFILE_GUID,
+                                     "Name": "old ccwho"}]}, fh)
+        self.run_setup(["--yes", "--no-list"])
+        with open(self.profile()) as fh:
+            profiles = json.load(fh)["Profiles"]
+        guids = [p["Guid"] for p in profiles]
+        self.assertIn("someone-elses", guids, "we replace ours, not the file")
+        self.assertEqual(guids.count(runner.setup.PROFILE_GUID), 1)
+        mine = [p for p in profiles if p["Guid"] == "someone-elses"][0]
+        self.assertEqual(mine["Name"], "mine")
+
+    def test_a_key_that_never_answers_is_not_a_successful_setup(self):
+        real = runner.setup.wait_for_proof
+        runner.setup.wait_for_proof = lambda *a, **k: False
+        try:
+            rc, out = self.run_setup(["--no-list"])
+        finally:
+            runner.setup.wait_for_proof = real
+        self.assertEqual(rc, 1, "a hotkey that was not proved is not installed")
+        self.assertNotIn("nothing was changed", out.lower(),
+                         "other steps in this run did change things")
+
+    def test_an_unwritable_launch_agents_directory_is_one_line(self):
+        self.facts["launchd_loaded"] = False
+        real = runner.os.makedirs
+        runner.os.makedirs = lambda *a, **k: (_ for _ in ()).throw(
+            PermissionError("read-only file system"))
+        try:
+            rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        finally:
+            runner.os.makedirs = real
+        self.assertEqual(rc, 1)
+        self.assertIn("ccwho setup:", out)
+        self.assertNotIn("Traceback", out)
+
+
+class TestTheJobRunsAnInterpreterThatWillStillBeThere(SetupHarness):
+    """launchd runs this job for years without anyone watching. A pyenv or
+    homebrew python can be uninstalled by an unrelated command, and the job then
+    fails silently forever - so the job names the one interpreter macOS always
+    has, as long as it can run ccwho."""
+
+    def test_it_names_the_system_python(self):
+        runner.sys.executable = "/Users/x/.pyenv/versions/3.13.5/bin/python3"
+        self.facts["launchd_loaded"] = False
+        self.seed_plist("<plist>old</plist>")
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        with open(self.plist()) as fh:
+            body = fh.read()
+        self.assertIn("/usr/bin/python3", body)
+        self.assertNotIn(".pyenv", body)
+
+    def test_without_one_it_falls_back_to_the_python_running_now(self):
+        real = runner.os.path.exists
+        runner.os.path.exists = lambda p: False if p == runner.SYSTEM_PYTHON \
+            else real(p)
+        runner.sys.executable = "/opt/homebrew/bin/python3"
+        try:
+            self.assertEqual(runner.job_python(), "/opt/homebrew/bin/python3")
+        finally:
+            runner.os.path.exists = real
+
+    def test_the_system_python_is_preferred_when_it_is_there(self):   # control
+        self.assertEqual(runner.job_python(), runner.SYSTEM_PYTHON)
+
+
+class TestSetupInstallsForTheUserRunningIt(SetupHarness):
+    def test_there_is_no_flag_that_installs_into_another_home(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["--help"])
+        self.assertNotIn("--home", out.getvalue())
+
+    def test_a_flag_that_aims_setup_at_another_home_is_refused(self):
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list",
+                                  "--home", "/Users/someone-else"])
+        self.assertEqual(rc, 2, "an option setup does not know is never guessed at")
+        self.assertIn("--home", out)
+        self.assertEqual(self.ran, [])
+        self.assertFalse(os.path.exists(os.path.join(
+            "/Users/someone-else", "Library", "LaunchAgents")))
+
+    def test_the_flags_it_does_know_still_work(self):                  # control
+        rc, _ = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(rc, 0)
+
+    def test_the_home_it_uses_is_the_one_this_account_has(self):
+        del os.environ[runner.TEST_HOME_VAR]
+        try:
+            self.assertEqual(runner.setup_home(), os.path.expanduser("~"))
+        finally:
+            os.environ[runner.TEST_HOME_VAR] = self.home

@@ -239,6 +239,319 @@ def run_ui():
         # R: the code on disk changed under a window that stays open for days
 
 
+# ------------------------------------------------------------- ccwho setup
+# One command for a new machine: the applet, the autosave job, and a key that
+# brings the list up over whatever you are doing. Everything it decides is in
+# ccwho_setup and tested there; this is the part that writes, prints, and asks.
+
+# The tests need setup to write somewhere that is not the real home. A FLAG
+# would let a real user install another account's paths into their own launchd
+# domain, so this is an environment variable the help never mentions instead.
+TEST_HOME_VAR = "CCWHO_TEST_HOME"
+
+
+def setup_home():
+    return os.environ.get(TEST_HOME_VAR) or os.path.expanduser("~")
+
+
+def repo_dir():
+    """Where ccwho's own files are - the template and install-handler.sh live
+    beside the runner, wherever it was cloned."""
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def ccwho_bin():
+    """The name to put in a plist or a profile. `ccwho` on PATH if that is this
+    same file (the usual symlink install), else this file itself - never a name
+    that resolves to somebody else's copy."""
+    link = shutil.which("ccwho")
+    if link and os.path.realpath(link) == os.path.realpath(__file__):
+        return link
+    return os.path.realpath(__file__)
+
+
+SETUP_FLAGS = {"--yes", "-y", "--no-hotkey", "--no-list", "--hotkey", "--proof"}
+
+
+def setup_cmd(argv):
+    """Install what ccwho needs, say what was already there, end in the list."""
+    # An option setup does not know is refused rather than ignored. This is the
+    # door that a --home would come back through, and a --home would install one
+    # account's paths into another account's launchd domain.
+    unknown = [a for i, a in enumerate(argv)
+               if a.startswith("-") and a not in SETUP_FLAGS
+               and not (i and argv[i - 1] in ("--hotkey", "--proof"))]
+    if unknown:
+        print(f"ccwho setup: unknown option(s): {' '.join(unknown)}", file=sys.stderr)
+        print(f"usage: ccwho setup [--yes] [--hotkey {setup.DEFAULT_HOTKEY}]"
+              " [--no-hotkey] [--no-list]", file=sys.stderr)
+        return 2
+    # Run BY the hotkey window, not by a person: record the nonce setup is
+    # waiting on, then become the list, so the first press is already useful.
+    if "--proof" in argv:
+        nonce = _arg(argv, "--proof", "")
+        if not nonce:
+            print("ccwho setup --proof needs the nonce setup is waiting for"
+                  " (setup puts it there itself)", file=sys.stderr)
+            return 2
+        setup.write_proof(ccwho_dir(), nonce)
+        return run_ui()
+
+    yes = "--yes" in argv or "-y" in argv
+    home = setup_home()
+    hotkey = _arg(argv, "--hotkey", setup.DEFAULT_HOTKEY)
+    if hotkey not in setup.HOTKEYS:
+        print(f"ccwho setup: no hotkey called {hotkey!r}. Choose one of: "
+              + ", ".join(sorted(setup.HOTKEYS)), file=sys.stderr)
+        return 2
+
+    facts = setup.gather(ccwho_dir=ccwho_dir())
+    facts["uv"] = shutil.which("uv") or ""
+    facts["hotkey_installed"] = setup.hotkey_installed(home)
+    # "Installed" is not "working": a job whose ccwho moved loads, runs, finds
+    # nothing and exits 0, and an applet can claim ccwho:// while calling a copy
+    # that was deleted. Both read as done unless we look.
+    facts["autosave_current"] = setup.plist_matches(
+        read_text(autosave_plist_path(home)), render_autosave(home) or "")
+    facts["handler_current"] = setup.handler_target(handler_script()) == ccwho_bin()
+    steps = setup.setup_plan(facts)
+
+    for s in steps:
+        print(f"{setup.step_mark(s)} {s['name']:<20} {s['detail']}")
+        if setup.step_mark(s) == "note":
+            print(f"     {s['fix']}")
+        if s["todo"] and s["blocking"]:
+            print(f"\n{s['fix']}")
+            return 1                 # nothing is written on a machine that cannot work
+    print()
+
+    todo = {s["name"] for s in steps if s["todo"]}
+    did = []
+    if "uv" in todo:
+        print("the live list needs uv: brew install uv   (everything else still works)\n")
+
+    if "ccwho:// handler" in todo:
+        rc = install_handler()
+        if rc:
+            print("ccwho setup: the ccwho:// handler could not be registered",
+                  file=sys.stderr)
+            return 1
+        did.append("registered the ccwho:// handler")
+
+    if "autosave job" in todo:
+        rc = install_autosave(home)
+        if rc:
+            return 1
+        did.append("loaded the autosave job (every 15 minutes, and at login)")
+
+    for line in did:
+        print(line)
+
+    # An installed hotkey is left alone: a second run must not take the key away
+    # and ask you to press it again. Naming a key is how you change your mind.
+    asked_for_a_key = "--hotkey" in argv
+    if "--no-hotkey" in argv:
+        pass
+    elif facts["hotkey_installed"] and not asked_for_a_key:
+        print(f"hotkey {setup.HOTKEYS[hotkey]['label']} was already installed")
+    else:
+        rc = install_hotkey(home, hotkey, prove=not yes and facts.get("iterm_ok"),
+                            iterm_ok=facts.get("iterm_ok"))
+        if rc:
+            return 1
+    if "--no-hotkey" in argv and not did:
+        print("already set up - nothing to do.")
+
+    if "--no-list" in argv:
+        return 0
+    if "uv" in todo:
+        return 0            # the install worked; only the list cannot open yet
+    return run_ui()
+
+
+def install_handler():
+    """The AppleScript applet that makes ccwho:// links work. The script is the
+    installer; running it is not reimplemented here."""
+    script = os.path.join(repo_dir(), "install-handler.sh")
+    env = dict(os.environ, CCWHO_BIN=ccwho_bin())
+    done = subprocess.run([shutil.which("bash") or "/bin/bash", script],
+                          env=env, capture_output=True, text=True)
+    return done.returncode
+
+
+def autosave_plist_path(home):
+    return os.path.join(home, "Library", "LaunchAgents",
+                        setup.PLIST_LABEL + ".plist")
+
+
+def read_text(path):
+    """A file's contents, or "" - never an exception. Every caller here is
+    asking "what is installed", and "nothing readable" is a fine answer."""
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def handler_script():
+    """The applet's own source, so we can see which ccwho it calls."""
+    for app in setup.handler_candidates():
+        scpt = os.path.join(app, "Contents", "Resources", "Scripts", "main.scpt")
+        if os.path.exists(scpt):
+            done = subprocess.run(["osadecompile", scpt],
+                                  capture_output=True, text=True)
+            return done.stdout if done.returncode == 0 else ""
+    return ""
+
+
+# macOS always has this one, and nothing an unrelated `pyenv uninstall` or
+# `brew upgrade` does can take it away. ccwho is stdlib only, so it runs there.
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def job_python():
+    """The interpreter to write into a job that runs unattended for years."""
+    return SYSTEM_PYTHON if os.path.exists(SYSTEM_PYTHON) else sys.executable
+
+
+def render_autosave(home):
+    """The job this machine should be running. None when the template is gone."""
+    template = read_text(os.path.join(repo_dir(), setup.PLIST_TEMPLATE_NAME))
+    if not template:
+        return None
+    return setup.render_plist(template, home=home, ccwho=ccwho_bin(),
+                              claude=shutil.which("claude") or "",
+                              python=job_python())
+
+
+def install_autosave(home):
+    """Render the job for THIS machine, check it, then replace the loaded one.
+
+    Order matters: the text is validated BEFORE the working job is taken out,
+    and the previous plist is kept so a refused bootstrap can be undone. The
+    failure being designed against is a machine left with no autosave at all.
+    """
+    body = render_autosave(home)
+    if body is None:
+        print("ccwho setup: cannot read the autosave template beside ccwho.py",
+              file=sys.stderr)
+        return 1
+    claude = shutil.which("claude") or ""
+    problems = setup.plist_problems(body, home=home, claude=claude)
+    if problems:
+        print("ccwho setup: the autosave job was not installed:", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        return 1                      # nothing written: no half-installed job
+
+    path = autosave_plist_path(home)
+    before = read_text(path)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_atomic(path, body)
+    except OSError as exc:
+        print(f"ccwho setup: cannot write {path}: {exc}", file=sys.stderr)
+        return 1
+
+    # bootstrap over a loaded job fails, so take it out first. A bootout that
+    # finds nothing loaded is not an error here.
+    target = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{target}/{setup.PLIST_LABEL}"],
+                   capture_output=True, text=True)
+    done = subprocess.run(["launchctl", "bootstrap", target, path],
+                          capture_output=True, text=True)
+    if done.returncode:
+        print(f"ccwho setup: launchctl refused the job: "
+              f"{(done.stderr or '').strip()}", file=sys.stderr)
+        if before:
+            # Put back the one that was working and load it again, or this
+            # leaves the machine with no autosave at all.
+            try:
+                write_atomic(path, before)
+            except OSError:
+                pass
+            back = subprocess.run(["launchctl", "bootstrap", target, path],
+                                  capture_output=True, text=True)
+            print("ccwho setup: the previous autosave job is "
+                  + ("loaded again" if back.returncode == 0
+                     else "back on disk but would not load - run it yourself:"
+                          f" launchctl bootstrap {target} {path}"),
+                  file=sys.stderr)
+        return 1
+    return 0
+
+
+def write_atomic(path, text):
+    """Temp + replace. A crash half way through must not leave half a file, and
+    must never lose the one that was there."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0):
+    """Write the iTerm2 profile, and - when there is an iTerm2 to ask - make the
+    user press the key before calling it done.
+
+    A profile that was written is not a hotkey that works: another app can own
+    the key already. So the profile runs a one-shot command carrying a nonce,
+    and this waits to see that nonce land. If it never does, whatever was on
+    this machine before goes back, and the user is told which key to try next.
+    """
+    key = setup.HOTKEYS[hotkey]
+    path = setup.profile_path(home)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    before = None
+    if os.path.exists(path):
+        with open(path) as fh:
+            before = fh.read()
+
+    def write(doc):
+        # Ours is one profile in a file that may hold others. Replace the entry
+        # with our Guid and keep every other one exactly as it was.
+        try:
+            existing = json.loads(before)["Profiles"]
+        except (TypeError, ValueError, KeyError):
+            existing = []
+        keep = [p for p in existing if p.get("Guid") != setup.PROFILE_GUID]
+        write_atomic(path, json.dumps({"Profiles": keep + doc["Profiles"]},
+                                      indent=2))
+
+    plain = setup.hotkey_profile(ccwho_bin(), hotkey=hotkey)
+    if not prove:
+        write(plain)
+        print(f"hotkey {key['label']} installed"
+              f" ({key['label']} no longer types {key['instead_of']})")
+        if not iterm_ok:
+            print("start iTerm2, then press " + key['label'])
+        return 0
+
+    nonce = setup.new_nonce()
+    write(setup.hotkey_profile(setup.proof_command(ccwho_bin(), nonce),
+                               hotkey=hotkey))
+    print(f"press {key['label']} now - it should open the list."
+          f"  ({key['label']} no longer types {key['instead_of']})")
+    if setup.wait_for_proof(ccwho_dir(), nonce, deadline=deadline):
+        write(plain)               # the nonce was a test, not the hotkey's job
+        print(f"{key['label']} works.")
+        return 0
+
+    if before is None:
+        os.remove(path)
+    else:
+        write_atomic(path, before)
+    print(f"{key['label']} did not reach ccwho - something else may own that key."
+          f"\nthe hotkey was left as it was. Try another: "
+          + " or ".join(f"ccwho setup --hotkey {k}"
+                        for k in setup.HOTKEYS if k != hotkey))
+    return 1                # setup did not do what it said it would do
+
 def index_path():
     return os.path.join(ccwho_dir(), "index.jsonl")
 
@@ -889,6 +1202,8 @@ def main(argv=None):
         return ls(argv[1:])
     if argv and argv[0] == "doctor":
         return doctor(argv[1:])
+    if argv and argv[0] == "setup":
+        return setup_cmd(argv[1:])
     if argv and argv[0] == "show":
         return show(argv[1:])
     if argv and argv[0] == "open":
@@ -907,6 +1222,7 @@ def main(argv=None):
         print("                                                  (--all includes sessions a program started)")
         print("       ccwho show <anything>                      what that session was working on")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
+        print("       ccwho setup [--yes] [--hotkey KEY]         install what ccwho needs, once")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")

@@ -1099,6 +1099,42 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     }
 
 
+def digest_of(sessions, mtimes):
+    """What the list would be built from, in one comparable value.
+
+    A session needs you either because claude says it is waiting, or because it
+    asked you something - and the question is in the transcript, which means the
+    transcript grew. Status and mtime together cover both.
+    """
+    return tuple(sorted((s.get("sessionId", ""), s.get("status", ""),
+                         mtimes.get(s.get("sessionId", ""), 0))
+                        for s in sessions))
+
+
+def fleet_digest():
+    """The cheap question, asked on its own: has anything changed?
+
+    Measured on sixteen live sessions: 0.15s to ask claude for the list and
+    0.005s to stat every transcript, against 0.50s for a warm full scan. That is
+    what lets the list notice a session needing you within a second or two
+    without spending a third of a core doing it.
+
+    None is "could not ask", which is not "nothing changed".
+    """
+    sessions = parse_sessions(agents_json() or "")
+    if sessions is None:
+        return None
+    mtimes = {}
+    for s in sessions:
+        sid = s.get("sessionId", "")
+        path = transcript_path(sid)
+        try:
+            mtimes[sid] = os.path.getmtime(path) if path else 0
+        except OSError:
+            mtimes[sid] = 0
+    return digest_of(sessions, mtimes)
+
+
 def collect(cache=None, status=None):
     """`status` is a caller-owned dict, same idiom as `cache`. It carries out the
     one fact a caller cannot recover from the rows: whether the session source
@@ -1116,14 +1152,20 @@ def collect(cache=None, status=None):
     ids = [s.get("sessionId", "") for s in sessions]
     orphans = attribute_orphans(ps_out, ids)
     rows = []
+    mtimes = {}
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
+        mtimes[sid] = mtime or 0
         tty = ttys.get(s.get("pid"), "")
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), "")))
     rows.sort(key=sort_key)
+    if status is not None:
+        # The same value the cheap check computes, from data already in hand -
+        # so a scan does not leave the cheap check thinking the world moved.
+        status["digest"] = digest_of(sessions, mtimes)
     if cache is not None:                       # drop windows for sessions that ended
         # Keys that are not a session id belong to something else sharing this
         # dict (the tab names). Sweeping them out every tick is how a cache ends

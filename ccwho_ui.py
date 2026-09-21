@@ -66,7 +66,11 @@ STATE_STYLE = {"needs": "bold #e5a50a",    # amber: this one is waiting for you
 # run - in its window list, in Mission Control and in the window menu.
 WINDOW_NAME = "ccwho"
 
-REFRESH_VISIBLE = 5.0
+# The cheap check runs often; the full scan is the floor under it. Seeing a
+# session start needing you is the whole point of the list, so that is the one
+# that gets the short interval.
+WATCH_EVERY = 1.5              # "has anything changed?" - 0.16s to answer
+REFRESH_VISIBLE = 20.0         # a full scan even when nothing moved
 REFRESH_HIDDEN = 60.0          # nobody is looking: the terminal said so
 AFTER_A_JUMP = 2.0             # long enough for the session to notice you
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
@@ -201,6 +205,7 @@ class CcwhoUi(App):
         self.query_one("#search").display = False
         self.query_one("#detail").display = False
         self.set_interval(REFRESH_VISIBLE, self.tick)
+        self.set_interval(WATCH_EVERY, self.watch_tick)
         self.set_interval(0.2, self.check_width)      # no subprocess, just a number
         self.collect()
 
@@ -243,6 +248,23 @@ class CcwhoUi(App):
         if not self.collector.due(self.has_focus_hint()):
             return
         self.collect()
+
+    def watch_tick(self):
+        """The cheap question, often. Nobody looking: nobody asks."""
+        if not self.has_focus_hint():
+            return
+        self.sniff()
+
+    @work(exclusive=True, thread=True, group="sniff")
+    def sniff(self):
+        """Off the UI thread like every other call out of this process.
+
+        It asks claude for the session list and stats the transcripts - 0.16s
+        against 0.50s for a full scan - and only then does the expensive thing,
+        and only if the answer moved.
+        """
+        if self.collector.changed():
+            self.call_from_thread(self.look_again)
 
     def has_focus_hint(self):
         """Is anyone looking at this?
@@ -656,6 +678,20 @@ class Collector:
         self.cache = {}
         self.last = 0.0
         self.reload_error = ""
+        self.digest = None      # the world as of the last look, cheap or full
+
+    def changed(self):
+        """Has anything happened that could change the list?
+
+        False when we could not ask: "the source is unreachable" is not "a
+        session started needing you", and firing a full scan on every failed
+        call is how a broken `claude` turns into a busy loop.
+        """
+        now = engine.fleet_digest()
+        if now is None or now == self.digest:
+            return False
+        self.digest = now
+        return True
 
     def mark(self, now=None):
         """This moment counts as the last look."""
@@ -702,6 +738,10 @@ class Collector:
             rows, _ = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
             return Fleet([], False, "", f"could not read the fleet: {ex}")
+        # The scan's own answer to the cheap question, so the next cheap check
+        # does not see a changed world and scan all over again.
+        if status.get("digest") is not None:
+            self.digest = status["digest"]
         trouble = self.reload_error or ("" if status.get("source_ok") else
                                         "cannot read the session list - run `ccwho doctor`")
         return Fleet(rows, status.get("source_ok", False),

@@ -49,9 +49,13 @@ class FakeCollector:
         return True
 
     last = 0.0
+    digest = None
 
     def mark(self, now=None):
         self.last = now or 1.0
+
+    def changed(self):
+        return False            # the world sits still unless a test says so
 
     reloads = 0
 
@@ -1123,3 +1127,107 @@ class TestALookAfterAJumpIsOneLook(UiTest):
             await pilot.pause()
             collector.last = 0.0
             self.assertTrue(collector.due(True))
+
+
+class TestItNoticesQuicklyWhenSomethingNeedsYou(UiTest):
+    """The point of the list. A full scan is 0.50s, so scanning every second
+    would cost half a core; the cheap check is 0.16s and answers the only
+    question that has to be answered quickly - did anything change?"""
+
+    class Sniffer(FakeCollector):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.digest = ("a", "idle")
+            self.looks = 0
+
+        def changed(self):
+            self.looks += 1
+            return self.digest != self.seen
+
+        seen = ("a", "idle")
+
+    async def test_a_change_brings_a_scan_forward(self):
+        collector = self.Sniffer()
+        collector.due = lambda visible, now=None: False     # not due for ages
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = collector.calls
+            collector.digest = ("a", "waiting")             # it now needs you
+            app.sniff()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertGreater(collector.calls, before,
+                               "a session that starts needing you cannot wait"
+                               " for the next scheduled scan")
+
+    async def test_nothing_changing_costs_nothing(self):              # control
+        collector = self.Sniffer()
+        collector.due = lambda visible, now=None: False
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = collector.calls
+            for _ in range(3):
+                app.sniff()
+                await pilot.pause()
+            self.assertEqual(collector.calls, before,
+                             "no scan while the world sits still")
+
+    async def test_it_does_not_ask_while_nobody_is_looking(self):
+        collector = self.Sniffer()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            before = collector.looks
+            app.watch_tick()
+            await pilot.pause()
+            self.assertEqual(collector.looks, before)
+
+    async def test_it_asks_while_you_are_looking(self):               # control
+        collector = self.Sniffer()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = collector.looks
+            app.watch_tick()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertGreater(collector.looks, before)
+
+
+class TestTheCheapCheckIsCheap(unittest.TestCase):
+    def test_a_scan_records_the_digest_so_the_check_does_not_refire(self):
+        collector = ui.Collector()
+        seen = {}
+
+        class FakeEngine:
+            @staticmethod
+            def collect(cache=None, status=None):
+                status["source_ok"] = True
+                status["digest"] = ("a", "busy")
+                return [], 0
+
+        # fleet() re-imports the engine first, which would put the real
+        # collect back before it is called.
+        collector.reload = lambda: None
+        real = ui.engine.collect
+        ui.engine.collect = FakeEngine.collect
+        try:
+            collector.fleet()
+        finally:
+            ui.engine.collect = real
+        self.assertEqual(collector.digest, ("a", "busy"),
+                         "the scan's own answer, or the next check fires again")
+
+    def test_being_unable_to_ask_is_not_a_change(self):
+        collector = ui.Collector()
+        collector.digest = ("a", "busy")
+        real = ui.engine.fleet_digest
+        ui.engine.fleet_digest = lambda: None
+        try:
+            self.assertFalse(collector.changed())
+        finally:
+            ui.engine.fleet_digest = real

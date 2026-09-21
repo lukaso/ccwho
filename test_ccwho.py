@@ -1947,3 +1947,73 @@ class TestWhatIsColouredAndWhatIsNot(unittest.TestCase):
     def test_a_state_nobody_planned_for_still_draws(self):
         first, _ = self.cells(attention="something-new")
         self.assertEqual(len([t for t, r in first if r == "mark"]), 1)
+
+
+class TestTheCheapQuestion(unittest.TestCase):
+    """"Does anything need me?" must be answerable far more often than "tell me
+    everything about every session".
+
+    Measured on a live fleet of sixteen: a full scan is 0.50s warm, of which
+    `ps` and iTerm2 are most; asking claude for the session list is 0.15s and
+    stat-ing every transcript is 0.005s. So the list can notice a session that
+    starts needing you in a second or two, at a third of the cost of scanning.
+    """
+
+    def sessions(self, *pairs):
+        return [{"sessionId": sid, "status": status} for sid, status in pairs]
+
+    def test_the_same_world_gives_the_same_answer(self):              # control
+        a = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "busy")),
+                            {"a": 100.0, "b": 200.0})
+        b = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "busy")),
+                            {"a": 100.0, "b": 200.0})
+        self.assertEqual(a, b)
+
+    def test_a_session_that_starts_waiting_changes_it(self):
+        before = ccwho.digest_of(self.sessions(("a", "busy")), {"a": 100.0})
+        after = ccwho.digest_of(self.sessions(("a", "waiting")), {"a": 100.0})
+        self.assertNotEqual(before, after)
+
+    def test_a_session_that_says_something_changes_it(self):
+        # A session can start asking you something without its status moving:
+        # the question is in the transcript, and the transcript grew.
+        before = ccwho.digest_of(self.sessions(("a", "idle")), {"a": 100.0})
+        after = ccwho.digest_of(self.sessions(("a", "idle")), {"a": 101.0})
+        self.assertNotEqual(before, after)
+
+    def test_a_session_appearing_or_ending_changes_it(self):
+        one = ccwho.digest_of(self.sessions(("a", "idle")), {"a": 100.0})
+        two = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "idle")),
+                              {"a": 100.0, "b": 100.0})
+        self.assertNotEqual(one, two)
+
+    def test_the_order_it_came_in_does_not_matter(self):
+        a = ccwho.digest_of(self.sessions(("a", "idle"), ("b", "busy")),
+                            {"a": 1.0, "b": 2.0})
+        b = ccwho.digest_of(self.sessions(("b", "busy"), ("a", "idle")),
+                            {"a": 1.0, "b": 2.0})
+        self.assertEqual(a, b, "the feed's order is not a change")
+
+    def test_nothing_running_is_an_answer_not_a_blank(self):
+        self.assertEqual(ccwho.digest_of([], {}), ())
+
+    def test_being_unable_to_ask_is_not_an_answer(self):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: None
+        try:
+            self.assertIsNone(ccwho.fleet_digest(),
+                              "None means we could not ask - never 'nothing changed'")
+        finally:
+            ccwho.agents_json = real
+
+    def test_a_full_scan_hands_back_the_same_answer(self):
+        # or the cheap check would fire again immediately after every scan
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: '[]'
+        try:
+            status = {}
+            ccwho.collect(cache={}, status=status)
+            self.assertIn("digest", status)
+            self.assertEqual(status["digest"], ccwho.fleet_digest())
+        finally:
+            ccwho.agents_json = real

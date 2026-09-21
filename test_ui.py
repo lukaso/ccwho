@@ -1042,3 +1042,23 @@ class TestTouchingItMeansYouAreWatching(UiTest):
                 await pilot.press("up")
             await pilot.pause()
             self.assertEqual(collector.calls, before)
+
+
+class TestTheWindowSaysWhatItIs(UiTest):
+    """In iTerm2's window list the panel showed up as "python3" - the name of
+    the interpreter uv happened to run. Anything that has a window has a name
+    in Mission Control, in the window menu, and in a jump script's output."""
+
+    async def test_it_tells_the_terminal_its_name(self):
+        # App.title is Textual's own idea of the title and never leaves the
+        # process - measured: running the app emits no title sequence at all.
+        # The terminal only knows what it is told, in OSC 0.
+        written = []
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.name_the_window(write=written.append)
+        self.assertEqual(written, ["\x1b]0;ccwho\x07"])
+
+    def test_the_name_is_not_the_interpreter(self):                   # control
+        self.assertNotIn("python", ui.WINDOW_NAME.lower())

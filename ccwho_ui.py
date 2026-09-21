@@ -61,6 +61,11 @@ STATE_STYLE = {"needs": "bold #e5a50a",    # amber: this one is waiting for you
 # is a fifth of a core, all day, for a panel that sits open. So the list
 # refreshes every five, and the moments that MATTER get their own look: when you
 # come back to it, and right after you answer a session.
+# What the terminal calls this window. Without telling it, iTerm2 names the
+# window after the running command - "python3", the interpreter uv happened to
+# run - in its window list, in Mission Control and in the window menu.
+WINDOW_NAME = "ccwho"
+
 REFRESH_VISIBLE = 5.0
 REFRESH_HIDDEN = 60.0          # nobody is looking: the terminal said so
 AFTER_A_JUMP = 2.0             # long enough for the session to notice you
@@ -136,6 +141,8 @@ class Row(Static):
 class CcwhoUi(App):
     """The screen. Everything it knows comes from a Fleet snapshot."""
 
+    TITLE = WINDOW_NAME
+
     CSS = """
     Screen { layout: vertical; }
     #header { height: 1; }
@@ -190,11 +197,29 @@ class CcwhoUi(App):
         yield Footer()
 
     def on_mount(self):
+        self.name_the_window()
         self.query_one("#search").display = False
         self.query_one("#detail").display = False
         self.set_interval(REFRESH_VISIBLE, self.tick)
         self.set_interval(0.2, self.check_width)      # no subprocess, just a number
         self.collect()
+
+    def name_the_window(self, write=None):
+        """Tell the terminal what this window is, in OSC 0.
+
+        Textual's own title never leaves the process. A window in a list of
+        windows needs a name a person recognises.
+        """
+        write = write or self._to_terminal
+        write(f"\x1b]0;{WINDOW_NAME}\x07")
+
+    @staticmethod
+    def _to_terminal(text):
+        try:
+            sys.__stdout__.write(text)
+            sys.__stdout__.flush()
+        except Exception:
+            pass          # a title is never worth taking the screen down for
 
     # ------------------------------------------------------------- collecting
 

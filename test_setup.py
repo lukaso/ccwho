@@ -8,6 +8,7 @@ python3 -m unittest test_setup -v
 """
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -276,3 +277,419 @@ class TestAgeWords(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThePlistIsRenderedForThisMachine(unittest.TestCase):
+    """The committed plist used to hold one developer's home directory. It is a
+    template now, because a hard-coded path is a job that loads, runs, finds
+    nothing, and reports success."""
+
+    TEMPLATE = setup.PLIST_TEMPLATE_NAME
+
+    def render(self, **over):
+        args = dict(home="/Users/sam", ccwho="/Users/sam/src/ccwho/ccwho.py",
+                    claude="/Users/sam/.local/bin/claude",
+                    python="/usr/bin/python3")
+        args.update(over)
+        with open(os.path.join(os.path.dirname(os.path.abspath(setup.__file__)),
+                               self.TEMPLATE)) as fh:
+            return setup.render_plist(fh.read(), **args)
+
+    def test_the_committed_template_has_nobodys_home_in_it(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(setup.__file__)),
+                            self.TEMPLATE)
+        with open(path) as fh:
+            body = fh.read()
+        self.assertNotIn("/Users/", body,
+                         "a template with a real home is the bug this replaces")
+
+    def test_it_runs_the_ccwho_it_was_installed_from(self):
+        out = self.render()
+        self.assertIn("/Users/sam/src/ccwho/ccwho.py", out)
+        self.assertIn("<string>save</string>", out)
+
+    def test_the_path_contains_the_directory_claude_is_in(self):
+        out = self.render(claude="/opt/somewhere/bin/claude")
+        self.assertIn("/opt/somewhere/bin", out,
+                      "launchd's PATH does not include ~/.local/bin: without the"
+                      " real directory the save finds no sessions")
+
+    def test_the_log_goes_under_this_users_home(self):
+        out = self.render(home="/Users/sam")
+        self.assertIn("/Users/sam/.ccwho/autosave.log", out)
+
+    def test_nothing_is_left_unrendered(self):
+        self.assertNotIn("{{", self.render())
+
+    def test_a_rendered_plist_has_no_complaints(self):          # control
+        self.assertEqual(
+            setup.plist_problems(self.render(), home="/Users/sam",
+                                 claude="/Users/sam/.local/bin/claude"), [])
+
+    def test_someone_elses_home_is_a_complaint(self):
+        bad = self.render(home="/Users/sam").replace("/Users/sam/.ccwho",
+                                                     "/Users/other/.ccwho")
+        problems = setup.plist_problems(bad, home="/Users/sam",
+                                        claude="/Users/sam/.local/bin/claude")
+        self.assertTrue(any("/Users/other" in p for p in problems), problems)
+
+    def test_a_path_that_cannot_find_claude_is_a_complaint(self):
+        out = self.render(claude="/opt/somewhere/bin/claude")
+        problems = setup.plist_problems(out, home="/Users/sam",
+                                        claude="/elsewhere/bin/claude")
+        self.assertTrue(any("claude" in p for p in problems), problems)
+
+
+class TestTheHotkeyProfile(unittest.TestCase):
+    """A Dynamic Profile is a JSON file iTerm2 picks up by itself. The key names
+    below are not guesses: they were read out of iTerm.app 3.7."""
+
+    def profile(self, **over):
+        args = dict(command="/Users/sam/.local/bin/ccwho")
+        args.update(over)
+        return setup.hotkey_profile(**args)["Profiles"][0]
+
+    def test_it_is_a_dynamic_profile_document(self):
+        doc = setup.hotkey_profile(command="/x/ccwho")
+        self.assertEqual(list(doc), ["Profiles"])
+        self.assertEqual(len(doc["Profiles"]), 1)
+
+    def test_the_guid_is_stable_so_re_running_replaces_rather_than_adds(self):
+        a = self.profile()["Guid"]
+        b = self.profile(command="/somewhere/else/ccwho")["Guid"]
+        self.assertEqual(a, b)
+
+    def test_it_runs_the_command_it_was_given_and_not_a_login_shell(self):
+        p = self.profile(command="/Users/sam/.local/bin/ccwho")
+        self.assertEqual(p["Command"], "/Users/sam/.local/bin/ccwho")
+        self.assertEqual(p["Custom Command"], "Yes")
+
+    def test_option_slash_is_the_default_and_carries_every_hotkey_key(self):
+        p = self.profile()
+        self.assertTrue(p["Has Hotkey"])
+        self.assertEqual(p["HotKey Key Code"], 44)              # the / key
+        self.assertEqual(p["HotKey Modifier Flags"], setup.OPTION)
+        self.assertEqual(p["HotKey Characters Ignoring Modifiers"], "/")
+        self.assertEqual(p["HotKey Characters"], "÷")
+
+    def test_another_key_can_be_chosen(self):
+        p = self.profile(hotkey="option-space")
+        self.assertEqual(p["HotKey Key Code"], setup.HOTKEYS["option-space"]["code"])
+        self.assertNotEqual(p["HotKey Key Code"], 44)
+
+    def test_an_unknown_key_is_refused_not_silently_dropped(self):
+        with self.assertRaises(KeyError):
+            self.profile(hotkey="option-banana")
+
+    def test_the_window_comes_back_over_whatever_you_are_in(self):
+        p = self.profile()
+        self.assertTrue(p["HotKey Window Floats"])
+        self.assertEqual(p["Space"], -1, "all spaces, or it is useless on space 2")
+
+    def test_what_the_key_used_to_type_is_stated(self):
+        self.assertEqual(setup.HOTKEYS["option-slash"]["instead_of"], "÷")
+        self.assertEqual(setup.HOTKEYS["option-slash"]["label"], "⌥/")
+
+
+class TestTheHotkeyIsProvedNotAssumed(unittest.TestCase):
+    """Writing the profile proves nothing: another app can own the key, or
+    iTerm2 may not reload. So the profile runs a one-time command with a nonce
+    in it, and setup waits for that nonce to appear on disk."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_each_run_asks_for_a_different_nonce(self):
+        self.assertNotEqual(setup.new_nonce(), setup.new_nonce())
+
+    def test_the_proof_command_carries_the_nonce_and_the_real_ccwho(self):
+        cmd = setup.proof_command("/Users/sam/.local/bin/ccwho", "abc123")
+        self.assertIn("/Users/sam/.local/bin/ccwho", cmd)
+        self.assertIn("abc123", cmd)
+
+    def test_a_path_with_a_space_survives_the_command(self):
+        cmd = setup.proof_command("/Users/sam/my tools/ccwho", "abc")
+        self.assertIn("'/Users/sam/my tools/ccwho'", cmd)
+
+    def test_waiting_ends_the_moment_the_nonce_lands(self):
+        setup.write_proof(self.dir, "n1")
+        self.assertTrue(setup.wait_for_proof(self.dir, "n1", deadline=0.0))
+
+    def test_a_nonce_that_never_lands_gives_up_rather_than_hanging(self):
+        self.assertFalse(setup.wait_for_proof(self.dir, "n2", deadline=0.05))
+
+    def test_a_different_nonce_does_not_count(self):
+        setup.write_proof(self.dir, "other")
+        self.assertFalse(setup.wait_for_proof(self.dir, "n3", deadline=0.05))
+
+
+class TestSetupSaysWhatItWillDoAndIsSafeToRerun(unittest.TestCase):
+    """Every step reports done / to-do from the same facts doctor reads, so a
+    second run is a no-op that says so rather than a second install."""
+
+    def plan(self, **over):
+        f = facts(uv="/opt/homebrew/bin/uv", hotkey_installed=True)
+        f.update(over)
+        return {s["name"]: s for s in setup.setup_plan(f)}
+
+    def test_on_a_finished_machine_every_step_is_already_done(self):    # control
+        self.assertEqual([s for s in self.plan().values() if s["todo"]], [])
+
+    def test_no_claude_stops_everything_after_it(self):
+        steps = setup.setup_plan(facts(claude="", uv="/x/uv"))
+        self.assertTrue(steps[0]["blocking"])
+        self.assertEqual(steps[0]["name"], "claude")
+
+    def test_no_uv_is_a_step_with_the_line_to_run(self):
+        step = self.plan(uv="")["uv"]
+        self.assertTrue(step["todo"])
+        self.assertIn("brew install uv", step["fix"])
+
+    def test_a_missing_handler_is_to_do(self):
+        self.assertTrue(self.plan(handler_registered=False)["ccwho:// handler"]["todo"])
+
+    def test_a_missing_autosave_job_is_to_do(self):
+        self.assertTrue(self.plan(launchd_loaded=False)["autosave job"]["todo"])
+
+    def test_a_missing_hotkey_is_to_do(self):
+        self.assertTrue(self.plan(hotkey_installed=False)["hotkey"]["todo"])
+
+    def test_the_status_hook_is_reported_but_never_written(self):
+        step = self.plan(cc_status_hook=False)["iTerm2 status hook"]
+        self.assertFalse(step["todo"], "ccwho does not write another tool's settings")
+        self.assertIn("ccwho will not write", step["fix"])
+
+
+class TestAStepThatIsNotOursIsNotReportedAsFine(unittest.TestCase):
+    """The iTerm2 status hook is another tool's file: setup reports it and never
+    writes it. That is not the same as "ok", and printing `ok  ` beside the word
+    "missing" is the exact false-all-clear doctor exists to prevent."""
+
+    def steps(self, **over):
+        f = facts(uv="/x/uv", hotkey_installed=True)
+        f.update(over)
+        return {s["name"]: s for s in setup.setup_plan(f)}
+
+    def test_something_missing_we_will_not_fix_reads_as_a_note(self):
+        step = self.steps(cc_status_hook=False)["iTerm2 status hook"]
+        self.assertEqual(setup.step_mark(step), "note")
+
+    def test_the_same_step_is_ok_when_it_is_actually_there(self):        # control
+        step = self.steps(cc_status_hook=True)["iTerm2 status hook"]
+        self.assertEqual(setup.step_mark(step), "ok  ")
+
+    def test_on_a_finished_machine_every_step_reads_ok(self):          # control
+        marks = {n: setup.step_mark(s) for n, s in self.steps().items()}
+        self.assertEqual(set(marks.values()), {"ok  "}, marks)
+
+    def test_a_step_that_is_done_carries_no_leftover_fix(self):
+        self.assertEqual(self.steps()["autosave job"]["fix"], "",
+                         "a fix printed beside a finished step reads as a to-do")
+
+    def test_something_setup_will_install_reads_as_to_do(self):
+        self.assertEqual(setup.step_mark(self.steps(launchd_loaded=False)
+                                         ["autosave job"]), "todo")
+
+
+class TestARenderedJobIsValidBeforeAnythingIsTouched(unittest.TestCase):
+    """A path with an & in it - /Users/sam/R&D/ccwho - is not valid XML. The old
+    order wrote the file and booted the working job out before launchd rejected
+    it, so the check happens on the text, first."""
+
+    def render(self, **over):
+        args = dict(home="/Users/sam", ccwho="/Users/sam/R&D/cc who/ccwho.py",
+                    claude="/Users/sam/.local/bin/claude", python="/usr/bin/python3")
+        args.update(over)
+        path = os.path.join(os.path.dirname(os.path.abspath(setup.__file__)),
+                            setup.PLIST_TEMPLATE_NAME)
+        with open(path) as fh:
+            return setup.render_plist(fh.read(), **args)
+
+    def test_an_ampersand_in_a_path_still_parses_as_a_plist(self):
+        import plistlib
+        doc = plistlib.loads(self.render().encode())
+        self.assertIn("/Users/sam/R&D/cc who/ccwho.py", doc["ProgramArguments"])
+
+    def test_a_less_than_in_a_path_survives_unchanged(self):
+        import plistlib
+        doc = plistlib.loads(self.render(ccwho="/Users/sam/a<b/ccwho.py").encode())
+        self.assertIn("/Users/sam/a<b/ccwho.py", doc["ProgramArguments"])
+
+    def test_text_that_is_not_a_plist_is_a_complaint(self):
+        problems = setup.plist_problems("<plist><dict><key>oops",
+                                        home="/Users/sam",
+                                        claude="/Users/sam/.local/bin/claude")
+        self.assertTrue(any("plist" in p.lower() for p in problems), problems)
+
+    def test_a_good_one_has_no_complaints(self):                      # control
+        self.assertEqual(setup.plist_problems(
+            self.render(), home="/Users/sam",
+            claude="/Users/sam/.local/bin/claude"), [])
+
+
+class TestALoadedJobIsNotAWorkingJob(unittest.TestCase):
+    """The failure this whole repo exists for: a job that is loaded, runs, finds
+    nothing and exits 0. `launchctl list` says loaded either way, so setup
+    compares what is INSTALLED with what it would write today."""
+
+    def rendered(self, ccwho="/Users/sam/src/ccwho/ccwho.py"):
+        path = os.path.join(os.path.dirname(os.path.abspath(setup.__file__)),
+                            setup.PLIST_TEMPLATE_NAME)
+        with open(path) as fh:
+            return setup.render_plist(fh.read(), home="/Users/sam", ccwho=ccwho,
+                                      claude="/Users/sam/.local/bin/claude",
+                                      python="/usr/bin/python3")
+
+    def test_the_same_job_matches(self):                              # control
+        self.assertTrue(setup.plist_matches(self.rendered(), self.rendered()))
+
+    def test_a_job_pointing_at_a_moved_repo_does_not_match(self):
+        self.assertFalse(setup.plist_matches(
+            self.rendered(ccwho="/Users/sam/old/ccwho/ccwho.py"), self.rendered()))
+
+    def test_a_job_whose_path_cannot_find_claude_does_not_match(self):
+        stale = self.rendered().replace("/Users/sam/.local/bin:", "")
+        self.assertFalse(setup.plist_matches(stale, self.rendered()))
+
+    def test_a_missing_or_unreadable_job_never_matches(self):
+        self.assertFalse(setup.plist_matches("", self.rendered()))
+        self.assertFalse(setup.plist_matches("not a plist at all", self.rendered()))
+
+    def test_a_comment_change_is_not_a_difference(self):
+        self.assertTrue(setup.plist_matches(
+            self.rendered().replace("<!--", "<!-- x "), self.rendered()),
+            "only what the job DOES counts")
+
+
+class TestTheAppletIsAskedWhereItPoints(unittest.TestCase):
+    """An applet can claim ccwho:// while calling a copy that was deleted. That
+    reads as "registered" and does nothing when clicked."""
+
+    def test_the_path_is_read_out_of_the_script(self):
+        script = ('on open location this_URL\n  try\n'
+                  '    do shell script quoted form of "/Users/sam/.local/bin/ccwho"'
+                  ' & " url " & quoted form of this_URL\n  end try\nend open location')
+        self.assertEqual(setup.handler_target(script), "/Users/sam/.local/bin/ccwho")
+
+    def test_an_escaped_path_reads_back_as_the_real_path(self):
+        # The applet holds an AppleScript literal: a path with a quote or a
+        # backslash is escaped in it. Read back unescaped, or setup compares it
+        # with the real path, sees a difference, and rebuilds the applet forever.
+        real = '/Users/sam/we"ird\\path/ccwho'        # the directory as it is
+        escaped = real.replace("\\", "\\\\").replace('"', '\\"')
+        self.assertEqual(
+            setup.handler_target(f'do shell script quoted form of "{escaped}"'),
+            real)
+
+    def test_a_script_we_cannot_read_gives_nothing_not_a_wrong_answer(self):
+        self.assertEqual(setup.handler_target(""), "")
+        self.assertEqual(setup.handler_target("display dialog \"hi\""), "")
+
+
+class TestThePlanKnowsStaleFromMissing(unittest.TestCase):
+    def plan(self, **over):
+        f = facts(uv="/x/uv", hotkey_installed=True,
+                  handler_current=True, autosave_current=True)
+        f.update(over)
+        return {s["name"]: s for s in setup.setup_plan(f)}
+
+    def test_a_current_machine_has_nothing_to_do(self):               # control
+        self.assertEqual([s for s in self.plan().values() if s["todo"]], [])
+
+    def test_a_job_that_is_loaded_but_stale_is_to_do(self):
+        step = self.plan(autosave_current=False)["autosave job"]
+        self.assertTrue(step["todo"])
+        self.assertIn("loaded", step["detail"].lower())
+
+    def test_a_stale_job_is_not_accused_of_being_broken(self):
+        # It may be an older job that still works, written by an older ccwho.
+        # Saying it "runs a ccwho that is not here" is a claim we cannot make
+        # from a text comparison.
+        step = self.plan(autosave_current=False)["autosave job"]
+        self.assertNotIn("not here", step["detail"])
+        self.assertIn("would write", step["detail"])
+
+    def test_an_applet_pointing_at_another_copy_is_to_do(self):
+        step = self.plan(handler_current=False)["ccwho:// handler"]
+        self.assertTrue(step["todo"])
+        self.assertIn("points", step["detail"].lower())
+
+
+class TestTheHandlerInstallerKeepsWhatWorks(unittest.TestCase):
+    """install-handler.sh builds the ccwho:// applet. `ccwho setup` now runs it
+    unattended, so the two ways it could leave a machine with no handler at all
+    are covered here. osacompile, PlistBuddy and lsregister are stubbed: this is
+    about the script's ORDER, not about AppleScript."""
+
+    SCRIPT = os.path.join(os.path.dirname(os.path.abspath(setup.__file__)),
+                          "install-handler.sh")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.app = os.path.join(self.tmp, "ccwho-jump.app")
+
+    def stub(self, name, body):
+        path = os.path.join(self.bin, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/bash\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def run_install(self, ccwho="/Users/sam/.local/bin/ccwho", compiles=True):
+        # A fake osacompile that keeps the SOURCE, so the test can read what
+        # would have been compiled; it makes the bundle PlistBuddy needs.
+        keep = os.path.join(self.tmp, "source.applescript")
+        self.stub("osacompile", f"""
+            [ "{int(compiles)}" = "1" ] || exit 7
+            out="$2"; src="$3"
+            mkdir -p "$out/Contents"
+            cp "$src" "{keep}"
+            printf '%s' '<?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict/></plist>' > "$out/Contents/Info.plist"
+        """)
+        self.stub("plistbuddy", 'exit 0')
+        self.stub("lsregister", 'exit 0')
+        env = dict(os.environ, CCWHO_BIN=ccwho,
+                   OSACOMPILE=os.path.join(self.bin, "osacompile"),
+                   PLISTBUDDY=os.path.join(self.bin, "plistbuddy"),
+                   LSREGISTER=os.path.join(self.bin, "lsregister"))
+        done = subprocess.run(["bash", self.SCRIPT, self.app], env=env,
+                              capture_output=True, text=True)
+        source = ""
+        if os.path.exists(keep):
+            with open(keep) as fh:
+                source = fh.read()
+        return done, source
+
+    def test_a_build_that_fails_leaves_the_working_applet_alone(self):
+        os.makedirs(os.path.join(self.app, "Contents"))
+        marker = os.path.join(self.app, "Contents", "marker")
+        with open(marker, "w") as fh:
+            fh.write("the one that works")
+        done, _ = self.run_install(compiles=False)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(os.path.exists(marker),
+                        "a failed build must not delete a handler that works")
+
+    def test_a_build_that_works_replaces_it(self):                    # control
+        os.makedirs(os.path.join(self.app, "Contents"))
+        with open(os.path.join(self.app, "Contents", "marker"), "w") as fh:
+            fh.write("the old one")
+        done, _ = self.run_install()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.app, "Contents",
+                                                     "marker")))
+        self.assertFalse(os.path.exists(self.app + ".old"), "and nothing is left over")
+
+    def test_a_path_with_a_quote_in_it_stays_that_path(self):
+        odd = '/Users/sam/we"ird\\path/ccwho'
+        done, source = self.run_install(ccwho=odd)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(setup.handler_target(source), odd,
+                         "an AppleScript literal, escaped and read back whole")

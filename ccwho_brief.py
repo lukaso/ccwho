@@ -65,6 +65,27 @@ def command_of(text):
     return f"{m.group(1)} {arg}".strip()
 
 
+def project_of(cwd):
+    """Repo name for a cwd. A worktree reports its parent repo, not the branch dir.
+
+    Pure, and needed in two places: the live row (from `claude agents`) and the
+    index (from the cwd every transcript record carries). Claude Code's own
+    folder name is the path with slashes turned into dashes, so its last segment
+    is a worktree's BRANCH - which is why the index cannot use it.
+    """
+    if not cwd:
+        return "?"
+    parts = [p for p in cwd.split("/") if p]
+    if not parts:
+        return "?"
+    for marker in (".claude", ".git", ".wt"):
+        if marker in parts:
+            i = parts.index(marker)
+            if i > 0:
+                return parts[i - 1]
+    return parts[-1]
+
+
 def is_human_prompt(text):
     """Did a human type this, or did the harness put it there?"""
     if not text:

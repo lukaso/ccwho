@@ -22,6 +22,7 @@ import time
 import traceback
 
 import ccwho_engine as engine
+import ccwho_index as index
 import ccwho_setup as setup
 
 CLEAR_HOME = "\033[H\033[2J"
@@ -48,19 +49,24 @@ def _load_beside(module):
 def reload_engine(state):
     """Re-read the engine. A broken edit keeps the last good module and says so.
 
-    ccwho_brief goes first: it holds half the extraction rules and the engine
-    imports it, so reloading only the engine would leave a running watch showing
-    the OLD rules while its file on disk says otherwise - a fix that looks like
-    it did nothing is worse than no hot reload at all.
+    The modules the engine imports go first - ccwho_brief holds half the
+    extraction rules, ccwho_index the rest - because reloading only the engine
+    would leave a running watch using the OLD rules while its file on disk says
+    otherwise, and a fix that looks like it did nothing is worse than no hot
+    reload at all.
     """
+    old = {m.__name__: m for m in (engine.brief, index)}
     try:
-        new_brief = _load_beside(engine.brief)
-        sys.modules[new_brief.__name__] = new_brief
+        for name, module in list(old.items()):
+            sys.modules[name] = _load_beside(module)
         try:
             importlib.reload(engine)
         except Exception:
-            sys.modules[engine.brief.__name__] = engine.brief   # put the old one back
+            sys.modules.update(old)         # put the working ones back
             raise
+        # and rebind OUR handles: sys.modules is what the next import sees, but
+        # this module's globals still point at the objects loaded at startup
+        globals()["index"] = sys.modules[index.__name__]
         state["engine_error"] = ""
     except Exception:
         state["engine_error"] = traceback.format_exc(limit=2).strip().splitlines()[-1]
@@ -164,7 +170,18 @@ def show(argv):
     want_json = "--json" in argv
     query = " ".join(a for a in argv if not a.startswith("-"))
     rows, _ = engine.collect(cache={})
-    hits = engine.match_rows(rows, query) if query else rows
+    entry = {}
+    if query:
+        # Not running is not gone: the transcript is still on disk, and so is the
+        # answer to "what was that one about".
+        hits, ended = matches(query, rows, everything="--all" in argv)
+        hits = hits + ended
+        found = index.search(fresh_index(), query, everything="--all" in argv)
+        by_id = {e.get("sessionId"): e for e in found}
+        if hits:
+            entry = by_id.get(hits[0].get("sessionId"), {})
+    else:
+        hits = rows
     if not hits:
         print(f"ccwho show: no session matches {query!r}", file=sys.stderr)
         return 1
@@ -176,15 +193,109 @@ def show(argv):
                   f" {engine.short_tty(r.get('tty','')):<6}"
                   f" {r.get('title') or r.get('name')}", file=sys.stderr)
         return 2
+    if not hits:
+        return 1
     row = hits[0]
     head, tail, _mtime = engine.read_windows(row.get("sessionId", ""))
     b = engine.brief.build(head, tail, session=row,
                            now=engine.now_iso(), as_records=engine.as_records)
+    # The index read the WHOLE transcript once; the brief reads a head and a tail
+    # window. A recap in the unread middle belongs to the index, and dropping it
+    # here would lose the very line that found the session.
+    if entry.get("recap") and (not b["recap"] or entry.get("recap_ts", "") > b["recap_ts"]):
+        b["recap"] = entry["recap"]
+        b["recap_ts"] = entry.get("recap_ts", "")
+        b["recap_age"] = engine.brief.age_between(b["recap_ts"], engine.now_iso())
+        b["turns_since_recap"] = entry.get("turns_since_recap", 0)
     if want_json:
         print(json.dumps(b, indent=2))
         return 0
     print(engine.render_brief(b, row, color=sys.stdout.isatty()
                               and "NO_COLOR" not in os.environ))
+    return 0
+
+
+def index_path():
+    return os.path.join(ccwho_dir(), "index.jsonl")
+
+
+def fresh_index(quiet=False):
+    """The index of every session on disk, brought up to date.
+
+    Cold: ~11s over 1,402 transcripts, once. Warm: 0.03s, because only the bytes
+    appended since last time are read. The first build says what it is doing -
+    eleven silent seconds reads as a hang.
+    """
+    idx = index.load(index_path())
+    paths = index.transcripts()
+    if not idx and not quiet:
+        print(f"indexing {len(paths)} sessions (first run only)...", file=sys.stderr)
+    fresh = index.update(idx, paths)
+    if fresh != idx:
+        index.save(fresh, index_path())
+    return fresh
+
+
+def _ended_row(entry, now_iso):
+    """An index entry in the shape the row renderers expect."""
+    return {"sessionId": entry.get("sessionId", ""), "project": entry.get("project", "?"),
+            "title": entry.get("title", ""), "tab_title": "", "name": "",
+            "attention": "ended", "status": "ended", "tty": "", "pid": None,
+            "cwd": entry.get("cwd", ""), "topic": entry.get("you_said", ""),
+            "first": entry.get("opened", ""), "ask": "", "doing": "",
+            "orphans": 0, "work": 0, "ts": entry.get("last_ts", ""),
+            "since": engine.brief.age_between(entry.get("last_ts", ""), now_iso),
+            "age": "", "waitingFor": ""}
+
+
+def matches(query, rows, everything=False):
+    """Every session matching, live ones as live rows and the rest as ended ones.
+
+    Two sources with different strengths: the live table knows what is running,
+    the index knows what each session was ABOUT (including recaps from the middle
+    of a long transcript) and matches word by word rather than as one phrase. A
+    session found through the index that is running is still running - reporting
+    it as ended because of where the match came from is a lie about the world.
+    """
+    by_id = {r.get("sessionId"): r for r in rows}
+    hits = list(engine.match_rows(rows, query))
+    seen = {r.get("sessionId") for r in hits}
+    now = engine.now_iso()
+    ended = []
+    for entry in index.search(fresh_index(), query, live_ids=set(by_id),
+                              everything=everything):
+        sid = entry.get("sessionId")
+        if sid in seen:
+            continue
+        seen.add(sid)
+        if sid in by_id:
+            hits.append(by_id[sid])          # running, found by what it is about
+        else:
+            ended.append(_ended_row(entry, now))
+    hits.sort(key=engine.sort_key)
+    return hits, ended
+
+
+def ls(argv):
+    """The table. With words, the sessions that match - including ended ones."""
+    query = " ".join(a for a in argv if not a.startswith("-"))
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
+    rows, total = engine.collect(cache={})
+    if not query:
+        sys.stdout.write(engine.render(rows, total, color=color))
+        return 0
+    live, ended = matches(query, rows, everything="--all" in argv)
+    if not live and not ended:
+        print(f"ccwho: no session matches {query!r}", file=sys.stderr)
+        return 1
+    if live:
+        sys.stdout.write(engine.render(live, 0, color=color))
+    if ended:
+        print(f"\n{DIM if color else ''}ended sessions{RESET if color else ''}")
+        for r in ended[:10]:
+            print(f"  {engine.brief.short_id(r['sessionId']):<6} {r['project'][:12]:<12}"
+                  f" {engine.truncate(r['title'] or r['topic'], 44):<44}"
+                  f" ended {r['since']} ago")
     return 0
 
 
@@ -745,6 +856,8 @@ def main(argv=None):
         return rc
     if argv and argv[0] == "restore":
         return restore(argv[1:])
+    if argv and argv[0] == "ls":
+        return ls(argv[1:])
     if argv and argv[0] == "doctor":
         return doctor(argv[1:])
     if argv and argv[0] == "show":
@@ -761,6 +874,8 @@ def main(argv=None):
         print("       ccwho restore [--open] [--from PATH]       list it back / reopen the windows")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
+        print("       ccwho ls [words] [--all]                   the table, or every session matching")
+        print("                                                  (--all includes sessions a program started)")
         print("       ccwho show <anything>                      what that session was working on")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")

@@ -26,6 +26,7 @@ import sys
 import time
 
 import ccwho_brief as brief
+import ccwho_index
 
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
@@ -91,19 +92,8 @@ def read_is_complete(raw):
     return all(isinstance(d, dict) and d.get("sessionId") for d in data)
 
 
-def project_of(cwd):
-    """Repo name for a cwd. A worktree reports its parent repo, not the branch dir."""
-    if not cwd:
-        return "?"
-    parts = [p for p in cwd.split("/") if p]
-    if not parts:
-        return "?"
-    for marker in (".claude", ".git"):
-        if marker in parts:
-            i = parts.index(marker)
-            if i > 0:
-                return parts[i - 1]
-    return parts[-1]
+# One definition, in the pure module: the live row and the index both need it.
+project_of = brief.project_of
 
 
 def _text_of(content):
@@ -419,10 +409,21 @@ def truncate(s, width):
 # ------------------------------------------------------------------ disk reads
 
 def transcript_path(session_id):
+    """Where this session's transcript lives, in ANY config root.
+
+    Not every session runs under the login in ~/.claude: some use a
+    CLAUDE_CODE_OAUTH_TOKEN, and CLAUDE_CONFIG_DIR moves a session's whole
+    directory. ccwho never logs in - it reads files - so a hard-coded path was
+    the one thing that could tie it to a single login. (index.config_roots lists
+    them: $CLAUDE_CONFIG_DIR, ~/.claude, and anything in ~/.ccwho/roots.)
+    """
     if not session_id:
         return None
-    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{session_id}.jsonl"))
-    return hits[0] if hits else None
+    for root in ccwho_index.config_roots():
+        hits = glob.glob(os.path.join(root, "projects", "*", f"{session_id}.jsonl"))
+        if hits:
+            return hits[0]
+    return None
 
 
 def read_windows(session_id, tail_bytes=1024 * 1024, head_lines=400, cache=None):

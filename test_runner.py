@@ -1118,6 +1118,30 @@ class TestHotReloadCoversTheBriefModule(unittest.TestCase):
                 fh.write(original)
             runner.reload_engine({"engine_error": ""})
 
+    def test_every_hot_module_is_re_read_not_just_the_engine(self):
+        # the engine imports both of them now; a module left out of the reload is
+        # a module whose fix silently does not land in a running watch
+        for mod in ("ccwho_brief", "ccwho_index"):
+            with self.subTest(module=mod):
+                m = __import__(mod)
+                path = m.__file__
+                original = open(path).read()
+                try:
+                    with open(path, "w") as fh:
+                        fh.write(original + "\n\ndef _hot_probe():\n    return 1\n")
+                    runner.reload_engine({"engine_error": ""})
+                    self.assertTrue(hasattr(__import__(mod), "_hot_probe"), mod)
+                    # and the runner's own handle has to be the new module too,
+                    # or `ccwho ls` keeps calling yesterday's code
+                    handle = {"ccwho_brief": runner.engine.brief,
+                              "ccwho_index": runner.index}[mod]
+                    self.assertTrue(hasattr(handle, "_hot_probe"),
+                                    f"runner still holds the old {mod}")
+                finally:
+                    with open(path, "w") as fh:
+                        fh.write(original)
+                    runner.reload_engine({"engine_error": ""})
+
     def test_a_broken_brief_edit_does_not_kill_the_loop(self):
         import ccwho_brief
         path = ccwho_brief.__file__
@@ -1166,10 +1190,15 @@ class TestShowVerb(unittest.TestCase):
                                         "content": [{"type": "text",
                                                      "text": "Shall I land it?"}]}})]
         runner.engine.read_windows = lambda sid, **kw: (head, tail, 1788213090)
+        # the index is on this machine, and a test that reads it measures this
+        # laptop rather than the code
+        self.real_index = runner.fresh_index
+        runner.fresh_index = lambda quiet=False: {}
 
     def tearDown(self):
         runner.engine.collect = self.real_collect
         runner.engine.read_windows = self.real_windows
+        runner.fresh_index = self.real_index
 
     def _show(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -1328,3 +1357,120 @@ class TestWatchBannerIsCheap(unittest.TestCase):
             "newest_manifest_age": 10.0, "cc_status_hook": True,
             "settings_path": "/x"}
         self.assertEqual(runner.doctor_banner_cached({}, now=1000.0), "")
+
+
+class TestFindsSessionsThatAreNotRunning(unittest.TestCase):
+    """The live fleet is fifteen; the disk holds a month. "Sometimes I need to
+    find sessions from a while ago, so all sessions are fair game.\""""
+
+    LIVE = "live1111-0000-4000-8000-000000000001"
+    DEAD = "dead2222-0000-4000-8000-000000000002"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.rows = [{"sessionId": self.LIVE, "project": "liveapp", "tty": "ttys022",
+                      "pid": 90266, "name": "liveapp-f0", "title": "Issue 362",
+                      "tab_title": "✳ Issue 362 (claude)", "attention": "stopped",
+                      "status": "idle", "since": "5h", "cwd": "/Users/x/liveapp",
+                      "topic": "", "first": "", "ask": "", "doing": "", "orphans": 0,
+                      "work": 0}]
+        self.index = {
+            self.LIVE: {"sessionId": self.LIVE, "title": "Issue 362", "recap": "",
+                        "you_said": "rebase", "opened": "", "project": "liveapp",
+                        "last_ts": "2026-09-20T10:00:00.000Z"},
+            self.DEAD: {"sessionId": self.DEAD, "title": "Docker high CPU",
+                        "recap": "containers pegged a core", "you_said": "why hot",
+                        "opened": "", "project": "liveapp",
+                        "last_ts": "2026-09-01T10:00:00.000Z"},
+        }
+        self.real_collect = runner.engine.collect
+        self.real_load = runner.index.load
+        self.real_update = runner.index.update
+        self.real_windows = runner.engine.read_windows
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True
+            return (list(self.rows), 0)
+
+        runner.engine.collect = fake_collect
+        runner.index.load = lambda path: dict(self.index)
+        runner.index.update = lambda idx, paths, **kw: dict(self.index)
+        runner.engine.read_windows = lambda sid, **kw: ([], [json.dumps(
+            {"type": "system", "subtype": "away_summary",
+             "content": "containers pegged a core",
+             "timestamp": "2026-09-01T09:00:00.000Z"})], 0)
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.index.load = self.real_load
+        runner.index.update = self.real_update
+        runner.engine.read_windows = self.real_windows
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, fn, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = fn(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_show_falls_back_to_a_session_that_ended(self):
+        rc, out = self._run(runner.show, "docker")
+        self.assertEqual(rc, 0)
+        self.assertIn("pegged a core", out)
+        self.assertIn("ended", out.lower(), "say that it is not running any more")
+        self.assertIn("claude --resume " + self.DEAD, out)
+
+    def test_a_live_session_still_wins(self):                     # control
+        rc, out = self._run(runner.show, "362")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("ended", out.lower())
+
+    def test_ls_with_words_lists_live_and_ended(self):
+        rc, out = self._run(runner.ls, "liveapp")
+        self.assertEqual(rc, 0)
+        self.assertIn("Issue 362", out)
+        self.assertIn("Docker high CPU", out)
+        self.assertIn("ended", out.lower())
+
+    def test_ls_without_words_is_the_table_as_it_was(self):
+        rc, out = self._run(runner.ls)
+        self.assertEqual(rc, 0)
+        self.assertIn("Issue 362", out)
+        self.assertNotIn("Docker high CPU", out, "ended sessions are not the fleet")
+
+    def test_a_live_session_found_through_the_index_is_still_live(self):
+        # the index knows the recap; the live table does not. A word from the
+        # recap must not turn a running session into an "ended" one.
+        self.index[self.LIVE]["recap"] = "the gate flake, finally understood"
+        rc, out = self._run(runner.ls, "flake")
+        self.assertEqual(rc, 0)
+        self.assertIn("Issue 362", out)
+        self.assertNotIn("ended", out.lower(),
+                         "it is running: the row belongs in the table")
+
+    def test_words_match_across_fields_not_just_as_a_phrase(self):
+        # "gate flake" should find a session whose title has one word and whose
+        # recap has the other - the live table matches contiguous text only
+        self.index[self.LIVE]["recap"] = "flake in the timing suite"
+        rc, out = self._run(runner.ls, "362 flake")
+        self.assertEqual(rc, 0)
+        self.assertIn("Issue 362", out)
+
+    def test_show_keeps_the_recap_the_index_found(self):
+        # the brief reads a head and a tail window; a recap in the unread middle
+        # of a long transcript is exactly what the index is for
+        self.index[self.DEAD]["recap"] = "the middle-of-file summary"
+        self.index[self.DEAD]["turns_since_recap"] = 7
+        runner.engine.read_windows = lambda sid, **kw: ([], [], 0)
+        rc, out = self._run(runner.show, "docker")
+        self.assertEqual(rc, 0)
+        self.assertIn("middle-of-file summary", out)
+        self.assertIn("7 turns", out)
+
+    def test_ls_says_when_nothing_matches(self):
+        rc, out = self._run(runner.ls, "nothing-like-this")
+        self.assertEqual(rc, 1)
+        self.assertIn("no session", out.lower())

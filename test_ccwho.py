@@ -1,11 +1,28 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
 import json
 import os
+import shutil
 import shlex
+import tempfile
 import unittest
 
 import ccwho_brief as brief
 import ccwho_engine as ccwho
+
+
+class MachinelessCollect(unittest.TestCase):
+    """collect() reaches the machine: ps, the tty map, and an AppleScript round
+    trip to iTerm2. A test that leaves those live measures this laptop, takes a
+    second each, and answers differently on someone else's. Pin them."""
+
+    def setUp(self):
+        self._saved = (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot)
+        ccwho.ps_snapshot = lambda: ""
+        ccwho.tty_snapshot = lambda: ""
+        ccwho.titles_snapshot = lambda timeout=5.0: {}
+
+    def tearDown(self):
+        (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot) = self._saved
 
 
 class TestParseSessions(unittest.TestCase):
@@ -1172,7 +1189,7 @@ class CheckManifest(unittest.TestCase):
             self.assertFalse(ok, repr(junk))
 
 
-class TestSessionSourceAvailability(unittest.TestCase):
+class TestSessionSourceAvailability(MachinelessCollect):
     """`[]` and "could not ask" are DIFFERENT answers.
 
     Conflating them is how a scheduled save writes "you had nothing open" over the
@@ -1180,10 +1197,12 @@ class TestSessionSourceAvailability(unittest.TestCase):
     """
 
     def setUp(self):
+        super().setUp()
         self.real_which = ccwho.shutil.which
         self.real_run = ccwho.subprocess.run
 
     def tearDown(self):
+        super().tearDown()
         ccwho.shutil.which = self.real_which
         ccwho.subprocess.run = self.real_run
 
@@ -1363,6 +1382,39 @@ class TestParseSessionsSaysWhenItCouldNotParse(unittest.TestCase):
 
     def test_none_in_none_out(self):
         self.assertIsNone(ccwho.parse_sessions(None))
+
+
+class TestTranscriptsAreFoundUnderEveryConfigRoot(unittest.TestCase):
+    """Sessions do not all run under the same login. Some use ~/.claude, some a
+    CLAUDE_CODE_OAUTH_TOKEN, and CLAUDE_CONFIG_DIR moves a session's whole
+    directory. ccwho reads files and never logs in - so the only thing that could
+    tie it to one login is a hard-coded path, and this is where that was."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.sid = "abcd1234-0000-4000-8000-00000000abcd"
+        d = os.path.join(self.tmp, "other-config", "projects", "-Users-x-football")
+        os.makedirs(d)
+        self.path = os.path.join(d, self.sid + ".jsonl")
+        with open(self.path, "w") as fh:
+            fh.write('{"type":"user","message":{"role":"user","content":"hi"}}\n')
+        os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self.tmp, "other-config")
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_transcript_in_another_config_dir_is_found(self):
+        self.assertEqual(ccwho.transcript_path(self.sid), self.path)
+
+    def test_a_session_nobody_has_a_transcript_for_is_nothing(self):   # control
+        self.assertIsNone(
+            ccwho.transcript_path("0000dead-0000-4000-8000-000000000000"))
+
+    def test_reading_its_windows_works_the_same(self):
+        head, tail, mtime = ccwho.read_windows(self.sid)
+        self.assertTrue(head or tail)
+        self.assertGreater(mtime, 0)
 
 
 class TestTerminalNames(unittest.TestCase):
@@ -1608,7 +1660,7 @@ class TestResolveOpenNeverForksALiveSession(unittest.TestCase):
         self.assertEqual(action, "missing")
 
 
-class TestCollectReportsAnUnparseableSource(unittest.TestCase):
+class TestCollectReportsAnUnparseableSource(MachinelessCollect):
     def test_a_partly_understood_feed_still_renders_but_blocks_launching(self):
         real = ccwho.agents_json
         ccwho.agents_json = lambda: json.dumps(

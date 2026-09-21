@@ -396,9 +396,13 @@ class TestTheHotkeyProfile(unittest.TestCase):
         # you did ask for. The key is how you open it.
         self.assertFalse(self.profile()["HotKey Window Reopens On Activation"])
 
-    def test_it_hides_itself_when_you_leave_it(self):
-        self.assertTrue(self.profile()["HotKey Window AutoHides"],
-                        "press the key, read it, carry on: it gets out of the way")
+    def test_it_stays_open_when_you_go_to_a_session(self):
+        # It is a control panel, not a popup: pressing Enter takes you to a
+        # session's window, and the list has to still be there when you come
+        # back. AutoHides made it vanish the moment anything else took focus -
+        # including the window ccwho had just put you in.
+        self.assertFalse(self.profile()["HotKey Window AutoHides"],
+                         "it goes away when you ask it to, not by itself")
 
     def test_the_window_comes_back_over_whatever_you_are_in(self):
         p = self.profile()

@@ -420,7 +420,11 @@ def hotkey_profile(command, hotkey=DEFAULT_HOTKEY, name=PROFILE_NAME,
         "HotKey Modifier Flags": OPTION,
         "HotKey Activated By Modifier": False,
         "HotKey Window Floats": True,          # over whatever you were reading
-        "HotKey Window AutoHides": True,       # and gone again when you leave
+        # False: this is a control panel. Enter takes you to a session's
+        # window, and AutoHides would close the list at exactly that
+        # moment - every time you used it. It goes when you press the key
+        # again, or q.
+        "HotKey Window AutoHides": False,
         "HotKey Window Animates": False,
         # False: the list appears because you pressed the key, never
         # because iTerm2 happened to come to the front.

@@ -619,12 +619,307 @@ class TestNothingPaintsIntoAScreenThatIsGone(UiTest):
     NoMatches out of a callback nobody is waiting on."""
 
     async def test_a_tick_after_the_widgets_are_gone_is_not_a_crash(self):
+        for gone in ("#list", "#header", "#banner", "#detail"):
+            app = self.app()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.query_one(gone).remove()
+                await pilot.pause()
+                app.painted_width = 0      # force the poll to act
+                app.painted_shape = None   # and the full rebuild path
+                app.check_width()          # none of these may raise
+                app.rebuild()
+                app.paint_detail()
+                app.mark_selected()
+                app.restore_selection()
+
+
+def many(n):
+    return [row("%04d1111-0000-4000-8000-00000000%04d" % (i, i),
+                "stopped" if i % 2 else "asks", title=f"session {i}",
+                tab_title=f"session {i}") for i in range(n)]
+
+
+class TestTheArrowsMoveTheSelectionNotTheScrollbar(UiTest):
+    """With more sessions than the window can hold, the list container took the
+    arrow keys for scrolling and the selection never moved. The keys belong to
+    the row that has focus."""
+
+    def long(self):
+        return FakeCollector(fleet=ui.Fleet(many(40), True, "12:00:00"))
+
+    async def test_down_moves_to_the_next_session(self):
+        app = self.app(collector=self.long())
+        async with app.run_test(size=(120, 12)) as pilot:
+            await pilot.pause()
+            first = app.selected
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertNotEqual(app.selected, first)
+            self.assertEqual([w.row["sessionId"] for w in app.query(ui.Row)
+                              if w.has_class("selected")], [app.selected])
+
+    async def test_up_comes_back(self):
+        app = self.app(collector=self.long())
+        async with app.run_test(size=(120, 12)) as pilot:
+            await pilot.pause()
+            first = app.selected
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(app.selected, first)
+
+    async def test_the_list_follows_the_selection_down_past_the_window(self):
+        app = self.app(collector=self.long())
+        async with app.run_test(size=(120, 12)) as pilot:
+            await pilot.pause()
+            for _ in range(12):
+                await pilot.press("down")
+            await pilot.pause()
+            listing = app.query_one("#list")
+            picked = [w for w in app.query(ui.Row) if w.has_class("selected")][0]
+            self.assertGreater(listing.scroll_offset.y, 0,
+                               "the list scrolled to keep up")
+            self.assertIn(picked, listing.children,
+                          "and the selected row is one of the rows on screen")
+
+    async def test_a_short_list_still_moves(self):                    # control
         app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.query_one("#list").remove()
+            first = app.selected
+            await pilot.press("down")
             await pilot.pause()
-            app.painted_width = 0          # force the poll to act
-            app.check_width()              # must not raise
+            self.assertNotEqual(app.selected, first)
+
+
+class TestOneClickGoesThere(UiTest):
+    """Reported: picking a session with the mouse only highlighted it, and then
+    you still had to reach for the keyboard."""
+
+    async def test_clicking_a_row_selects_it_and_goes(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rows = list(app.query(ui.Row))
+            await pilot.click(rows[1])
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(app.selected, rows[1].row["sessionId"])
+            self.assertEqual(adapter.asked, [rows[1].row["sessionId"]])
+
+
+class TestARebuildIsOnePaint(UiTest):
+    """Tearing the list down and mounting it again shows the empty list for a
+    frame. Textual can hold the screen still until the whole rebuild is done."""
+
+    async def test_the_rows_are_mounted_while_the_screen_is_held(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            listing = app.query_one("#list")
+            held = []
+            real = listing.mount_all
+            # Textual calls batch_update itself in places, so watching THAT
+            # proves nothing. What matters is whether the screen is being held
+            # at the moment the rows go in.
+            listing.mount_all = lambda widgets: (
+                held.append(app._batch_count) or real(widgets))
+            app.painted_shape = None          # force the full path
             app.rebuild()
-            app.paint_detail()
+            await pilot.pause()
+            self.assertTrue(held, "the rebuild mounts in one go")
+            self.assertGreater(held[0], 0,
+                               "a rebuild paints once, not row by row")
+
+
+class TestARowIsWrittenOnlyWhenItsWordsChange(UiTest):
+    """A collection re-reads everything, so most row dicts differ every tick in
+    fields the screen never shows - a process id, a byte offset, a timestamp.
+    Comparing the dict meant every row was written three times a second."""
+
+    async def counted(self, changed):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            writes = []
+            for widget in app.query(ui.Row):
+                real = widget.refresh_text
+                widget.refresh_text = lambda w, r=real, name=widget: (
+                    writes.append(name) or r(w))
+            collector.fleet_value = ui.Fleet([dict(LIVE, **changed), BUSY],
+                                             True, "12:00:01")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            return writes
+
+    async def test_a_field_nobody_sees_does_not_repaint_the_row(self):
+        self.assertEqual(await self.counted({"pid": 99999, "work": 3}), [])
+
+    async def test_a_new_recap_does_repaint_it(self):                 # control
+        writes = await self.counted({"recap": "something new to read"})
+        self.assertEqual(len(writes), 1)
+
+
+class TestItRestsWhenYouAreNotLookingAtIt(UiTest):
+    """The window used to hide itself, so "nobody is looking" took care of
+    itself. Now it stays open as a control panel - which means it would run
+    three processes every three seconds, all day, behind whatever you are
+    actually doing. The terminal tells us when it loses focus; use that."""
+
+    async def test_it_slows_down_when_the_terminal_loses_focus(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            # Put focus back on a row by hand. Losing focus happens to clear it
+            # too, and a test that leans on THAT passes whether or not anything
+            # noticed the terminal go away.
+            list(app.query(ui.Row))[0].focus()
+            await pilot.pause()
+            self.assertIsNotNone(app.focused)
+            self.assertFalse(app.has_focus_hint())
+
+    async def test_it_wakes_up_the_moment_you_come_back(self):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            before = collector.calls
+            app.post_message(ui.events.AppFocus())
+            await pilot.pause()
+            await pilot.pause()
+            self.assertTrue(app.has_focus_hint())
+            self.assertGreater(collector.calls, before,
+                               "a list you just looked at must not be stale")
+
+    async def test_while_you_are_in_it_it_is_awake(self):             # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertTrue(app.has_focus_hint())
+
+
+class TestEnterActsOnTheRowYouAreLookingAt(UiTest):
+    """Reported from real use: Enter on the first NEEDS YOU row went to a busy
+    session further down instead.
+
+    The selection fell back to the first row of the SNAPSHOT, and the snapshot
+    is not in screen order - the screen groups by what each session needs. So
+    "nothing chosen yet" meant "whatever the collector happened to list first".
+    """
+
+    def out_of_order(self):
+        # BUSY first in the snapshot, NEEDS YOU first on screen.
+        return FakeCollector(fleet=ui.Fleet([BUSY, LIVE], True, "12:00:00"))
+
+    async def test_the_first_row_on_screen_is_the_one_that_is_selected(self):
+        app = self.app(collector=self.out_of_order())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            first_shown = list(app.query(ui.Row))[0]
+            self.assertEqual(app.selected, first_shown.row["sessionId"])
+            self.assertTrue(first_shown.has_class("selected"))
+
+    async def test_enter_goes_where_the_highlight_is(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.out_of_order())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]],
+                             "the row under the highlight, not the snapshot's first")
+
+    async def test_a_selection_the_search_hid_does_not_stay_the_target(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.selected = BUSY["sessionId"]
+            await pilot.press("slash")
+            await pilot.pause()
+            app.query_one("#search").value = "Issue 362"      # hides BUSY
+            await pilot.pause()
+            await pilot.press("enter")     # leaves the box, lands in the list
+            await pilot.pause()
+            await pilot.press("enter")     # and now: go
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]],
+                             "Enter cannot act on a session that is not shown")
+
+    async def test_a_hidden_session_is_never_what_enter_would_act_on(self):
+        # Straight at the method: a rebuild repairs the selection a moment
+        # later, which is enough to hide this from a test that goes through
+        # keystrokes - and not enough to make it safe in between.
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.selected = BUSY["sessionId"]
+            app.filter_text = "Issue 362"                 # hides BUSY
+            self.assertEqual(app.selected_row()["sessionId"], LIVE["sessionId"])
+            self.assertEqual([r["sessionId"] for r in app.visible_rows()],
+                             [LIVE["sessionId"]])
+
+    async def test_moving_still_chooses_deliberately(self):           # control
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.out_of_order())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [BUSY["sessionId"]])
+
+
+class TestTheJumpSaysWhereItLanded(unittest.TestCase):
+    """A jump that goes to the wrong window in silence is how "it went to the
+    wrong session" becomes a mystery. The script checks what is in front after
+    it selects, and says so when it is not what was asked for."""
+
+    def script(self):
+        import os
+        with open(os.path.join(os.path.dirname(os.path.abspath(ui.__file__)),
+                               "jump.applescript")) as fh:
+            return fh.read()
+
+    def test_it_activates_before_it_selects(self):
+        body = self.script()
+        self.assertLess(body.index("activate"), body.index("select w"),
+                        "activating raises windows, which would undo a selection"
+                        " made before it")
+
+    def test_it_compares_what_is_in_front_with_what_was_asked_for(self):
+        body = self.script()
+        self.assertIn("current session of current tab of current window", body)
+        self.assertIn("landed on", body)
+
+    def test_a_session_it_cannot_find_is_not_reported_as_focused(self):  # control
+        self.assertIn('return "not found: "', self.script())
+
+
+class TestTheStatusSaysWhichSessionItWent(UiTest):
+    """"focused /dev/ttys007" is not an answer to "did it go to the one I
+    picked". The name you chose it by is."""
+
+    async def test_going_names_the_session_not_just_the_device(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            header = str(app.query_one("#header").content)
+            self.assertIn("Issue 362", header,
+                          "say which session, in the words you picked it by")

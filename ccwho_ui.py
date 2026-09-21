@@ -82,6 +82,15 @@ class Row(Static):
     a style, and the only way to be sure of that is never to parse it.
     """
 
+    # The keys are bound HERE, on the thing that has focus. On the App they
+    # were reached only after the scrolling container had already taken up and
+    # down for itself, so with more sessions than the window could hold the
+    # list scrolled and the selection never moved.
+    BINDINGS = [
+        Binding("down,j", "app.next", "down", show=False),
+        Binding("up,k", "app.prev", "up", show=False),
+    ]
+
     def __init__(self, row, width):
         self.row = row
         self.width = width
@@ -96,8 +105,17 @@ class Row(Static):
         first, second = engine.ui_row_cells(self.row, width=max(40, self.width - 4))
         return list(first) + [("\n", "pad")] + list(second)
 
+    def words(self, width):
+        """Exactly what would be on screen at this width, as one string."""
+        was, self.width = self.width, width
+        try:
+            return "".join(text for text, _ in self.spans())
+        finally:
+            self.width = was
+
     def _as_text(self, width):
         self.width = width
+        self.painted = self.words(width)
         state = STATE_STYLE.get(engine.ui_state_style(self.row), "")
         text = Text(no_wrap=True, overflow="crop")
         for part, role in self.spans():
@@ -152,6 +170,7 @@ class CcwhoUi(App):
         self.painted_width = 0
         self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
+        self.watched = True     # until the terminal says otherwise
 
     # ------------------------------------------------------------------ layout
 
@@ -195,10 +214,27 @@ class CcwhoUi(App):
         self.collect()
 
     def has_focus_hint(self):
-        """Visible? The hotkey window is hidden most of the day, and refreshing
-        three processes a tick for a window nobody is looking at is how --watch
-        once burned a core."""
-        return self.app.screen is not None and self.is_running and self.focused is not None
+        """Is anyone looking at this?
+
+        It used to be a guess that was always true. It matters now: the window
+        stays open instead of hiding itself, so without this it would run three
+        processes every three seconds all day behind whatever you are actually
+        doing. The terminal says when it loses and regains focus.
+        """
+        return (self.app.screen is not None and self.is_running
+                and self.focused is not None and self.watched)
+
+    @on(events.AppBlur)
+    def looked_away(self):
+        self.watched = False
+
+    @on(events.AppFocus)
+    def looked_back(self):
+        """Straight back to work: a list you have just looked at must not be
+        showing what was true a minute ago."""
+        self.watched = True
+        self.collector.last = 0.0
+        self.collect()
 
     def show(self, fleet):
         seq = getattr(fleet, "seq", 0)
@@ -227,20 +263,24 @@ class CcwhoUi(App):
                               tuple(r.get("sessionId") for r in g["rows"]))
                              for g in groups))
 
-    def alive(self):
-        """Is there still a screen to paint into? On the way out the widgets go
-        before the timers stop, and a paint then raises out of a callback that
-        nobody is waiting on."""
+    def part(self, selector):
+        """A widget, or None when the screen is going away.
+
+        On the way out the widgets go before the timers stop, and a paint into
+        one that has gone raises out of a callback nobody is waiting on. Asking
+        for what this paint actually touches is the check; asking about some
+        OTHER widget is how a teardown crash came back on #header after #list
+        was already covered.
+        """
         try:
-            self.query_one("#list")
+            return self.query_one(selector)
         except Exception:
-            return False
-        return True
+            return None
 
     def rebuild(self):
-        if not self.alive():
+        listing = self.part("#list")
+        if listing is None or self.part("#header") is None:
             return
-        listing = self.query_one("#list")
         width = self.list_width()
         groups = self.fleet.groups(self.filter_text)
         shape = self.shape_of(groups, width)
@@ -250,14 +290,19 @@ class CcwhoUi(App):
             return
         self.painted_shape = shape
         keep = self.selected_id()
-        listing.remove_children()
-        for group in groups:
-            listing.mount(Static(group["heading"], classes="heading", markup=False))
-            for row in group["rows"]:
-                listing.mount(Row(row, width))
-        self.paint_header(groups)
-        if not groups:
-            listing.mount(Static(self.empty_text(), markup=False))
+        # One paint: mounting row by row shows the list half built, which is the
+        # flicker you see on a window that refreshes all day.
+        with self.batch_update():
+            listing.remove_children()
+            fresh = []
+            for group in groups:
+                fresh.append(Static(group["heading"], classes="heading",
+                                    markup=False))
+                fresh.extend(Row(row, width) for row in group["rows"])
+            if not fresh:
+                fresh.append(Static(self.empty_text(), markup=False))
+            listing.mount_all(fresh)
+            self.paint_header(groups)
         # Mounting is asynchronous: focusing a widget in the same breath as
         # mounting it silently does nothing, and the cursor lands nowhere.
         self.call_after_refresh(self.restore_selection, keep)
@@ -271,8 +316,12 @@ class CcwhoUi(App):
             row = fresh.get(widget.row.get("sessionId"))
             if row is None:
                 continue
-            if row != widget.row or width != widget.width:
-                widget.row = row
+            # Compare the WORDS, not the dict: a collection re-reads every
+            # field, and most of them - a pid, a timestamp, a byte offset -
+            # never reach the screen. Comparing dicts rewrote every row three
+            # times a second for nothing.
+            widget.row = row
+            if widget.words(width) != widget.painted or width != widget.width:
                 widget.refresh_text(width)
         self.mark_selected()
 
@@ -284,31 +333,32 @@ class CcwhoUi(App):
         return "  No Claude Code sessions running.  o = restore the last save"
 
     def paint_header(self, groups):
-        if not self.alive():
+        header, banner = self.part("#header"), self.part("#banner")
+        if header is None or banner is None:
             return
         counts = " · ".join(f"{len(g['rows'])} {g['heading'].split()[0].lower()}"
                             for g in groups)
         stale = f"  (stale {self.fleet.at})" if self.fleet.error else ""
-        self.query_one("#header").update(
+        header.update(
             f"{len(self.fleet.rows)} sessions" + (f": {counts}" if counts else "")
             + stale + ("  " + self.status if self.status else ""))
-        self.query_one("#banner").update(self.fleet.error or "")
-        self.query_one("#banner").display = bool(self.fleet.error)
+        banner.update(self.fleet.error or "")
+        banner.display = bool(self.fleet.error)
 
     def paint_detail(self):
         row = self.selected_row()
-        if not row or not self.alive():
+        detail, brief_box = self.part("#detail"), self.part("#brief")
+        if not row or detail is None or brief_box is None or self.part("#list") is None:
             return
         b = self.collector.brief(row)
         # color=True and then from_ansi: the brief already knows which words are
         # labels and which are the answer. Asking for plain text and drawing it
         # all the same way threw that away and made the pane a wall of white.
         brief = engine.render_brief(self.collector.brief(row), row, color=True)
-        self.query_one("#brief").update(Text.from_ansi(brief, no_wrap=False))
-        detail = self.query_one("#detail")
+        brief_box.update(Text.from_ansi(brief, no_wrap=False))
         detail.display = True
         detail.set_class(self.size.width < engine.UI_WIDE, "full")
-        self.query_one("#list").display = self.size.width >= engine.UI_WIDE
+        self.part("#list").display = self.size.width >= engine.UI_WIDE
 
     # --------------------------------------------------------------- selection
 
@@ -326,10 +376,22 @@ class CcwhoUi(App):
         # A pure read. It used to record whatever had focus, which meant focus
         # WANDERING - and it wanders the moment the list is hidden behind a
         # narrow detail - silently moved the selection to another session.
-        for row in self.fleet.rows:
+        #
+        # In SCREEN order, and only rows that are on screen. The snapshot is not
+        # in screen order - the screen groups by what each session needs - so
+        # falling back to the snapshot's first row sent Enter to a session
+        # further down the list than the one under the highlight. A session the
+        # search has hidden cannot be the target either.
+        rows = self.visible_rows()
+        for row in rows:
             if row.get("sessionId") == self.selected:
                 return row
-        return self.fleet.rows[0] if self.fleet.rows else None
+        return rows[0] if rows else None
+
+    def visible_rows(self):
+        """Every row on screen, in the order the screen puts them."""
+        return [row for group in self.fleet.groups(self.filter_text)
+                for row in group["rows"]]
 
     def selected_id(self):
         row = self.selected_row()
@@ -342,8 +404,8 @@ class CcwhoUi(App):
         rows = self.rows_on_screen()
         if not rows:
             return
-        box = self.query_one("#search")
-        if box.display and self.focused is box:
+        box = self.part("#search")
+        if box is not None and box.display and self.focused is box:
             return        # you are typing: every keystroke rebuilds the list, and
                           # taking focus back would eat the rest of the word
         for widget in rows:
@@ -376,12 +438,27 @@ class CcwhoUi(App):
         across two resizes). A width comparison costs nothing and cannot be
         missed.
         """
-        if self.size.width == self.painted_width or not self.alive():
+        if self.size.width == self.painted_width:
             return
         self.painted_width = self.size.width
         self.rebuild()
         if self.detail_open:
             self.paint_detail()
+
+    @on(events.Click)
+    def clicked(self, event):
+        """One click picks the session AND goes to it. Reaching for the mouse to
+        highlight a row and then for the keyboard to act on it is two gestures
+        for one decision."""
+        widget = getattr(event, "widget", None)
+        while widget is not None and not isinstance(widget, Row):
+            widget = widget.parent
+        if widget is None:
+            return
+        self.selected = widget.row.get("sessionId", "")
+        self.mark_selected()
+        widget.focus()
+        self.action_go()
 
     @on(events.DescendantFocus)
     def followed_focus(self, event):
@@ -404,8 +481,17 @@ class CcwhoUi(App):
         rows = self.rows_on_screen()
         if not rows:
             return
-        here = next((i for i, w in enumerate(rows) if w is self.focused), -1)
-        rows[max(0, min(len(rows) - 1, here + step))].focus()
+        here = next((i for i, w in enumerate(rows)
+                     if w.row.get("sessionId") == self.selected), -1)
+        widget = rows[max(0, min(len(rows) - 1, here + step))]
+        widget.focus()
+        self.selected = widget.row.get("sessionId", "")
+        self.mark_selected()
+        # or the selection walks off the bottom of a list too long to show
+        # No scroll_visible: focus() scrolls the widget into view by itself,
+        # and a line that cannot fail is a line nobody can test.
+        if self.detail_open:
+            self.paint_detail()
 
     def action_detail(self):
         self.detail_open = True
@@ -452,7 +538,11 @@ class CcwhoUi(App):
         row = self.selected_row()
         if not row:
             return
-        self.status = f"going to {engine.brief.short_id(row.get('sessionId', ''))}..."
+        # Name it the way you picked it. "going to daf9..." is not something
+        # you can check against the window that comes forward; the title is.
+        name = (row.get("tab_title") or row.get("title") or row.get("name") or "")
+        self.status = (f"going to {engine.brief.short_id(row.get('sessionId', ''))}"
+                       f" {engine.truncate(name, 40)}...")
         self.paint_header(self.fleet.groups(self.filter_text))
         self.go_to(row)
 
@@ -461,9 +551,20 @@ class CcwhoUi(App):
         """Also off the UI thread: osascript is another program, and a hung
         iTerm2 must not take the list with it."""
         result = self.adapter.focus(row, deadline=FOCUS_DEADLINE)
-        self.call_from_thread(self.said, result)
+        self.call_from_thread(self.said, result, row)
 
-    def said(self, text):
+    def said(self, text, row=None):
+        """What happened, in the words you chose the session by.
+
+        "focused s022" cannot be checked against the window that came forward.
+        Anything the jump did NOT expect - not found, or landed somewhere else -
+        passes through as it is, because that is the part worth reading.
+        """
+        if row is not None and text.startswith("focused"):
+            name = (row.get("tab_title") or row.get("title")
+                    or row.get("name") or "")
+            text = (f"went to {engine.brief.short_id(row.get('sessionId', ''))}"
+                    f"  {engine.truncate(name, 40)}")
         self.status = text
         self.paint_header(self.fleet.groups(self.filter_text))
 

@@ -445,3 +445,186 @@ class TestRefreshRate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestComingBackFromTheDetailKeepsTheSearch(UiTest):
+    """Reported from real use: search, open the detail, press left - and the
+    search was gone, so you were back at the whole fleet instead of the three
+    rows you had narrowed it to."""
+
+    async def test_left_closes_the_detail_and_leaves_the_search_alone(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            app.query_one("#search").value = "queue"
+            await pilot.pause()
+            await pilot.press("enter")               # out of the box, into the list
+            await pilot.pause()
+            await pilot.press("right")               # the brief
+            await pilot.pause()
+            self.assertTrue(app.detail_open)
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertFalse(app.detail_open, "left closes the detail first")
+            self.assertEqual(app.filter_text, "queue", "and the search survives it")
+
+    async def test_a_second_left_then_clears_the_search(self):        # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            app.query_one("#search").value = "queue"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(app.filter_text, "")
+
+
+class TestTheScreenDoesNotFlash(UiTest):
+    """Every collection tore the list down and built it again - three times a
+    second's worth of flicker on a window that sits open all day. A refresh that
+    changes nothing must change nothing on screen."""
+
+    async def test_an_unchanged_fleet_does_not_rebuild_the_list(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = list(app.query(ui.Row))
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            after = list(app.query(ui.Row))
+            self.assertEqual([id(w) for w in before], [id(w) for w in after],
+                             "the same rows, not new widgets in their place")
+
+    async def test_a_changed_recap_is_written_into_the_row_that_is_there(self):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = list(app.query(ui.Row))
+            changed = dict(LIVE, recap="now it says something else")
+            collector.fleet_value = ui.Fleet([changed, BUSY], True, "12:01:00")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("something else", self.screen_text(app))
+            self.assertEqual([id(w) for w in before],
+                             [id(w) for w in app.query(ui.Row)])
+
+    async def test_a_session_that_appears_does_rebuild(self):          # control
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = len(list(app.query(ui.Row)))
+            collector.fleet_value = ui.Fleet(
+                [LIVE, BUSY, row("cccc3333-0000-4000-8000-000000000003")],
+                True, "12:01:00")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(len(list(app.query(ui.Row))), before + 1)
+
+
+class TestYouCanSeeWhichRowYouAreOn(UiTest):
+    async def test_the_selected_row_is_marked_in_the_text_not_only_by_colour(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rows = list(app.query(ui.Row))
+            self.assertTrue(rows)
+            picked = [w for w in rows if w.has_class("selected")]
+            self.assertEqual(len(picked), 1, "exactly one row is the selected one")
+            self.assertIs(picked[0], app.focused)
+
+    async def test_moving_moves_the_mark(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            first = [w for w in app.query(ui.Row) if w.has_class("selected")][0]
+            await pilot.press("down")
+            await pilot.pause()
+            second = [w for w in app.query(ui.Row) if w.has_class("selected")][0]
+            self.assertIsNot(first, second)
+            self.assertFalse(first.has_class("selected"))
+
+
+class TestColourCarriesOneMeaning(UiTest):
+    async def test_a_row_is_drawn_from_the_parts_the_engine_named(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            widget = list(app.query(ui.Row))[0]
+            styles = {style for _, style in widget.spans()}
+            self.assertIn("recap", styles, "the recap is drawn as the recap")
+            self.assertIn("mark", styles)
+
+    async def test_the_state_is_in_the_mark_and_not_over_the_whole_row(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for widget in app.query(ui.Row):
+                painted = [role for _, role in widget.spans()
+                           if role in ("mark",)]
+                self.assertEqual(len(painted), 1, widget.row.get("sessionId"))
+
+    def test_every_role_the_engine_names_has_a_style(self):
+        import ccwho_engine as engine
+        for role in engine.UI_ROLES:
+            self.assertIn(role, ui.ROLE_STYLE, role)
+        for name in set(engine.UI_STATE_STYLE.values()):
+            self.assertIn(name, ui.STATE_STYLE, name)
+
+
+class TestTheBriefIsNotAWallOfWhite(UiTest):
+    """render_brief already marks its labels dim and its title bold. The screen
+    was asking it for plain text and then drawing every word the same."""
+
+    async def test_the_detail_is_drawn_with_the_structure_the_brief_has(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            content = app.query_one("#brief").content
+            styles = {str(s.style) for s in getattr(content, "spans", [])}
+            self.assertGreater(len(styles), 1,
+                               "labels, values and the title cannot all look the same")
+            self.assertNotIn("\x1b", str(content), "no escape codes as text")
+
+    async def test_the_words_are_all_there(self):                     # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            shown = str(app.query_one("#brief").content)
+            for word in ("Issue 362", "rebase and land", "claude --resume"):
+                self.assertIn(word, shown)
+
+
+class TestNothingPaintsIntoAScreenThatIsGone(UiTest):
+    """The width poll runs on a timer. On the way out - q, or the hotkey window
+    closing - the widgets go before the timer stops, and a paint then raises
+    NoMatches out of a callback nobody is waiting on."""
+
+    async def test_a_tick_after_the_widgets_are_gone_is_not_a_crash(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.query_one("#list").remove()
+            await pilot.pause()
+            app.painted_width = 0          # force the poll to act
+            app.check_width()              # must not raise
+            app.rebuild()
+            app.paint_detail()

@@ -34,8 +34,27 @@ from textual.app import App, ComposeResult                         # noqa: E402
 from textual.binding import Binding                                # noqa: E402
 from textual.containers import Horizontal, VerticalScroll          # noqa: E402
 from textual.widgets import Footer, Input, Static                  # noqa: E402
+from rich.text import Text                                         # noqa: E402
 
 import ccwho_engine as engine                                      # noqa: E402
+
+# What each part of a row is drawn as. The engine says what a part IS; only this
+# table says what that looks like, and it is deliberately short: the first screen
+# painted whole rows by state, three states shared one colour, and the result was
+# a wall of orange that was harder to read than plain text and told you nothing.
+ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYLE
+              "id": "dim",
+              "project": "bold",
+              "name": "",              # plain: this is the thing you are reading
+              "meta": "dim",
+              "age": "bold",           # inside a dim line, the age stands out
+              "recap": "dim",
+              "pad": ""}
+
+# Three states, three colours, used on one glyph per row and on its heading.
+STATE_STYLE = {"needs": "bold #e5a50a",    # amber: this one is waiting for you
+               "busy": "#33d17a",          # green: it is working
+               "quiet": "dim"}             # grey: nothing is happening
 
 REFRESH_VISIBLE = 3.0
 REFRESH_HIDDEN = 60.0          # the hotkey window is hidden most of the day
@@ -56,20 +75,38 @@ class Fleet:
 
 
 class Row(Static):
-    """One session: what it is, and what it is about."""
+    """One session: what it is, and what it is about.
+
+    The text is built from the parts the engine names, each drawn by its role.
+    No markup is parsed: a session title containing [brackets] is a title, not
+    a style, and the only way to be sure of that is never to parse it.
+    """
 
     def __init__(self, row, width):
         self.row = row
-        super().__init__(self._text(width), markup=False)
+        self.width = width
+        # NOT _render: Widget._render is Textual's own, and overriding it with a
+        # different signature breaks every paint. Same trap as self.query.
+        super().__init__(self._as_text(width), markup=False)
         self.can_focus = True
-        self.add_class("row", row.get("attention", "idle"))
+        self.add_class("row")
 
-    def _text(self, width):
-        first, second = engine.ui_row_lines(self.row, width=max(40, width - 4))
-        return f"{first}\n{second}"
+    def spans(self):
+        """(text, role) for every part on both lines - what the tests read."""
+        first, second = engine.ui_row_cells(self.row, width=max(40, self.width - 4))
+        return list(first) + [("\n", "pad")] + list(second)
+
+    def _as_text(self, width):
+        self.width = width
+        state = STATE_STYLE.get(engine.ui_state_style(self.row), "")
+        text = Text(no_wrap=True, overflow="crop")
+        for part, role in self.spans():
+            text.append(part, style=state if role == "mark"
+                        else ROLE_STYLE.get(role, ""))
+        return text
 
     def refresh_text(self, width):
-        self.update(self._text(width))
+        self.update(self._as_text(width))
 
 
 class CcwhoUi(App):
@@ -84,13 +121,11 @@ class CcwhoUi(App):
     #detail { width: 38%; border-left: solid $panel; padding: 0 1; }
     #detail.full { width: 1fr; border-left: none; }
     #search { height: 3; }
-    .row { height: 2; padding: 0 1; }
-    .row:focus { background: $boost; }
-    .blocked, .waiting { color: $warning; text-style: bold; }
-    .asks { color: $secondary; text-style: bold; }
-    .stopped { color: $warning; }
-    .busy, .running { color: $accent; }
-    .heading { color: $text-muted; text-style: bold; padding: 1 1 0 1; }
+    .row { height: 2; padding: 0 1; border-left: blank; }
+    /* The selected row is a block of colour with a bar down its left edge, not
+       a shade of the background: on a dark terminal $boost was invisible. */
+    .row.selected { background: $primary 60%; border-left: thick $accent; }
+    .heading { color: $accent; text-style: bold; padding: 1 1 0 1; }
     """
 
     BINDINGS = [
@@ -115,6 +150,7 @@ class CcwhoUi(App):
         self.status = "collecting..."
         self.started = self.shown = 0
         self.painted_width = 0
+        self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
 
     # ------------------------------------------------------------------ layout
@@ -175,13 +211,46 @@ class CcwhoUi(App):
 
     # ---------------------------------------------------------------- painting
 
+    def list_width(self):
+        return self.size.width - (int(self.size.width * 0.38) if self.detail_open
+                                  and self.size.width >= engine.UI_WIDE else 0)
+
+    @staticmethod
+    def shape_of(groups, width):
+        """Which rows are on screen, in which order, under which headings.
+
+        Everything else - a new recap, a changed age - is text inside a row that
+        is already there. Tearing the list down for THAT is what made the window
+        flicker three times a second all day.
+        """
+        return (width, tuple((g["heading"],
+                              tuple(r.get("sessionId") for r in g["rows"]))
+                             for g in groups))
+
+    def alive(self):
+        """Is there still a screen to paint into? On the way out the widgets go
+        before the timers stop, and a paint then raises out of a callback that
+        nobody is waiting on."""
+        try:
+            self.query_one("#list")
+        except Exception:
+            return False
+        return True
+
     def rebuild(self):
+        if not self.alive():
+            return
         listing = self.query_one("#list")
+        width = self.list_width()
+        groups = self.fleet.groups(self.filter_text)
+        shape = self.shape_of(groups, width)
+        if shape == self.painted_shape and listing.children:
+            self.repaint_rows(groups, width)
+            self.paint_header(groups)
+            return
+        self.painted_shape = shape
         keep = self.selected_id()
         listing.remove_children()
-        width = self.size.width - (int(self.size.width * 0.38) if self.detail_open
-                                   and self.size.width >= engine.UI_WIDE else 0)
-        groups = self.fleet.groups(self.filter_text)
         for group in groups:
             listing.mount(Static(group["heading"], classes="heading", markup=False))
             for row in group["rows"]:
@@ -195,6 +264,18 @@ class CcwhoUi(App):
         if self.detail_open:
             self.call_after_refresh(self.paint_detail)
 
+    def repaint_rows(self, groups, width):
+        """Same rows, newer words: write them into the widgets that are there."""
+        fresh = {r.get("sessionId"): r for g in groups for r in g["rows"]}
+        for widget in self.query(Row):
+            row = fresh.get(widget.row.get("sessionId"))
+            if row is None:
+                continue
+            if row != widget.row or width != widget.width:
+                widget.row = row
+                widget.refresh_text(width)
+        self.mark_selected()
+
     def empty_text(self):
         if self.filter_text:
             return f"  no session matches {self.filter_text!r} - esc to clear"
@@ -203,6 +284,8 @@ class CcwhoUi(App):
         return "  No Claude Code sessions running.  o = restore the last save"
 
     def paint_header(self, groups):
+        if not self.alive():
+            return
         counts = " · ".join(f"{len(g['rows'])} {g['heading'].split()[0].lower()}"
                             for g in groups)
         stale = f"  (stale {self.fleet.at})" if self.fleet.error else ""
@@ -214,10 +297,14 @@ class CcwhoUi(App):
 
     def paint_detail(self):
         row = self.selected_row()
-        if not row:
+        if not row or not self.alive():
             return
         b = self.collector.brief(row)
-        self.query_one("#brief").update(engine.render_brief(b, row, color=False))
+        # color=True and then from_ansi: the brief already knows which words are
+        # labels and which are the answer. Asking for plain text and drawing it
+        # all the same way threw that away and made the pane a wall of white.
+        brief = engine.render_brief(self.collector.brief(row), row, color=True)
+        self.query_one("#brief").update(Text.from_ansi(brief, no_wrap=False))
         detail = self.query_one("#detail")
         detail.display = True
         detail.set_class(self.size.width < engine.UI_WIDE, "full")
@@ -263,9 +350,19 @@ class CcwhoUi(App):
             if widget.row.get("sessionId") == session_id:
                 widget.focus()
                 self.selected = session_id
+                self.mark_selected()
                 return
         rows[0].focus()
         self.selected = rows[0].row.get("sessionId", "")
+        self.mark_selected()
+
+    def mark_selected(self):
+        """One row carries the class the stylesheet paints. Focus alone is not
+        enough: the list can be hidden behind a narrow detail, and focus then
+        belongs to something else entirely."""
+        for widget in self.rows_on_screen():
+            widget.set_class(widget.row.get("sessionId") == self.selected,
+                             "selected")
 
     # ----------------------------------------------------------------- actions
 
@@ -279,7 +376,7 @@ class CcwhoUi(App):
         across two resizes). A width comparison costs nothing and cannot be
         missed.
         """
-        if self.size.width == self.painted_width:
+        if self.size.width == self.painted_width or not self.alive():
             return
         self.painted_width = self.size.width
         self.rebuild()
@@ -293,6 +390,7 @@ class CcwhoUi(App):
         widget = getattr(event, "widget", None)
         if isinstance(widget, Row) and self.query_one("#list").display:
             self.selected = widget.row.get("sessionId", "")
+            self.mark_selected()
             if self.detail_open:
                 self.paint_detail()      # the brief always shows what Enter acts on
 
@@ -314,6 +412,14 @@ class CcwhoUi(App):
         self.paint_detail()
 
     def action_back(self):
+        # The detail goes first. Coming back from a brief you opened FROM a
+        # search must land you in that search, not in the whole fleet again.
+        if self.detail_open:
+            self.detail_open = False
+            self.query_one("#detail").display = False
+            self.query_one("#list").display = True
+            self.call_after_refresh(self.restore_selection)
+            return
         box = self.query_one("#search")
         if box.display:
             # an open search box keeps focus and eats j, k and q as text, so
@@ -333,10 +439,6 @@ class CcwhoUi(App):
             self.query_one("#search").value = ""
             self.query_one("#search").display = False
             self.rebuild()
-            return
-        self.detail_open = False
-        self.query_one("#detail").display = False
-        self.query_one("#list").display = True
 
     def action_search(self):
         box = self.query_one("#search")

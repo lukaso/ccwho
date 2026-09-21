@@ -601,8 +601,13 @@ class CcwhoUi(App):
         self.set_timer(AFTER_A_JUMP, self.look_again)
 
     def look_again(self):
-        """A fresh look that the usual wait cannot hold up."""
-        self.collector.last = 0.0
+        """A fresh look that the usual wait cannot hold up.
+
+        It counts as the last look, rather than resetting the clock to zero: a
+        zero clock made the very next tick collect all over again, so every jump
+        cost two full scans a second apart.
+        """
+        self.collector.mark()
         self.collect()
 
     @work(thread=True)
@@ -651,6 +656,11 @@ class Collector:
         self.cache = {}
         self.last = 0.0
         self.reload_error = ""
+
+    def mark(self, now=None):
+        """This moment counts as the last look."""
+        import time
+        self.last = time.time() if now is None else now
 
     def due(self, visible, now=None):
         import time

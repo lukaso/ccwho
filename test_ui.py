@@ -48,6 +48,11 @@ class FakeCollector:
     def due(self, visible, now=None):
         return True
 
+    last = 0.0
+
+    def mark(self, now=None):
+        self.last = now or 1.0
+
     reloads = 0
 
     def reload(self):
@@ -889,25 +894,46 @@ class TestTheJumpSaysWhereItLanded(unittest.TestCase):
     it selects, and says so when it is not what was asked for."""
 
     def script(self):
+        """The CODE, with the comments stripped out.
+
+        The first version of this read the whole file, and every order it
+        checked was satisfied by the prose above the code - the comment
+        explaining `select s` sits before the line that does it, so the test
+        passed with the calls in either order. A mutant caught that.
+        """
         import os
         with open(os.path.join(os.path.dirname(os.path.abspath(ui.__file__)),
                                "jump.applescript")) as fh:
-            return fh.read()
+            lines = [line.split("--")[0] for line in fh]
+        return "\n".join(line for line in lines if line.strip())
 
-    def test_it_selects_the_pane_before_the_tab_and_the_window(self):
-        # Measured on a real fleet: sixteen sessions in three windows, one tab
-        # each, up to eight PANES in a tab. Selecting the tab alone leaves you
-        # looking at whichever pane was last active in it.
+    def test_the_comments_are_not_what_is_being_tested(self):         # control
+        self.assertNotIn("select s", "-- only `select s` picks the pane"
+                         .split("--")[0])
+
+    def test_it_ends_on_the_pane(self):
+        # Measured on a real fleet: eleven PANES in a single tab. Selecting the
+        # tab alone leaves you looking at whichever pane was last active in it.
         body = self.script()
-        self.assertLess(body.index("select s"), body.index("select t"))
-        self.assertLess(body.index("select t"), body.index("select w"))
+        self.assertLess(body.index("select t"), body.index("select s"))
+
+    def test_it_never_holds_a_window_by_its_position(self):
+        # `repeat with w in windows` yields "window 3 of ...", and the first
+        # select reorders the windows - so that reference then means a
+        # DIFFERENT window. Everything after the search goes by id.
+        body = self.script()
+        self.assertIn("set winId to id of w", body)
+        self.assertIn("tell window id winId", body)
+        self.assertNotIn("select w\n", body + "\n")
+        self.assertNotIn("index of w to 1", body)
 
     def test_it_raises_the_window_it_chose(self):
         # Activating raises every window the app has, so the chosen one has to
         # be put at the front explicitly, or another window ends up on top.
         body = self.script()
-        self.assertLess(body.index("select w"), body.index("activate"))
-        self.assertIn("set index of w to 1", body)
+        self.assertLess(body.index("select window id winId"),
+                        body.index("activate"))
+        self.assertIn("set index of window id winId to 1", body)
 
     def test_it_compares_what_is_in_front_with_what_was_asked_for(self):
         body = self.script()
@@ -1062,3 +1088,38 @@ class TestTheWindowSaysWhatItIs(UiTest):
 
     def test_the_name_is_not_the_interpreter(self):                   # control
         self.assertNotIn("python", ui.WINDOW_NAME.lower())
+
+
+class TestALookAfterAJumpIsOneLook(UiTest):
+    """The look after a jump set the refresh clock to zero and then collected,
+    so the very next tick saw a zero clock and collected all over again - two
+    full scans, a second apart, every time you opened a session."""
+
+    def setUp(self):
+        self.real_wait = ui.AFTER_A_JUMP
+        ui.AFTER_A_JUMP = 0.05
+        self.addCleanup(setattr, ui, "AFTER_A_JUMP", self.real_wait)
+
+    async def test_the_tick_after_it_does_not_collect_again(self):
+        collector = ui.Collector()          # the real one: its clock is the point
+        collector.fleet = lambda: ui.Fleet([LIVE, BUSY], True, "12:00:00")
+        collector.brief = lambda row: {}
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await asyncio.sleep(0.2)        # the look after the jump
+            await pilot.pause()
+            self.assertFalse(collector.due(True),
+                             "that look counts as the last one")
+
+    async def test_it_still_looks_when_the_wait_is_over(self):        # control
+        collector = ui.Collector()
+        collector.fleet = lambda: ui.Fleet([LIVE, BUSY], True, "12:00:00")
+        collector.brief = lambda row: {}
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            collector.last = 0.0
+            self.assertTrue(collector.due(True))

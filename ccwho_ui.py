@@ -56,8 +56,14 @@ STATE_STYLE = {"needs": "bold #e5a50a",    # amber: this one is waiting for you
                "busy": "#33d17a",          # green: it is working
                "quiet": "dim"}             # grey: nothing is happening
 
-REFRESH_VISIBLE = 3.0
-REFRESH_HIDDEN = 60.0          # the hotkey window is hidden most of the day
+# A warm refresh costs about half a second (measured: 0.50s wall, 0.48s of child
+# CPU over 16 sessions - ps, iTerm2 and the transcripts). At three seconds that
+# is a fifth of a core, all day, for a panel that sits open. So the list
+# refreshes every five, and the moments that MATTER get their own look: when you
+# come back to it, and right after you answer a session.
+REFRESH_VISIBLE = 5.0
+REFRESH_HIDDEN = 60.0          # nobody is looking: the terminal said so
+AFTER_A_JUMP = 2.0             # long enough for the session to notice you
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
 
 
@@ -228,6 +234,21 @@ class CcwhoUi(App):
     def looked_away(self):
         self.watched = False
 
+    @on(events.Key)
+    def touched(self):
+        """Any key is proof that you are here.
+
+        The slow cadence is armed by the terminal saying it lost focus. A
+        terminal can fail to say it got focus back - and the list would then sit
+        five seconds of work behind a minute of waiting while you looked at it.
+        """
+        self.wake()
+
+    def wake(self):
+        self.watched = True
+        if self.collector.due(True):
+            self.collect()
+
     @on(events.AppFocus)
     def looked_back(self):
         """Straight back to work: a list you have just looked at must not be
@@ -338,10 +359,13 @@ class CcwhoUi(App):
             return
         counts = " · ".join(f"{len(g['rows'])} {g['heading'].split()[0].lower()}"
                             for g in groups)
-        stale = f"  (stale {self.fleet.at})" if self.fleet.error else ""
+        # Always say when this was true. Without it, a list that has stopped
+        # refreshing and a fleet where nothing is happening look identical -
+        # and the first thing anyone asks is "is this thing updating?".
+        when = f"  {self.fleet.at}" + ("  (stale)" if self.fleet.error else "")
         header.update(
             f"{len(self.fleet.rows)} sessions" + (f": {counts}" if counts else "")
-            + stale + ("  " + self.status if self.status else ""))
+            + when + ("  " + self.status if self.status else ""))
         banner.update(self.fleet.error or "")
         banner.display = bool(self.fleet.error)
 
@@ -458,6 +482,7 @@ class CcwhoUi(App):
         self.selected = widget.row.get("sessionId", "")
         self.mark_selected()
         widget.focus()
+        self.watched = True          # a click is proof that you are here
         self.action_go()
 
     @on(events.DescendantFocus)
@@ -545,6 +570,15 @@ class CcwhoUi(App):
                        f" {engine.truncate(name, 40)}...")
         self.paint_header(self.fleet.groups(self.filter_text))
         self.go_to(row)
+        # The session you just opened is about to stop needing you. Look again
+        # shortly, rather than scanning everything more often for the sake of
+        # the one row that is about to change.
+        self.set_timer(AFTER_A_JUMP, self.look_again)
+
+    def look_again(self):
+        """A fresh look that the usual wait cannot hold up."""
+        self.collector.last = 0.0
+        self.collect()
 
     @work(thread=True)
     def go_to(self, row):

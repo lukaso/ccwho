@@ -894,11 +894,20 @@ class TestTheJumpSaysWhereItLanded(unittest.TestCase):
                                "jump.applescript")) as fh:
             return fh.read()
 
-    def test_it_activates_before_it_selects(self):
+    def test_it_selects_the_pane_before_the_tab_and_the_window(self):
+        # Measured on a real fleet: sixteen sessions in three windows, one tab
+        # each, up to eight PANES in a tab. Selecting the tab alone leaves you
+        # looking at whichever pane was last active in it.
         body = self.script()
-        self.assertLess(body.index("activate"), body.index("select w"),
-                        "activating raises windows, which would undo a selection"
-                        " made before it")
+        self.assertLess(body.index("select s"), body.index("select t"))
+        self.assertLess(body.index("select t"), body.index("select w"))
+
+    def test_it_raises_the_window_it_chose(self):
+        # Activating raises every window the app has, so the chosen one has to
+        # be put at the front explicitly, or another window ends up on top.
+        body = self.script()
+        self.assertLess(body.index("select w"), body.index("activate"))
+        self.assertIn("set index of w to 1", body)
 
     def test_it_compares_what_is_in_front_with_what_was_asked_for(self):
         body = self.script()
@@ -923,3 +932,113 @@ class TestTheStatusSaysWhichSessionItWent(UiTest):
             header = str(app.query_one("#header").content)
             self.assertIn("Issue 362", header,
                           "say which session, in the words you picked it by")
+
+
+class TestYouCanSeeWhenItLastLooked(UiTest):
+    """"The list is not updating" should be answerable by looking at it. The
+    time of the snapshot was shown only when something had gone wrong, so a
+    frozen list and a quiet fleet looked exactly the same."""
+
+    async def test_the_header_says_when_the_snapshot_was_taken(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIn("12:00:00", str(app.query_one("#header").content))
+
+    async def test_a_newer_snapshot_shows_its_own_time(self):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            collector.fleet_value = ui.Fleet([LIVE, BUSY], True, "12:00:30")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("12:00:30", str(app.query_one("#header").content))
+
+
+class TestItChecksAgainRightAfterYouAnswerOne(UiTest):
+    """Your words: when you open one that needs you, check THAT soon rather
+    than scanning everything all the time. The moment you jump to a session is
+    the moment its state is about to change - it stops needing you."""
+
+    def setUp(self):
+        # The real wait is two seconds; the behaviour under test is "it looks
+        # again", not how long it waits.
+        self.real_wait = ui.AFTER_A_JUMP
+        ui.AFTER_A_JUMP = 0.05
+        self.addCleanup(setattr, ui, "AFTER_A_JUMP", self.real_wait)
+
+    async def test_a_jump_schedules_another_look_soon(self):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = collector.calls
+            await pilot.press("enter")
+            await pilot.pause()
+            await asyncio.sleep(0.2)
+            await pilot.pause()
+            self.assertGreater(collector.calls, before,
+                               "the session you just opened no longer needs you")
+
+    async def test_the_look_is_not_blocked_by_the_usual_wait(self):
+        # due() would say "not yet" for another few seconds; answering a session
+        # is new information, not a tick.
+        collector = FakeCollector()
+        collector.due = lambda visible, now=None: False
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = collector.calls
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertGreater(collector.calls, before)
+
+
+class TestTouchingItMeansYouAreWatching(UiTest):
+    """The refresh slows down when the terminal says it lost focus. If that
+    message never comes back - and a focus report is a thing terminals can miss
+    - the list would stay slow while you sat looking at it. Any key you press
+    is proof that you are here."""
+
+    async def test_a_keypress_counts_as_being_here(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            self.assertFalse(app.watched)
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertTrue(app.watched, "you are clearly looking at it")
+
+    async def test_and_it_looks_again_straight_away(self):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            collector.last = 0.0                 # the snapshot is old
+            before = collector.calls
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertGreater(collector.calls, before)
+
+    async def test_it_does_not_collect_on_every_keystroke(self):      # control
+        import time
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            collector.last = time.time()         # just collected
+            collector.due = lambda visible, now=None: False
+            before = collector.calls
+            for _ in range(5):
+                await pilot.press("down")
+                await pilot.press("up")
+            await pilot.pause()
+            self.assertEqual(collector.calls, before)

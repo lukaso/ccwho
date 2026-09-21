@@ -22,9 +22,11 @@ import time
 import traceback
 
 import ccwho_engine as engine
+import ccwho_setup as setup
 
 CLEAR_HOME = "\033[H\033[2J"
 DIM, RESET, RED = "\033[2m", "\033[0m", "\033[31m"
+AMBER = "\033[33;1m"
 
 
 def _load_beside(module):
@@ -184,6 +186,48 @@ def show(argv):
     print(engine.render_brief(b, row, color=sys.stdout.isatty()
                               and "NO_COLOR" not in os.environ))
     return 0
+
+
+def doctor(argv):
+    """What is installed, what drifted, and what to run about it.
+
+    Read-only by design. The failure this exists for - iTerm2's own status hook
+    vanishing from settings.json - was silent for weeks, and a tool that repairs
+    another tool's config without asking is how that happened in the first place.
+    """
+    checks = setup.doctor_checks(setup.gather(ccwho_dir=ccwho_dir()))
+    if "--json" in argv:
+        print(json.dumps({"ok": setup.doctor_verdict(checks) == 0,
+                          "checks": checks}, indent=2))
+        return setup.doctor_verdict(checks)
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    for c in checks:
+        mark = "ok  " if c["ok"] else "BAD "
+        if color:
+            mark = ("\033[32mok  \033[0m" if c["ok"] else "\033[33;1mBAD \033[0m")
+        print(f"{mark}{c['name']:<20} {c['detail']}")
+        if c["fix"]:
+            print(f"    {DIM}fix:{RESET} {c['fix']}" if color else f"    fix: {c['fix']}")
+    rc = setup.doctor_verdict(checks)
+    print("\neverything ccwho depends on is in place." if rc == 0
+          else "\nrun the fixes above, then `ccwho doctor` again.")
+    return rc
+
+
+# Drift happens over weeks, not seconds, and each check is a subprocess. A watch
+# that re-ran them every tick would spend more time diagnosing than listing.
+DOCTOR_TTL = 300.0
+
+
+def doctor_banner_cached(state, now=None):
+    """One line for the watch header when something drifted, at most every
+    DOCTOR_TTL. Empty when everything ccwho needs is in place."""
+    now = time.time() if now is None else now
+    ts, line = state.get("_doctor", (None, ""))
+    if ts is None or now - ts >= DOCTOR_TTL:
+        line = setup.doctor_banner(setup.doctor_checks(setup.gather(ccwho_dir=ccwho_dir())))
+        state["_doctor"] = (now, line)
+    return line
 
 
 KEEP_LOG_LINES = int(os.environ.get("CCWHO_KEEP_LOG_LINES", "1000"))
@@ -701,6 +745,8 @@ def main(argv=None):
         return rc
     if argv and argv[0] == "restore":
         return restore(argv[1:])
+    if argv and argv[0] == "doctor":
+        return doctor(argv[1:])
     if argv and argv[0] == "show":
         return show(argv[1:])
     if argv and argv[0] == "open":
@@ -716,6 +762,7 @@ def main(argv=None):
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
         print("       ccwho show <anything>                      what that session was working on")
+        print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")
@@ -760,6 +807,11 @@ def main(argv=None):
             banner = ""
             if state["engine_error"]:
                 banner = f"{RED if color else ''}engine reload failed: {state['engine_error']}{RESET if color else ''}\n"
+            drift = doctor_banner_cached(state)
+            if drift:
+                # The failure this whole tool is about was silent. A watch that
+                # can see something drifted and says nothing repeats it.
+                banner += f"{AMBER if color else ''}⚠ {drift}{RESET if color else ''}\n"
             footer = (f"{DIM if color else ''}tick {state['ticks']} · every {interval:g}s · "
                       f"{time.strftime('%H:%M:%S')} · ctrl-c to stop{RESET if color else ''}\n")
             saved = ""

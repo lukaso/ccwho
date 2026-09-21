@@ -1222,3 +1222,109 @@ class TestShowVerb(unittest.TestCase):
         got = json.loads(out)
         self.assertEqual(got["aka"]["short_id"], "6c4c")
         self.assertIn("memory bloat", got["recap"])
+
+
+class TestDoctorVerb(unittest.TestCase):
+    """`ccwho doctor` reports; it never repairs. Every line says what was checked
+    and, when it is wrong, the command to run."""
+
+    def setUp(self):
+        self.real_gather = runner.setup.gather
+        self.facts = {"claude": "/usr/local/bin/claude", "iterm_ok": True,
+                      "handler_registered": True, "launchd_loaded": True,
+                      "last_run_age": 300.0, "newest_manifest_age": 300.0,
+                      "cc_status_hook": True,
+                      "settings_path": "/Users/x/.claude/settings.json"}
+        runner.setup.gather = lambda **kw: dict(self.facts)
+
+    def tearDown(self):
+        runner.setup.gather = self.real_gather
+
+    def _doctor(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.doctor(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_healthy_machine_exits_zero_and_says_so(self):
+        rc, out = self._doctor()
+        self.assertEqual(rc, 0)
+        self.assertIn("claude", out)
+        self.assertIn("ok", out.lower())
+
+    def test_a_fault_exits_one_and_prints_the_command_to_run(self):
+        self.facts["handler_registered"] = False
+        rc, out = self._doctor()
+        self.assertEqual(rc, 1)
+        self.assertIn("install-handler.sh", out)
+
+    def test_it_repairs_nothing(self):
+        self.facts["cc_status_hook"] = False
+        real_run = runner.subprocess.run
+        runs = []
+        runner.subprocess.run = lambda *a, **k: runs.append(a) or None
+        try:
+            self._doctor()
+        finally:
+            runner.subprocess.run = real_run
+        self.assertEqual(runs, [], "R1 doctor writes nothing and runs nothing")
+
+    def test_json_for_a_status_line(self):
+        rc, out = self._doctor("--json")
+        got = json.loads(out)
+        self.assertTrue(all("name" in c and "ok" in c for c in got["checks"]))
+        self.assertEqual(got["ok"], True)
+
+
+class TestWatchShowsTheWorstFault(unittest.TestCase):
+    def test_the_header_carries_one_banner_line(self):
+        checks = runner.setup.doctor_checks(
+            {"claude": "", "iterm_ok": True, "handler_registered": True,
+             "launchd_loaded": True, "last_run_age": 10.0,
+             "newest_manifest_age": 10.0, "cc_status_hook": True,
+             "settings_path": "/x"})
+        line = runner.setup.doctor_banner(checks)
+        self.assertIn("ccwho doctor", line)
+        self.assertEqual(line.count("\n"), 0, "a header has room for one line")
+
+
+class TestWatchBannerIsCheap(unittest.TestCase):
+    """The watch header should say when something drifted, but the checks shell
+    out to launchctl, osascript and plutil. At a 5s tick that is three processes
+    a second for an answer that changes about once a month."""
+
+    def setUp(self):
+        self.calls = []
+        self.real = runner.setup.gather
+        runner.setup.gather = lambda **kw: self.calls.append(1) or {
+            "claude": "", "iterm_ok": True, "handler_registered": True,
+            "launchd_loaded": True, "last_run_age": 10.0,
+            "newest_manifest_age": 10.0, "cc_status_hook": True,
+            "settings_path": "/x"}
+
+    def tearDown(self):
+        runner.setup.gather = self.real
+
+    def test_the_banner_names_the_fault(self):
+        state = {}
+        self.assertIn("claude", runner.doctor_banner_cached(state, now=1000.0))
+
+    def test_it_does_not_re_check_every_tick(self):
+        state = {}
+        for t in range(0, 20, 5):        # four ticks of a 5s watch
+            runner.doctor_banner_cached(state, now=1000.0 + t)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_it_re_checks_eventually(self):
+        state = {}
+        runner.doctor_banner_cached(state, now=1000.0)
+        runner.doctor_banner_cached(state, now=1000.0 + runner.DOCTOR_TTL + 1)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_healthy_machine_shows_nothing(self):
+        runner.setup.gather = lambda **kw: {
+            "claude": "/bin/claude", "iterm_ok": True, "handler_registered": True,
+            "launchd_loaded": True, "last_run_age": 10.0,
+            "newest_manifest_age": 10.0, "cc_status_hook": True,
+            "settings_path": "/x"}
+        self.assertEqual(runner.doctor_banner_cached({}, now=1000.0), "")

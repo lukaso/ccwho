@@ -1533,6 +1533,9 @@ class TestPlainCcwhoOpensTheUi(unittest.TestCase):
 
     def test_without_uv_it_says_what_to_install(self):
         real_which = runner.shutil.which
+        real_exists = runner.os.path.exists
+        runner.os.path.exists = lambda p: False      # nor in the usual places
+        self.addCleanup(setattr, runner.os.path, "exists", real_exists)
         runner.shutil.which = lambda name: None
         try:
             rc, out = self._main([], tty=True)
@@ -2021,3 +2024,78 @@ class TestSetupInstallsForTheUserRunningIt(SetupHarness):
             self.assertEqual(runner.setup_home(), os.path.expanduser("~"))
         finally:
             os.environ[runner.TEST_HOME_VAR] = self.home
+
+
+class TestTheListStartsFromAWindowWithNoPath(unittest.TestCase):
+    """A hotkey window inherits iTerm2's environment, and iTerm2 was started by
+    the Dock: PATH is /usr/bin:/bin:/usr/sbin:/sbin and nothing else. uv lives in
+    none of those. The window then ran ccwho, ccwho said "install uv", and the
+    window closed before anyone could read it - iTerm2 reports only "a session
+    ended very soon after starting"."""
+
+    def setUp(self):
+        self.real_which = runner.shutil.which
+        self.real_exists = runner.os.path.exists
+        self.addCleanup(setattr, runner.shutil, "which", self.real_which)
+        self.addCleanup(setattr, runner.os.path, "exists", self.real_exists)
+
+    def only(self, *paths):
+        runner.shutil.which = lambda n: ""
+        runner.os.path.exists = lambda p: p in paths
+
+    def test_uv_on_path_is_used_as_it_always_was(self):               # control
+        runner.shutil.which = lambda n: "/opt/homebrew/bin/uv" if n == "uv" else ""
+        self.assertEqual(runner.find_uv(), "/opt/homebrew/bin/uv")
+
+    def test_homebrew_is_found_with_no_path_at_all(self):
+        self.only("/opt/homebrew/bin/uv")
+        self.assertEqual(runner.find_uv(), "/opt/homebrew/bin/uv")
+
+    def test_every_place_uv_installs_itself_is_looked_at(self):
+        for p in ("/usr/local/bin/uv",
+                  os.path.expanduser("~/.local/bin/uv"),
+                  os.path.expanduser("~/.cargo/bin/uv")):
+            self.only(p)
+            self.assertEqual(runner.find_uv(), p)
+
+    def test_no_uv_anywhere_is_still_nothing(self):
+        self.only()
+        self.assertEqual(runner.find_uv(), "")
+
+
+class TestAHotkeyWindowNeverDiesWithTheReasonUnread(unittest.TestCase):
+    def setUp(self):
+        self.real_ui = runner.run_ui
+        self.addCleanup(setattr, runner, "run_ui", self.real_ui)
+        self.waited = []
+        self.real_wait = runner.wait_for_a_key
+        runner.wait_for_a_key = lambda: self.waited.append(True)
+        self.addCleanup(setattr, runner, "wait_for_a_key", self.real_wait)
+
+    def run_hotkey(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = runner.main(["hotkey"])
+        return rc, out.getvalue()
+
+    def test_a_list_that_cannot_start_holds_the_window_open(self):
+        runner.run_ui = lambda: 1
+        rc, out = self.run_hotkey()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.waited, [True],
+                         "otherwise the window closes and iTerm2 says only that"
+                         " a session ended very soon after starting")
+
+    def test_a_list_that_runs_does_not_hold_anything_open(self):      # control
+        runner.run_ui = lambda: 0
+        rc, _ = self.run_hotkey()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.waited, [])
+
+    def test_the_profile_that_gets_installed_runs_that_verb(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        runner.install_hotkey(home, runner.setup.DEFAULT_HOTKEY, prove=False)
+        with open(runner.setup.profile_path(home)) as fh:
+            command = json.load(fh)["Profiles"][0]["Command"]
+        self.assertTrue(command.endswith(" hotkey"), command)

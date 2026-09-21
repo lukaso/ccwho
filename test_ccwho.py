@@ -1200,18 +1200,28 @@ class TestSessionSourceAvailability(MachinelessCollect):
         super().setUp()
         self.real_which = ccwho.shutil.which
         self.real_run = ccwho.subprocess.run
+        self.real_exists = ccwho.os.path.exists
 
     def tearDown(self):
         super().tearDown()
         ccwho.shutil.which = self.real_which
         ccwho.subprocess.run = self.real_run
+        ccwho.os.path.exists = self.real_exists
+
+    def nowhere(self):
+        """claude is not on PATH AND not where it installs itself. Stubbing
+        only which() stopped being the whole failure when ccwho started looking
+        in ~/.local/bin - a window with no login shell has no PATH worth the
+        name, and that is exactly where claude lives."""
+        ccwho.shutil.which = lambda name: None
+        ccwho.os.path.exists = lambda p: False
 
     class _Done:
         def __init__(self, rc, out):
             self.returncode, self.stdout = rc, out
 
     def test_binary_missing_is_none_not_empty_list(self):
-        ccwho.shutil.which = lambda name: None
+        self.nowhere()
         self.assertIsNone(ccwho.agents_json())
 
     def test_nonzero_exit_is_none(self):
@@ -1234,7 +1244,7 @@ class TestSessionSourceAvailability(MachinelessCollect):
         self.assertEqual(ccwho.agents_json(), "[]")
 
     def test_collect_reports_the_source_to_its_caller(self):
-        ccwho.shutil.which = lambda name: None
+        self.nowhere()
         st = {}
         ccwho.collect(cache={}, status=st)
         self.assertIs(st.get("source_ok"), False)
@@ -1815,3 +1825,125 @@ class TestTheViewModelBehindTheUi(unittest.TestCase):
 
     def test_an_empty_search_is_everything(self):          # control
         self.assertEqual(len(ccwho.ui_filter(self.rows(), "")), 4)
+
+
+class TestFindingTheToolsWhenThereIsNoPath(unittest.TestCase):
+    """Three times now the same fault: a process with no login shell has
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin. A launchd job gets that, and so does a
+    window opened by a global hotkey, because iTerm2 was started by the Dock.
+    `claude` and `uv` live in none of those directories, and the failure looks
+    like an empty fleet or a window that closes on its own."""
+
+    def setUp(self):
+        self.real_which = ccwho.shutil.which
+        self.real_exists = ccwho.os.path.exists
+        self.addCleanup(setattr, ccwho.shutil, "which", self.real_which)
+        self.addCleanup(setattr, ccwho.os.path, "exists", self.real_exists)
+
+    def only(self, *paths):
+        ccwho.shutil.which = lambda n: ""
+        ccwho.os.path.exists = lambda p: p in paths
+
+    def test_path_is_still_asked_first(self):                        # control
+        ccwho.shutil.which = lambda n: "/somewhere/odd/" + n
+        self.assertEqual(ccwho.find_tool("claude"), "/somewhere/odd/claude")
+
+    def test_claude_is_found_with_no_path_at_all(self):
+        self.only(os.path.expanduser("~/.local/bin/claude"))
+        self.assertEqual(ccwho.find_tool("claude"),
+                         os.path.expanduser("~/.local/bin/claude"))
+
+    def test_homebrew_counts_too(self):
+        self.only("/opt/homebrew/bin/claude")
+        self.assertEqual(ccwho.find_tool("claude"), "/opt/homebrew/bin/claude")
+
+    def test_a_tool_that_is_not_here_is_still_nothing(self):
+        self.only()
+        self.assertEqual(ccwho.find_tool("claude"), "")
+
+    def test_the_session_list_is_read_from_a_window_with_no_path(self):
+        self.only(os.path.expanduser("~/.local/bin/claude"))
+        ran = []
+
+        class Done:
+            returncode = 0
+            stdout = "[]"
+
+        real_run = ccwho.subprocess.run
+        ccwho.subprocess.run = lambda cmd, **k: ran.append(cmd) or Done()
+        try:
+            self.assertEqual(ccwho.agents_json(), "[]")
+        finally:
+            ccwho.subprocess.run = real_run
+        self.assertEqual(ran[0][0], os.path.expanduser("~/.local/bin/claude"),
+                         "called by its full path, not by a name PATH cannot resolve")
+
+    def test_no_claude_anywhere_is_still_None_not_an_empty_fleet(self):
+        self.only()
+        self.assertIsNone(ccwho.agents_json(),
+                          "nothing to ask is not the same as nothing open")
+
+
+class TestWhatIsColouredAndWhatIsNot(unittest.TestCase):
+    """The first screen was a wall of orange: state was painted over whole rows,
+    and three of the four states used the same colour, so the colour told you
+    nothing and the text was harder to read than plain text would have been.
+
+    A row is now plain text with ONE coloured mark, and the recap under it is
+    subordinate. The decision lives here, where it can be tested without a
+    terminal; the UI only maps a role to a style.
+    """
+
+    def cells(self, **row):
+        base = {"sessionId": "abcd1234", "project": "liveapp", "tab_title": "fix the queue",
+                "attention": "stopped", "since": "6m", "tty": "ttys024",
+                "recap": "the admission queue is released", "recap_age": "3h",
+                "turns_since_recap": 4}
+        base.update(row)
+        return ccwho.ui_row_cells(base, width=100)
+
+    def roles(self, line):
+        return [role for _, role in line]
+
+    def test_a_row_is_two_lines_of_parts(self):
+        first, second = self.cells()
+        self.assertTrue(first and second)
+        for text, role in list(first) + list(second):
+            self.assertIsInstance(text, str)
+            self.assertIn(role, ccwho.UI_ROLES, role)
+
+    def test_the_words_are_exactly_the_line_they_replace(self):       # control
+        row = {"sessionId": "abcd1234", "project": "liveapp",
+               "tab_title": "fix the queue", "attention": "stopped",
+               "since": "6m", "tty": "ttys024", "recap": "released", "recap_age": "3h"}
+        first, second = ccwho.ui_row_cells(row, width=100)
+        self.assertEqual(("".join(t for t, _ in first),
+                          "".join(t for t, _ in second)),
+                         ccwho.ui_row_lines(row, width=100))
+
+    def test_only_the_mark_carries_the_state(self):
+        first, _ = self.cells(attention="waiting")
+        marks = [t for t, role in first if role == "mark"]
+        self.assertEqual(len(marks), 1)
+        # everything else is ordinary text, not another colour to decode
+        self.assertNotIn("state", self.roles(first))
+
+    def test_the_whole_second_line_is_subordinate(self):
+        _, second = self.cells()
+        self.assertEqual(set(self.roles(second)) - {"pad"}, {"age", "recap"},
+                         "the recap reads as context, and its age stands out in it")
+
+    def test_a_session_that_needs_you_is_marked_differently_from_one_that_does_not(self):
+        need = [t for t, r in self.cells(attention="waiting")[0] if r == "mark"]
+        idle = [t for t, r in self.cells(attention="stopped")[0] if r == "mark"]
+        self.assertNotEqual(need, idle)
+
+    def test_every_state_has_a_mark_and_a_style(self):
+        for _, states in ccwho.UI_GROUPS:
+            for state in states:
+                self.assertIn(state, ccwho.UI_STATE_MARK, state)
+                self.assertIn(state, ccwho.UI_STATE_STYLE, state)
+
+    def test_a_state_nobody_planned_for_still_draws(self):
+        first, _ = self.cells(attention="something-new")
+        self.assertEqual(len([t for t, r in first if r == "mark"]), 1)

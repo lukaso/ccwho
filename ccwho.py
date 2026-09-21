@@ -219,12 +219,44 @@ def show(argv):
 UI_RESTART = 42             # what ccwho_ui exits with when you press R
 
 
+def find_uv():
+    """uv on PATH, or wherever it installed itself. "" when it is not here.
+
+    A hotkey window has iTerm2's environment, and iTerm2 was started by the
+    Dock: no homebrew on PATH, so `uv` is not found, the list never starts, and
+    the window closes reporting nothing.
+    """
+    return engine.find_tool("uv")
+
+
+def wait_for_a_key():
+    """Hold a window open so the line above can be read."""
+    try:
+        input("\npress return to close this window ")
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
+
+def hotkey_window(argv):
+    """The list, started by the hotkey rather than by you.
+
+    The difference that matters: nobody typed this, so nobody is watching a
+    shell prompt afterwards. If the list cannot start, the window would close
+    with the reason unread, and iTerm2 would report only "a session ended very
+    soon after starting" - which is what it did.
+    """
+    rc = run_ui()
+    if rc:
+        wait_for_a_key()
+    return rc
+
+
 def run_ui():
     """Hand over to the TUI. uv fetches Textual from the script's own header, so
     there is no virtualenv to make - but if uv is missing, say that in one line
     rather than dying in an import."""
     ui = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ccwho_ui.py")
-    uv = shutil.which("uv")
+    uv = find_uv()
     if not uv:
         print("ccwho: the live list needs uv (it fetches Textual for you):",
               file=sys.stderr)
@@ -295,7 +327,7 @@ def setup_cmd(argv):
                   " (setup puts it there itself)", file=sys.stderr)
             return 2
         setup.write_proof(ccwho_dir(), nonce)
-        return run_ui()
+        return hotkey_window([])       # a proof window dies as silently as any
 
     yes = "--yes" in argv or "-y" in argv
     home = setup_home()
@@ -307,7 +339,9 @@ def setup_cmd(argv):
 
     facts = setup.gather(ccwho_dir=ccwho_dir())
     facts["uv"] = shutil.which("uv") or ""
-    facts["hotkey_installed"] = setup.hotkey_installed(home)
+    facts["hotkey_installed"] = setup.hotkey_current(
+        home, setup.hotkey_profile(setup.window_command(ccwho_bin()),
+                                   hotkey=hotkey))
     # "Installed" is not "working": a job whose ccwho moved loads, runs, finds
     # nothing and exits 0, and an applet can claim ccwho:// while calling a copy
     # that was deleted. Both read as done unless we look.
@@ -354,6 +388,10 @@ def setup_cmd(argv):
         pass
     elif facts["hotkey_installed"] and not asked_for_a_key:
         print(f"hotkey {setup.HOTKEYS[hotkey]['label']} was already installed")
+    elif setup.hotkey_installed(home, hotkey) and not asked_for_a_key:
+        # The key itself is unchanged and already proved: only the profile's
+        # settings moved on. Rewrite it, and do not make anyone press anything.
+        install_hotkey(home, hotkey, prove=False, iterm_ok=facts.get("iterm_ok"))
     else:
         rc = install_hotkey(home, hotkey, prove=not yes and facts.get("iterm_ok"),
                             iterm_ok=facts.get("iterm_ok"))
@@ -421,7 +459,7 @@ def render_autosave(home):
     if not template:
         return None
     return setup.render_plist(template, home=home, ccwho=ccwho_bin(),
-                              claude=shutil.which("claude") or "",
+                              claude=engine.find_tool("claude"),
                               python=job_python())
 
 
@@ -437,7 +475,7 @@ def install_autosave(home):
         print("ccwho setup: cannot read the autosave template beside ccwho.py",
               file=sys.stderr)
         return 1
-    claude = shutil.which("claude") or ""
+    claude = engine.find_tool("claude")
     problems = setup.plist_problems(body, home=home, claude=claude)
     if problems:
         print("ccwho setup: the autosave job was not installed:", file=sys.stderr)
@@ -523,7 +561,8 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0):
         write_atomic(path, json.dumps({"Profiles": keep + doc["Profiles"]},
                                       indent=2))
 
-    plain = setup.hotkey_profile(ccwho_bin(), hotkey=hotkey)
+    plain = setup.hotkey_profile(setup.window_command(ccwho_bin()),
+                                 hotkey=hotkey)
     if not prove:
         write(plain)
         print(f"hotkey {key['label']} installed"
@@ -1204,6 +1243,8 @@ def main(argv=None):
         return doctor(argv[1:])
     if argv and argv[0] == "setup":
         return setup_cmd(argv[1:])
+    if argv and argv[0] == "hotkey":
+        return hotkey_window(argv[1:])
     if argv and argv[0] == "show":
         return show(argv[1:])
     if argv and argv[0] == "open":

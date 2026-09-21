@@ -29,6 +29,8 @@ import time
 import uuid
 import xml.sax.saxutils
 
+import ccwho_engine as engine
+
 # The launchd timer is 15 minutes. Two windows of grace before calling it stale:
 # StartInterval only fires while the Mac is awake, so one skipped window is normal.
 AUTOSAVE_STALE_AFTER = 31 * 60
@@ -128,7 +130,9 @@ def doctor_banner(results):
 
 def gather(ccwho_dir=None, settings_path=None, now=None):
     return {
-        "claude": shutil.which("claude") or "",
+        # not shutil.which: a hotkey window and a launchd job both run without
+        # a login shell, and `claude` is not on the PATH either of them gets.
+        "claude": engine.find_tool("claude"),
         "iterm_ok": iterm_scriptable(),
         "handler_registered": handler_registered(),
         "launchd_loaded": launchd_loaded(),
@@ -385,6 +389,16 @@ HOTKEYS = {
 DEFAULT_HOTKEY = "option-slash"
 
 
+# The window runs `ccwho hotkey`, not `ccwho`: started by a key rather than by
+# a person, it has to hold itself open long enough to show what went wrong.
+HOTKEY_VERB = "hotkey"
+
+
+def window_command(ccwho):
+    """What the hotkey window runs once the key is proved."""
+    return f"{shlex.quote(ccwho)} {HOTKEY_VERB}"
+
+
 def hotkey_profile(command, hotkey=DEFAULT_HOTKEY, name=PROFILE_NAME,
                    guid=PROFILE_GUID):
     """A Dynamic Profile iTerm2 loads by itself - no preferences to edit.
@@ -408,7 +422,9 @@ def hotkey_profile(command, hotkey=DEFAULT_HOTKEY, name=PROFILE_NAME,
         "HotKey Window Floats": True,          # over whatever you were reading
         "HotKey Window AutoHides": True,       # and gone again when you leave
         "HotKey Window Animates": False,
-        "HotKey Window Reopens On Activation": True,
+        # False: the list appears because you pressed the key, never
+        # because iTerm2 happened to come to the front.
+        "HotKey Window Reopens On Activation": False,
         "Prevent Opening in a Tab": True,      # never swallowed by a window
         "Space": -1,                           # all spaces, or useless on space 2
         "Screen": -1,                          # wherever the cursor is
@@ -420,6 +436,30 @@ def profile_path(home=None):
     home = home or os.path.expanduser("~")
     return os.path.join(home, "Library", "Application Support", "iTerm2",
                         "DynamicProfiles", "ccwho.json")
+
+
+def hotkey_current(home, wanted):
+    """Is OUR profile on this machine the one we would write today?
+
+    Same rule as the autosave job: "it is installed" is not "it works the way
+    this version means it to". Without this, a settings change never reaches a
+    machine that ran setup once - the profile has our Guid and a hotkey, so it
+    reads as done for ever.
+    """
+    mine = _our_profile(profile_path(home))
+    return bool(mine) and mine == wanted["Profiles"][0]
+
+
+def _our_profile(path):
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    for p in doc.get("Profiles", []):
+        if p.get("Guid") == PROFILE_GUID:
+            return p
+    return None
 
 
 def hotkey_installed(home=None, hotkey=None):

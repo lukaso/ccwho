@@ -6,6 +6,7 @@ that is the half that has to be right.
 
 python3 -m unittest test_setup -v
 """
+import json
 import os
 import shutil
 import subprocess
@@ -360,9 +361,17 @@ class TestTheHotkeyProfile(unittest.TestCase):
         self.assertEqual(a, b)
 
     def test_it_runs_the_command_it_was_given_and_not_a_login_shell(self):
-        p = self.profile(command="/Users/sam/.local/bin/ccwho")
-        self.assertEqual(p["Command"], "/Users/sam/.local/bin/ccwho")
+        p = self.profile(command="/Users/sam/.local/bin/ccwho hotkey")
+        self.assertEqual(p["Command"], "/Users/sam/.local/bin/ccwho hotkey")
         self.assertEqual(p["Custom Command"], "Yes")
+
+    def test_the_window_command_names_the_verb_that_holds_it_open(self):
+        self.assertEqual(setup.window_command("/Users/sam/bin/ccwho"),
+                         "/Users/sam/bin/ccwho hotkey")
+
+    def test_a_path_with_a_space_is_quoted_for_the_window(self):
+        self.assertEqual(setup.window_command("/Users/sam/my tools/ccwho"),
+                         "'/Users/sam/my tools/ccwho' hotkey")
 
     def test_option_slash_is_the_default_and_carries_every_hotkey_key(self):
         p = self.profile()
@@ -380,6 +389,16 @@ class TestTheHotkeyProfile(unittest.TestCase):
     def test_an_unknown_key_is_refused_not_silently_dropped(self):
         with self.assertRaises(KeyError):
             self.profile(hotkey="option-banana")
+
+    def test_it_does_not_reappear_just_because_you_switched_to_iterm(self):
+        # Reopens On Activation means the list pops up whenever iTerm2 comes to
+        # the front for any reason - a window you did not ask for, over the work
+        # you did ask for. The key is how you open it.
+        self.assertFalse(self.profile()["HotKey Window Reopens On Activation"])
+
+    def test_it_hides_itself_when_you_leave_it(self):
+        self.assertTrue(self.profile()["HotKey Window AutoHides"],
+                        "press the key, read it, carry on: it gets out of the way")
 
     def test_the_window_comes_back_over_whatever_you_are_in(self):
         p = self.profile()
@@ -693,3 +712,79 @@ class TestTheHandlerInstallerKeepsWhatWorks(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(setup.handler_target(source), odd,
                          "an AppleScript literal, escaped and read back whole")
+
+
+class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
+    """doctor and setup both read the `claude` fact. A window opened by the
+    hotkey, and a launchd job, both run with PATH=/usr/bin:/bin:/usr/sbin:/sbin,
+    where claude is not - and then doctor says "not on PATH: no session list at
+    all" about a machine where ccwho works perfectly."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for name, answer in (("iterm_scriptable", True),
+                             ("handler_registered", True),
+                             ("launchd_loaded", True),
+                             ("cc_status_hook", True)):
+            self.addCleanup(setattr, setup, name, getattr(setup, name))
+            setattr(setup, name, lambda *a, **k: answer)
+        self.addCleanup(setattr, setup.shutil, "which", setup.shutil.which)
+        setup.shutil.which = lambda n: ""          # nothing on PATH at all
+
+    def test_claude_is_found_where_it_installs_itself(self):
+        real = setup.engine.find_tool
+        self.addCleanup(setattr, setup.engine, "find_tool", real)
+        setup.engine.find_tool = lambda n: "/Users/sam/.local/bin/" + n
+        self.assertEqual(setup.gather(ccwho_dir=self.tmp)["claude"],
+                         "/Users/sam/.local/bin/claude")
+
+    def test_a_machine_without_claude_still_reports_none(self):       # control
+        real = setup.engine.find_tool
+        self.addCleanup(setattr, setup.engine, "find_tool", real)
+        setup.engine.find_tool = lambda n: ""
+        self.assertEqual(setup.gather(ccwho_dir=self.tmp)["claude"], "")
+
+
+class TestAnInstalledProfileIsNotNecessarilyTheRightProfile(unittest.TestCase):
+    """The same lesson as the launchd job, one layer up: "there is a profile
+    with our Guid and a hotkey on it" is not "the profile we would write now".
+    A settings change would otherwise never reach a machine that already ran
+    setup once."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.path = setup.profile_path(self.home)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+    def write(self, doc):
+        with open(self.path, "w") as fh:
+            json.dump(doc, fh)
+
+    def current(self, command="/x/ccwho hotkey"):
+        return setup.hotkey_profile(command)
+
+    def test_the_profile_we_would_write_matches_itself(self):          # control
+        self.write(self.current())
+        self.assertTrue(setup.hotkey_current(self.home, self.current()))
+
+    def test_one_changed_setting_is_not_current(self):
+        stale = self.current()
+        stale["Profiles"][0]["HotKey Window Reopens On Activation"] = True
+        self.write(stale)
+        self.assertFalse(setup.hotkey_current(self.home, self.current()))
+
+    def test_a_profile_running_another_command_is_not_current(self):
+        self.write(self.current(command="/somewhere/else/ccwho hotkey"))
+        self.assertFalse(setup.hotkey_current(self.home, self.current()))
+
+    def test_no_profile_at_all_is_not_current(self):
+        self.assertFalse(setup.hotkey_current(self.home, self.current()))
+
+    def test_other_profiles_beside_ours_do_not_matter(self):
+        doc = self.current()
+        doc["Profiles"].insert(0, {"Guid": "someone-elses", "Name": "theirs"})
+        self.write(doc)
+        self.assertTrue(setup.hotkey_current(self.home, self.current()),
+                        "we compare ours, not the file")

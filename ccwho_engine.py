@@ -797,6 +797,28 @@ def ps_snapshot():
         return ""
 
 
+# Where the tools ccwho shells out to actually live. A process with no login
+# shell - a launchd job, or a window opened by a global hotkey, because iTerm2
+# itself was started by the Dock - has PATH=/usr/bin:/bin:/usr/sbin:/sbin, and
+# none of these are in it. The symptom is never "command not found": it is an
+# empty fleet, or a window that closes before you can read why.
+TOOL_PLACES = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",
+               "~/.cargo/bin", "~/bin")
+
+
+def find_tool(name):
+    """A tool's full path: PATH first, then where it installs itself. "" when
+    it is not on this machine at all."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for place in TOOL_PLACES:
+        candidate = os.path.join(os.path.expanduser(place), name)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
 def agents_json():
     """The live session list as JSON text, or None when the SOURCE is unavailable.
 
@@ -806,7 +828,7 @@ def agents_json():
     a non-zero exit, a timeout. Returning "[]" for both is how a save writes
     "you had nothing open" over the record of what you did.
     """
-    exe = shutil.which("claude")
+    exe = find_tool("claude")
     if not exe:
         return None
     try:
@@ -1209,9 +1231,32 @@ def ui_groups(rows):
     return out
 
 
-def ui_row_lines(row, width=100):
-    """The two lines a session gets: what it is, and what it is about.
+# One mark per row, and one place that says which. Painting a whole row by its
+# state made three of the four states the same colour over most of the screen:
+# the colour stopped meaning anything and the text got harder to read. The mark
+# carries the state; the words stay plain.
+UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲",
+                 "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
+                 "busy": "●", "running": "●"}
+UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
+                  "stopped": "quiet", "ready": "quiet", "shell": "quiet",
+                  "idle": "quiet", "busy": "busy", "running": "busy"}
+UI_UNKNOWN_MARK = "·"
 
+# What a part of a row IS, so the screen can decide how to draw it. The engine
+# never names a colour: a terminal's palette is not its business.
+UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad")
+
+
+def ui_state_style(row):
+    """The one word the screen needs about this row's state."""
+    return UI_STATE_STYLE.get(row.get("attention", ""), "quiet")
+
+
+def ui_row_cells(row, width=100):
+    """The two lines a session gets, in parts, each part saying what it is.
+
+    Line one is what the session IS: a mark for its state, then plain text.
     Line two is the recap - the harness's own summary, which is the only line
     written to answer "what was this about" - never without its age. No recap
     yet, and it says so and shows the last thing the session did instead.
@@ -1221,8 +1266,12 @@ def ui_row_lines(row, width=100):
     tail = f" · {row.get('since', '')}"
     if row.get("tty"):
         tail += f" · {short_tty(row['tty'])}"
+    glyph = UI_STATE_MARK.get(row.get("attention", ""), UI_UNKNOWN_MARK) + " "
     head = f"{sid}  {row.get('project', '?')[:12]}  "
-    first = head + truncate(name, max(8, width - visible_len(head) - visible_len(tail))) + tail
+    room = max(8, width - visible_len(glyph) - visible_len(head) - visible_len(tail))
+    first = [(glyph, "mark"), (f"{sid}  ", "id"),
+             (f"{row.get('project', '?')[:12]}  ", "project"),
+             (truncate(name, room), "name"), (tail, "meta")]
 
     # The age goes FIRST. At the end of a long recap it is the first thing
     # truncation eats, and a recap whose age you cannot see reads as the current
@@ -1236,8 +1285,28 @@ def ui_row_lines(row, width=100):
         mark = ""
         body = "(no recap yet) " + (row.get("doing") or "")
     pad = "        "
-    second = pad + mark + truncate(body, max(8, width - len(pad) - visible_len(mark)))
-    return (truncate(first, width), truncate(second, width))
+    second = [(pad, "pad"), (mark, "age"),
+              (truncate(body, max(8, width - len(pad) - visible_len(mark))), "recap")]
+    return (_fit(first, width), _fit(second, width))
+
+
+def _fit(cells, width):
+    """Drop what does not fit, so a part is never half drawn."""
+    out, room = [], width
+    for text, role in cells:
+        if room <= 0:
+            break
+        if visible_len(text) > room:
+            text = truncate(text, room)
+        out.append((text, role))
+        room -= visible_len(text)
+    return out
+
+
+def ui_row_lines(row, width=100):
+    """The same two lines as plain text, for anything that cannot draw styles."""
+    return tuple("".join(text for text, _ in line)
+                 for line in ui_row_cells(row, width=width))
 
 
 _UI_SEARCHED = ("tab_title", "title", "name", "project", "recap", "doing", "ask",

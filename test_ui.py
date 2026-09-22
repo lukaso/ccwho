@@ -739,7 +739,11 @@ class TestARebuildIsOnePaint(UiTest):
             # at the moment the rows go in.
             listing.mount_all = lambda widgets: (
                 held.append(app._batch_count) or real(widgets))
-            app.painted_shape = None          # force the full path
+            # a real build: a session that was not there before. Re-ordering
+            # the rows that ARE there no longer goes through this path.
+            app.fleet = ui.Fleet([LIVE, BUSY, row("aaaa9999-0000-4000-8000-000000009999")],
+                                 True, "12:00:02")
+            app.painted_shape = None
             app.rebuild()
             await pilot.pause()
             self.assertTrue(held, "the rebuild mounts in one go")
@@ -1260,3 +1264,144 @@ class TestTheTwoTiersLookDifferent(UiTest):
         self.assertIn(engine.UI_STATE_STYLE["review"], ui.STATE_STYLE)
         self.assertNotEqual(ui.STATE_STYLE[engine.UI_STATE_STYLE["review"]],
                             ui.STATE_STYLE[engine.UI_STATE_STYLE["blocked"]])
+
+
+class TestReorderingIsNotRebuilding(UiTest):
+    """Rows sort newest-first inside their group, so every session that writes
+    jumps to the top of its group. Measured: nine reorderings a minute on a
+    live fleet - and each one tore the list down and built it again, which is
+    the flashing that came back.
+
+    Moving a row is not the same as replacing it.
+    """
+
+    def two(self, first, second):
+        return FakeCollector(fleet=ui.Fleet([first, second], True, "12:00:00"))
+
+    async def test_the_same_rows_in_a_new_order_are_moved_not_remade(self):
+        collector = self.two(LIVE, BUSY)
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = {w.row["sessionId"]: id(w) for w in app.query(ui.Row)}
+            # same two sessions, swapped: BUSY is now the one that just spoke
+            collector.fleet_value = ui.Fleet([dict(BUSY, attention="asks"),
+                                              dict(LIVE, attention="asks")],
+                                             True, "12:00:01")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            after = {w.row["sessionId"]: id(w) for w in app.query(ui.Row)}
+            self.assertEqual(before, after, "the same widgets, moved")
+
+    async def test_and_the_order_on_screen_actually_changes(self):
+        collector = self.two(LIVE, BUSY)
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            first = [w.row["sessionId"] for w in app.query(ui.Row)]
+            collector.fleet_value = ui.Fleet([dict(BUSY, attention="asks"),
+                                              dict(LIVE, attention="asks")],
+                                             True, "12:00:01")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual([w.row["sessionId"] for w in app.query(ui.Row)],
+                             list(reversed(first)))
+
+    async def test_a_row_moving_between_groups_is_still_a_move(self):
+        collector = self.two(LIVE, BUSY)
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = {w.row["sessionId"]: id(w) for w in app.query(ui.Row)}
+            collector.fleet_value = ui.Fleet([dict(LIVE, attention="stopped"),
+                                              BUSY], True, "12:00:01")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual({w.row["sessionId"]: id(w) for w in app.query(ui.Row)},
+                             before)
+            self.assertIn("STOPPED", self.screen_text(app))
+
+    async def test_a_session_appearing_still_rebuilds(self):          # control
+        collector = self.two(LIVE, BUSY)
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = len(list(app.query(ui.Row)))
+            collector.fleet_value = ui.Fleet(
+                [LIVE, BUSY, row("ffff6666-0000-4000-8000-000000000006")],
+                True, "12:00:01")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(len(list(app.query(ui.Row))), before + 1)
+
+    async def test_the_selection_survives_a_move(self):
+        collector = self.two(LIVE, BUSY)
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.selected = BUSY["sessionId"]
+            app.mark_selected()
+            collector.fleet_value = ui.Fleet([dict(BUSY, attention="asks"),
+                                              dict(LIVE, attention="asks")],
+                                             True, "12:00:01")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            picked = [w.row["sessionId"] for w in app.query(ui.Row)
+                      if w.has_class("selected")]
+            self.assertEqual(picked, [BUSY["sessionId"]])
+
+
+class TestYouCanTellWhenYouAreSearching(UiTest):
+    """"When in search mode, it's hard to tell, so if you forget, it looks
+    broken." A list that is hiding most of itself has to say so where you are
+    already looking - the header - not only in a box at the bottom."""
+
+    async def test_the_header_says_what_is_being_hidden(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.filter_text = "Issue 362"
+            app.rebuild()
+            await pilot.pause()
+            header = str(app.query_one("#header").content)
+            self.assertIn("Issue 362", header)
+            self.assertIn("1 of 2", header, "how much you cannot see")
+            self.assertIn("esc", header.lower(), "and how to get it back")
+
+    async def test_a_search_that_finds_nothing_still_says_it(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.filter_text = "nothing matches this"
+            app.rebuild()
+            await pilot.pause()
+            header = str(app.query_one("#header").content)
+            self.assertIn("0 of 2", header)
+
+    async def test_no_search_says_nothing_about_searching(self):      # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            header = str(app.query_one("#header").content)
+            self.assertNotIn("esc", header.lower())
+            self.assertNotIn(" of ", header)
+
+    async def test_clearing_it_takes_the_notice_away(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            app.query_one("#search").value = "Issue 362"
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIn("esc to clear",
+                             str(app.query_one("#header").content).lower())

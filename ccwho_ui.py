@@ -338,6 +338,10 @@ class CcwhoUi(App):
             self.repaint_rows(groups, width)
             self.paint_header(groups)
             return
+        if self.reordered(listing, groups, width):
+            self.painted_shape = shape
+            self.paint_header(groups)
+            return
         self.painted_shape = shape
         keep = self.selected_id()
         # One paint: mounting row by row shows the list half built, which is the
@@ -358,6 +362,43 @@ class CcwhoUi(App):
         self.call_after_refresh(self.restore_selection, keep)
         if self.detail_open:
             self.call_after_refresh(self.paint_detail)
+
+    def reordered(self, listing, groups, width):
+        """Move the rows that are already there, when that is all it takes.
+
+        Rows sort newest-first inside their group, so every session that writes
+        jumps up, and a session that finishes changes group - measured at nine
+        times a minute on a live fleet. Tearing the list down for that is the
+        flashing that came back. The ROWS have not changed; where they sit has.
+
+        False when a session has arrived or left, which is a real build.
+        """
+        on_screen = {w.row.get("sessionId"): w for w in self.query(Row)}
+        want_ids = {r.get("sessionId") for g in groups for r in g["rows"]}
+        if not on_screen or want_ids != set(on_screen):
+            return False
+        spare = {str(getattr(w, "content", "")): w
+                 for w in listing.children if not isinstance(w, Row)}
+        with self.batch_update():
+            wanted = []
+            for group in groups:
+                head = spare.pop(group["heading"], None)
+                if head is None:
+                    # a group that was empty a moment ago: the heading is a
+                    # one-line Static, the rows are what must not be remade
+                    head = Static(group["heading"], classes="heading",
+                                  markup=False)
+                    listing.mount(head)
+                wanted.append(head)
+                wanted += [on_screen[r.get("sessionId")] for r in group["rows"]]
+            for leftover in spare.values():
+                leftover.remove()
+            for index, want in enumerate(wanted):
+                if index >= len(listing.children) or \
+                        list(listing.children)[index] is not want:
+                    listing.move_child(want, before=index)
+            self.repaint_rows(groups, width)
+        return True
 
     def repaint_rows(self, groups, width):
         """Same rows, newer words: write them into the widgets that are there."""
@@ -392,9 +433,16 @@ class CcwhoUi(App):
         # refreshing and a fleet where nothing is happening look identical -
         # and the first thing anyone asks is "is this thing updating?".
         when = f"  {self.fleet.at}" + ("  (stale)" if self.fleet.error else "")
+        # A list hiding most of itself has to SAY so, where you are already
+        # looking. The box at the bottom is easy to forget, and a filtered list
+        # you have forgotten about looks like a broken one.
+        shown = sum(len(g["rows"]) for g in groups)
+        searching = (f"   search {self.filter_text!r}: {shown} of "
+                     f"{len(self.fleet.rows)} · esc to clear"
+                     if self.filter_text else "")
         header.update(
             f"{len(self.fleet.rows)} sessions" + (f": {counts}" if counts else "")
-            + when + ("  " + self.status if self.status else ""))
+            + when + searching + ("  " + self.status if self.status else ""))
         banner.update(self.fleet.error or "")
         banner.display = bool(self.fleet.error)
 

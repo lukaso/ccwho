@@ -2496,6 +2496,20 @@ class TestOnlyAWindowThatIsSHOWINGItCounts(unittest.TestCase):
         self.assertEqual(ccwho.owning_tty(28087, parents, ttys, self.TITLES,
                                           commands=cmds), "ttys000")
 
+    def test_the_daemons_own_terminal_is_not_a_window_showing_it(self):
+        # Start a session with `claude --bg` from a prompt and the daemon
+        # inherits THAT terminal - which still has a window, showing your
+        # shell. Without excluding the daemon's own processes the walk stops
+        # there and jumps you to a terminal that knows nothing about it.
+        parents = {28087: 27890, 27890: 1378}
+        ttys = {28087: "ttys015", 27890: "ttys015", 1378: "ttys000"}
+        cmds = {28087: "claude bg-spare --bg-spare /tmp/x.sock",
+                27890: "claude daemon run --origin transient",
+                1378: "claude --resume"}
+        self.assertEqual(ccwho.owning_tty(28087, parents, ttys, self.TITLES,
+                                          commands=cmds), "ttys000",
+                         "the daemon's terminal shows a shell, not the session")
+
     def test_a_shell_ancestor_is_not_a_window_showing_it(self):
         # `claude --bg` from a prompt: the shell is still there, on a tty with
         # a window, and that window is showing a shell - not this session.

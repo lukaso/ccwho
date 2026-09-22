@@ -405,7 +405,10 @@ def setup_cmd(argv):
     asked_for_a_key = "--hotkey" in argv
     if "--no-hotkey" in argv:
         pass
-    elif facts["hotkey_installed"] and not asked_for_a_key:
+    elif facts["hotkey_installed"]:
+        # Already exactly what we would write - including the key asked for,
+        # because hotkey_current compares the whole profile. Rewriting it would
+        # take the hotkey away and give it back for nothing.
         print(f"hotkey {setup.HOTKEYS[hotkey]['label']} was already installed")
     elif setup.hotkey_installed(home, hotkey) and not asked_for_a_key:
         # The key itself is unchanged and already proved: only the profile's
@@ -552,6 +555,13 @@ def write_atomic(path, text):
             os.remove(tmp)
 
 
+# iTerm2 registers a hotkey when a profile APPEARS. Measured: editing the
+# profile in place left it firing on the OLD key - the file said key code 44
+# while iTerm2 still had 13 - so a changed key means taking the profile away,
+# letting iTerm2 notice, and putting it back.
+PROFILE_RELOAD_PAUSE = 1.5
+
+
 def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0):
     """Write the iTerm2 profile, and - when there is an iTerm2 to ask - make the
     user press the key before calling it done.
@@ -568,6 +578,25 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0):
     if os.path.exists(path):
         with open(path) as fh:
             before = fh.read()
+
+    def key_of(text):
+        try:
+            for p in json.loads(text or "")["Profiles"]:
+                if p.get("Guid") == setup.PROFILE_GUID:
+                    return p.get("HotKey Key Code")
+        except (ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    if before and key_of(before) not in (None, setup.HOTKEYS[hotkey]["code"]):
+        # A different key is registered. Editing the profile does not move it:
+        # the profile has to go away and come back.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        time.sleep(PROFILE_RELOAD_PAUSE)
+        before = None           # it is gone; there is nothing to put back
 
     def write(doc):
         # Ours is one profile in a file that may hold others. Replace the entry

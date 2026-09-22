@@ -2243,3 +2243,52 @@ class TestOpenGivesABackgroundSessionAWindow(unittest.TestCase):
     def test_it_says_what_it_did(self):
         _, out = self.run_open()
         self.assertIn("attach", out.lower())
+
+
+class TestChangingTheHotkeyActuallyChangesIt(SetupHarness):
+    """Measured: after `ccwho setup --hotkey option-slash`, the file on disk
+    said key code 44 and iTerm2 was still firing on key code 13 - the old key.
+    iTerm2 registers a hotkey when a profile APPEARS and does not re-register
+    when one is edited in place, so the profile has to go away and come back.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.real_pause = runner.PROFILE_RELOAD_PAUSE
+        runner.PROFILE_RELOAD_PAUSE = 0.0
+        self.addCleanup(setattr, runner, "PROFILE_RELOAD_PAUSE", self.real_pause)
+        self.events = []
+        real_remove, real_write = runner.os.remove, runner.write_atomic
+        runner.os.remove = lambda p: self.events.append(("remove", p)) or real_remove(p)
+        runner.write_atomic = lambda p, t: self.events.append(("write", p)) or \
+            real_write(p, t)
+        self.addCleanup(setattr, runner.os, "remove", real_remove)
+        self.addCleanup(setattr, runner, "write_atomic", real_write)
+
+    def profile(self):
+        return runner.setup.profile_path(self.home)
+
+    def key_code(self):
+        with open(self.profile()) as fh:
+            return json.load(fh)["Profiles"][0]["HotKey Key Code"]
+
+    def test_a_new_key_takes_the_profile_away_and_brings_it_back(self):
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-w"])
+        self.events.clear()
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        kinds = [k for k, _ in self.events]
+        self.assertIn("remove", kinds, "iTerm2 only registers a profile that appears")
+        self.assertLess(kinds.index("remove"), kinds.index("write"))
+        self.assertEqual(self.key_code(), runner.setup.HOTKEYS["option-slash"]["code"])
+
+    def test_the_same_key_twice_does_not_churn(self):                 # control
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.events.clear()
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.assertEqual([k for k, _ in self.events], [],
+                         "nothing changed: taking the hotkey away and back would"
+                         " make the window disappear for no reason")
+
+    def test_a_first_install_just_writes_it(self):                    # control
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.assertEqual([k for k, _ in self.events], ["write"])

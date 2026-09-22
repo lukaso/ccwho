@@ -1104,7 +1104,57 @@ def parent_map(ps_output):
     return out
 
 
-def owning_tty(pid, parents, ttys, titles, depth=12):
+def command_map(ps_output):
+    """pid -> command, so a window can be asked what it is showing."""
+    out = {}
+    for pid, _ppid, cmd in _ps_rows(ps_output):
+        try:
+            out[int(pid)] = cmd
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# The daemon's own processes: they run a session, they do not show one.
+_NOT_A_VIEWER = re.compile(r"\bclaude\s+(bg-spare|bg-pty-host|daemon)\b")
+
+
+def is_viewer(command, session_id=""):
+    """Is this process a terminal SHOWING a session?
+
+    `claude --resume`, `claude attach <id>`, plain `claude` - yes. The daemon
+    and its helpers run sessions without showing them, and a shell is just a
+    shell: a session started with `claude --bg` from a prompt has that shell as
+    an ancestor, and jumping to its window puts you in front of a terminal that
+    knows nothing about the session.
+    """
+    cmd = (command or "").strip()
+    if not cmd or _NOT_A_VIEWER.search(cmd):
+        return False
+    if session_id and f"attach {session_id}" in cmd:
+        return True
+    head = os.path.basename(cmd.split()[0].strip("-"))
+    return head == "claude"
+
+
+def attached_tty(session_id, ttys, commands):
+    """The terminal running `claude attach <id>`, if one is.
+
+    An attach can be anywhere - it is not an ancestor of the session it shows -
+    so it is looked for by name rather than walked to.
+    """
+    if not session_id:
+        return ""
+    for pid, cmd in (commands or {}).items():
+        if f"attach {session_id}" in (cmd or ""):
+            tty = ttys.get(pid, "")
+            if tty:
+                return tty
+    return ""
+
+
+def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
+               session_id=""):
     """The terminal a session is DISPLAYED in, which is not always its own.
 
     Measured on a session running under the Claude Code daemon:
@@ -1121,15 +1171,22 @@ def owning_tty(pid, parents, ttys, titles, depth=12):
     Without iTerm2 to ask, nothing is known about windows and the session's own
     tty stands - never a guess dressed as an answer.
     """
+    shown = attached_tty(session_id, ttys, commands)
+    if shown:
+        return shown
     seen, own = set(), ""
     while pid and pid not in seen and depth > 0:
         seen.add(pid)
         depth -= 1
         tty = ttys.get(pid, "")
         if tty:
-            own = own or tty
-            if not titles or short_tty_full(tty) in titles:
-                return tty
+            # Only a process that SHOWS the session counts. Without commands to
+            # look at, the old rule stands rather than reporting no window.
+            viewing = commands is None or is_viewer(commands.get(pid, ""), session_id)
+            if viewing:
+                own = own or tty
+                if not titles or short_tty_full(tty) in titles:
+                    return tty
         pid = parents.get(pid)
     return own
 
@@ -1337,13 +1394,14 @@ def collect(cache=None, status=None):
     orphans = attribute_orphans(ps_out, ids)
     reviewed = load_reviewed()
     rows = []
-    parents = parent_map(ps_out)
+    parents, commands = parent_map(ps_out), command_map(ps_out)
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
         # not ttys[pid]: a session served by the daemon reports a background
         # process, and the window showing it belongs to an ancestor
-        tty = owning_tty(s.get("pid"), parents, ttys, titles)
+        tty = owning_tty(s.get("pid"), parents, ttys, titles,
+                         commands=commands, session_id=sid)
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), ""),

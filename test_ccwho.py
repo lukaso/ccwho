@@ -2462,3 +2462,73 @@ class TestABackgroundSessionCanBeGivenAWindow(unittest.TestCase):
         self.assertNotIn("no window", line,
                          "'no window' reads as broken; 'background' reads as"
                          " a session you can open")
+
+
+class TestOnlyAWindowThatIsSHOWINGItCounts(unittest.TestCase):
+    """A fourth kind: background AND already attached - running under the
+    daemon with a terminal displaying it.
+
+    Measured on this machine: no process carries the session id and nothing
+    runs `claude attach`; the window at ttys000 runs `claude --resume`, and
+    that process IS the viewer - the daemon it spawned runs the session.
+
+        28087  claude bg-spare      ttys042
+        27890  claude bg-pty-host
+        27713  claude daemon run
+         1378  claude --resume      ttys000   <- the viewer
+
+    So walking up to "the first ancestor with a tty" is not enough. A session
+    started with --bg from a shell has that shell as an ancestor, and its
+    window is NOT showing the session: jumping there would put you in front of
+    a terminal that knows nothing about it.
+    """
+
+    SID = "51fddd61-822b-49e0-9aeb-2145e91e1244"
+    TITLES = {"ttys000": "a tab", "ttys015": "another tab"}
+
+    def test_a_viewer_ancestor_is_the_window(self):
+        parents = {28087: 27890, 27890: 27713, 27713: 1378, 1378: 98607}
+        ttys = {28087: "ttys042", 1378: "ttys000", 98607: "ttys000"}
+        cmds = {28087: "claude bg-spare --bg-spare /tmp/x.sock",
+                27890: "claude bg-pty-host /tmp/x.sock",
+                27713: "claude daemon run --origin transient",
+                1378: "claude --resume", 98607: "-zsh"}
+        self.assertEqual(ccwho.owning_tty(28087, parents, ttys, self.TITLES,
+                                          commands=cmds), "ttys000")
+
+    def test_a_shell_ancestor_is_not_a_window_showing_it(self):
+        # `claude --bg` from a prompt: the shell is still there, on a tty with
+        # a window, and that window is showing a shell - not this session.
+        parents = {5000: 4000, 4000: 3000}
+        ttys = {5000: "", 4000: "", 3000: "ttys015"}
+        cmds = {5000: "claude bg-spare", 4000: "claude daemon run", 3000: "-zsh"}
+        self.assertEqual(ccwho.owning_tty(5000, parents, ttys, self.TITLES,
+                                          commands=cmds), "",
+                         "no window is showing it: it wants attaching, not a jump")
+
+    def test_an_attach_process_is_the_window_wherever_it_is(self):
+        # `claude attach <id>` run in some other terminal: that IS the viewer,
+        # and it is not an ancestor of anything.
+        ttys = {7000: "ttys015"}
+        cmds = {7000: f"claude attach {self.SID}"}
+        self.assertEqual(ccwho.owning_tty(5000, {}, ttys, self.TITLES,
+                                          commands=cmds, session_id=self.SID),
+                         "ttys015")
+
+    def test_an_attach_to_a_different_session_is_not_it(self):        # control
+        ttys = {7000: "ttys015"}
+        cmds = {7000: "claude attach 9999aaaa-0000-4000-8000-000000000000"}
+        self.assertEqual(ccwho.owning_tty(5000, {}, ttys, self.TITLES,
+                                          commands=cmds, session_id=self.SID), "")
+
+    def test_an_ordinary_session_is_unaffected(self):                 # control
+        # its own process is on the tty, and is a viewer
+        self.assertEqual(ccwho.owning_tty(
+            42, {}, {42: "ttys000"}, self.TITLES,
+            commands={42: "claude --resume abc"}), "ttys000")
+
+    def test_without_commands_it_still_answers(self):                 # control
+        # ps without a command column, or a caller that has none: fall back to
+        # the old rule rather than reporting no window at all
+        self.assertEqual(ccwho.owning_tty(42, {}, {42: "ttys000"}, self.TITLES),
+                         "ttys000")

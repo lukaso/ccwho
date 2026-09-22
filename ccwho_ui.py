@@ -676,6 +676,15 @@ class CcwhoUi(App):
         name = (row.get("tab_title") or row.get("title") or row.get("name") or "")
         self.status = (f"going to {engine.brief.short_id(row.get('sessionId', ''))}"
                        f" {engine.truncate(name, 40)}...")
+        if row.get("windowed") is False:
+            # We asked iTerm2 about this tty and it had never heard of it: the
+            # session is alive with nowhere to go to - `claude bg-spare` does
+            # this. Asking iTerm2 anyway returns "not found: /dev/ttys042",
+            # which is not an answer anyone can act on.
+            self.said(f"{engine.brief.short_id(row.get('sessionId', ''))} has no"
+                      f" window - it runs in the background."
+                      f"  resume it: claude --resume {row.get('sessionId', '')}")
+            return
         self.paint_header(self.fleet.groups(self.filter_text))
         self.go_to(row)
         # The session you just opened is about to stop needing you. Look again

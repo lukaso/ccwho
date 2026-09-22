@@ -2284,3 +2284,115 @@ class TestOneTableSaysWhatAStateIsCalled(unittest.TestCase):
         out = ccwho.render(rows, 0, color=False)
         self.assertIn("FINISHED", out)
         self.assertNotIn(" review ", out)
+
+
+class TestASessionWithNoWindowSaysSo(unittest.TestCase):
+    """Clicking a session did nothing, and the reason was invisible: it runs in
+    the background - `claude bg-spare` on a tty iTerm2 has never heard of - so
+    there was no window to raise. ccwho had the evidence already (it asked
+    iTerm2 for that tty's name and got nothing back) and said none of it.
+
+    Three states, not two. iTerm2 knows the tty; iTerm2 does not know it; we
+    could not ask iTerm2 at all - and the last of those must never be reported
+    as the second, or every row says "no window" the moment iTerm2 is shut.
+    """
+
+    def test_a_tty_iterm_knows_is_windowed(self):                    # control
+        # the titles map is keyed the way iTerm2 reports a tty
+        self.assertIs(ccwho.windowed(tty="ttys024", titles={"ttys024": "a tab"}), True)
+
+    def test_a_tty_iterm_does_not_know_is_not(self):
+        self.assertIs(ccwho.windowed(tty="ttys042", titles={"ttys024": "a tab"}), False)
+
+    def test_no_titles_at_all_is_unknown_not_missing(self):
+        self.assertIsNone(ccwho.windowed(tty="ttys042", titles={}),
+                          "iTerm2 shut is not every session losing its window")
+
+    def test_no_tty_at_all_has_no_window(self):
+        self.assertIs(ccwho.windowed(tty="", titles={"ttys024": "a tab"}), False)
+
+    def test_the_row_carries_it(self):
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1},
+                              [], [], None, tty="ttys042", tab_title="",
+                              windowed=False)
+        self.assertIs(row["windowed"], False)
+
+    def test_a_row_says_it_where_you_can_see_it(self):
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1},
+                              [], [], None, tty="ttys042", tab_title="",
+                              windowed=False)
+        first, _ = ccwho.ui_row_cells(row, width=100)
+        self.assertIn("no window", "".join(t for t, _ in first))
+
+    def test_a_windowed_row_says_nothing_of_the_kind(self):           # control
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1},
+                              [], [], None, tty="ttys024", tab_title="a tab",
+                              windowed=True)
+        first, _ = ccwho.ui_row_cells(row, width=100)
+        self.assertNotIn("no window", "".join(t for t, _ in first))
+
+    def test_not_knowing_says_nothing_either(self):                   # control
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1},
+                              [], [], None, tty="ttys042", tab_title="",
+                              windowed=None)
+        first, _ = ccwho.ui_row_cells(row, width=100)
+        self.assertNotIn("no window", "".join(t for t, _ in first))
+
+
+class TestFindingTheWindowASessionIsShownIn(unittest.TestCase):
+    """Measured on this machine, on a session running under the Claude Code
+    daemon:
+
+        28087  claude bg-spare      ttys042   <- what `claude agents` reports
+        27890  claude bg-pty-host
+        27713  claude daemon run
+         1378  claude --resume      ttys000   <- the window you are looking at
+
+    The feed names a background process whose tty no window owns, while the
+    session is plainly on screen. Its ANCESTOR is the terminal it is displayed
+    in, so that is what to walk to.
+    """
+
+    PARENTS = {28087: 27890, 27890: 27713, 27713: 1378, 1378: 98607}
+    TTYS = {28087: "ttys042", 27890: "", 27713: "", 1378: "ttys000",
+            98607: "ttys000"}
+    TITLES = {"ttys000": "◑ Session discovery and management UX (claude)"}
+
+    def test_it_walks_up_to_the_terminal_that_has_a_window(self):
+        self.assertEqual(ccwho.owning_tty(28087, self.PARENTS, self.TTYS,
+                                          self.TITLES), "ttys000")
+
+    def test_a_session_in_its_own_window_is_left_alone(self):         # control
+        titles = dict(self.TITLES, ttys042="some other tab")
+        self.assertEqual(ccwho.owning_tty(28087, self.PARENTS, self.TTYS,
+                                          titles), "ttys042")
+
+    def test_no_ancestor_with_a_window_keeps_its_own_tty(self):
+        self.assertEqual(ccwho.owning_tty(28087, {28087: 27890}, self.TTYS,
+                                          self.TITLES), "ttys042",
+                         "say where it is, even when nothing can show it")
+
+    def test_iterm_unavailable_changes_nothing(self):                 # control
+        self.assertEqual(ccwho.owning_tty(28087, self.PARENTS, self.TTYS, {}),
+                         "ttys042")
+
+    def test_a_loop_in_the_tree_does_not_hang(self):
+        self.assertEqual(ccwho.owning_tty(1, {1: 2, 2: 1}, {1: "", 2: ""},
+                                          self.TITLES), "")
+
+    def test_no_pid_is_no_terminal(self):
+        self.assertEqual(ccwho.owning_tty(0, self.PARENTS, self.TTYS,
+                                          self.TITLES), "")
+
+    def test_the_parent_map_comes_out_of_ps(self):
+        out = ("  PID  PPID     ELAPSED COMMAND\n"
+               "28087 27890    01:00:00 claude bg-spare\n"
+               "27890 27713    01:00:00 claude bg-pty-host\n")
+        self.assertEqual(ccwho.parent_map(out), {28087: 27890, 27890: 27713})
+
+    def test_a_windowed_session_found_this_way_can_be_jumped_to(self):
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 28087},
+                              [], [], None, tty="ttys000",
+                              tab_title=self.TITLES["ttys000"], windowed=True)
+        self.assertIs(row["windowed"], True)
+        self.assertEqual(row["tty"], "ttys000")

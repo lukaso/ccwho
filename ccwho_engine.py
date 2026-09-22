@@ -1078,8 +1078,66 @@ def iterm_open_script(entries):
 
 # -------------------------------------------------------------------- assemble
 
+def parent_map(ps_output):
+    """pid -> ppid, from the ps output collect already takes."""
+    out = {}
+    for pid, ppid, _cmd in _ps_rows(ps_output):
+        try:
+            out[int(pid)] = int(ppid)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def owning_tty(pid, parents, ttys, titles, depth=12):
+    """The terminal a session is DISPLAYED in, which is not always its own.
+
+    Measured on a session running under the Claude Code daemon:
+
+        28087  claude bg-spare      ttys042   <- what `claude agents` reports
+        27890  claude bg-pty-host
+        27713  claude daemon run
+         1378  claude --resume      ttys000   <- the window on screen
+
+    The feed names a background process on a tty no window owns, while the
+    session is plainly in front of you. Its ancestor is the terminal showing
+    it, so walk up until a tty iTerm2 knows appears.
+
+    Without iTerm2 to ask, nothing is known about windows and the session's own
+    tty stands - never a guess dressed as an answer.
+    """
+    seen, own = set(), ""
+    while pid and pid not in seen and depth > 0:
+        seen.add(pid)
+        depth -= 1
+        tty = ttys.get(pid, "")
+        if tty:
+            own = own or tty
+            if not titles or short_tty_full(tty) in titles:
+                return tty
+        pid = parents.get(pid)
+    return own
+
+
+def windowed(tty, titles):
+    """Is there a terminal window to go to?
+
+    True, False, or None for "we could not ask". The third matters: iTerm2 shut
+    or unscriptable is not every session losing its window, and saying so would
+    put "no window" on every row at the moment the answer is least reliable.
+
+    Found by a session running as `claude bg-spare` - alive, with a tty, and no
+    window anywhere. Clicking it did nothing and said nothing.
+    """
+    if not titles:
+        return None
+    if not tty:
+        return False
+    return short_tty_full(tty) in titles
+
+
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
-              tab_title="", reviewed=None):
+              tab_title="", reviewed=None, windowed=None):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -1120,7 +1178,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     # second line is "what is this about", and the harness already answered it.
     recs = as_records(head) + as_records(tail)
     r = brief.recap(recs)
+    has_window = windowed
     return {
+        "windowed": has_window,
         "project": project_of(session.get("cwd", "")),
         "status": status,
         "attention": attention,
@@ -1261,14 +1321,18 @@ def collect(cache=None, status=None):
     orphans = attribute_orphans(ps_out, ids)
     reviewed = load_reviewed()
     rows = []
+    parents = parent_map(ps_out)
     for s in sessions:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
-        tty = ttys.get(s.get("pid"), "")
+        # not ttys[pid]: a session served by the daemon reports a background
+        # process, and the window showing it belongs to an ancestor
+        tty = owning_tty(s.get("pid"), parents, ttys, titles)
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), ""),
-                              reviewed=reviewed))
+                              reviewed=reviewed,
+                              windowed=windowed(tty, titles)))
     rows.sort(key=sort_key)
     if status is not None:
         # The same value the cheap check computes, so finishing a scan never
@@ -1425,7 +1489,11 @@ def ui_row_cells(row, width=100):
     sid = brief.short_id(row.get("sessionId", ""))
     name = row.get("tab_title") or ("~" + (row.get("title") or row.get("name") or ""))
     tail = f" · {row.get('since', '')}"
-    if row.get("tty"):
+    if row.get("windowed") is False:
+        # there is nothing to go to, and a row that does not say so is a row
+        # that quietly does nothing when you press Enter on it
+        tail += " · no window"
+    elif row.get("tty"):
         tail += f" · {short_tty(row['tty'])}"
     glyph = UI_STATE_MARK.get(row.get("attention", ""), UI_UNKNOWN_MARK) + " "
     head = f"{sid}  {row.get('project', '?')[:12]}  "

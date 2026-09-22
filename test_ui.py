@@ -16,7 +16,7 @@ from textual.widgets import Input
 
 def row(sid, attention="stopped", **kw):
     base = {"sessionId": sid, "project": "liveapp", "attention": attention,
-            "ts": "",
+            "ts": "", "windowed": None,
             "title": "Issue 362", "tab_title": "✳ Issue 362 (claude)",
             "tty": "ttys022", "since": "5h", "doing": "Bash: read the verdict",
             "recap": "", "recap_age": "", "turns_since_recap": 0,
@@ -1515,3 +1515,61 @@ class TestAHiddenSearchBoxCannotEatYourKeys(UiTest):
             await pilot.press("q")
             await pilot.pause()
             self.assertEqual(app.query_one("#search").value, "q")
+
+
+class TestItNeverOffersAJumpItCannotMake(UiTest):
+    """Clicking a session did nothing: it runs as `claude bg-spare`, on a tty
+    iTerm2 has never heard of, so there was no window to raise. ccwho already
+    knew - it had asked iTerm2 for that tty and got nothing - and said neither
+    that nor "not found: /dev/ttys042", which is what it did say."""
+
+    def homeless(self):
+        return row("9999aaaa-0000-4000-8000-000000009999", "busy",
+                   tab_title="", tty="ttys042", windowed=False)
+
+    async def test_enter_says_there_is_no_window(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([self.homeless()], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            header = str(app.query_one("#header").content).lower()
+            self.assertIn("no window", header)
+            self.assertEqual(adapter.asked, [],
+                             "and it does not ask iTerm2 to do the impossible")
+
+    async def test_it_says_how_to_reach_it_instead(self):
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([self.homeless()], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("resume", str(app.query_one("#header").content).lower())
+
+    async def test_a_session_with_a_window_still_jumps(self):         # control
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([dict(LIVE, windowed=True)], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]])
+
+    async def test_not_knowing_still_tries(self):                     # control
+        # iTerm2 shut or unscriptable: try anyway and report what comes back
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([dict(LIVE, windowed=None)], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]])

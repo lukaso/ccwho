@@ -87,6 +87,9 @@ class FakeAdapter:
 
     def attach(self, cmd, deadline=5.0):
         self.attached.append(cmd)
+        if self.hang:
+            import time
+            time.sleep(deadline + 0.2)
         return "attached in a new window"
 
     def focus(self, row, deadline=5.0):
@@ -1638,3 +1641,85 @@ class TestEnterOnABackgroundSessionGivesItAWindow(UiTest):
         script = " ".join(" ".join(c) for c in ran)
         self.assertIn("create window", script)
         self.assertIn("claude attach abc", script)
+
+
+class TestYouCanSeeWhichRowIsBeingOpened(UiTest):
+    """Pressing Enter sends the work to another program - iTerm2, or a new
+    window running `claude attach` - and that can take a moment. The list said
+    so in one word at the end of the header, which is not where you are
+    looking: you are looking at the row you just acted on."""
+
+    async def test_the_row_is_marked_while_it_is_being_opened(self):
+        adapter = FakeAdapter(hang=True)          # iTerm2 taking its time
+        app = self.app(adapter=adapter)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            target = app.selected
+            await pilot.press("enter")
+            await pilot.pause()
+            acting = [w.row["sessionId"] for w in app.query(ui.Row)
+                      if w.has_class("acting")]
+            self.assertEqual(acting, [target])
+
+    async def test_it_blinks_rather_than_sitting_there(self):
+        adapter = FakeAdapter(hang=True)
+        app = self.app(adapter=adapter)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            row = [w for w in app.query(ui.Row) if w.has_class("acting")][0]
+            first = row.has_class("pulse")
+            app.pulse()
+            await pilot.pause()
+            self.assertNotEqual(row.has_class("pulse"), first,
+                                "a mark that never changes is easy to miss")
+
+    async def test_the_mark_goes_when_the_window_is_open(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual([w for w in app.query(ui.Row)
+                              if w.has_class("acting")], [],
+                             "it is open: stop saying it is opening")
+
+    async def test_nothing_is_marked_when_nothing_is_happening(self):  # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual([w for w in app.query(ui.Row)
+                              if w.has_class("acting")], [])
+
+    async def test_the_mark_survives_a_refresh(self):
+        adapter = FakeAdapter(hang=True)
+        collector = FakeCollector()
+        app = self.app(adapter=adapter, collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            target = app.selected
+            await pilot.press("enter")
+            await pilot.pause()
+            collector.fleet_value = ui.Fleet([dict(LIVE, recap="moved on"), BUSY],
+                                             True, "12:00:05")
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            acting = [w.row["sessionId"] for w in app.query(ui.Row)
+                      if w.has_class("acting")]
+            self.assertEqual(acting, [target], "a scan must not clear it")
+
+    async def test_a_background_session_being_attached_is_marked_too(self):
+        adapter = FakeAdapter(hang=True)
+        bg = row("51fddd61-822b-49e0-9aeb-2145e91e1244", "busy", tab_title="",
+                 tty="", windowed=False, kind="background")
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([bg], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual([w.row["sessionId"] for w in app.query(ui.Row)
+                              if w.has_class("acting")], [bg["sessionId"]])

@@ -74,6 +74,7 @@ WINDOW_NAME = "ccwho"
 WATCH_EVERY = 1.0              # "has anything changed?" - 0.5ms to answer
 REFRESH_EVERY = 20.0           # a full scan even when nothing moved
 AFTER_A_JUMP = 2.0             # long enough for the session to notice you
+PULSE_EVERY = 0.45             # the blink on a row that is being opened
 
 # There is no second cadence for "the window is hidden". Knowing that a session
 # needs you is this tool's job whether or not you are looking at it - one day it
@@ -172,6 +173,10 @@ class CcwhoUi(App):
     /* The selected row is a block of colour with a bar down its left edge, not
        a shade of the background: on a dark terminal $boost was invisible. */
     .row.selected { background: $primary 60%; border-left: thick $accent; }
+    /* Being opened: a slow blink between two shades, so a row that is waiting
+       on iTerm2 is obvious from across the room. */
+    .row.acting { background: $warning 30%; border-left: thick $warning; }
+    .row.acting.pulse { background: $warning 70%; }
     .heading { color: $accent; text-style: bold; padding: 1 1 0 1; }
     """
 
@@ -200,6 +205,8 @@ class CcwhoUi(App):
         self.painted_width = 0
         self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
+        self.acting = ""        # the session a window is being opened for
+        self.pulsing = False
 
     # ------------------------------------------------------------------ layout
 
@@ -218,6 +225,7 @@ class CcwhoUi(App):
         self.query_one("#detail").display = False
         self.set_interval(REFRESH_EVERY, self.tick)
         self.set_interval(WATCH_EVERY, self.watch_tick)
+        self.set_interval(PULSE_EVERY, self.pulse)
         self.set_interval(0.2, self.check_width)      # no subprocess, just a number
         self.collect()
 
@@ -443,6 +451,7 @@ class CcwhoUi(App):
             if widget.words(width) != widget.painted or width != widget.width:
                 widget.refresh_text(width)
         self.mark_selected()
+        self.mark_acting()
 
     def empty_text(self):
         if self.filter_text:
@@ -550,6 +559,28 @@ class CcwhoUi(App):
         rows[0].focus()
         self.selected = rows[0].row.get("sessionId", "")
         self.mark_selected()
+        self.mark_acting()
+
+    def pulse(self):
+        """Blink whatever is being opened. Nothing to blink costs nothing."""
+        if not self.acting:
+            return
+        self.pulsing = not self.pulsing
+        for widget in self.rows_on_screen():
+            if widget.row.get("sessionId") == self.acting:
+                widget.set_class(self.pulsing, "pulse")
+
+    def mark_acting(self, session_id=None):
+        """One row carries the "being opened" mark. Like the selection, it is
+        held by session id, so a scan that rebuilds the list cannot lose it."""
+        if session_id is not None:
+            self.acting = session_id
+            self.pulsing = False
+        for widget in self.rows_on_screen():
+            here = widget.row.get("sessionId") == self.acting
+            widget.set_class(bool(self.acting) and here, "acting")
+            if not here:
+                widget.set_class(False, "pulse")
 
     def mark_selected(self):
         """One row carries the class the stylesheet paints. Focus alone is not
@@ -683,6 +714,7 @@ class CcwhoUi(App):
             # running, with no window: give it one. The same guard the command
             # line uses decides this, so neither can resume a live session.
             self.status = "opening a window for it..."
+            self.mark_acting(row.get("sessionId", ""))
             self.paint_header(self.fleet.groups(self.filter_text))
             self.attaching(value)
             return
@@ -695,6 +727,7 @@ class CcwhoUi(App):
                       f" window - it runs in the background."
                       f"  resume it: claude --resume {row.get('sessionId', '')}")
             return
+        self.mark_acting(row.get("sessionId", ""))
         self.paint_header(self.fleet.groups(self.filter_text))
         self.go_to(row)
         # The session you just opened is about to stop needing you. Look again
@@ -756,6 +789,7 @@ class CcwhoUi(App):
             text = (f"went to {engine.brief.short_id(row.get('sessionId', ''))}"
                     f"  {engine.truncate(name, 40)}")
         self.status = text
+        self.mark_acting("")        # it is open: stop saying it is opening
         self.paint_header(self.fleet.groups(self.filter_text))
 
     def action_reopen(self):

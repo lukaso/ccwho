@@ -2030,3 +2030,70 @@ class TestTheCheapQuestion(unittest.TestCase):
             self.assertEqual(status.get("watch"), ccwho.watch_digest([]))
         finally:
             ccwho.agents_json = real
+
+
+class TestAQuestionIsAQuestionWhateverTheFeedSays(unittest.TestCase):
+    """Reported: a session asked a question and the list did not say so for a
+    long time.
+
+    ccwho asked `claude agents` what state each session was in, and only looked
+    at the transcript when that answer was already "waiting". While the feed
+    still said "busy", a question sitting unanswered in the transcript counted
+    for nothing.
+
+    Measured on a live fleet: a session sitting on AskUserQuestion, and this
+    session, busy, sitting on a running Bash. Those must not read the same -
+    which is why "a pending tool call" is not the signal and "a pending
+    QUESTION" is. Across the newest 200 transcripts on this machine, the only
+    tool ever left unanswered at the end of one was AskUserQuestion.
+    """
+
+    def records(self, *blocks):
+        # a LIST of lines: as_records iterates what it is given, and a single
+        # joined string iterates into characters and yields nothing
+        return [json.dumps(b) for b in blocks]
+
+    def asking(self, tool="AskUserQuestion"):
+        return self.records(
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": tool, "input": {}}]}})
+
+    def answered(self, tool="AskUserQuestion"):
+        return self.asking(tool) + self.records(
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}})
+
+    def row(self, status, tail):
+        return ccwho.build_row({"sessionId": "a", "status": status, "pid": 1},
+                               "", tail, None)
+
+    def test_a_question_while_the_feed_still_says_busy_needs_you(self):
+        self.assertEqual(self.row("busy", self.asking())["attention"], "blocked")
+
+    def test_a_question_while_the_feed_says_idle_needs_you(self):
+        self.assertEqual(self.row("idle", self.asking())["attention"], "blocked")
+
+    def test_a_running_tool_is_not_a_question(self):                  # control
+        self.assertEqual(self.row("busy", self.asking("Bash"))["attention"], "busy")
+
+    def test_a_plan_waiting_to_be_approved_needs_you(self):
+        self.assertEqual(self.row("busy", self.asking("ExitPlanMode"))["attention"],
+                         "blocked")
+
+    def test_answering_it_clears_it_before_the_feed_catches_up(self):
+        # The other half of the report: it has to STOP saying needs you the
+        # moment you answer, not when the feed notices.
+        self.assertNotEqual(self.row("waiting", self.answered())["attention"],
+                            "blocked")
+
+    def test_a_session_with_nothing_pending_is_unchanged(self):       # control
+        quiet = self.records({"type": "assistant",
+                              "message": {"role": "assistant",
+                                          "content": [{"type": "text",
+                                                       "text": "done."}]}})
+        self.assertEqual(self.row("busy", quiet)["attention"], "busy")
+
+    def test_the_tools_that_mean_a_human_is_needed_are_named(self):
+        self.assertIn("AskUserQuestion", ccwho.HUMAN_TOOLS)
+        self.assertIn("ExitPlanMode", ccwho.HUMAN_TOOLS)
+        self.assertNotIn("Bash", ccwho.HUMAN_TOOLS)

@@ -315,6 +315,43 @@ def extract_ask(lines):
     return _closing_line(text) if asks_user(text) else ""
 
 
+# The tools that hand the decision to a person. A pending tool call on its own
+# means nothing - this session was sitting on a running Bash while it worked -
+# but a pending QUESTION means the session is waiting for you, whatever the
+# session feed says. Measured over the newest 200 transcripts on a real
+# machine: AskUserQuestion is the only tool ever left unanswered at the end of
+# one, and a running Bash is what "busy" looks like.
+HUMAN_TOOLS = ("AskUserQuestion", "ExitPlanMode")
+
+
+def pending_tools(lines):
+    """Tool calls with no result yet, newest last, by name."""
+    pending = {}
+    for d in as_records(lines):
+        content = d.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        if d.get("type") == "assistant":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    pending[b.get("id")] = b.get("name", "")
+        elif d.get("type") == "user":
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    pending.pop(b.get("tool_use_id"), None)
+    return list(pending.values())
+
+
+def is_asking_you(lines):
+    """Is this session sitting on a question it put to you?
+
+    Read from the transcript, which is written the moment the question is asked
+    and again the moment you answer it - both faster, and both more certain,
+    than the session feed noticing.
+    """
+    return any(name in HUMAN_TOOLS for name in pending_tools(lines))
+
+
 def waiting_kind(lines):
     """Split Claude Code's `waiting` into what it actually means.
 
@@ -1054,9 +1091,14 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
             or extract_topic(tail)["last"])
     status = session.get("status", "?")
     ask = extract_ask(tail)
-    if status == "waiting":
+    # A question it asked you outranks whatever the feed says, in both
+    # directions: the transcript gains the question the moment it is asked, and
+    # gains your answer the moment you give it.
+    if is_asking_you(tail):
+        attention = "blocked"
+    elif status == "waiting":
         attention = waiting_kind(tail)
-        if attention == "ready":
+        if attention == "ready":  # not a state of its own
             # not a state of its own: decided like any other non-busy session
             attention = "asks" if ask else ("running" if work else "stopped")
     elif status != "busy" and ask:

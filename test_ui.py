@@ -83,6 +83,11 @@ class FakeCollector:
 class FakeAdapter:
     def __init__(self, answer="focused s022", hang=False):
         self.answer, self.hang, self.asked = answer, hang, []
+        self.attached = []
+
+    def attach(self, cmd, deadline=5.0):
+        self.attached.append(cmd)
+        return "attached in a new window"
 
     def focus(self, row, deadline=5.0):
         self.asked.append(row.get("sessionId"))
@@ -1573,3 +1578,63 @@ class TestItNeverOffersAJumpItCannotMake(UiTest):
             await pilot.pause()
             await pilot.pause()
             self.assertEqual(adapter.asked, [LIVE["sessionId"]])
+
+
+class TestEnterOnABackgroundSessionGivesItAWindow(UiTest):
+    """The third kind: running, no window, and you want one. Enter opens a
+    terminal and attaches - it never resumes, which would fork a conversation
+    that is running."""
+
+    def bg(self):
+        return row("51fddd61-822b-49e0-9aeb-2145e91e1244", "busy",
+                   tab_title="", tty="", windowed=False, kind="background")
+
+    def fleet(self):
+        return FakeCollector(fleet=ui.Fleet([self.bg()], True, "12:00:00"))
+
+    async def test_enter_attaches_it(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.fleet())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.attached, ["claude attach "
+                                                "51fddd61-822b-49e0-9aeb-2145e91e1244"])
+            self.assertEqual(adapter.asked, [], "there is no window to focus yet")
+
+    async def test_it_says_so(self):
+        app = self.app(collector=self.fleet())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("attach", str(app.query_one("#header").content).lower())
+
+    async def test_a_windowed_session_still_jumps(self):              # control
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([dict(LIVE, windowed=True)], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]])
+            self.assertEqual(adapter.attached, [])
+
+    def test_the_adapter_builds_one_window_running_that_command(self):
+        ran = []
+        adapter = ui.Adapter()
+        real = ui.subprocess.run
+        ui.subprocess.run = lambda cmd, **k: ran.append(cmd) or type(
+            "D", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+        try:
+            adapter.attach("claude attach abc")
+        finally:
+            ui.subprocess.run = real
+        script = " ".join(" ".join(c) for c in ran)
+        self.assertIn("create window", script)
+        self.assertIn("claude attach abc", script)

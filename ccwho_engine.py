@@ -640,14 +640,25 @@ def parse_ccwho_url(url):
     return ("", "")
 
 
+def attach_command(session_id):
+    """Put a running background session in a terminal.
+
+    `claude attach <id>`: "Open the background session in this terminal." The
+    session feed marks these `kind: background` - on a live fleet of fifteen,
+    fourteen interactive and one background.
+    """
+    return f"claude attach {shlex.quote(session_id)}" if session_id else ""
+
+
 def resolve_open(session_id, live_rows, entries, source_ok=True):
     """What a click on an open-link should DO, decided against the world right now.
 
     ("jump", tty)             it is running and has a window - focus it.
-    ("live-no-window", pid)   it is running with no window we can find. NOT a resume:
-                              "I cannot see a window" is not "it is not running", and
-                              resuming a live session forks the conversation into two
-                              processes writing one transcript.
+    ("attach", cmd)           it is running with no window we can find - a background
+                              session. `claude attach <id>` opens it in a terminal.
+                              NOT a resume: "I cannot see a window" is not "it is not
+                              running", and resuming a live session forks the
+                              conversation into two processes writing one transcript.
     ("resume", cmd)           it is not running - reopen it.
     ("unknown", why)          we could not read the live fleet at all. An empty list
                               from a failed read looks exactly like "nothing is
@@ -665,7 +676,11 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
             tty = short_tty(r.get("tty", ""))
             if tty:
                 return ("jump", tty)
-            return ("live-no-window", str(r.get("pid") or ""))
+            # Running, with no window we can find - which is a session to OPEN,
+            # not one to reopen. `claude attach` puts a running session in a
+            # terminal; `claude --resume` would start a second process on a
+            # live transcript.
+            return ("attach", attach_command(session_id))
     for e_ in entries or []:
         if e_.get("sessionId") == session_id:
             cmd = restore_command(e_)
@@ -1181,6 +1196,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     has_window = windowed
     return {
         "windowed": has_window,
+        "kind": session.get("kind", ""),
         "project": project_of(session.get("cwd", "")),
         "status": status,
         "attention": attention,
@@ -1489,7 +1505,11 @@ def ui_row_cells(row, width=100):
     sid = brief.short_id(row.get("sessionId", ""))
     name = row.get("tab_title") or ("~" + (row.get("title") or row.get("name") or ""))
     tail = f" · {row.get('since', '')}"
-    if row.get("windowed") is False:
+    if row.get("kind") == "background" and row.get("windowed") is False:
+        # not "no window", which reads as broken: this is a session you can
+        # open, with `claude attach`
+        tail += " · background"
+    elif row.get("windowed") is False:
         # there is nothing to go to, and a row that does not say so is a row
         # that quietly does nothing when you press Enter on it
         tail += " · no window"

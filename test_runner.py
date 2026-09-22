@@ -827,13 +827,18 @@ class TestOpenNeverForksALiveSession(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
 
-    def test_a_live_session_without_a_window_is_named_not_reopened(self):
-        self.live = [{"sessionId": self.SID, "tty": "", "pid": 90266}]
+    def test_a_live_session_without_a_window_is_attached_not_reopened(self):
+        # It used to refuse and say so. A running session with no window is a
+        # background session, and `claude attach` gives it one - which is what
+        # you wanted from it. Reopening it would still fork the conversation.
+        self.live = [{"sessionId": self.SID, "tty": "", "pid": 90266,
+                      "kind": "background"}]
         rc, out = self._open(self.SID)
-        self.assertEqual(rc, 1)
-        self.assertEqual(self.runs, [], "a running session must not be resumed")
-        self.assertIn("90266", out)
-        self.assertIn("not reopening", out)
+        self.assertEqual(rc, 0, out)
+        script = " ".join(" ".join(c) for c in self.runs)
+        self.assertIn("claude attach", script)
+        self.assertNotIn("--resume", script,
+                         "a running session must never be resumed")
 
     def test_an_unreadable_fleet_opens_nothing(self):
         self.source_ok = False
@@ -2195,3 +2200,46 @@ class TestTheUiCanReopenTheLastSave(unittest.TestCase):
         finally:
             runner.restore = real
         self.assertIn("could not", said.lower())
+
+
+class TestOpenGivesABackgroundSessionAWindow(unittest.TestCase):
+    """`ccwho open` on a running background session: put it in a terminal, do
+    not reopen it. Reopening a live session forks the conversation."""
+
+    SID = "51fddd61-822b-49e0-9aeb-2145e91e1244"
+
+    def setUp(self):
+        self.ran = []
+        self.real_run = runner.subprocess.run
+        self.real_collect = runner.engine.collect
+        runner.subprocess.run = lambda cmd, *a, **k: self.ran.append(cmd) or type(
+            "D", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        runner.engine.collect = lambda cache=None, status=None: (
+            status.update({"source_ok": True}) or
+            ([{"sessionId": self.SID, "tty": "", "pid": 42,
+               "kind": "background"}], 0))
+        self.addCleanup(setattr, runner.subprocess, "run", self.real_run)
+        self.addCleanup(setattr, runner.engine, "collect", self.real_collect)
+
+    def run_open(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.open_session([self.SID])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_it_opens_a_window_that_attaches(self):
+        rc, out = self.run_open()
+        self.assertEqual(rc, 0, out)
+        script = " ".join(" ".join(c) for c in self.ran)
+        self.assertIn("claude attach", script)
+        self.assertIn("create window", script)
+
+    def test_it_never_resumes_it(self):
+        self.run_open()
+        script = " ".join(" ".join(c) for c in self.ran)
+        self.assertNotIn("--resume", script,
+                         "that would fork a conversation that is running")
+
+    def test_it_says_what_it_did(self):
+        _, out = self.run_open()
+        self.assertIn("attach", out.lower())

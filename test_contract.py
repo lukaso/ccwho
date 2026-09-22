@@ -25,6 +25,7 @@ ROW_KEYS = {
     "tab_title",          # added 2026-09-21: the name iTerm2 shows for that tty
     "recap", "recap_ts", "recap_age", "turns_since_recap",   # added 2026-09-21
     "windowed",           # added 2026-09-22: is there a window to go to at all
+    "kind",               # added 2026-09-22: interactive, or a background session
 }
 
 # Every key a manifest session entry has ever carried. Append only.

@@ -676,6 +676,16 @@ class CcwhoUi(App):
         name = (row.get("tab_title") or row.get("title") or row.get("name") or "")
         self.status = (f"going to {engine.brief.short_id(row.get('sessionId', ''))}"
                        f" {engine.truncate(name, 40)}...")
+        action, value = engine.resolve_open(row.get("sessionId", ""),
+                                            self.fleet.rows, [],
+                                            source_ok=self.fleet.source_ok)
+        if action == "attach":
+            # running, with no window: give it one. The same guard the command
+            # line uses decides this, so neither can resume a live session.
+            self.status = "opening a window for it..."
+            self.paint_header(self.fleet.groups(self.filter_text))
+            self.attaching(value)
+            return
         if row.get("windowed") is False:
             # We asked iTerm2 about this tty and it had never heard of it: the
             # session is alive with nowhere to go to - `claude bg-spare` does
@@ -720,6 +730,11 @@ class CcwhoUi(App):
         """
         self.collector.mark()
         self.collect()
+
+    @work(thread=True)
+    def attaching(self, cmd):
+        said = self.adapter.attach(cmd, deadline=FOCUS_DEADLINE)
+        self.call_from_thread(self.said, said)
 
     @work(thread=True)
     def go_to(self, row):
@@ -881,6 +896,20 @@ class Collector:
 
 class Adapter:
     """iTerm2, behind a door the tests can close."""
+
+    def attach(self, cmd, deadline=FOCUS_DEADLINE):
+        """One new iTerm2 window, running `claude attach <id>`."""
+        try:
+            done = subprocess.run(
+                ["osascript", "-e", engine.iterm_run_script(cmd)],
+                capture_output=True, text=True, timeout=deadline)
+        except subprocess.TimeoutExpired:
+            return f"iTerm2 did not answer in {deadline:g}s"
+        except OSError as ex:
+            return f"could not reach iTerm2: {ex}"
+        if done.returncode:
+            return f"could not open a window: {(done.stderr or '').strip()}"
+        return "attached it in a new window"
 
     def focus(self, row, deadline=FOCUS_DEADLINE):
         # The DEVICE path, not the short form the list shows: AppleScript matches

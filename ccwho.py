@@ -901,11 +901,17 @@ def open_session(argv):
                                         source_ok=status.get("source_ok", False))
     if action == "jump":
         return jump([value])
-    if action == "live-no-window":
-        print(f"ccwho open: {sid} is running (pid {value or '?'}) but has no iTerm2"
-              " window - not reopening it, that would fork the conversation.",
-              file=sys.stderr)
-        return 1
+    if action == "attach":
+        # Running, with no window: give it one. `claude attach` opens a session
+        # that is already running; reopening it would fork the conversation.
+        res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            print("ccwho open: could not open a window: %s"
+                  % (res.stderr or "").strip(), file=sys.stderr)
+            return 1
+        print(f"attached {sid} in a new window")
+        return 0
     if action == "unknown":
         print(f"ccwho open: {value} - not reopening anything.", file=sys.stderr)
         print("  Check that `claude` is on PATH and `claude agents --json` answers.",
@@ -1221,7 +1227,7 @@ def restore(argv):
                 continue          # one process per transcript, however the manifest got two
             seen.add(sid)
             action, _v = engine.resolve_open(sid, live, [e_], source_ok=True)
-            if action in ("jump", "live-no-window"):
+            if action in ("jump", "attach"):
                 running.append(e_)
             elif action == "resume":
                 if claim_launch(sid):

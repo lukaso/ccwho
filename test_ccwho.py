@@ -1334,8 +1334,9 @@ class TestResolveOpen(unittest.TestCase):
         # No window to focus is not the same fact as no session to open.
         live = [{"sessionId": self.SID, "tty": "", "pid": 91}]
         action, value = ccwho.resolve_open(self.SID, live, [self.ENTRY])
-        self.assertEqual(action, "live-no-window")
-        self.assertEqual(value, "91")
+        self.assertEqual(action, "attach", "a running session is opened, not reopened")
+        self.assertIn("claude attach", value)
+        self.assertNotIn("--resume", value)
 
 
 class TestRestoreListLinks(unittest.TestCase):
@@ -1661,8 +1662,9 @@ class TestResolveOpenNeverForksALiveSession(unittest.TestCase):
 
     def test_live_without_a_window_is_not_a_resume(self):
         action, value = ccwho.resolve_open(self.SID, self.LIVE_NO_TTY, [self.ENTRY])
-        self.assertEqual(action, "live-no-window")
-        self.assertEqual(value, "4242", "the pid, so the caller can name it")
+        self.assertEqual(action, "attach")
+        self.assertIn(self.SID, value, "the id, so it can be attached to")
+        self.assertNotIn("--resume", value)
 
     def test_an_unreadable_source_is_unknown_not_dead(self):
         action, why = ccwho.resolve_open(self.SID, [], [self.ENTRY], source_ok=False)
@@ -2396,3 +2398,67 @@ class TestFindingTheWindowASessionIsShownIn(unittest.TestCase):
                               tab_title=self.TITLES["ttys000"], windowed=True)
         self.assertIs(row["windowed"], True)
         self.assertEqual(row["tty"], "ttys000")
+
+
+class TestABackgroundSessionCanBeGivenAWindow(unittest.TestCase):
+    """The third kind, in the user's words: "it's running in the background,
+    doesn't have a visible window and we want to get a visible window."
+
+    Claude Code has had the answer all along and ccwho ignored it. The session
+    feed carries a `kind` - on this fleet, fourteen interactive and one
+    background - and the CLI has `claude attach <id>`: "Open the background
+    session in this terminal."
+
+    Resuming it would be the wrong answer and a dangerous one: the session is
+    RUNNING, and `claude --resume` on a live session forks the conversation
+    into two processes writing one transcript.
+    """
+
+    def live(self, **over):
+        row = {"sessionId": "abc", "tty": "", "pid": 42, "kind": "background"}
+        row.update(over)
+        return [row]
+
+    def test_a_live_session_with_no_window_is_attached_to(self):
+        action, cmd = ccwho.resolve_open("abc", self.live(), [], source_ok=True)
+        self.assertEqual(action, "attach")
+        self.assertIn("claude attach abc", cmd)
+
+    def test_it_is_never_resumed(self):
+        action, cmd = ccwho.resolve_open("abc", self.live(), [], source_ok=True)
+        self.assertNotEqual(action, "resume")
+        self.assertNotIn("--resume", cmd)
+
+    def test_a_session_with_a_window_is_still_jumped_to(self):        # control
+        action, where = ccwho.resolve_open("abc", self.live(tty="ttys024"), [],
+                                           source_ok=True)
+        self.assertEqual(action, "jump")
+        self.assertEqual(where, "s024")
+
+    def test_a_session_that_is_not_running_is_still_resumed(self):    # control
+        gone = "aaaa1111-0000-4000-8000-000000000001"
+        action, cmd = ccwho.resolve_open(
+            "gone" if False else gone, [],
+            [{"sessionId": gone, "cwd": "/tmp"}], source_ok=True)
+        self.assertEqual(action, "resume")
+        self.assertIn("--resume", cmd)
+
+    def test_an_unreadable_fleet_still_decides_nothing(self):         # control
+        action, _ = ccwho.resolve_open("abc", self.live(), [], source_ok=False)
+        self.assertEqual(action, "unknown")
+
+    def test_the_row_carries_what_kind_it_is(self):
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1,
+                               "kind": "background"}, [], [], None)
+        self.assertEqual(row["kind"], "background")
+
+    def test_a_background_row_says_so_where_you_can_see_it(self):
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1,
+                               "kind": "background"}, [], [], None,
+                              tty="", windowed=False)
+        first, _ = ccwho.ui_row_cells(row, width=100)
+        line = "".join(t for t, _ in first)
+        self.assertIn("background", line)
+        self.assertNotIn("no window", line,
+                         "'no window' reads as broken; 'background' reads as"
+                         " a session you can open")

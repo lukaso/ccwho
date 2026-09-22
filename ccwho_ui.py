@@ -52,7 +52,8 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "pad": ""}
 
 # Three states, three colours, used on one glyph per row and on its heading.
-STATE_STYLE = {"needs": "bold #e5a50a",    # amber: this one is waiting for you
+STATE_STYLE = {"needs": "bold #e5a50a",    # amber: it is waiting on you
+               "review": "#e5a50a",        # the same amber, unbold: it finished
                "busy": "#33d17a",          # green: it is working
                "quiet": "dim"}             # grey: nothing is happening
 
@@ -590,6 +591,7 @@ class CcwhoUi(App):
         row = self.selected_row()
         if not row:
             return
+        self.looked_at(row)
         # Name it the way you picked it. "going to daf9..." is not something
         # you can check against the window that comes forward; the title is.
         name = (row.get("tab_title") or row.get("title") or row.get("name") or "")
@@ -601,6 +603,25 @@ class CcwhoUi(App):
         # shortly, rather than scanning everything more often for the sake of
         # the one row that is about to change.
         self.set_timer(AFTER_A_JUMP, self.look_again)
+
+    def looked_at(self, row):
+        """You are going to this session, so you have reviewed what it did.
+
+        It leaves NEEDS YOU here and now rather than on the next scan, and the
+        row is rewritten in place - anything else is a list that argues with
+        you for two seconds after you act on it. A session that is genuinely
+        waiting on you cannot be dismissed this way: looking at a question does
+        not answer it.
+        """
+        if row.get("attention") != "review":
+            return
+        sid, ts = row.get("sessionId", ""), row.get("ts", "")
+        if not (sid and ts):
+            return
+        engine.mark_reviewed(sid, ts)
+        row["attention"] = "stopped"
+        self.painted_shape = None       # it moves group, so the list is rebuilt
+        self.rebuild()
 
     def look_again(self):
         """A fresh look that the usual wait cannot hold up.

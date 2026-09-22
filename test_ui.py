@@ -15,6 +15,7 @@ import ccwho_ui as ui
 
 def row(sid, attention="stopped", **kw):
     base = {"sessionId": sid, "project": "liveapp", "attention": attention,
+            "ts": "",
             "title": "Issue 362", "tab_title": "✳ Issue 362 (claude)",
             "tty": "ttys022", "since": "5h", "doing": "Bash: read the verdict",
             "recap": "", "recap_age": "", "turns_since_recap": 0,
@@ -1176,3 +1177,86 @@ class TestItWatchesWhetherOrNotYouAre(UiTest):
             await pilot.pause()
             await pilot.pause()
             self.assertGreater(collector.calls, before)
+
+
+def reviewable(sid="dddd4444-0000-4000-8000-000000000004"):
+    return row(sid, "review", title="Landed the rebase",
+               tab_title="✳ Landed the rebase (claude)",
+               ts="2026-09-22T10:00:00.000Z")
+
+
+class TestLookingAtOneDropsItOutOfTheList(UiTest):
+    """"Once I click on a row, it drops to stopped immediately until it picks
+    up again." Immediately means on the screen, not on the next scan."""
+
+    def setUp(self):
+        self.marks = []
+        self.real_mark = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: self.marks.append((sid, ts))
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", self.real_mark)
+
+    def fleet(self):
+        return FakeCollector(fleet=ui.Fleet([reviewable(), BUSY], True, "12:00:00"))
+
+    async def test_going_to_a_session_records_that_you_looked(self):
+        app = self.app(collector=self.fleet())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(self.marks,
+                             [(reviewable()["sessionId"], "2026-09-22T10:00:00.000Z")])
+
+    async def test_the_row_leaves_needs_you_at_once(self):
+        app = self.app(collector=self.fleet())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIn("NEEDS YOU", self.screen_text(app))
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            listed = [w.row["attention"] for w in app.query(ui.Row)
+                      if w.row["sessionId"] == reviewable()["sessionId"]]
+            self.assertEqual(listed, ["stopped"],
+                             "not on the next scan - now")
+
+    async def test_a_click_does_the_same(self):
+        app = self.app(collector=self.fleet())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rows = list(app.query(ui.Row))
+            await pilot.click(rows[0])
+            await pilot.pause()
+            self.assertTrue(self.marks)
+
+    async def test_a_session_with_a_question_is_not_dismissed(self):  # control
+        # it is still actually waiting on you: looking cannot make that false
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([row("eeee5555-0000-4000-8000-000000000005",
+                                "blocked", ts="2026-09-22T10:00:00.000Z"),
+                            BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            still = [w.row["attention"] for w in app.query(ui.Row)
+                     if w.row["attention"] == "blocked"]
+            self.assertEqual(still, ["blocked"])
+
+
+class TestTheTwoTiersLookDifferent(UiTest):
+    async def test_a_finished_session_is_drawn_more_quietly(self):
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([LIVE, reviewable()], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            marks = {w.row["attention"]: [t for t, r in w.spans() if r == "mark"][0]
+                     for w in app.query(ui.Row)}
+            self.assertNotEqual(marks.get("asks"), marks.get("review"))
+
+    def test_the_style_table_knows_the_new_tier(self):
+        import ccwho_engine as engine
+        self.assertIn(engine.UI_STATE_STYLE["review"], ui.STATE_STYLE)
+        self.assertNotEqual(ui.STATE_STYLE[engine.UI_STATE_STYLE["review"]],
+                            ui.STATE_STYLE[engine.UI_STATE_STYLE["blocked"]])

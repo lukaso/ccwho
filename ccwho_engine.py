@@ -32,8 +32,8 @@ import ccwho_index
 # stopped outranks busy: a stopped session will not progress without you, while a
 # busy one is fine. `running` is not busy but has background work in flight - it is
 # waiting on a machine, not on you, so it sorts last.
-_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "stopped": 2, "busy": 3,
-         "ready": 4, "shell": 5, "idle": 6, "running": 7}
+_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "review": 2, "stopped": 3,
+         "busy": 4, "ready": 5, "shell": 6, "idle": 7, "running": 8}
 
 # Descendants that are session infrastructure rather than work. An idle session
 # keeps its MCP servers alive; counting them would make every session look busy.
@@ -1079,7 +1079,7 @@ def iterm_open_script(entries):
 # -------------------------------------------------------------------- assemble
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
-              tab_title=""):
+              tab_title="", reviewed=None):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -1109,6 +1109,13 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # Not busy and not asking: either it stopped, or it is waiting on work.
         attention = "running" if work else "stopped"
     ts = last_turn_ts(tail)
+    # Anything that finished a turn you have not looked at since is worth
+    # reviewing - that is most of what a session ever asks of you. Looking at it
+    # drops it out; the session doing more work brings it back, because its last
+    # turn then lands after the one you dismissed.
+    if attention == "stopped" and ts and (reviewed or {}).get(
+            session.get("sessionId", "")) != ts:
+        attention = "review"
     # The recap comes off the windows this function was already given: the list's
     # second line is "what is this about", and the harness already answered it.
     recs = as_records(head) + as_records(tail)
@@ -1195,6 +1202,47 @@ def transcript_path_cached(session_id, cache=None):
     return paths[session_id]
 
 
+# What you have already looked at, and up to when. Keyed by session, valued by
+# the turn you dismissed - so the session doing more work brings it back all by
+# itself, with no transition to track.
+REVIEWED_CAP = 500          # sessions end; this file must not grow for ever
+
+
+def reviewed_path():
+    return os.path.join(os.path.expanduser("~"), ".ccwho", "reviewed.json")
+
+
+def load_reviewed(path=None):
+    """Never raises: an unreadable file means you have reviewed nothing, which
+    shows you more than you wanted rather than less."""
+    try:
+        with open(path or reviewed_path()) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def mark_reviewed(session_id, ts, path=None):
+    """Remember that you have seen this session up to this turn."""
+    path = path or reviewed_path()
+    seen = load_reviewed(path)
+    seen.pop(session_id, None)          # re-inserted last: newest at the end
+    seen[session_id] = ts
+    if len(seen) > REVIEWED_CAP:
+        for gone in list(seen)[:len(seen) - REVIEWED_CAP]:
+            seen.pop(gone)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(seen, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass                            # a dismissal is not worth an exception
+    return seen
+
+
 def collect(cache=None, status=None):
     """`status` is a caller-owned dict, same idiom as `cache`. It carries out the
     one fact a caller cannot recover from the rows: whether the session source
@@ -1211,6 +1259,7 @@ def collect(cache=None, status=None):
     titles = titles_cached(cache, ttys=set(ttys.values()))
     ids = [s.get("sessionId", "") for s in sessions]
     orphans = attribute_orphans(ps_out, ids)
+    reviewed = load_reviewed()
     rows = []
     for s in sessions:
         sid = s.get("sessionId", "")
@@ -1218,12 +1267,14 @@ def collect(cache=None, status=None):
         tty = ttys.get(s.get("pid"), "")
         rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
                               work=work_descendants(ps_out, s.get("pid")),
-                              tty=tty, tab_title=titles.get(short_tty_full(tty), "")))
+                              tty=tty, tab_title=titles.get(short_tty_full(tty), ""),
+                              reviewed=reviewed))
     rows.sort(key=sort_key)
     if status is not None:
         # The same value the cheap check computes, so finishing a scan never
         # leaves the check thinking the world moved.
         status["watch"] = watch_digest(ids, cache=cache)
+        status["reviewed"] = reviewed
     if cache is not None:                       # drop windows for sessions that ended
         # Keys that are not a session id belong to something else sharing this
         # dict (the tab names). Sweeping them out every tick is how a cache ends
@@ -1236,6 +1287,7 @@ def collect(cache=None, status=None):
 # --------------------------------------------------------------------- display
 
 _C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[33m",
+      "review": "\033[33m",
       "running": "\033[2m", "ready": "\033[33m", "waiting": "\033[33;1m",
       "busy": "\033[36m", "idle": "\033[2m",
       "shell": "\033[35m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
@@ -1253,6 +1305,7 @@ def now_iso(now=None):
 
 
 _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
+          "review": "FINISHED", "ready": "stopped",
           "stopped": "STOPPED", "busy": "busy", "running": "running",
           "ready": "ready", "shell": "shell", "idle": "idle"}
 
@@ -1310,7 +1363,11 @@ def render_brief(b, row=None, color=True):
 # two lines say, what a search matches: decided here, where it is testable
 # without a terminal, and hot-reloaded like everything else in this module.
 
-UI_GROUPS = (("NEEDS YOU / ASKED YOU", ("blocked", "waiting", "asks")),
+# One group for everything that has done something since you last looked, and
+# the urgent kind first inside it. A session that finished its turn is not a
+# lesser event than one that asked a question - you want to review it either
+# way - it is just less pressing.
+UI_GROUPS = (("NEEDS YOU", ("blocked", "waiting", "asks", "review")),
              ("STOPPED", ("stopped", "ready", "shell", "idle")),
              ("BUSY", ("busy", "running")))
 
@@ -1326,6 +1383,9 @@ def ui_groups(rows):
     out = []
     for heading, states in UI_GROUPS:
         members = [r for r in rows if r.get("attention") in states]
+        # certain first: a question you can see beats one we inferred from the
+        # English a session happened to end with
+        members.sort(key=lambda r: _RANK.get(r.get("attention", ""), _UNKNOWN_RANK))
         if members:
             out.append({"heading": heading, "rows": members})
     return out
@@ -1335,10 +1395,11 @@ def ui_groups(rows):
 # state made three of the four states the same colour over most of the screen:
 # the colour stopped meaning anything and the text got harder to read. The mark
 # carries the state; the words stay plain.
-UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲",
+UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△",
                  "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
                  "busy": "●", "running": "●"}
 UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
+                  "review": "review",
                   "stopped": "quiet", "ready": "quiet", "shell": "quiet",
                   "idle": "quiet", "busy": "busy", "running": "busy"}
 UI_UNKNOWN_MARK = "·"
@@ -1457,8 +1518,7 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False, links
 
     for r in rows:
         att = r.get("attention") or r["status"]
-        label = {"blocked": "NEEDS YOU", "asks": "ASKED YOU",
-                 "stopped": "STOPPED", "ready": "stopped"}.get(att, att)
+        label = _LABEL.get(att, att)
         # The name on the tab is the one you can see, so it is the one the list
         # shows. When iTerm2 could not tell us (not running, not scriptable, a
         # session with no window), fall back to Claude Code's own title and MARK

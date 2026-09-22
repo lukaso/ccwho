@@ -532,11 +532,17 @@ class TestBuildRow(unittest.TestCase):
         self.assertEqual(row["attention"], "asks")
         self.assertEqual(row["ask"], "Want me to build S2a?")
 
-    def test_plain_finish_with_no_background_work_is_stopped(self):
+    def test_plain_finish_with_no_background_work_wants_reviewing(self):
+        # It reads as "stopped" only once you have looked at it: finishing a
+        # turn is the commonest thing a session ever needs you for.
         tail = [self._turn("2026-08-31T12:00:00.000Z", "234 tests green.")]
         row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1788177600.0, work=0)
-        self.assertEqual(row["attention"], "stopped")
+        self.assertEqual(row["attention"], "review")
         self.assertEqual(row["ask"], "")
+        seen = {self.SESSION["sessionId"]: row["ts"]}
+        self.assertEqual(ccwho.build_row(self.SESSION, [], tail, mtime=0,
+                                         now=1788177600.0, work=0,
+                                         reviewed=seen)["attention"], "stopped")
 
     def test_busy_is_never_reclassified_as_asks(self):
         s = dict(self.SESSION, status="busy")
@@ -654,10 +660,10 @@ class TestStoppedVsRunning(unittest.TestCase):
         return {"type": "assistant", "timestamp": "2026-08-31T12:00:00.000Z",
                 "message": {"content": [{"type": "text", "text": text}]}}
 
-    def test_not_busy_with_no_work_is_stopped(self):
+    def test_not_busy_with_no_work_wants_reviewing(self):
         row = ccwho.build_row(self.SESSION, [], [self._turn("All done.")],
                               mtime=0, now=1788177600.0, work=0)
-        self.assertEqual(row["attention"], "stopped")
+        self.assertEqual(row["attention"], "review")
 
     def test_not_busy_with_background_work_is_running(self):
         row = ccwho.build_row(self.SESSION, [], [self._turn("All done.")],
@@ -762,10 +768,14 @@ class TestReadyCollapsesIntoStopped(unittest.TestCase):
         return {"type": "assistant", "timestamp": "2026-08-31T12:00:00.000Z",
                 "message": {"content": [{"type": "text", "text": text}]}}
 
-    def test_waiting_with_nothing_pending_and_no_work_is_stopped(self):
+    def test_waiting_with_nothing_pending_and_no_work_wants_reviewing(self):
         row = ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
                               now=1788177600.0, work=0)
-        self.assertEqual(row["attention"], "stopped")
+        self.assertEqual(row["attention"], "review")
+        seen = {self.SESSION["sessionId"]: row["ts"]}
+        self.assertEqual(ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
+                                         now=1788177600.0, work=0,
+                                         reviewed=seen)["attention"], "stopped")
 
     def test_waiting_with_nothing_pending_but_work_is_running(self):
         row = ccwho.build_row(self.SESSION, [], [self._turn()], mtime=0,
@@ -1765,7 +1775,7 @@ class TestTheViewModelBehindTheUi(unittest.TestCase):
     def test_groups_are_what_each_one_needs_from_you(self):
         groups = ccwho.ui_groups(self.rows())
         self.assertEqual([g["heading"] for g in groups],
-                         ["NEEDS YOU / ASKED YOU", "STOPPED", "BUSY"])
+                         ["NEEDS YOU", "STOPPED", "BUSY"])
         self.assertEqual(len(groups[0]["rows"]), 2, "blocked and asks belong together")
         self.assertEqual(len(groups[1]["rows"]), 1)
         self.assertEqual(len(groups[2]["rows"]), 1)
@@ -2097,3 +2107,180 @@ class TestAQuestionIsAQuestionWhateverTheFeedSays(unittest.TestCase):
         self.assertIn("AskUserQuestion", ccwho.HUMAN_TOOLS)
         self.assertIn("ExitPlanMode", ccwho.HUMAN_TOOLS)
         self.assertNotIn("Bash", ccwho.HUMAN_TOOLS)
+
+
+class TestEverythingThatFinishedIsWorthReviewing(unittest.TestCase):
+    """"Once an item finishes, I want to review it every time. The questions
+    are just more urgent."
+
+    So NEEDS YOU is not "sessions that asked something" - it is "sessions that
+    have done something since you last looked". A pending question is the
+    urgent kind and sorts first; a session that simply finished its turn is the
+    same list, a tier down.
+    """
+
+    def row(self, status="idle", tail=(), ts="2026-09-22T10:00:00.000Z",
+            reviewed=None):
+        turn = json.dumps({"type": "assistant", "timestamp": ts,
+                           "message": {"role": "assistant",
+                                       "content": [{"type": "text",
+                                                    "text": "done."}]}})
+        return ccwho.build_row({"sessionId": "a", "status": status, "pid": 1},
+                               [], [turn] + list(tail), None,
+                               reviewed=reviewed or {})
+
+    def finished(self, **kw):
+        return self.row(**kw)
+
+    def test_a_session_that_finished_wants_reviewing(self):
+        self.assertEqual(self.finished()["attention"], "review")
+
+    def test_looking_at_it_drops_it_to_stopped(self):
+        row = self.finished()
+        seen = {"a": row["ts"]}
+        self.assertEqual(self.finished(reviewed=seen)["attention"], "stopped")
+
+    def test_it_comes_back_when_the_session_does_more(self):
+        row = self.finished()
+        seen = {"a": row["ts"]}
+        self.assertEqual(self.row(ts="2026-09-22T11:00:00.000Z",
+                                  reviewed=seen)["attention"], "review",
+                         "it picked up again and finished again")
+
+    def test_a_busy_session_is_not_waiting_to_be_reviewed(self):      # control
+        self.assertEqual(self.row(status="busy")["attention"], "busy")
+
+    def test_a_question_is_still_the_urgent_kind(self):
+        asking = [json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "AskUserQuestion"}]}})]
+        self.assertEqual(self.row(tail=asking)["attention"], "blocked")
+
+    def test_dismissing_a_question_does_not_hide_it(self):
+        # you cannot dismiss something that is still actually waiting on you
+        asking = [json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "AskUserQuestion"}]}})]
+        row = self.row(tail=asking)
+        self.assertEqual(self.row(tail=asking,
+                                  reviewed={"a": row["ts"]})["attention"],
+                         "blocked")
+
+
+class TestTheUrgentOnesComeFirst(unittest.TestCase):
+    def rows(self, *states):
+        return [{"sessionId": s, "attention": s, "ts": ""} for s in states]
+
+    def test_one_group_holds_them_all(self):
+        groups = ccwho.ui_groups(self.rows("review", "blocked", "asks"))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["heading"].split()[0], "NEEDS")
+
+    def test_a_pending_question_sorts_above_one_that_just_finished(self):
+        groups = ccwho.ui_groups(self.rows("review", "blocked"))
+        self.assertEqual([r["attention"] for r in groups[0]["rows"]],
+                         ["blocked", "review"])
+
+    def test_a_phrase_match_sorts_above_one_that_just_finished(self):
+        groups = ccwho.ui_groups(self.rows("review", "asks"))
+        self.assertEqual([r["attention"] for r in groups[0]["rows"]],
+                         ["asks", "review"])
+
+    def test_the_two_tiers_do_not_look_the_same(self):
+        self.assertNotEqual(ccwho.UI_STATE_MARK["review"],
+                            ccwho.UI_STATE_MARK["blocked"])
+        self.assertNotEqual(ccwho.UI_STATE_STYLE["review"],
+                            ccwho.UI_STATE_STYLE["blocked"])
+
+    def test_stopped_is_still_its_own_group(self):                    # control
+        groups = ccwho.ui_groups(self.rows("stopped", "busy"))
+        self.assertEqual([g["heading"].split()[0] for g in groups],
+                         ["STOPPED", "BUSY"])
+
+
+class TestWhatYouHaveLookedAtSurvives(unittest.TestCase):
+    """Dismissals live on disk, not in the window. Pressing R restarts the
+    screen, and a reboot takes it away entirely; neither should hand you back
+    fifteen sessions you already reviewed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "reviewed.json")
+
+    def test_nothing_reviewed_yet_is_an_empty_answer(self):
+        self.assertEqual(ccwho.load_reviewed(self.path), {})
+
+    def test_what_you_looked_at_comes_back(self):
+        ccwho.mark_reviewed("a", "2026-09-22T10:00:00.000Z", path=self.path)
+        self.assertEqual(ccwho.load_reviewed(self.path),
+                         {"a": "2026-09-22T10:00:00.000Z"})
+
+    def test_looking_again_moves_it_forward(self):
+        ccwho.mark_reviewed("a", "2026-09-22T10:00:00.000Z", path=self.path)
+        ccwho.mark_reviewed("a", "2026-09-22T11:00:00.000Z", path=self.path)
+        self.assertEqual(ccwho.load_reviewed(self.path)["a"],
+                         "2026-09-22T11:00:00.000Z")
+
+    def test_two_sessions_do_not_tread_on_each_other(self):
+        ccwho.mark_reviewed("a", "t1", path=self.path)
+        ccwho.mark_reviewed("b", "t2", path=self.path)
+        self.assertEqual(ccwho.load_reviewed(self.path), {"a": "t1", "b": "t2"})
+
+    def test_a_file_full_of_nonsense_is_not_a_crash(self):
+        with open(self.path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(ccwho.load_reviewed(self.path), {})
+
+    def test_a_half_written_file_never_reaches_a_reader(self):
+        # temp + replace, like everything else this repo writes
+        ccwho.mark_reviewed("a", "t1", path=self.path)
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["reviewed.json"])
+
+    def test_it_does_not_grow_for_ever(self):
+        for i in range(ccwho.REVIEWED_CAP + 50):
+            ccwho.mark_reviewed(f"s{i}", f"t{i}", path=self.path)
+        kept = ccwho.load_reviewed(self.path)
+        self.assertLessEqual(len(kept), ccwho.REVIEWED_CAP)
+        self.assertIn(f"s{ccwho.REVIEWED_CAP + 49}", kept, "the newest are kept")
+
+    def test_a_scan_uses_them(self):
+        ccwho.mark_reviewed("a", "t1", path=self.path)
+        real = ccwho.reviewed_path
+        ccwho.reviewed_path = lambda: self.path
+        real_agents = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        try:
+            status = {}
+            ccwho.collect(cache={}, status=status)
+        finally:
+            ccwho.reviewed_path = real
+            ccwho.agents_json = real_agents
+        self.assertEqual(status.get("reviewed"), {"a": "t1"})
+
+
+class TestOneTableSaysWhatAStateIsCalled(unittest.TestCase):
+    """The table had its own copy of the label map, so a state added to the
+    engine printed as its internal name - "review" instead of FINISHED. One
+    table, and a test that every state the screen groups has an entry in it."""
+
+    def test_every_grouped_state_has_a_label(self):
+        for _, states in ccwho.UI_GROUPS:
+            for state in states:
+                self.assertIn(state, ccwho._LABEL, state)
+
+    def test_every_grouped_state_has_a_colour(self):
+        for _, states in ccwho.UI_GROUPS:
+            for state in states:
+                self.assertIn(state, ccwho._C, state)
+
+    def test_the_table_prints_the_label_not_the_state(self):
+        rows = [{"sessionId": "a", "attention": "review", "status": "idle",
+                 "project": "liveapp", "title": "x", "tab_title": "", "name": "n",
+                 "doing": "", "ask": "", "since": "1m", "ts": "", "topic": "",
+                 "first": "", "age": "", "orphans": 0, "work": 0, "tty": "",
+                 "pid": 1, "cwd": "/x", "recap": "", "recap_ts": "",
+                 "recap_age": "", "turns_since_recap": 0}]
+        out = ccwho.render(rows, 0, color=False)
+        self.assertIn("FINISHED", out)
+        self.assertNotIn(" review ", out)

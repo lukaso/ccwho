@@ -153,6 +153,10 @@ class Row(Static):
 class CcwhoUi(App):
     """The screen. Everything it knows comes from a Fleet snapshot."""
 
+    # Textual focuses the first focusable widget on mount, which is the search
+    # Input - a box that is not on screen. The list decides its own focus.
+    AUTO_FOCUS = None
+
     TITLE = WINDOW_NAME
 
     CSS = """
@@ -178,6 +182,7 @@ class CcwhoUi(App):
         Binding("slash", "search", "search"),
         Binding("j,down", "next", "down", show=False),
         Binding("k,up", "prev", "up", show=False),
+        Binding("o", "reopen", "reopen", show=False),
         Binding("r", "restart", "restart", show=False),
         Binding("q", "quit", "quit"),
     ]
@@ -209,7 +214,7 @@ class CcwhoUi(App):
 
     def on_mount(self):
         self.name_the_window()
-        self.query_one("#search").display = False
+        self.hide_search()
         self.query_one("#detail").display = False
         self.set_interval(REFRESH_EVERY, self.tick)
         self.set_interval(WATCH_EVERY, self.watch_tick)
@@ -312,6 +317,29 @@ class CcwhoUi(App):
         return (width, tuple((g["heading"],
                               tuple(r.get("sessionId") for r in g["rows"]))
                              for g in groups))
+
+    def hide_search(self):
+        """Out of sight AND out of the focus chain.
+
+        display=False is not enough: with no rows to focus, focus fell into the
+        box anyway and every key went into a filter nobody could see.
+        """
+        box = self.part("#search")
+        if box is None:
+            return
+        box.display = False
+        box.can_focus = False
+        if self.focused is box:
+            # it kept focus after being hidden, and every key went into it
+            self.set_focus(None)
+
+    def show_search(self):
+        box = self.part("#search")
+        if box is None:
+            return
+        box.display = True
+        box.can_focus = True
+        return box
 
     def part(self, selector):
         """A widget, or None when the screen is going away.
@@ -421,7 +449,11 @@ class CcwhoUi(App):
             return f"  no session matches {self.filter_text!r} - esc to clear"
         if not self.fleet.source_ok:
             return "  cannot read the session list - run `ccwho doctor`"
-        return "  No Claude Code sessions running.  o = restore the last save"
+        saved = self.collector.saved_count()
+        if saved:
+            return (f"  No Claude Code sessions running."
+                    f"   o = reopen the {saved} from the last save")
+        return "  No Claude Code sessions running, and nothing saved to reopen."
 
     def paint_header(self, groups):
         header, banner = self.part("#header"), self.part("#banner")
@@ -611,7 +643,7 @@ class CcwhoUi(App):
         if box.display:
             # an open search box keeps focus and eats j, k and q as text, so
             # escape closes it whether or not you typed anything
-            box.display = False
+            self.hide_search()
             if self.filter_text:
                 self.filter_text = ""
                 box.value = ""
@@ -624,12 +656,11 @@ class CcwhoUi(App):
         if self.filter_text:
             self.filter_text = ""
             self.query_one("#search").value = ""
-            self.query_one("#search").display = False
+            self.hide_search()
             self.rebuild()
 
     def action_search(self):
-        box = self.query_one("#search")
-        box.display = True
+        box = self.show_search()
         # after the refresh, for the same reason the selection is: a widget that
         # was hidden a moment ago cannot take focus yet, and the keys you type
         # next go to the app's own bindings instead of into the box
@@ -702,6 +733,24 @@ class CcwhoUi(App):
                     f"  {engine.truncate(name, 40)}")
         self.status = text
         self.paint_header(self.fleet.groups(self.filter_text))
+
+    def action_reopen(self):
+        """Bring back the last saved fleet - but only when nothing is running.
+
+        The empty list has always offered this and no key did it. Offering it
+        with sessions alive would be a way to start a second copy of every one
+        of them, so the offer and the key both belong to an empty list.
+        """
+        if self.fleet.rows:
+            return
+        self.status = "reopening the last save..."
+        self.paint_header(self.fleet.groups(self.filter_text))
+        self.reopening()
+
+    @work(thread=True)
+    def reopening(self):
+        said = self.collector.restore()
+        self.call_from_thread(self.said, said)
 
     def action_restart(self):
         # result, not message: run() returns the result, and `message` is only
@@ -798,6 +847,22 @@ class Collector:
         self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble)
+
+    def saved_count(self):
+        """How many sessions the newest manifest holds, or 0."""
+        try:
+            import ccwho as runner
+            return len(runner.newest_manifest().get("sessions", []))
+        except Exception:
+            return 0
+
+    def restore(self):
+        """Reopen the saved fleet, by running ccwho's own restore."""
+        try:
+            import ccwho as runner
+            return runner.reopen_saved()
+        except Exception as ex:
+            return f"could not reopen: {ex}"
 
     def brief(self, row):
         head, tail, _ = engine.read_windows(row.get("sessionId", ""), cache=self.cache)

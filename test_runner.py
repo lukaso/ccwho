@@ -2099,3 +2099,99 @@ class TestAHotkeyWindowNeverDiesWithTheReasonUnread(unittest.TestCase):
         with open(runner.setup.profile_path(home)) as fh:
             command = json.load(fh)["Profiles"][0]["Command"]
         self.assertTrue(command.endswith(" hotkey"), command)
+
+
+class TestSetupAsksForTheHotkeyPermission(SetupHarness):
+    """"The ask on install, as other apps do." macOS raises that dialog when a
+    process without the permission tries to use it - and a process inside
+    iTerm2 raises it AS iTerm2, which is the app that needs it."""
+
+    def setUp(self):
+        super().setUp()
+        self.asked = []
+        self.real_ask = runner.setup.ask_for_accessibility
+        runner.setup.ask_for_accessibility = lambda *a, **k: (
+            self.asked.append(1) or self.answer)
+        self.answer = True
+        self.addCleanup(setattr, runner.setup, "ask_for_accessibility",
+                        self.real_ask)
+        self.facts.update({"accessibility": True, "iterm_granted_at": 1000.0,
+                           "iterm_started_at": 2000.0})
+
+    def test_it_asks_when_the_permission_is_missing(self):
+        self.facts["accessibility"] = False
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(self.asked, [1])
+        self.assertIn("accessibility", out.lower())
+
+    def test_it_does_not_ask_when_there_is_nothing_to_ask_for(self):  # control
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(self.asked, [])
+
+    def test_a_refused_permission_is_said_plainly_and_not_fatal(self):
+        self.facts["accessibility"] = False
+        self.answer = False
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(rc, 0, "everything else was installed")
+        self.assertIn("system settings", out.lower())
+
+    def test_a_restart_is_asked_for_but_never_done(self):
+        self.facts["iterm_granted_at"] = 3000.0      # granted after it started
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertIn("restart iterm2", out.lower())
+        self.assertEqual([c for c in self.ran if "iTerm" in " ".join(c)], [],
+                         "ccwho never quits iTerm2: it would end every session")
+
+
+class TestTheUiCanReopenTheLastSave(unittest.TestCase):
+    """The list has always offered "o = restore the last save" with no key
+    behind it. The key calls these, so they have to exist and to be the same
+    restore the command line runs - not a second implementation of it."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.dir = os.path.join(self.home, ".ccwho")
+        os.makedirs(os.path.join(self.dir, "restore"))
+        self.real_dir = runner.ccwho_dir
+        runner.ccwho_dir = lambda: self.dir
+        self.addCleanup(setattr, runner, "ccwho_dir", self.real_dir)
+
+    def write(self, name, sessions):
+        with open(os.path.join(self.dir, "restore", name), "w") as fh:
+            json.dump({"saved": name, "sessions": sessions}, fh)
+
+    def test_nothing_saved_is_an_empty_manifest(self):
+        self.assertEqual(runner.newest_manifest(), {})
+
+    def test_the_newest_is_the_one_it_reads(self):
+        self.write("2026-09-22T1000.json", [{"sessionId": "a"}])
+        self.write("2026-09-22T1200.json", [{"sessionId": "b"},
+                                            {"sessionId": "c"}])
+        self.assertEqual(len(runner.newest_manifest()["sessions"]), 2)
+
+    def test_a_broken_manifest_is_not_a_crash(self):
+        with open(os.path.join(self.dir, "restore", "2026-09-22T1300.json"),
+                  "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(runner.newest_manifest(), {})
+
+    def test_reopening_runs_the_same_restore_the_command_line_does(self):
+        seen = []
+        real = runner.restore
+        runner.restore = lambda argv: seen.append(argv) or 0
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertEqual(seen, [["--open"]])
+        self.assertIn("reopen", said.lower())
+
+    def test_it_says_when_the_restore_refused(self):
+        real = runner.restore
+        runner.restore = lambda argv: 1
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertIn("could not", said.lower())

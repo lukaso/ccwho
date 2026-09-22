@@ -364,6 +364,17 @@ def setup_cmd(argv):
     if "uv" in todo:
         print("the live list needs uv: brew install uv   (everything else still works)\n")
 
+    if "hotkey reach" in todo:
+        # Ask the way any app asks: by trying to use it. macOS raises the
+        # dialog, attributed to iTerm2 - the app that needs the permission,
+        # because it is the one that registers the key grab.
+        print("asking macOS for Accessibility (the dialog names iTerm)...")
+        if setup.ask_for_accessibility():
+            did.append("Accessibility granted")
+        else:
+            print("  not granted. System Settings > Privacy & Security >"
+                  " Accessibility > iTerm, then run ccwho setup again.")
+
     if "ccwho:// handler" in todo:
         rc = install_handler()
         if rc:
@@ -380,6 +391,14 @@ def setup_cmd(argv):
 
     for line in did:
         print(line)
+
+    # Said, never done: quitting iTerm2 ends every session running in it, which
+    # is the user's call and nobody else's.
+    reach = setup.hotkey_reach(facts)
+    if reach["do"] == "restart":
+        print(f"\n{reach['detail']}.\n  restart iTerm2 once to fix it"
+              " - `ccwho save` first, so `ccwho restore --open` can bring your"
+              " sessions back.")
 
     # An installed hotkey is left alone: a second run must not take the key away
     # and ask you to press it again. Naming a key is how you change your mind.
@@ -1100,6 +1119,42 @@ def list_manifests():
         print("  %2d. %s  %s%s" % (i, n, held, tag))
     print("\nread one:  ccwho restore --from %s" % os.path.join(d, names[-1]))
     return 0
+
+
+def newest_manifest():
+    """The last saved fleet, or {}. Never raises: the screen asks this to decide
+    whether to offer a reopen at all."""
+    d = restore_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return {}
+    newest = engine.newest_manifest(names)
+    if not newest:
+        return {}
+    try:
+        with open(os.path.join(d, newest)) as fh:
+            man = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return man if isinstance(man, dict) else {}
+
+
+def reopen_saved():
+    """What `o` in the list does: the same restore the command line runs.
+
+    Not a second implementation - every guard that stops a bulk reopen forking
+    live conversations lives in restore(), and one of those written twice is
+    one of them wrong.
+    """
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        rc = restore(["--open"])
+    if rc:
+        tail = [l for l in out.getvalue().splitlines() if l.strip()]
+        return "could not reopen: " + (tail[-1] if tail else "see `ccwho restore --open`")
+    opened = sum(1 for l in out.getvalue().splitlines() if "reopen" in l.lower())
+    return f"reopened {opened} session(s)" if opened else "reopened the last save"
 
 
 def restore(argv):

@@ -797,3 +797,114 @@ class TestAnInstalledProfileIsNotNecessarilyTheRightProfile(unittest.TestCase):
         self.write(doc)
         self.assertTrue(setup.hotkey_current(self.home, self.current()),
                         "we compare ours, not the file")
+
+
+class TestTheHotkeyOnlyReachesYouWithPermission(unittest.TestCase):
+    """A global hotkey - one that fires while another app is in front - needs
+    Accessibility at the moment the app registers the key grab. Found the hard
+    way: iTerm2 was granted it three days after it started, so the key worked
+    only while iTerm2 was already frontmost and looked broken from Chrome.
+
+    Two different faults with two different answers, and setup has to tell them
+    apart: not granted (ask for it, the way any app asks) and granted too late
+    (restart iTerm2 once - which ccwho says and never does, because it would
+    end every session running in it).
+    """
+
+    def facts(self, **over):
+        f = {"accessibility": True,
+             "iterm_granted_at": 1000.0,
+             "iterm_started_at": 2000.0}      # granted BEFORE it started
+        f.update(over)
+        return f
+
+    def test_granted_before_it_started_is_fine(self):                 # control
+        check = setup.hotkey_reach(self.facts())
+        self.assertTrue(check["ok"])
+        self.assertFalse(check["fix"])
+
+    def test_granted_after_it_started_needs_a_restart(self):
+        check = setup.hotkey_reach(self.facts(iterm_granted_at=3000.0))
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["do"], "restart")
+        self.assertIn("in front", check["detail"].lower(),
+                      "say what the symptom is, or nobody connects the two")
+
+    def test_not_granted_is_something_to_ask_for(self):
+        check = setup.hotkey_reach(self.facts(accessibility=False))
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["do"], "ask")
+
+    def test_asking_comes_before_restarting(self):
+        # no point restarting into a permission that is still not there
+        check = setup.hotkey_reach(self.facts(accessibility=False,
+                                              iterm_granted_at=3000.0))
+        self.assertEqual(check["do"], "ask")
+
+    def test_a_machine_we_cannot_read_is_not_accused_of_anything(self):
+        # the grant TIME comes from a database that needs Full Disk Access;
+        # plenty of machines will not have it, and crying wolf is how a real
+        # fault gets ignored later
+        check = setup.hotkey_reach(self.facts(iterm_granted_at=None))
+        self.assertTrue(check["ok"])
+
+    def test_iterm_not_running_is_not_a_fault_either(self):
+        check = setup.hotkey_reach(self.facts(iterm_started_at=None))
+        self.assertTrue(check["ok"])
+
+
+class TestTheGatherersForThatSurviveAnyMachine(unittest.TestCase):
+    """Asking the machine these questions must never raise, and must never
+    answer confidently when it could not look."""
+
+    def test_asking_whether_we_have_accessibility_never_raises(self):
+        self.assertIn(setup.accessibility_ok(), (True, False, None))
+
+    def test_a_missing_database_reads_as_unknown(self):
+        self.assertIsNone(setup.accessibility_granted_at(
+            "com.googlecode.iterm2", db="/nowhere/TCC.db"))
+
+    def test_iterm_start_time_is_none_when_it_is_not_running(self):
+        self.assertIsNone(setup.iterm_started_at(pid=999999))
+
+    def test_iterm_start_time_is_a_number_when_it_is(self):           # control
+        pid = subprocess.run(["pgrep", "-x", "iTerm2"], capture_output=True,
+                             text=True).stdout.split()
+        if not pid:
+            self.skipTest("iTerm2 is not running on this machine")
+        self.assertIsInstance(setup.iterm_started_at(pid=int(pid[0])), float)
+
+
+class TestBothCommandsKnowAboutIt(unittest.TestCase):
+    def facts(self, **over):
+        f = facts(uv="/x/uv", hotkey_installed=True, handler_current=True,
+                  autosave_current=True, accessibility=True,
+                  iterm_granted_at=1000.0, iterm_started_at=2000.0)
+        f.update(over)
+        return f
+
+    def test_doctor_reports_a_hotkey_that_cannot_reach_you(self):
+        checks = {c["name"]: c for c in setup.doctor_checks(
+            self.facts(iterm_granted_at=3000.0))}
+        self.assertIn("hotkey reach", checks)
+        self.assertFalse(checks["hotkey reach"]["ok"])
+        self.assertIn("restart", checks["hotkey reach"]["fix"].lower())
+
+    def test_doctor_is_quiet_when_it_can(self):                       # control
+        checks = {c["name"]: c for c in setup.doctor_checks(self.facts())}
+        self.assertTrue(checks["hotkey reach"]["ok"])
+
+    def test_setup_has_a_step_for_asking(self):
+        step = {s["name"]: s for s in setup.setup_plan(
+            self.facts(accessibility=False))}["hotkey reach"]
+        self.assertTrue(step["todo"])
+
+    def test_setup_leaves_it_alone_when_it_is_right(self):            # control
+        step = {s["name"]: s for s in setup.setup_plan(self.facts())}["hotkey reach"]
+        self.assertFalse(step["todo"])
+
+    def test_a_restart_is_reported_but_never_done(self):
+        step = {s["name"]: s for s in setup.setup_plan(
+            self.facts(iterm_granted_at=3000.0))}["hotkey reach"]
+        self.assertFalse(step["todo"], "ccwho does not quit iTerm2 for you")
+        self.assertIn("restart", step["fix"].lower())

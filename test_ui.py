@@ -11,6 +11,7 @@ import asyncio
 import unittest
 
 import ccwho_ui as ui
+from textual.widgets import Input
 
 
 def row(sid, attention="stopped", **kw):
@@ -57,6 +58,14 @@ class FakeCollector:
 
     def changed(self):
         return False            # the world sits still unless a test says so
+
+    saved = 14
+
+    def saved_count(self):
+        return self.saved
+
+    def restore(self):
+        return "reopened 14 session(s)"
 
     reloads = 0
 
@@ -1405,3 +1414,104 @@ class TestYouCanTellWhenYouAreSearching(UiTest):
             await pilot.pause()
             self.assertNotIn("esc to clear",
                              str(app.query_one("#header").content).lower())
+
+
+class TestTheEmptyListCanBringThemBack(UiTest):
+    """The empty list has always said "o = restore the last save" and there was
+    no o binding: the screen advertised a key that did nothing. It does it now,
+    and only from an empty list - pressing o with fifteen sessions running must
+    never start fifteen more."""
+
+    def empty(self):
+        return FakeCollector(fleet=ui.Fleet([], True, "12:00:00"))
+
+    def setUp(self):
+        self.restored = []
+        self.real = FakeCollector.restore
+        FakeCollector.restore = lambda s: self.restored.append(1) or "reopened 14"
+        self.addCleanup(setattr, FakeCollector, "restore", self.real)
+
+    async def test_o_reopens_the_last_save(self):
+        app = self.app(collector=self.empty())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.restored, [1])
+
+    async def test_it_says_what_happened(self):
+        app = self.app(collector=self.empty())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("reopened", str(app.query_one("#header").content))
+
+    async def test_o_does_nothing_while_sessions_are_running(self):   # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.restored, [],
+                             "fifteen running sessions must not become thirty")
+
+    async def test_the_offer_is_only_made_when_there_is_a_save(self):
+        real = FakeCollector.saved_count
+        FakeCollector.saved_count = lambda s: 0
+        try:
+            app = self.app(collector=self.empty())
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertNotIn(" o ", self.screen_text(app))
+        finally:
+            FakeCollector.saved_count = real
+
+    async def test_the_offer_names_how_many(self):
+        real = FakeCollector.saved_count
+        FakeCollector.saved_count = lambda s: 14
+        try:
+            app = self.app(collector=self.empty())
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertIn("14", self.screen_text(app))
+        finally:
+            FakeCollector.saved_count = real
+
+
+class TestAHiddenSearchBoxCannotEatYourKeys(UiTest):
+    """With no rows to focus, focus fell to the search Input - which is not on
+    screen. Every key then went into an invisible filter: pressing o typed "o"
+    and the list, already empty, stayed empty for a new reason."""
+
+    def empty(self):
+        return FakeCollector(fleet=ui.Fleet([], True, "12:00:00"))
+
+    async def test_an_empty_list_does_not_put_focus_in_the_box(self):
+        app = self.app(collector=self.empty())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertNotIsInstance(app.focused, Input,
+                                     "a box nobody can see cannot hold focus")
+
+    async def test_keys_reach_their_bindings_with_an_empty_list(self):
+        app = self.app(collector=self.empty())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await pilot.pause()
+            self.assertEqual(app.filter_text, "",
+                             "o is a key, not a letter to type")
+
+    async def test_the_box_still_takes_keys_when_you_open_it(self):   # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            await pilot.press("q")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#search").value, "q")

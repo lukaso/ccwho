@@ -94,6 +94,9 @@ def doctor_checks(facts):
         + ("" if fresh else " - the job is loaded but not running"),
         "check the job: launchctl print gui/$(id -u)/com.lukaso.ccwho.save"))
 
+    reach = hotkey_reach(facts)
+    out.append(_check("hotkey reach", reach["ok"], reach["detail"], reach["fix"]))
+
     out.append(_check(
         "iTerm2 status hook", bool(facts.get("cc_status_hook")),
         "present in " + str(facts.get("settings_path") or "settings.json")
@@ -139,6 +142,11 @@ def gather(ccwho_dir=None, settings_path=None, now=None):
         "last_run_age": last_run_age(ccwho_dir, now=now),
         "newest_manifest_age": newest_manifest_age(ccwho_dir, now=now),
         "cc_status_hook": cc_status_hook(settings_path),
+        # the hotkey is only global if iTerm2 had Accessibility when it
+        # registered the key grab - see hotkey_reach
+        "accessibility": accessibility_ok(),
+        "iterm_granted_at": accessibility_granted_at(),
+        "iterm_started_at": iterm_started_at(),
         "settings_path": settings_path or os.path.expanduser("~/.claude/settings.json"),
     }
 
@@ -267,6 +275,127 @@ def cc_status_hook(settings_path=None):
     except (OSError, ValueError):
         return False
     return "cc-status" in json.dumps(data.get("hooks", {}))
+
+
+# ------------------------------------------------- the key that reaches you
+# A hotkey that fires while another app is in front is a GLOBAL key grab, and
+# macOS only gives one to an app with Accessibility - as of the moment the app
+# registers it. Measured on this machine: iTerm2 started on the 18th, was
+# granted Accessibility on the 21st, and the key worked only while iTerm2 was
+# already frontmost. Nothing about the profile was wrong.
+
+ITERM_BUNDLE = "com.googlecode.iterm2"
+TCC_DB = "/Library/Application Support/com.apple.TCC/TCC.db"
+
+# Asking System Events for anything at all requires the permission, so this
+# doubles as the request: a process with no Accessibility gets the standard
+# macOS dialog, attributed to the app it is running inside - which is iTerm2.
+_AX_PROBE = 'tell application "System Events" to return name of first process'
+
+
+def accessibility_ok(timeout=10.0):
+    """True, False, or None when the answer was neither.
+
+    None matters: "we could not tell" must never be reported as "it is broken".
+    """
+    try:
+        done = subprocess.run(["osascript", "-e", _AX_PROBE],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return True
+    if "assistive access" in (done.stderr or "") or "-1728" in (done.stderr or ""):
+        return False
+    return None
+
+
+def ask_for_accessibility(timeout=60.0):
+    """Raise the macOS dialog, the way any app asks for it: by trying.
+
+    macOS shows it once per app until the person answers; afterwards the
+    attempt simply fails. So the caller says where the switch is as well.
+    """
+    return accessibility_ok(timeout=timeout)
+
+
+def accessibility_granted_at(bundle_id=ITERM_BUNDLE, db=None, timeout=10.0):
+    """WHEN the permission was granted, or None when we could not look.
+
+    Reading it needs Full Disk Access, which most machines will not have given
+    us, so None is the ordinary answer and must stay harmless.
+    """
+    try:
+        done = subprocess.run(
+            ["sqlite3", db or TCC_DB,
+             "select last_modified from access where service="
+             "'kTCCServiceAccessibility' and auth_value=2 and client="
+             f"'{bundle_id}'"],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = (done.stdout or "").strip().splitlines()
+    if done.returncode != 0 or not line:
+        return None
+    try:
+        return float(line[0])
+    except ValueError:
+        return None
+
+
+def iterm_started_at(pid=None, timeout=10.0):
+    """When the running iTerm2 started, in epoch seconds. None if it is not."""
+    if pid is None:
+        try:
+            found = subprocess.run(["pgrep", "-x", "iTerm2"],
+                                   capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        pids = (found.stdout or "").split()
+        if not pids:
+            return None
+        pid = int(pids[0])
+    try:
+        done = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stamp = (done.stdout or "").strip()
+    if done.returncode != 0 or not stamp:
+        return None
+    try:
+        import email.utils
+        parsed = time.strptime(stamp, "%a %d %b %H:%M:%S %Y")
+        return time.mktime(parsed)
+    except ValueError:
+        return None
+
+
+def hotkey_reach(facts):
+    """Can the hotkey reach you from another app?
+
+    Three answers, because they need three different things from you: ask for
+    the permission, restart iTerm2 so it can use one it has, or nothing.
+    """
+    allowed = facts.get("accessibility")
+    if allowed is False:
+        return _reach(False, "ask",
+                      "iTerm2 has no Accessibility permission, so the hotkey"
+                      " can only work while iTerm2 is already in front",
+                      "grant it when macOS asks, or System Settings >"
+                      " Privacy & Security > Accessibility > iTerm")
+    granted, started = facts.get("iterm_granted_at"), facts.get("iterm_started_at")
+    if allowed and granted and started and granted > started:
+        return _reach(False, "restart",
+                      "iTerm2 was granted Accessibility after it started, so"
+                      " the hotkey only works while iTerm2 is in front",
+                      "restart iTerm2 once (ccwho save first: it ends every"
+                      " session running in it)")
+    return _reach(True, "", "the hotkey can reach you from any app", "")
+
+
+def _reach(ok, do, detail, fix):
+    return {"ok": ok, "do": do, "detail": detail, "fix": fix}
 
 
 # ---------------------------------------------------------------- installing
@@ -572,6 +701,12 @@ def setup_plan(facts):
                        "installed" if facts.get("hotkey_installed")
                        else "no hotkey - the list is only ever a command away",
                        "setup writes an iTerm2 profile and asks you to press it"))
+
+    # Asking for a permission is something setup can do; restarting iTerm2 is
+    # not, because it ends every session running in it.
+    reach = hotkey_reach(facts)
+    steps.append(_step("hotkey reach", reach["do"] == "ask", reach["detail"],
+                       reach["fix"], report=not reach["ok"]))
 
     # Reported, never repaired: this is another tool's file, and a tool that
     # rewrites one without asking is the fault doctor exists for. report=True

@@ -1174,17 +1174,17 @@ class TestItNoticesQuicklyWhenSomethingNeedsYou(UiTest):
             self.assertEqual(collector.calls, before,
                              "no scan while the world sits still")
 
-    async def test_it_does_not_ask_while_nobody_is_looking(self):
-        collector = self.Sniffer()
-        app = self.app(collector=collector)
+    async def test_only_the_floor_scan_cares_whether_you_are_looking(self):
+        # The check itself is never gated: see
+        # TestItNeverWaitsOnTheTerminalToSayYouAreLooking. What the terminal
+        # says only decides how often a scan happens when NOTHING changed.
+        app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
+            self.assertTrue(app.has_focus_hint())
             app.post_message(ui.events.AppBlur())
             await pilot.pause()
-            before = collector.looks
-            app.watch_tick()
-            await pilot.pause()
-            self.assertEqual(collector.looks, before)
+            self.assertFalse(app.has_focus_hint())
 
     async def test_it_asks_while_you_are_looking(self):               # control
         collector = self.Sniffer()
@@ -1232,3 +1232,58 @@ class TestTheCheapCheckIsCheap(unittest.TestCase):
         finally:
             ui.engine.agents_json = real
         self.assertEqual(called, [], "0.23s of CPU per check is not a check")
+
+
+class TestItNeverWaitsOnTheTerminalToSayYouAreLooking(UiTest):
+    """Reported, with times: the header went 12:07, 12:09:16, 12:10:16 - the
+    sixty-second cadence for "nobody is looking", while it was being looked at.
+
+    Focus reporting is a message the terminal sends. If the "you have it back"
+    message never arrives, anything gated on it stays off for ever. The cheap
+    check costs 0.5ms and 4 changes a minute were measured on a live fleet, so
+    there is nothing to gate: it always runs, and a change is always acted on.
+    """
+
+    async def test_the_check_runs_even_when_the_terminal_says_nobody_is_there(self):
+        collector = FakeCollector()
+        looks = []
+        collector.changed = lambda: looks.append(1) or False
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            app.watch_tick()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertTrue(looks, "0.5ms is not worth being wrong about")
+
+    async def test_a_change_is_acted_on_even_then(self):
+        collector = FakeCollector()
+        collector.changed = lambda: True
+        collector.due = lambda visible, now=None: False
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.post_message(ui.events.AppBlur())
+            await pilot.pause()
+            before = collector.calls
+            app.watch_tick()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertGreater(collector.calls, before,
+                               "a session that starts needing you is news"
+                               " whether or not the terminal said you are here")
+
+    async def test_nothing_changing_is_still_free(self):              # control
+        collector = FakeCollector()
+        collector.changed = lambda: False
+        collector.due = lambda visible, now=None: False
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = collector.calls
+            for _ in range(3):
+                app.watch_tick()
+                await pilot.pause()
+            self.assertEqual(collector.calls, before)

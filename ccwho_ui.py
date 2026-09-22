@@ -251,9 +251,17 @@ class CcwhoUi(App):
         self.collect()
 
     def watch_tick(self):
-        """The cheap question, often. Nobody looking: nobody asks."""
-        if not self.has_focus_hint():
-            return
+        """The cheap question, always.
+
+        This used to be gated on the terminal reporting focus. Focus reporting
+        is a MESSAGE: when the "you have it back" message never arrived, the
+        list sat on the sixty-second cadence while it was being watched -
+        reported as a header going 12:07, 12:09:16, 12:10:16.
+
+        There is nothing here worth gating. The check is 0.5ms, and a live
+        fleet of fifteen changed four times a minute, so acting on every change
+        costs about 4% of a core.
+        """
         self.sniff()
 
     @work(exclusive=True, thread=True, group="sniff")
@@ -267,6 +275,9 @@ class CcwhoUi(App):
             self.call_from_thread(self.look_again)
 
     def has_focus_hint(self):
+        # Only the FLOOR scan uses this now - the one that runs when nothing
+        # has changed at all. Being wrong about it costs a stale tab title,
+        # never a session you did not know was waiting.
         """Is anyone looking at this?
 
         It used to be a guess that was always true. It matters now: the window

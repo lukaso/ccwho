@@ -45,7 +45,7 @@ class FakeCollector:
                     "tty": "ttys022"}}
         self.calls = 0
 
-    def due(self, visible, now=None):
+    def due(self, visible=None, now=None):
         return True
 
     last = 0.0
@@ -436,20 +436,22 @@ class TestTheEngineIsHotReloaded(unittest.TestCase):
 
 
 class TestRefreshRate(unittest.TestCase):
-    """Hidden, the hotkey window still runs. Three subprocesses a tick for a
-    window nobody is looking at is how --watch once burned a core."""
+    """One cadence. The cheap check between scans is what makes the list quick;
+    the scan is the floor under it, for what a file stat cannot see."""
 
-    def test_visible_refreshes_often(self):
+    def test_a_scan_waits_its_turn(self):
         c = ui.Collector()
-        self.assertTrue(c.due(True, now=1000.0))
-        self.assertFalse(c.due(True, now=1000.0 + 1))
-        self.assertTrue(c.due(True, now=1000.0 + ui.REFRESH_VISIBLE + 0.1))
+        self.assertTrue(c.due(now=1000.0))
+        self.assertFalse(c.due(now=1000.0 + 1))
+        self.assertTrue(c.due(now=1000.0 + ui.REFRESH_EVERY + 0.1))
 
-    def test_hidden_refreshes_rarely(self):
+    def test_the_same_whether_or_not_the_window_is_in_front(self):
+        # one cadence: the check between scans is what makes it quick, and it
+        # runs whatever the terminal thinks about focus
         c = ui.Collector()
-        self.assertTrue(c.due(False, now=1000.0))
-        self.assertFalse(c.due(False, now=1000.0 + ui.REFRESH_VISIBLE + 1))
-        self.assertTrue(c.due(False, now=1000.0 + ui.REFRESH_HIDDEN + 0.1))
+        self.assertTrue(c.due(now=1000.0))
+        self.assertEqual(c.due(True, now=1000.0 + ui.REFRESH_EVERY + 0.1),
+                         True)
 
 
 if __name__ == "__main__":
@@ -772,50 +774,6 @@ class TestARowIsWrittenOnlyWhenItsWordsChange(UiTest):
     async def test_a_new_recap_does_repaint_it(self):                 # control
         writes = await self.counted({"recap": "something new to read"})
         self.assertEqual(len(writes), 1)
-
-
-class TestItRestsWhenYouAreNotLookingAtIt(UiTest):
-    """The window used to hide itself, so "nobody is looking" took care of
-    itself. Now it stays open as a control panel - which means it would run
-    three processes every three seconds, all day, behind whatever you are
-    actually doing. The terminal tells us when it loses focus; use that."""
-
-    async def test_it_slows_down_when_the_terminal_loses_focus(self):
-        app = self.app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.post_message(ui.events.AppBlur())
-            await pilot.pause()
-            # Put focus back on a row by hand. Losing focus happens to clear it
-            # too, and a test that leans on THAT passes whether or not anything
-            # noticed the terminal go away.
-            list(app.query(ui.Row))[0].focus()
-            await pilot.pause()
-            self.assertIsNotNone(app.focused)
-            self.assertFalse(app.has_focus_hint())
-
-    async def test_it_wakes_up_the_moment_you_come_back(self):
-        collector = FakeCollector()
-        app = self.app(collector=collector)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.post_message(ui.events.AppBlur())
-            await pilot.pause()
-            before = collector.calls
-            app.post_message(ui.events.AppFocus())
-            await pilot.pause()
-            await pilot.pause()
-            self.assertTrue(app.has_focus_hint())
-            self.assertGreater(collector.calls, before,
-                               "a list you just looked at must not be stale")
-
-    async def test_while_you_are_in_it_it_is_awake(self):             # control
-        app = self.app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            self.assertTrue(app.has_focus_hint())
-
-
 class TestEnterActsOnTheRowYouAreLookingAt(UiTest):
     """Reported from real use: Enter on the first NEEDS YOU row went to a busy
     session further down instead.
@@ -1016,7 +974,7 @@ class TestItChecksAgainRightAfterYouAnswerOne(UiTest):
         # due() would say "not yet" for another few seconds; answering a session
         # is new information, not a tick.
         collector = FakeCollector()
-        collector.due = lambda visible, now=None: False
+        collector.due = lambda visible=None, now=None: False
         app = self.app(collector=collector)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -1025,55 +983,6 @@ class TestItChecksAgainRightAfterYouAnswerOne(UiTest):
             await pilot.pause()
             await pilot.pause()
             self.assertGreater(collector.calls, before)
-
-
-class TestTouchingItMeansYouAreWatching(UiTest):
-    """The refresh slows down when the terminal says it lost focus. If that
-    message never comes back - and a focus report is a thing terminals can miss
-    - the list would stay slow while you sat looking at it. Any key you press
-    is proof that you are here."""
-
-    async def test_a_keypress_counts_as_being_here(self):
-        app = self.app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.post_message(ui.events.AppBlur())
-            await pilot.pause()
-            self.assertFalse(app.watched)
-            await pilot.press("down")
-            await pilot.pause()
-            self.assertTrue(app.watched, "you are clearly looking at it")
-
-    async def test_and_it_looks_again_straight_away(self):
-        collector = FakeCollector()
-        app = self.app(collector=collector)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.post_message(ui.events.AppBlur())
-            await pilot.pause()
-            collector.last = 0.0                 # the snapshot is old
-            before = collector.calls
-            await pilot.press("down")
-            await pilot.pause()
-            await pilot.pause()
-            self.assertGreater(collector.calls, before)
-
-    async def test_it_does_not_collect_on_every_keystroke(self):      # control
-        import time
-        collector = FakeCollector()
-        app = self.app(collector=collector)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            collector.last = time.time()         # just collected
-            collector.due = lambda visible, now=None: False
-            before = collector.calls
-            for _ in range(5):
-                await pilot.press("down")
-                await pilot.press("up")
-            await pilot.pause()
-            self.assertEqual(collector.calls, before)
-
-
 class TestTheWindowSaysWhatItIs(UiTest):
     """In iTerm2's window list the panel showed up as "python3" - the name of
     the interpreter uv happened to run. Anything that has a window has a name
@@ -1148,7 +1057,7 @@ class TestItNoticesQuicklyWhenSomethingNeedsYou(UiTest):
 
     async def test_a_change_brings_a_scan_forward(self):
         collector = self.Sniffer()
-        collector.due = lambda visible, now=None: False     # not due for ages
+        collector.due = lambda visible=None, now=None: False     # not due for ages
         app = self.app(collector=collector)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -1163,7 +1072,7 @@ class TestItNoticesQuicklyWhenSomethingNeedsYou(UiTest):
 
     async def test_nothing_changing_costs_nothing(self):              # control
         collector = self.Sniffer()
-        collector.due = lambda visible, now=None: False
+        collector.due = lambda visible=None, now=None: False
         app = self.app(collector=collector)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -1173,18 +1082,6 @@ class TestItNoticesQuicklyWhenSomethingNeedsYou(UiTest):
                 await pilot.pause()
             self.assertEqual(collector.calls, before,
                              "no scan while the world sits still")
-
-    async def test_only_the_floor_scan_cares_whether_you_are_looking(self):
-        # The check itself is never gated: see
-        # TestItNeverWaitsOnTheTerminalToSayYouAreLooking. What the terminal
-        # says only decides how often a scan happens when NOTHING changed.
-        app = self.app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            self.assertTrue(app.has_focus_hint())
-            app.post_message(ui.events.AppBlur())
-            await pilot.pause()
-            self.assertFalse(app.has_focus_hint())
 
     async def test_it_asks_while_you_are_looking(self):               # control
         collector = self.Sniffer()
@@ -1232,19 +1129,16 @@ class TestTheCheapCheckIsCheap(unittest.TestCase):
         finally:
             ui.engine.agents_json = real
         self.assertEqual(called, [], "0.23s of CPU per check is not a check")
+class TestItWatchesWhetherOrNotYouAre(UiTest):
+    """The list is not only a screen: its job is to know when a session needs
+    you, so that one day it can say so out loud - a sound, a notification -
+    while you are looking at something else entirely.
 
-
-class TestItNeverWaitsOnTheTerminalToSayYouAreLooking(UiTest):
-    """Reported, with times: the header went 12:07, 12:09:16, 12:10:16 - the
-    sixty-second cadence for "nobody is looking", while it was being looked at.
-
-    Focus reporting is a message the terminal sends. If the "you have it back"
-    message never arrives, anything gated on it stays off for ever. The cheap
-    check costs 0.5ms and 4 changes a minute were measured on a live fleet, so
-    there is nothing to gate: it always runs, and a change is always acted on.
+    That makes "is anyone looking at the window?" the wrong question. It is
+    gone: one cadence, always watching.
     """
 
-    async def test_the_check_runs_even_when_the_terminal_says_nobody_is_there(self):
+    async def test_the_cadence_does_not_depend_on_focus(self):
         collector = FakeCollector()
         looks = []
         collector.changed = lambda: looks.append(1) or False
@@ -1255,35 +1149,30 @@ class TestItNeverWaitsOnTheTerminalToSayYouAreLooking(UiTest):
             await pilot.pause()
             app.watch_tick()
             await pilot.pause()
+            app.tick()
             await pilot.pause()
-            self.assertTrue(looks, "0.5ms is not worth being wrong about")
+            self.assertTrue(looks)
 
-    async def test_a_change_is_acted_on_even_then(self):
-        collector = FakeCollector()
-        collector.changed = lambda: True
-        collector.due = lambda visible, now=None: False
-        app = self.app(collector=collector)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.post_message(ui.events.AppBlur())
-            await pilot.pause()
-            before = collector.calls
-            app.watch_tick()
-            await pilot.pause()
-            await pilot.pause()
-            self.assertGreater(collector.calls, before,
-                               "a session that starts needing you is news"
-                               " whether or not the terminal said you are here")
+    def test_there_is_one_interval_not_two(self):
+        self.assertFalse(hasattr(ui, "REFRESH_HIDDEN"),
+                         "a hidden cadence is a list that misses things")
+        self.assertTrue(hasattr(ui, "REFRESH_EVERY"))
 
-    async def test_nothing_changing_is_still_free(self):              # control
+    def test_nothing_asks_whether_you_are_looking(self):
+        import inspect
+        body = inspect.getsource(ui)
+        for gone in ("has_focus_hint", "AppBlur", "AppFocus", "self.watched"):
+            self.assertNotIn(gone, body, f"{gone} decides nothing any more")
+
+    async def test_a_scan_still_happens_when_nothing_changes(self):   # control
         collector = FakeCollector()
         collector.changed = lambda: False
-        collector.due = lambda visible, now=None: False
         app = self.app(collector=collector)
         async with app.run_test() as pilot:
             await pilot.pause()
+            collector.last = 0.0            # the floor is due
             before = collector.calls
-            for _ in range(3):
-                app.watch_tick()
-                await pilot.pause()
-            self.assertEqual(collector.calls, before)
+            app.tick()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertGreater(collector.calls, before)

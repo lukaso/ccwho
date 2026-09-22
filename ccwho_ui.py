@@ -70,10 +70,16 @@ WINDOW_NAME = "ccwho"
 # session start needing you is the whole point of the list, so that is the one
 # that gets the short interval - and it is file stats only, starting no program
 # at all, or it would cost more than the scans it saves.
-WATCH_EVERY = 1.0              # "has anything changed?" - 0.3ms to answer
-REFRESH_VISIBLE = 20.0         # a full scan even when nothing moved
-REFRESH_HIDDEN = 60.0          # nobody is looking: the terminal said so
+WATCH_EVERY = 1.0              # "has anything changed?" - 0.5ms to answer
+REFRESH_EVERY = 20.0           # a full scan even when nothing moved
 AFTER_A_JUMP = 2.0             # long enough for the session to notice you
+
+# There is no second cadence for "the window is hidden". Knowing that a session
+# needs you is this tool's job whether or not you are looking at it - one day it
+# will say so out loud - and a list that watches less while you are elsewhere is
+# a list that tells you late. Measured: the check is 0.5ms, a live fleet of
+# fifteen changed four times a minute, and acting on every change is ~4% of a
+# core.
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
 
 
@@ -188,7 +194,6 @@ class CcwhoUi(App):
         self.painted_width = 0
         self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
-        self.watched = True     # until the terminal says otherwise
 
     # ------------------------------------------------------------------ layout
 
@@ -205,7 +210,7 @@ class CcwhoUi(App):
         self.name_the_window()
         self.query_one("#search").display = False
         self.query_one("#detail").display = False
-        self.set_interval(REFRESH_VISIBLE, self.tick)
+        self.set_interval(REFRESH_EVERY, self.tick)
         self.set_interval(WATCH_EVERY, self.watch_tick)
         self.set_interval(0.2, self.check_width)      # no subprocess, just a number
         self.collect()
@@ -246,7 +251,7 @@ class CcwhoUi(App):
         self.call_from_thread(self.show, fleet)
 
     def tick(self):
-        if not self.collector.due(self.has_focus_hint()):
+        if not self.collector.due():
             return
         self.collect()
 
@@ -274,46 +279,11 @@ class CcwhoUi(App):
         if self.collector.changed():
             self.call_from_thread(self.look_again)
 
-    def has_focus_hint(self):
-        # Only the FLOOR scan uses this now - the one that runs when nothing
-        # has changed at all. Being wrong about it costs a stale tab title,
-        # never a session you did not know was waiting.
-        """Is anyone looking at this?
-
-        It used to be a guess that was always true. It matters now: the window
-        stays open instead of hiding itself, so without this it would run three
-        processes every three seconds all day behind whatever you are actually
-        doing. The terminal says when it loses and regains focus.
-        """
-        return (self.app.screen is not None and self.is_running
-                and self.focused is not None and self.watched)
-
-    @on(events.AppBlur)
-    def looked_away(self):
-        self.watched = False
-
-    @on(events.Key)
-    def touched(self):
-        """Any key is proof that you are here.
-
-        The slow cadence is armed by the terminal saying it lost focus. A
-        terminal can fail to say it got focus back - and the list would then sit
-        five seconds of work behind a minute of waiting while you looked at it.
-        """
-        self.wake()
-
     def wake(self):
-        self.watched = True
-        if self.collector.due(True):
+        """Bring the next look forward. Any deliberate action means the list in
+        front of you should be current, not up to a cadence old."""
+        if self.collector.due():
             self.collect()
-
-    @on(events.AppFocus)
-    def looked_back(self):
-        """Straight back to work: a list you have just looked at must not be
-        showing what was true a minute ago."""
-        self.watched = True
-        self.collector.last = 0.0
-        self.collect()
 
     def show(self, fleet):
         seq = getattr(fleet, "seq", 0)
@@ -540,7 +510,6 @@ class CcwhoUi(App):
         self.selected = widget.row.get("sessionId", "")
         self.mark_selected()
         widget.focus()
-        self.watched = True          # a click is proof that you are here
         self.action_go()
 
     @on(events.DescendantFocus)
@@ -711,10 +680,10 @@ class Collector:
         import time
         self.last = time.time() if now is None else now
 
-    def due(self, visible, now=None):
+    def due(self, visible=None, now=None):
         import time
         now = time.time() if now is None else now
-        wait = REFRESH_VISIBLE if visible else REFRESH_HIDDEN
+        wait = REFRESH_EVERY
         if now - self.last < wait:
             return False
         self.last = now

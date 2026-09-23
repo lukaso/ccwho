@@ -640,6 +640,16 @@ def parse_ccwho_url(url):
     return ("", "")
 
 
+def daemon_short(session_id):
+    """The id `claude attach` knows a job by: the first eight hex of the session.
+
+    `claude agents --json` reports it as `id`, and on every job measured it is
+    the session id's prefix. Given the full session id, claude 2.1.280 says
+    "No job matching" - about a session that is running fine.
+    """
+    return (session_id or "")[:8]
+
+
 def attach_command(session_id):
     """Put a running background session in a terminal.
 
@@ -647,7 +657,16 @@ def attach_command(session_id):
     session feed marks these `kind: background` - on a live fleet of fifteen,
     fourteen interactive and one background.
     """
-    return f"claude attach {shlex.quote(session_id)}" if session_id else ""
+    return (f"claude attach {shlex.quote(daemon_short(session_id))}"
+            if session_id else "")
+
+
+def is_attach_to(command, session_id):
+    """Is this `claude attach` for this session, by its short id or its full one?"""
+    if not session_id:
+        return False
+    ids = "|".join(re.escape(i) for i in {session_id, daemon_short(session_id)})
+    return re.search(r"\battach\s+(%s)(\s|$)" % ids, command or "") is not None
 
 
 def resolve_open(session_id, live_rows, entries, source_ok=True):
@@ -1131,7 +1150,7 @@ def is_viewer(command, session_id=""):
     cmd = (command or "").strip()
     if not cmd or _NOT_A_VIEWER.search(cmd):
         return False
-    if session_id and f"attach {session_id}" in cmd:
+    if is_attach_to(cmd, session_id):
         return True
     head = os.path.basename(cmd.split()[0].strip("-"))
     return head == "claude"
@@ -1146,7 +1165,7 @@ def attached_tty(session_id, ttys, commands):
     if not session_id:
         return ""
     for pid, cmd in (commands or {}).items():
-        if f"attach {session_id}" in (cmd or ""):
+        if is_attach_to(cmd, session_id):
             tty = ttys.get(pid, "")
             if tty:
                 return tty

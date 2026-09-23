@@ -1603,8 +1603,9 @@ class TestEnterOnABackgroundSessionGivesItAWindow(UiTest):
             await pilot.press("enter")
             await pilot.pause()
             await pilot.pause()
-            self.assertEqual(adapter.attached, ["claude attach "
-                                                "51fddd61-822b-49e0-9aeb-2145e91e1244"])
+            # the short id: given the full one, `claude attach` says
+            # "No job matching" about this very session
+            self.assertEqual(adapter.attached, ["claude attach 51fddd61"])
             self.assertEqual(adapter.asked, [], "there is no window to focus yet")
 
     async def test_it_says_so(self):

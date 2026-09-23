@@ -1663,7 +1663,8 @@ class TestResolveOpenNeverForksALiveSession(unittest.TestCase):
     def test_live_without_a_window_is_not_a_resume(self):
         action, value = ccwho.resolve_open(self.SID, self.LIVE_NO_TTY, [self.ENTRY])
         self.assertEqual(action, "attach")
-        self.assertIn(self.SID, value, "the id, so it can be attached to")
+        self.assertEqual(value, "claude attach " + self.SID[:8],
+                         "the short id - the only one `claude attach` knows")
         self.assertNotIn("--resume", value)
 
     def test_an_unreadable_source_is_unknown_not_dead(self):
@@ -2424,6 +2425,16 @@ class TestABackgroundSessionCanBeGivenAWindow(unittest.TestCase):
         self.assertEqual(action, "attach")
         self.assertIn("claude attach abc", cmd)
 
+    def test_it_is_attached_by_its_short_id(self):
+        # `claude attach` knows a job by its daemon short id, the first eight
+        # hex of the session id. Given the full id it says "No job matching"
+        # (claude 2.1.280) - and the session looks lost.
+        sid = "51fddd61-822b-49e0-9aeb-2145e91e1244"
+        action, cmd = ccwho.resolve_open(sid, self.live(sessionId=sid), [],
+                                         source_ok=True)
+        self.assertEqual(action, "attach")
+        self.assertEqual(cmd, "claude attach 51fddd61")
+
     def test_it_is_never_resumed(self):
         action, cmd = ccwho.resolve_open("abc", self.live(), [], source_ok=True)
         self.assertNotEqual(action, "resume")
@@ -2528,6 +2539,22 @@ class TestOnlyAWindowThatIsSHOWINGItCounts(unittest.TestCase):
         self.assertEqual(ccwho.owning_tty(5000, {}, ttys, self.TITLES,
                                           commands=cmds, session_id=self.SID),
                          "ttys015")
+
+    def test_an_attach_by_short_id_is_the_window(self):
+        # the form that works, and the one ccwho itself now runs
+        ttys = {7000: "ttys015"}
+        cmds = {7000: f"claude attach {self.SID[:8]}"}
+        self.assertEqual(ccwho.owning_tty(5000, {}, ttys, self.TITLES,
+                                          commands=cmds, session_id=self.SID),
+                         "ttys015")
+        self.assertTrue(ccwho.is_viewer(cmds[7000], self.SID))
+
+    def test_an_attach_to_a_longer_id_with_the_same_prefix_is_not_it(self):  # control
+        # "attach 51fddd61" must not match inside "attach 51fddd61ff"
+        ttys = {7000: "ttys015"}
+        cmds = {7000: f"claude attach {self.SID[:8]}ff"}
+        self.assertEqual(ccwho.owning_tty(5000, {}, ttys, self.TITLES,
+                                          commands=cmds, session_id=self.SID), "")
 
     def test_an_attach_to_a_different_session_is_not_it(self):        # control
         ttys = {7000: "ttys015"}

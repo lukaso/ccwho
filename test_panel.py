@@ -154,6 +154,30 @@ class TheNotifications(unittest.TestCase):
                                      None, now=10.02))
         self.assertEqual(ax.raised, [PANEL])
 
+    def test_each_raise_is_written_down(self):
+        # The raise hides the bug: without a record nobody knows it came back
+        noted = []
+        ax, w = FakeAx(focused_now=SESSION), watch()
+        panel.handle(w, ax, "app", "AXApplicationDeactivated", None, now=10.0,
+                     note=noted.append)
+        panel.handle(w, ax, "app", "AXFocusedWindowChanged", PANEL, now=10.0,
+                     note=noted.append)
+        panel.handle(w, ax, "app", "AXFocusedWindowChanged", SESSION, now=10.2,
+                     note=noted.append)
+        panel.handle(w, ax, "app", "AXApplicationActivated", None, now=10.21,
+                     note=noted.append)
+        self.assertEqual(len(noted), 1)
+        self.assertIn(str(SESSION), noted[0], "which window took the focus")
+
+    def test_nothing_is_written_when_nothing_was_stolen(self):
+        noted = []
+        ax, w = FakeAx(focused_now=PANEL), watch()
+        for name, element in (("AXApplicationDeactivated", None),
+                              ("AXFocusedWindowChanged", PANEL),
+                              ("AXApplicationActivated", None)):
+            panel.handle(w, ax, "app", name, element, now=10.0, note=noted.append)
+        self.assertEqual(noted, [])
+
     def test_an_activation_with_nothing_stolen_raises_nothing(self):
         ax, w = FakeAx(focused_now=PANEL), watch()
         panel.handle(w, ax, "app", "AXApplicationDeactivated", None, now=10.0)
@@ -161,6 +185,25 @@ class TheNotifications(unittest.TestCase):
         self.assertFalse(panel.handle(w, ax, "app", "AXApplicationActivated",
                                       None, now=10.1))
         self.assertEqual(ax.raised, [])
+
+
+class TheRecord(unittest.TestCase):
+    def test_lines_are_appended_with_the_time(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sub", "panel.log")
+            panel.write_note(path, "took the focus back from 21541",
+                             stamp="2026-09-24 16:50:00")
+            panel.write_note(path, "took the focus back from 24786",
+                             stamp="2026-09-24 16:51:00")
+            with open(path) as fh:
+                self.assertEqual(fh.read().splitlines(), [
+                    "2026-09-24 16:50:00 took the focus back from 21541",
+                    "2026-09-24 16:51:00 took the focus back from 24786"])
+
+    def test_a_record_that_cannot_be_written_is_not_an_error(self):
+        panel.write_note("/dev/null/cannot/exist.log", "x", stamp="t")
 
 
 class Stop(BaseException):      # not Exception: the loop must survive those

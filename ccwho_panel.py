@@ -58,6 +58,7 @@ class StealWatch:
         self.active = active
         self.gained_at = None      # the panel came up while iTerm2 was inactive
         self.stolen = False
+        self.thief = None          # the window that took it
 
     def deactivated(self):
         self.active = False
@@ -73,6 +74,7 @@ class StealWatch:
             # a click after the panel came up is you choosing another window
             clicked_since = click_age < now - self.gained_at
             self.stolen = window_id is not None and not clicked_since
+            self.thief = window_id if self.stolen else None
             self.gained_at = None
         return None
 
@@ -228,8 +230,11 @@ def keep_in_front(env):
     return thread
 
 
-def handle(watch, ax, app, name, element, now):
-    """One notification into the rule; True when the panel was raised."""
+def handle(watch, ax, app, name, element, now, note=None):
+    """One notification into the rule; True when the panel was raised.
+
+    `note` is told about each raise. The raise hides the steal, so without a
+    record nobody would know that iTerm2 is doing it again."""
     if name == "AXApplicationDeactivated":
         watch.deactivated()
     elif name == "AXFocusedWindowChanged":
@@ -238,9 +243,28 @@ def handle(watch, ax, app, name, element, now):
         # be over by then, and asking again said "the session" both times.
         watch.focused(ax.window_id(element) if element else None, now=now,
                       click_age=ax.click_age())
-    elif name == "AXApplicationActivated" and watch.activated():
-        return ax.raise_window(app, watch.panel_id)
+    elif name == "AXApplicationActivated":
+        thief = watch.thief
+        if watch.activated():
+            if note:
+                note(f"took the focus back from window {thief}")
+            return ax.raise_window(app, watch.panel_id)
     return False
+
+
+LOG_PATH = os.path.expanduser("~/.ccwho/panel.log")
+
+
+def write_note(path, text, stamp=None):
+    """One line per raise. A record that cannot be written is not worth the
+    panel: it is dropped."""
+    stamp = stamp or time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(f"{stamp} {text}\n")
+    except OSError:
+        pass
 
 
 # How often the watcher checks that the iTerm2 it watches is still there, and
@@ -303,7 +327,8 @@ def _observe(ax, pid, panel):
     def on_note(_observer, element, _note, ref):
         try:
             name = _NOTES[ref - 1] if ref else None
-            handle(watch, ax, app, name, element, time.monotonic())
+            handle(watch, ax, app, name, element, time.monotonic(),
+                   note=lambda text: write_note(LOG_PATH, text))
         except Exception:
             pass                     # a watcher is never worth the list
 

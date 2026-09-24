@@ -284,7 +284,10 @@ def redact_command(cmd):
 # that contains "mcp" or runs from the npx cache (a dev server can do both)
 _HELPER = re.compile(r"(?:^|[\s/])(?:[\w.-]*-mcp(?:-server)?|mcp-server[\w.-]*|mcp_server"
                      r"[\w.-]*|safe-chain)(?:@\S*)?(?=\s|\Z)"
-                     r"|@modelcontextprotocol/server-[\w.-]+", re.I)
+                     r"|@modelcontextprotocol/server-[\w.-]+"
+                     # an installed MCP package, whatever file of it runs: not a
+                     # project folder that is merely named *-mcp
+                     r"|node_modules/(?:@[\w.-]+/)?[\w.-]*-mcp(?:-server)?/", re.I)
 
 
 def _ancestors(table, pid):

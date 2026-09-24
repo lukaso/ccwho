@@ -67,9 +67,10 @@ ccwho                         # on a terminal
 |---|---|
 | ↑ ↓ / `j` `k` | move |
 | Enter | go to the session's window - or give it one (see below) |
-| → | the brief: what it was working on, without opening it |
+| → | the brief: what it was working on, and the processes it started |
 | ← / Esc | back |
-| `/` | search every name a session has, plus what it is about |
+| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
+| `p` | every process agents started, grouped: each session, left behind, Codex, not sure |
 | `o` | reopen the last saved fleet - only offered when nothing is running |
 | `r` | restart the list |
 | `q` | quit |
@@ -177,14 +178,14 @@ ccwho ps --json             # for scripts, and for agents told to clean up
 ccwho ps --full             # the whole command line, not the short form
 ```
 
-The table (`ccwho ls`, `ccwho --watch`) says it in one dim line each, never louder
-than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
+The live list and the table (`ccwho ls`, `ccwho --watch`) say it in one dim line
+each, never louder than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
 ports on each row, and at the bottom `left behind: N processes` (sessions that have
 ended) and `codex: N processes` (Codex's own group: whether a Codex session is still
 running cannot be told cheaply, so its processes are never called left behind). A
 row's `+N detached` counts its processes that were orphaned (`&`, `nohup`) - the
-ones the session reports `idle` over while they run on. The live list does not show
-ports yet.
+ones the session reports `idle` over while they run on. In the live list, the bottom
+line says `· p to see`, and `p` shows the same list `ccwho ps` prints.
 
 `left behind` is the group a clean-up would kill, so nothing in doubt goes in it.
 A process whose session is gone is `not sure` instead when the session list could

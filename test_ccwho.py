@@ -3565,3 +3565,174 @@ class TestNoRowCarriesAControlCharacter(unittest.TestCase):
         row = self.row("fix the navbar")
         self.assertEqual((row["name"], row["title"], row["tab_title"]),
                          ("fix the navbar",) * 3)
+
+
+class TestTheListSaysWhatAgentsHold(unittest.TestCase):
+    """Slice 2b: the panel shows what the table shows, from the same functions.
+    NEEDS YOU owns the screen (DX D9): process data is dim, one line each, and
+    never changes a row's state, colour or order."""
+
+    SID = "aaaa1111-0000-4000-8000-000000000001"
+    ROW = {"sessionId": SID, "project": "app", "attention": "asks", "title": "fix nav",
+           "tab_title": "", "since": "2m", "tty": "ttys007", "recap": "", "doing": "",
+           "status": "idle", "ports": [3000, 5173], "procs": 2, "pid": 10, "name": "n"}
+    FLEET = {"ports_ok": True, "procs_ok": True, "sessions_ok": True,
+             "agent_ports": [{"port": 3000, "pid": 12, "who": "app"},
+                             {"port": 8080, "pid": 20, "who": "left behind"}],
+             "by_session": {SID: [
+                 {"pid": 12, "ports": [3000], "command": "vite --port 3000", "helper": False,
+                  "orphan": False, "harness": "claude", "session": SID},
+                 {"pid": 13, "ports": [], "command": "npm exec some-mcp", "helper": True,
+                  "orphan": False, "harness": "claude", "session": SID}]},
+             "left_behind": [{"pid": 20, "ports": [8080], "command": "next-server",
+                              "helper": False, "orphan": True, "harness": "claude",
+                              "session": "dddd"}],
+             "codex": [{"pid": 30, "ports": [], "command": "workerd serve", "helper": False,
+                        "orphan": True, "harness": "codex", "session": "01a0"}],
+             "unsure": [{"pid": 40, "ports": [], "command": "com.docker.backend",
+                         "helper": False, "orphan": True, "harness": "codex",
+                         "session": "01a0", "why": "it is an app"}]}
+
+    # ---- one line under the header
+    def test_the_ports_line(self):
+        self.assertEqual(ccwho.ports_line(self.FLEET), "agents hold :3000 app · :8080 left behind")
+
+    def test_no_ports_no_line(self):                                    # control
+        self.assertEqual(ccwho.ports_line(dict(self.FLEET, agent_ports=[])), "")
+        self.assertEqual(ccwho.ports_line({}), "")
+
+    def test_ports_unknown_is_said_once(self):
+        self.assertIn("ports unknown", ccwho.ports_line(dict(self.FLEET, ports_ok=False)))
+
+    def test_the_ports_line_fits_its_width(self):
+        many = [{"port": 3000 + i, "pid": i, "who": "liveapp"} for i in range(20)]
+        line = ccwho.ports_line(dict(self.FLEET, agent_ports=many), width=60)
+        self.assertLessEqual(len(line), 60)
+        self.assertRegex(line, r"· \+\d+$")          # says how many it left out
+
+    # ---- one collapsed line each at the bottom
+    def test_the_bottom_lines_name_the_key(self):
+        self.assertEqual(ccwho.bottom_lines(self.FLEET, hint="p"),
+                         ["left behind: 1 process, 1 port · p to see",
+                          "codex: 1 process · p to see"])
+
+    def test_nothing_left_nothing_said(self):                           # control
+        self.assertEqual(ccwho.bottom_lines(dict(self.FLEET, left_behind=[], codex=[])), [])
+
+    # ---- the process screen and `ccwho ps`: one listing
+    def test_the_listing_groups_every_process(self):
+        got = [(p["pid"], p["group"]) for p in ccwho.ps_listing([self.ROW], self.FLEET)]
+        self.assertEqual(got, [(12, "session"), (20, "left behind"), (30, "codex"),
+                               (40, "unsure")])
+
+    def test_the_process_screen_has_a_heading_per_group(self):
+        text = ccwho.render_ps_screen(ccwho.ps_listing([self.ROW], self.FLEET), self.FLEET,
+                                      width=100)
+        for heading in ("app · fix nav", "LEFT BEHIND", "CODEX", "NOT SURE"):
+            self.assertIn(heading, text)
+        self.assertIn(":3000", text)
+        self.assertIn("vite --port 3000", text)
+
+    def test_the_process_screen_says_when_it_does_not_know(self):
+        text = ccwho.render_ps_screen([], dict(self.FLEET, procs_ok=False), width=100)
+        self.assertIn("unknown", text)
+        self.assertNotIn("no processes", text)
+
+    def test_a_sessions_processes_for_its_brief(self):
+        lines = ccwho.session_procs_lines(self.FLEET, self.SID)
+        self.assertEqual(len(lines), 1)                   # the helper is not work
+        self.assertIn(":3000", lines[0])
+        self.assertEqual(ccwho.session_procs_lines(self.FLEET, "nobody"), [])   # control
+
+    # ---- the row
+    def test_a_row_shows_its_ports_dim(self):
+        first, _ = ccwho.ui_row_cells(self.ROW, width=120)
+        meta = "".join(t for t, role in first if role == "meta")
+        self.assertIn(":3000 :5173", meta)
+
+    def test_a_row_with_work_but_no_ports_says_how_many(self):
+        first, _ = ccwho.ui_row_cells(dict(self.ROW, ports=[], procs=3), width=120)
+        self.assertIn("3 procs", "".join(t for t, role in first if role == "meta"))
+
+    def test_a_row_with_nothing_says_nothing(self):                      # control
+        first, _ = ccwho.ui_row_cells(dict(self.ROW, ports=[], procs=0), width=120)
+        meta = "".join(t for t, role in first if role == "meta")
+        self.assertNotIn("procs", meta)
+        self.assertNotIn(":", meta.replace(" · ", ""))
+
+    def test_ports_unknown_on_a_row_is_not_a_crash(self):
+        ccwho.ui_row_cells(dict(self.ROW, ports=None), width=120)
+
+    def test_process_data_never_moves_or_recolours_a_row(self):
+        plain = dict(self.ROW, ports=[], procs=0)
+        busy = dict(self.ROW, attention="busy", ports=[], procs=0)
+        for r in (plain, busy):
+            with self.subTest(attention=r["attention"]):
+                loaded = dict(r, ports=[3000, 5173, 8080], procs=9, orphans=4)
+                self.assertEqual(ccwho.ui_state_style(loaded), ccwho.ui_state_style(r))
+                self.assertEqual([g["heading"] for g in ccwho.ui_groups([loaded])],
+                                 [g["heading"] for g in ccwho.ui_groups([r])])
+
+    # ---- search by port
+    def test_a_port_finds_the_row_that_holds_it(self):
+        other = dict(self.ROW, sessionId="bbbb", ports=[], title="other")
+        for q in ("3000", ":3000"):
+            with self.subTest(q=q):
+                got = ccwho.ui_filter([self.ROW, other], q)
+                self.assertEqual([r["sessionId"] for r in got], [self.SID])
+        self.assertEqual(ccwho.ui_filter([self.ROW, other], ":4444"), [])      # control
+
+
+class TestTheListSaysWhatAgentsHoldReview(unittest.TestCase):
+    """Review of slice 2b: the name keeps its room, odd shapes do not crash, a
+    title's escape codes do not reach the process screen."""
+
+    ROW = TestTheListSaysWhatAgentsHold.ROW
+    FLEET = TestTheListSaysWhatAgentsHold.FLEET
+
+    def name_of(self, row, width):
+        first, _ = ccwho.ui_row_cells(row, width=width)
+        return "".join(t for t, role in first if role == "name")
+
+    def test_ports_never_take_the_names_room(self):
+        row = dict(self.ROW, title="fix the login bug in auth", tab_title="")
+        loaded = dict(row, ports=[3000, 3001, 5173, 8080])
+        for width in range(40, 101, 5):
+            with self.subTest(width=width):
+                self.assertEqual(self.name_of(loaded, width), self.name_of(row, width))
+        for width in range(40, 101, 5):
+            with self.subTest(width=width, part="meta"):
+                first, _ = ccwho.ui_row_cells(loaded, width=width)
+                meta = "".join(t for t, role in first if role == "meta")
+                self.assertNotIn("…", meta, "a port is shown whole or not at all")
+        first, _ = ccwho.ui_row_cells(loaded, width=160)                    # control
+        self.assertIn(":3000", "".join(t for t, _ in first))
+
+    def test_odd_shapes_do_not_crash(self):
+        odd = {"ports_ok": True, "procs_ok": True,
+               "agent_ports": [{"port": 3000, "pid": 1}],
+               "left_behind": [{"pid": 2, "ports": None, "command": "x"}],
+               "codex": [{"ports": [], "command": "y"}],
+               "by_session": {self.ROW["sessionId"]: [{"pid": 3, "ports": None}]}}
+        ccwho.ports_line(odd, 80)
+        ccwho.bottom_lines(odd)
+        ccwho.render_ps_screen(ccwho.ps_listing([self.ROW], odd), odd, width=80)
+        ccwho.session_procs_lines(odd, self.ROW["sessionId"])
+
+    def test_a_titles_escape_codes_do_not_reach_the_process_screen(self):
+        row = dict(self.ROW, tab_title="evil\x1b]0;PWNED\x1b\\\x1b[31mRED\nnext")
+        listing = ccwho.ps_listing([row], self.FLEET)
+        for p in listing:
+            self.assertNotRegex(p["who"], r"[\x00-\x1f\x7f-\x9f]")
+        text = ccwho.render_ps_screen(listing, self.FLEET, width=100)
+        self.assertNotRegex(text.replace("\n", ""), r"[\x00-\x1f\x7f-\x9f]")
+
+    def test_a_bottom_line_fits_its_width(self):
+        many = dict(self.FLEET, left_behind=self.FLEET["left_behind"] * 12)
+        for line in ccwho.bottom_lines(many, hint="p", width=30):
+            self.assertLessEqual(len(line), 30)
+
+    def test_one_port_is_one_port(self):
+        line = ccwho.ports_line(dict(self.FLEET, agent_ports=[
+            {"port": 3000, "pid": 1, "who": "a-very-long-project-name-indeed"}]), width=20)
+        self.assertNotIn("1 ports", line)

@@ -1012,25 +1012,8 @@ def ps(argv):
         print("ccwho ps: processes unknown - ps or the environment read failed",
               file=sys.stderr)
         return 3
-    titles = {r.get("sessionId"): (r.get("tab_title") or r.get("title") or r.get("name")
-                                   or "?") for r in rows}
-    project = {r.get("sessionId"): r.get("project", "?") for r in rows}
-    listed = []
-    for sid, mine in (fleet.get("by_session") or {}).items():
-        listed += [dict(p, group="session", who=f"{project.get(sid, '?')} · "
-                                                f"{titles.get(sid, '?')}") for p in mine]
-    listed += [dict(p, group="left behind", who="left behind") for p in
-               fleet.get("left_behind") or []]
-    listed += [dict(p, group="codex", who="codex") for p in fleet.get("codex") or []]
-    # its session is gone, but there is doubt (the list is incomplete, a claude
-    # ccwho does not list runs it, or it is an app): never offered as litter
-    listed += [dict(p, group="unsure", who=f"not sure: {p.get('why', '?')}")
-               for p in fleet.get("unsure") or []]
-    if "--all" not in argv and port is None:
-        # left behind keeps its helpers: an MCP server whose session ended is
-        # litter like any other, and the bottom line counts it. A port question
-        # asks about every holder
-        listed = [p for p in listed if not p.get("helper") or p["group"] == "left behind"]
+    # a port question asks about every holder, helpers included
+    listed = engine.ps_listing(rows, fleet, show_all="--all" in argv or port is not None)
     known = fleet.get("ports_ok", True)
     if port is not None:
         if not known:

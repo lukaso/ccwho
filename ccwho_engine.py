@@ -1889,12 +1889,21 @@ def ui_row_cells(row, width=100):
         tail += " · no window"
     elif row.get("tty"):
         tail += f" · {short_tty(row['tty'])}"
+    # what it started: dim, in the meta part, never the mark or the order - and
+    # only in the room the name leaves: the name is what you are reading
+    ports = row.get("ports") or []
+    held = (" · " + " ".join(f":{p}" for p in ports[:3])
+            + (f" +{len(ports) - 3}" if len(ports) > 3 else "")) if ports else (
+        f" · {_plural(row['procs'], 'proc')}" if row.get("procs") else "")
     glyph = UI_STATE_MARK.get(row.get("attention", ""), UI_UNKNOWN_MARK) + " "
     head = f"{sid}  {row.get('project', '?')[:12]}  "
     room = max(8, width - visible_len(glyph) - visible_len(head) - visible_len(tail))
+    shown = truncate(name, room)
+    if visible_len(shown) + visible_len(held) <= room:
+        tail += held
     first = [(glyph, "mark"), (f"{sid}  ", "id"),
              (f"{row.get('project', '?')[:12]}  ", "project"),
-             (truncate(name, room), "name"), (tail, "meta")]
+             (shown, "name"), (tail, "meta")]
 
     # The age goes FIRST. At the end of a long recap it is the first thing
     # truncation eats, and a recap whose age you cannot see reads as the current
@@ -1949,7 +1958,9 @@ def ui_filter(rows, query):
     for r in rows:
         hay = " ".join(str(r.get(f, "")) for f in _UI_SEARCHED).lower()
         hay += " " + short_tty(r.get("tty", "")).lower() + " " + str(r.get("pid", ""))
-        if all(w in hay for w in words):
+        held = {str(p) for p in r.get("ports") or []}
+        # `3000` and `:3000` find the row holding that port
+        if all(w in hay or w.lstrip(":") in held for w in words):
             out.append(r)
     return out
 
@@ -1979,13 +1990,8 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
 
     out = [_paint(f"{len(rows)} sessions: {summary}", "bold", color)]
     # one dim line, never an alarm: NEEDS YOU owns this screen
-    if fleet and not fleet.get("ports_ok", True):
-        out.append(_paint("ports unknown - lsof could not be asked", "dim", color))
-    elif fleet.get("agent_ports"):
-        held = fleet["agent_ports"]
-        shown = " · ".join(f":{a['port']} {a['who']}" for a in held[:6])
-        more = f" · +{len(held) - 6}" if len(held) > 6 else ""
-        out.append(_paint(f"agents hold {shown}{more}", "dim", color))
+    if held := ports_line(fleet, width):
+        out.append(_paint(held, "dim", color))
     out.append("")
 
     for r in rows:
@@ -2017,16 +2023,121 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
         out.append(line)
         if show_prompt and r["topic"]:
             out.append(_paint(f"{' ' * (w_proj + w_tty + 16)}\u21b3 {truncate(r['topic'], width - w_proj - 18)}", "dim", color))
-    left, codex = fleet.get("left_behind") or [], fleet.get("codex") or []
-    if left or codex:
+    bottom = bottom_lines(fleet)
+    if bottom:
         out.append("")
-    if left:
-        n_ports = sum(len(p.get("ports", [])) for p in left)
-        out.append(_paint(f"left behind: {_plural(len(left), 'process')}, "
-                          f"{_plural(n_ports, 'port')} - ccwho ps", "dim", color))
-    if codex:
-        out.append(_paint(f"codex: {_plural(len(codex), 'process')} - ccwho ps", "dim", color))
+    out += [_paint(line, "dim", color) for line in bottom]
     return "\n".join(out) + "\n"
+
+
+# ------------------------------------------------ what agents started, and hold
+#
+# One set of lines for every surface: the table (`ccwho ls`, --watch), `ccwho ps`
+# and the live list all say it the same way, from the same fleet.
+
+def ports_line(fleet, width=None):
+    """The one dim line under the header: the ports agents hold, and whose. ""
+    when none - and "unknown" is said, once, rather than shown as none."""
+    fleet = fleet if isinstance(fleet, dict) else {}
+    if fleet and not fleet.get("ports_ok", True):
+        return "ports unknown - lsof could not be asked"
+    held = fleet.get("agent_ports") or []
+    if not held:
+        return ""
+    parts = [f":{a.get('port', '?')} {_one_line(a.get('who', '?'))}" for a in held]
+    for n in range(min(len(parts), 6), 0, -1):
+        more = f" · +{len(parts) - n}" if len(parts) > n else ""
+        line = "agents hold " + " · ".join(parts[:n]) + more
+        if width is None or len(line) <= width:
+            return line
+    return truncate(f"agents hold {_plural(len(parts), 'port')}", width)
+
+
+def _one_line(text):
+    """Text from a title or a tab, fit for one line: no escape codes, no breaks."""
+    return " ".join(procs.printable(str(text)).split())
+
+
+def bottom_lines(fleet, hint="ccwho ps", width=None):
+    """One collapsed line each for what was left behind and for Codex, naming
+    where to see them. None when there is nothing."""
+    fleet = fleet if isinstance(fleet, dict) else {}
+    left, codex = fleet.get("left_behind") or [], fleet.get("codex") or []
+    sep = " · " if len(hint) <= 2 else " - "
+    see = f"{sep}{hint} to see" if len(hint) <= 2 else f"{sep}{hint}"
+    out = []
+    if left:
+        n_ports = sum(len(p.get("ports") or []) for p in left)
+        out.append(f"left behind: {_plural(len(left), 'process')}, "
+                   f"{_plural(n_ports, 'port')}{see}")
+    if codex:
+        out.append(f"codex: {_plural(len(codex), 'process')}{see}")
+    return [truncate(line, width) for line in out] if width else out
+
+
+def ps_listing(rows, fleet, show_all=False):
+    """Every process an agent started, each with its `group` and `who` - what
+    `ccwho ps` prints and the process screen shows. Helpers (MCP servers and the
+    like) only with show_all, except left behind: litter is litter."""
+    fleet = fleet if isinstance(fleet, dict) else {}
+    titles = {r.get("sessionId"): (r.get("tab_title") or r.get("title") or r.get("name")
+                                   or "?") for r in rows or []}
+    project = {r.get("sessionId"): r.get("project", "?") for r in rows or []}
+    listed = []
+    for sid, mine in (fleet.get("by_session") or {}).items():
+        who = _one_line(f"{project.get(sid, '?')} · {titles.get(sid, '?')}")
+        listed += [dict(p, group="session", who=who) for p in mine]
+    listed += [dict(p, group="left behind", who="left behind")
+               for p in fleet.get("left_behind") or []]
+    listed += [dict(p, group="codex", who="codex") for p in fleet.get("codex") or []]
+    # its session is gone, but there is doubt (the list is incomplete, a claude
+    # ccwho does not list runs it, or it is an app): never offered as litter
+    listed += [dict(p, group="unsure", who=f"not sure: {p.get('why', '?')}")
+               for p in fleet.get("unsure") or []]
+    if not show_all:
+        listed = [p for p in listed if not p.get("helper") or p["group"] == "left behind"]
+    return listed
+
+
+_PS_HEADING = {"left behind": "LEFT BEHIND - their session ended",
+               "codex": "CODEX - whether its session still runs is not known",
+               "unsure": "NOT SURE - its session is gone, but it may not be litter"}
+
+
+def render_ps_screen(listing, fleet, width=100):
+    """The process screen: a heading per session and per group, then one line a
+    process - pid, ports, the command in its short form."""
+    fleet = fleet if isinstance(fleet, dict) else {}
+    if not fleet.get("procs_ok", True):
+        return "processes unknown - " + fleet.get("why", "ps or the environment read failed")
+    if not listing:
+        return "no processes started by agents"
+    known = fleet.get("ports_ok", True)
+    out, heading = [], None
+    for p in listing:
+        head = p["who"] if p["group"] == "session" else _PS_HEADING[p["group"]]
+        if head != heading:
+            out += ([""] if out else []) + [truncate(head, width)]
+            heading = head
+        ports = (" ".join(f":{n}" for n in p.get("ports") or []) or "-") if known else "?"
+        line = f"  {p.get('pid', '?'):<7} {ports:<13} {p.get('command', '')}"
+        if p["group"] == "unsure":
+            line += f"  ({p.get('why', '?')})"
+        out.append(truncate(line, width))
+    return "\n".join(out)
+
+
+def session_procs_lines(fleet, sid):
+    """A session's own work, for its brief: helpers left out."""
+    fleet = fleet if isinstance(fleet, dict) else {}
+    known = fleet.get("ports_ok", True)
+    out = []
+    for p in (fleet.get("by_session") or {}).get(sid) or []:
+        if p.get("helper"):
+            continue
+        ports = (" ".join(f":{n}" for n in p.get("ports") or []) or "-") if known else "?"
+        out.append(f"{p.get('pid', '?'):<7} {ports:<13} {p.get('command', '')}")
+    return out
 
 
 def main(argv=None):

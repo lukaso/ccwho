@@ -89,8 +89,13 @@ FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
 class Fleet:
     """One snapshot of the world, and the questions the screen asks of it."""
 
-    def __init__(self, rows=(), source_ok=True, at="", error=""):
+    def __init__(self, rows=(), source_ok=True, at="", error="", procs=None):
         self.rows, self.source_ok, self.at, self.error = list(rows), source_ok, at, error
+        # collect()'s second answer: what agents started, the ports they hold,
+        # what was left behind. None - not collected yet, or the scan failed -
+        # is "unknown", which must never read as "no processes"
+        self.procs = procs if isinstance(procs, dict) else {
+            "procs_ok": False, "why": "not collected yet, or the scan failed"}
 
     def visible(self, query):
         return engine.ui_filter(self.rows, query)
@@ -164,6 +169,7 @@ class CcwhoUi(App):
     CSS = """
     Screen { layout: vertical; }
     #header { height: 1; }
+    #ports, #procline { height: auto; padding: 0 1; }
     #banner { height: auto; color: $warning; }
     #body { height: 1fr; }
     #list { width: 1fr; }
@@ -186,6 +192,7 @@ class CcwhoUi(App):
         Binding("right", "detail", "detail"),
         Binding("left,escape", "back", "back"),
         Binding("slash", "search", "search"),
+        Binding("p", "procs", "processes"),
         Binding("j,down", "next", "down", show=False),
         Binding("k,up", "prev", "up", show=False),
         Binding("o", "reopen", "reopen", show=False),
@@ -201,6 +208,7 @@ class CcwhoUi(App):
         self.fleet = Fleet(at="")
         self.filter_text = ""   # not `query`: App.query() is Textual's own
         self.detail_open = False
+        self.detail_mode = "brief"      # or "procs": what the detail pane shows
         self.status = "collecting..."
         self.started = self.shown = 0
         self.painted_width = 0
@@ -213,10 +221,14 @@ class CcwhoUi(App):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header", markup=False)
+        # what agents hold: one dim line, never louder than what needs you
+        yield Static("", id="ports", markup=False)
         yield Static("", id="banner", markup=False)
         with Horizontal(id="body"):
             yield VerticalScroll(id="list")
             yield VerticalScroll(Static("", id="brief", markup=False), id="detail")
+        # what was left behind, and Codex's: one collapsed line each
+        yield Static("", id="procline", markup=False)
         yield Input(placeholder="search", id="search")
         yield Footer()
 
@@ -375,10 +387,12 @@ class CcwhoUi(App):
         if shape == self.painted_shape and listing.children:
             self.repaint_rows(groups, width)
             self.paint_header(groups)
+            self.repaint_detail()
             return
         if self.reordered(listing, groups, width):
             self.painted_shape = shape
             self.paint_header(groups)
+            self.repaint_detail()
             return
         self.painted_shape = shape
         keep = self.selected_id()
@@ -488,18 +502,61 @@ class CcwhoUi(App):
             + when + searching + ("  " + self.status if self.status else ""))
         banner.update(self.fleet.error or "")
         banner.display = bool(self.fleet.error)
+        self.paint_procs_lines()
+
+    def paint_procs_lines(self):
+        ports, bottom = self.part("#ports"), self.part("#procline")
+        if ports is None or bottom is None:
+            return
+        width = max(10, self.size.width - 2)
+        try:
+            held = engine.ports_line(self.fleet.procs, width)
+            lines = "\n".join(engine.bottom_lines(self.fleet.procs, hint="p", width=width))
+        except Exception:               # an odd shape is "unknown", never a crash
+            held, lines = "processes unknown", ""
+        ports.update(Text(held, style="dim", no_wrap=True, overflow="crop"))
+        ports.display = bool(held)
+        bottom.update(Text(lines, style="dim", no_wrap=True, overflow="crop"))
+        bottom.display = bool(lines)
+
+    def repaint_detail(self):
+        """A refresh that kept the rows still changes what they started: an open
+        pane that is not repainted contradicts the lines around it."""
+        if self.detail_open:
+            self.paint_detail()
 
     def paint_detail(self):
         row = self.selected_row()
         detail, brief_box = self.part("#detail"), self.part("#brief")
-        if not row or detail is None or brief_box is None or self.part("#list") is None:
+        if detail is None or brief_box is None or self.part("#list") is None:
             return
-        b = self.collector.brief(row)
-        # color=True and then from_ansi: the brief already knows which words are
-        # labels and which are the answer. Asking for plain text and drawing it
-        # all the same way threw that away and made the pane a wall of white.
-        brief = engine.render_brief(self.collector.brief(row), row, color=True)
-        brief_box.update(Text.from_ansi(brief, no_wrap=False))
+        if self.detail_mode == "procs":
+            procs = self.fleet.procs
+            # the pane's own width: wide, it is 38% of the screen, not all of it
+            wide = self.size.width >= engine.UI_WIDE
+            width = (int(self.size.width * 0.38) if wide else self.size.width) - 4
+            try:
+                text = engine.render_ps_screen(engine.ps_listing(self.fleet.rows, procs),
+                                               procs, width=max(20, width))
+            except Exception:           # an odd shape is "unknown", never a crash
+                text = "processes unknown"
+            brief_box.update(Text(text, no_wrap=True, overflow="crop"))
+        else:
+            if not row:
+                return
+            # color=True and then from_ansi: the brief already knows which words
+            # are labels and which are the answer. Asking for plain text and
+            # drawing it all the same way made the pane a wall of white.
+            brief = engine.render_brief(self.collector.brief(row), row, color=True)
+            text = Text.from_ansi(brief, no_wrap=False)
+            try:
+                mine = engine.session_procs_lines(self.fleet.procs, row.get("sessionId"))
+            except Exception:
+                mine = []
+            if mine:
+                text.append("\n\nprocesses\n", style="bold")
+                text.append("\n".join(mine), style="dim")
+            brief_box.update(text)
         detail.display = True
         detail.set_class(self.size.width < engine.UI_WIDE, "full")
         self.part("#list").display = self.size.width >= engine.UI_WIDE
@@ -644,6 +701,13 @@ class CcwhoUi(App):
         self.move(-1)
 
     def move(self, step):
+        if self.detail_open and self.detail_mode == "procs":
+            # the process screen is not about the selected session: these keys
+            # scroll it, and never move a selection you cannot see
+            detail = self.part("#detail")
+            if detail is not None:
+                detail.scroll_relative(y=step, animate=False)
+            return
         rows = self.rows_on_screen()
         if not rows:
             return
@@ -661,6 +725,13 @@ class CcwhoUi(App):
 
     def action_detail(self):
         self.detail_open = True
+        self.detail_mode = "brief"
+        self.paint_detail()
+
+    def action_procs(self):
+        """Every process agents started, in the detail pane - `ccwho ps`, here."""
+        self.detail_open = True
+        self.detail_mode = "procs"
         self.paint_detail()
 
     def action_back(self):
@@ -886,7 +957,7 @@ class Collector:
         self.reload()
         status = {}
         try:
-            rows, _ = engine.collect(cache=self.cache, status=status)
+            rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
             return Fleet([], False, "", f"could not read the fleet: {ex}")
         # The scan's own answer to the cheap question, so the next cheap check
@@ -897,7 +968,7 @@ class Collector:
                                         "cannot read the session list - run `ccwho doctor`")
         self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
-                     time.strftime("%H:%M:%S"), trouble)
+                     time.strftime("%H:%M:%S"), trouble, procs=procs)
 
     def saved_count(self):
         """How many sessions the newest manifest holds, or 0."""

@@ -1792,3 +1792,243 @@ class TestTheListReloadsLikeTheWatch(unittest.TestCase):
     def test_a_good_edit_is_not_reported_as_an_error(self):             # control
         c = self.reload()
         self.assertEqual(c.reload_error, "")
+
+
+# ---------------------------------------------------------------- slice 2b
+# What agents started, in the list: one dim line under the header, the ports on
+# each row, one collapsed line at the bottom, and `p` for the whole list. NEEDS
+# YOU still owns the screen (DX D9).
+
+PROCS = {"ports_ok": True, "procs_ok": True, "sessions_ok": True,
+         "agent_ports": [{"port": 3000, "pid": 12, "who": "liveapp"},
+                         {"port": 8080, "pid": 20, "who": "left behind"}],
+         "by_session": {LIVE["sessionId"]: [
+             {"pid": 12, "ports": [3000], "command": "vite --port 3000", "helper": False,
+              "orphan": False, "harness": "claude", "session": LIVE["sessionId"]}]},
+         "left_behind": [{"pid": 20, "ports": [8080], "command": "next-server",
+                          "helper": False, "orphan": True, "harness": "claude",
+                          "session": "dddd"}],
+         "codex": [], "unsure": []}
+HOLDING = dict(LIVE, ports=[3000], procs=1)
+
+
+def with_procs(procs=PROCS, rows=(HOLDING, BUSY)):
+    return FakeCollector(fleet=ui.Fleet(list(rows), True, "12:00:00", procs=procs))
+
+
+class TestTheListSaysWhatAgentsHold(UiTest):
+    async def test_one_dim_line_under_the_header(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            line = app.query_one("#ports")
+            self.assertTrue(line.display)
+            self.assertIn("agents hold :3000 liveapp", str(line.content))
+
+    async def test_no_ports_no_line(self):                               # control
+        app = self.app(collector=with_procs(dict(PROCS, agent_ports=[], left_behind=[])))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#ports").display)
+            self.assertFalse(app.query_one("#procline").display)
+
+    async def test_the_row_shows_its_ports(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            row = [w for w in app.rows_on_screen()
+                   if w.row["sessionId"] == LIVE["sessionId"]][0]
+            self.assertIn(":3000", row.painted)
+
+    async def test_left_behind_is_one_line_at_the_bottom(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            line = app.query_one("#procline")
+            self.assertTrue(line.display)
+            self.assertEqual(str(line.content), "left behind: 1 process, 1 port · p to see")
+
+    async def test_p_shows_every_process_and_escape_goes_back(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertTrue(app.query_one("#detail").display)
+            text = str(app.query_one("#brief").content)
+            for want in ("vite --port 3000", "LEFT BEHIND", "next-server", ":8080"):
+                self.assertIn(want, text)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app.query_one("#detail").display)
+            self.assertTrue(isinstance(app.focused, ui.Row))
+
+    async def test_the_brief_lists_the_sessions_processes(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            text = str(app.query_one("#brief").content)
+            self.assertIn("vite --port 3000", text)
+            self.assertIn("Shall I land it?", text)                     # still the brief
+
+    async def test_a_port_search_finds_the_row(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            for ch in ":3000":
+                await pilot.press(ch)
+            await pilot.pause()
+            text = self.screen_text(app)
+            self.assertIn("Issue 362", text)
+            self.assertNotIn("Release queue", text)
+
+    async def test_the_old_fleet_shape_still_works(self):                # compat
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([LIVE, BUSY], True, "12:00:00")))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertTrue(app.rows_on_screen())
+
+
+class TestTheCollectorPassesWhatAgentsStarted(unittest.TestCase):
+    def test_the_fleet_carries_collects_second_answer(self):
+        real_collect, real_reload = ui.engine.collect, ui.engine.reload_all
+        ui.engine.collect = lambda cache=None, status=None: (
+            [dict(LIVE)], PROCS) if status.update(source_ok=True) is None else None
+        ui.engine.reload_all = lambda engine: None
+        try:
+            fleet = ui.Collector().fleet()
+        finally:
+            ui.engine.collect, ui.engine.reload_all = real_collect, real_reload
+        self.assertEqual(fleet.procs, PROCS)
+        self.assertFalse(ui.Fleet([], True, "").procs["procs_ok"])       # control: unknown
+
+
+class TestTheProcessScreenReview(UiTest):
+    """Review of slice 2b: the pane follows refreshes, unknown is not none, the
+    keys on the process screen do not move a selection you cannot see."""
+
+    async def test_a_refresh_repaints_the_open_process_screen(self):
+        collector = with_procs()
+        app = self.app(collector=collector)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertIn("next-server", str(app.query_one("#brief").content))
+            # one refresh with the pane open settles the list at its new width:
+            # the next one keeps the rows and takes the cheap path
+            app.show(ui.Fleet([HOLDING, BUSY], True, "12:00:03", procs=PROCS))
+            await pilot.pause()
+            app.show(ui.Fleet([HOLDING, BUSY], True, "12:00:05",
+                              procs=dict(PROCS, left_behind=[])))
+            await pilot.pause()
+            text = str(app.query_one("#brief").content)
+            self.assertNotIn("next-server", text)
+            self.assertIn("vite --port 3000", text)                         # control
+
+    async def test_a_refresh_repaints_the_briefs_processes(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIn("vite --port 3000", str(app.query_one("#brief").content))
+            app.show(ui.Fleet([HOLDING, BUSY], True, "12:00:03", procs=PROCS))
+            await pilot.pause()
+            app.show(ui.Fleet([HOLDING, BUSY], True, "12:00:05",
+                              procs=dict(PROCS, by_session={})))
+            await pilot.pause()
+            self.assertNotIn("vite --port 3000", str(app.query_one("#brief").content))
+
+    async def test_not_collected_is_not_no_processes(self):
+        for fleet in (ui.Fleet([LIVE, BUSY], True, "12:00:00"),
+                      ui.Fleet([], False, "", "could not read the fleet: boom")):
+            with self.subTest(error=fleet.error):
+                app = self.app(collector=FakeCollector(fleet=fleet))
+                async with app.run_test(size=(160, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("p")
+                    await pilot.pause()
+                    text = str(app.query_one("#brief").content)
+                    self.assertNotIn("no processes", text)
+                    self.assertIn("unknown", text)
+
+    async def test_an_empty_valid_answer_is_no_processes(self):          # control
+        empty = dict(PROCS, by_session={}, left_behind=[], agent_ports=[])
+        app = self.app(collector=with_procs(empty))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertIn("no processes started by agents",
+                          str(app.query_one("#brief").content))
+
+    async def test_keys_on_the_process_screen_do_not_move_the_selection(self):
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            before = app.selected
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.press("j")
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.selected, before)
+
+    async def test_keys_on_the_brief_still_move_it(self):                # control
+        app = self.app(collector=with_procs())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            before = app.selected
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("j")
+            await pilot.pause()
+            self.assertNotEqual(app.selected, before)
+
+    async def test_bad_process_data_never_takes_the_list_down(self):
+        # a shape the engine itself cannot read: the UI still stands
+        bad = dict(PROCS, left_behind="not a list", agent_ports=[{"port": 3000, "pid": 1}],
+                   codex=[{"ports": [], "command": "y"}])
+        app = self.app(collector=with_procs(bad))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertIsNone(app.return_code)
+            self.assertTrue(app.rows_on_screen())
+
+    async def test_the_lines_stay_one_line(self):
+        long_who = [{"port": 3000 + i, "pid": i, "who": "project\nwith a newline"}
+                    for i in range(12)]
+        procs = dict(PROCS, agent_ports=long_who,
+                     left_behind=PROCS["left_behind"] * 12,
+                     codex=[dict(PROCS["left_behind"][0], harness="codex")])
+        for width in (40, 60, 200):
+            with self.subTest(width=width):
+                app = self.app(collector=with_procs(procs))
+                async with app.run_test(size=(width, 30)) as pilot:
+                    await pilot.pause()
+                    self.assertLessEqual(app.query_one("#ports").size.height, 1)
+                    self.assertLessEqual(app.query_one("#procline").size.height, 2)
+                    for line in str(app.query_one("#procline").content).splitlines():
+                        self.assertLessEqual(len(line), width - 2)
+
+    async def test_the_process_screen_fits_its_pane(self):
+        long = dict(PROCS, left_behind=[dict(PROCS["left_behind"][0],
+                                             command="node " + "x" * 200 + ".js")])
+        for width in (160, 80):
+            with self.subTest(width=width):
+                app = self.app(collector=with_procs(long))
+                async with app.run_test(size=(width, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("p")
+                    await pilot.pause()
+                    box = app.query_one("#brief")
+                    for line in str(box.content).splitlines():
+                        self.assertLessEqual(len(line), box.content_size.width)

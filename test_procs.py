@@ -673,7 +673,10 @@ class TestHelpers(unittest.TestCase):
         for cmd in ("npm exec chrome-devtools-mcp@latest", "npx -y some-mcp-server",
                     "node /Users/me/.npm/_npx/1/node_modules/.bin/chrome-devtools-mcp",
                     "uvx mcp-server-fetch", "/Users/x/.safe-chain/bin/safe-chain npm i",
-                    "node /x/node_modules/@modelcontextprotocol/server-github/dist/index.js"):
+                    "node /x/node_modules/@modelcontextprotocol/server-github/dist/index.js",
+                    # measured: chrome-devtools-mcp's watchdog, one per session
+                    "node /Users/x/.npm/_npx/15c6/node_modules/chrome-devtools-mcp/build/src/"
+                    "telemetry/watchdog/main.js --parent-pid=7324 --app-version=1.9.0"):
             with self.subTest(cmd=cmd):
                 self.assertTrue(procs.is_helper(cmd))
 

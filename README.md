@@ -11,8 +11,30 @@ liveapp       busy        liveapp-06     yes, let's do that. create a directory�
 chiefofstaff  idle        chiefofstaff-08  commit and push                          10d
 ```
 
-No daemon, no hooks, no tmux, no config. One command, ~0.8s over 16 sessions.
-Stdlib Python only. Reads only what Claude Code already writes to disk.
+No daemon, no hooks, no tmux, no config. Reads only what Claude Code already writes
+to disk. The engine is stdlib Python; only the live list needs a library (Textual),
+and `uv` fetches that for you.
+
+On a terminal, `ccwho` opens the **live list**: every session, what needs you at the
+top, the harness's own recap under each row, and Enter to go to its window. Piped,
+or with a subcommand, it is the one-shot table above.
+
+## Install
+
+macOS, iTerm2 and Claude Code. `uv` for the live list (`brew install uv`).
+
+```sh
+git clone https://github.com/lukaso/ccwho ~/projects/ccwho
+ln -s ~/projects/ccwho/ccwho.py  ~/.local/bin/ccwho
+ln -s ~/projects/ccwho/ccgate.py ~/.local/bin/ccgate
+ccwho setup
+```
+
+`ccwho setup` does the rest once, and says what it did: the `ccwho://` link
+handler, the autosave job, the iTerm2 hotkey window, and the Accessibility
+permission the hotkey needs to reach you from another app. It writes nothing on a
+machine that cannot work, and a second run changes nothing that is already right.
+`ccwho doctor` checks the same things later, read-only.
 
 ## Why
 
@@ -24,12 +46,95 @@ it because it is a data problem, not a display problem.
 `ccwho` shows the **last thing you actually said** to each session, pulled from its
 transcript. That is the column no tool has.
 
+## The live list
+
+```
+ccwho                         # on a terminal
+⌥/                            # from any app, after `ccwho setup`
+```
+
+| key | does |
+|---|---|
+| ↑ ↓ / `j` `k` | move |
+| Enter | go to the session's window - or give it one (see below) |
+| → | the brief: what it was working on, without opening it |
+| ← / Esc | back |
+| `/` | search every name a session has, plus what it is about |
+| `o` | reopen the last saved fleet - only offered when nothing is running |
+| `r` | restart the list |
+| `q` | quit |
+
+The second line of every row is the **recap** Claude Code writes into the
+transcript itself (`away_summary`), always with its age: one session's newest recap
+was 2 days and 23 turns old, and a recap without its age reads as the current state.
+
+It notices a session start needing you within a second, by stat-ing transcript
+files - no program is started for that - and does a full scan every 20 seconds.
+Collection runs in a worker thread, because `claude agents --json` can take 30
+seconds when it is unhappy and a list that freezes when you reach for it is the
+problem this exists to solve.
+
+**The hotkey.** `ccwho setup` adds an iTerm2 hotkey window running the list, on ⌥/
+by default (`ccwho setup --hotkey option-w` to change it). A hotkey is only global if
+iTerm2 had Accessibility when it registered the key; setup asks for it, and says
+when iTerm2 must be restarted for it to take.
+
+### Background sessions
+
+A session started with `claude --bg`, or sent to the background from agent view,
+runs under the Claude Code daemon with no window at all. Enter on one opens a new
+iTerm2 window running `claude attach <short id>`, and the row blinks while it opens.
+It is never resumed: `claude --resume` on a running session starts a second process
+on one transcript.
+
+`claude attach` takes the **short** id - the 8 hex that `claude agents` lists - not
+the session UUID. Given the UUID it says `No job matching`, about a session that is
+running fine, while `--resume` correctly refuses it: every way in fails and the
+session looks lost.
+
+To end one: `claude stop <short id>` (the conversation is kept, and `--resume` works
+after), or `claude rm <short id>` to delete it. The session keeps the directory it
+was started in wherever you attach from; `--resume` uses the directory you are in.
+
+## Finding an old session
+
+```sh
+ccwho ls                   # the table
+ccwho ls hotkey            # every session matching - running or ended
+ccwho ls hotkey --all      # ...including sessions a program started
+ccwho show hotkey          # what that session was working on
+```
+
+The live fleet is fifteen sessions; the disk holds a month of them (1,480
+transcripts, 1 GB, measured 2026-09-19). `ls` and `show` search a small index in
+`~/.ccwho/` that reads only what was **appended** since last time - transcripts only
+grow at the end, so (inode, size, offset) is enough to resume. The first build
+stored pasted logs whole and came to 177 MB; entries are now capped, since you
+recognise a line by its front.
+
+## ccwho doctor
+
+```sh
+ccwho doctor          # ok / BAD per dependency, and the line to run when BAD
+ccwho doctor --json
+```
+
+It exists because iTerm2's own Claude Code integration stopped working and nothing
+said so: its hook had been dropped from `~/.claude/settings.json` by another tool's
+rewrite. Every dependency ccwho has can fail that quietly - an autosave job loaded
+but not run since Tuesday, a link handler calling a copy of ccwho that was deleted -
+so each gets a check. Read-only by design: a tool that rewrites another tool's
+config without asking is how that happened in the first place. `ccwho --watch`
+shows the first fault in its header.
+
 ## Sources
 
 | What | Where |
 |---|---|
 | session list, status, `waitingFor` | `claude agents --json` |
 | the topic | `~/.claude/projects/*/<sessionId>.jsonl` (head + tail read only) |
+| the recap | the same transcript, `system` / `away_summary` records |
+| old sessions | the index, `~/.ccwho/` |
 | detached work | `ps`, PID-1 orphans matched by sessionId in the cmdline |
 
 `sessionId` from the agents feed **is** the transcript filename, which is what makes
@@ -99,7 +204,7 @@ iTerm2 (3.x) it is genuinely clickable. Clicking hands `ccwho://jump/s032` to
 LaunchServices, where a small applet turns it back into `ccwho jump s032`.
 
 ```sh
-bash install-handler.sh      # once; builds ~/Applications/ccwho-jump.app
+ccwho setup                  # once; builds ~/Applications/ccwho-jump.app
 ```
 
 The applet is ~10 lines of AppleScript, has no Dock icon (`LSUIElement`), and runs
@@ -178,12 +283,10 @@ dashboard order, so what was waiting on you is at the top and still carries its 
 you did not plan. `ccwho --watch` writes a manifest every 5 minutes
 (`CCWHO_AUTOSAVE` seconds, `0` disables) - but only while a watch is open in some
 window, which on 2026-09-05 meant a crash found a manifest five days old. So
-`com.lukaso.ccwho.save.plist` puts it on a 15-minute launchd timer as well:
-
-```sh
-cp com.lukaso.ccwho.save.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lukaso.ccwho.save.plist
-```
+`ccwho setup` puts it on a 15-minute launchd timer as well. The job is rendered from
+`com.lukaso.ccwho.save.plist.template` for this machine - its home, its ccwho, the
+directory its `claude` is in, because launchd's `PATH` has none of them - and
+`ccwho doctor` says when the installed job no longer matches what setup would write.
 
 `StartInterval` fires only while the Mac is awake and never wakes it, and after a
 sleep launchd runs the job once if the interval elapsed. Manifests live in
@@ -216,7 +319,11 @@ and the verb is decided against the world at click time:
 
 - running, with a window -> **focus it** (reopening a live session would fork the
   conversation into two processes)
-- not running, or running with no window -> **reopen it** in a new iTerm2 window
+- running, with no window -> **attach it** in a new iTerm2 window, with
+  `claude attach` - the same guard, never a second process
+- not running -> **reopen it** in a new iTerm2 window
+- the live list could not be read -> **do nothing**: an empty list from a failed
+  read looks exactly like "nothing is running"
 - in neither the live fleet nor any manifest -> say so, do nothing
 
 So after a reboot every link in the list reopens, and ten minutes later the same
@@ -253,25 +360,24 @@ that was invisible because `found[:-0]` is `found[:0]`. The battery carries a co
 cell that must stay green - a run where every cell agrees is a broken harness, not a
 result.
 
-## Install
-
-```sh
-git clone <this> ~/projects/ccwho
-ln -s ~/projects/ccwho/ccwho.py  ~/.local/bin/ccwho
-ln -s ~/projects/ccwho/ccgate.py ~/.local/bin/ccgate
-```
-
 ## Use
 
 ```sh
-ccwho                 # one shot, needs-you first
-ccwho --watch         # live, redraws every 5s (and saves a restore manifest)
-ccwho --watch 2       # ...every 2s  (also -w 2, --watch=2)
-ccwho --blocked       # only what needs you or holds detached work
-ccwho save            # record the live fleet (before a reboot)
+ccwho                   # the live list (on a terminal)
+ccwho ls [words] [--all]  # the one-shot table, or every session matching
+ccwho show <anything>   # what that session was working on
+ccwho jump <tty|pid|title>  # focus that window
+ccwho open <session-id> # focus it, give it a window, or reopen it
+ccwho --watch           # the plain table, redrawn every 5s (and autosaving)
+ccwho --watch 2         # ...every 2s  (also -w 2, --watch=2)
+ccwho --blocked         # only what needs you or holds detached work
+ccwho --prompt          # add the last thing you said, under each row
+ccwho --json            # machine-readable, for a status line or key binding
+ccwho save              # record the live fleet (before a reboot)
 ccwho restore [--open]  # list it back, or reopen the windows
-ccwho --prompt        # add the last thing you said, under each row
-ccwho --json          # machine-readable, for a status line or key binding
+ccwho reap              # leaked helper processes, dry run
+ccwho doctor            # is everything ccwho needs in place?
+ccwho setup             # install what it needs, once
 ```
 
 ## Columns
@@ -416,8 +522,15 @@ Pure functions and plain dicts only.
 ## Tests
 
 ```sh
-python3 -m unittest -v
+./test
 ```
 
-208 tests, stdlib only. Every guard has been mutation-checked: reverting the fix it
+881 tests: 767 for the engine, runner, brief, index and setup (stdlib only), and
+114 for the live list, which `uv` runs with Textual. If uv cannot fetch Textual the
+UI tests FAIL rather than skip - "OK (skipped=12)" while the screen is broken is a
+green light for nothing. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.
+
+## License
+
+MIT.

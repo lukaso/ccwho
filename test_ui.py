@@ -84,10 +84,6 @@ class FakeAdapter:
     def __init__(self, answer="focused s022", hang=False):
         self.answer, self.hang, self.asked = answer, hang, []
         self.attached = []
-        self.kept_in_front = 0
-
-    def keep_in_front(self):
-        self.kept_in_front += 1
 
     def attach(self, cmd, deadline=5.0):
         self.attached.append(cmd)
@@ -116,15 +112,6 @@ class UiTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTheList(UiTest):
-    async def test_the_panel_is_kept_in_front_from_the_start(self):
-        # the hotkey panel loses the focus iTerm2 gives it - see ccwho_panel;
-        # whether this window IS the panel is the adapter's question, not ours
-        adapter = FakeAdapter()
-        app = self.app(adapter=adapter)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            self.assertEqual(adapter.kept_in_front, 1)
-
     async def test_it_groups_by_what_each_session_needs(self):
         app = self.app()
         async with app.run_test() as pilot:

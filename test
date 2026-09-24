@@ -3,7 +3,7 @@
 #
 # The engine, the brief, the index and the runner are stdlib and run anywhere:
 #   python3 -m unittest test_ccwho test_procs test_runner test_brief test_index test_setup \
-#                       test_contract
+#                       test_contract test_panel
 #
 # The UI tests need Textual. uv fetches and caches it from the header in
 # ccwho_ui.py, so there is nothing to install - but if it cannot, the UI tests
@@ -12,7 +12,7 @@
 set -e
 cd "$(dirname "$0")"
 
-CORE="test_ccwho test_procs test_runner test_brief test_index test_setup test_contract"
+CORE="test_ccwho test_procs test_runner test_brief test_index test_setup test_contract test_panel"
 echo "== engine, brief, index, setup, runner (stdlib) =="
 python3 -m unittest $CORE "$@"
 

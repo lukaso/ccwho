@@ -21,12 +21,19 @@ import datetime
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
 
 import ccwho_brief as brief
 import ccwho_index
+import ccwho_procs as procs
+
+# The rule modules the engine imports, in the order they are re-read. One list,
+# used by the watch loop and the list alike: a module named in only one of two
+# lists is a fix that lands in one window and not the other.
+RELOAD_FIRST = ("ccwho_brief", "ccwho_index", "ccwho_procs")
 
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
@@ -430,7 +437,15 @@ def truncate(s, width):
 
 # ------------------------------------------------------------------ disk reads
 
-def transcript_path(session_id):
+def all_roots(cache=None):
+    """The known config roots, plus the dirs running sessions named for
+    themselves on the last scan - kept in the caller's cache by collect(),
+    because an isolated session's transcript lives under ITS dir."""
+    extra = (cache or {}).get("_extra_roots", [])
+    return procs.config_dirs(extra, ccwho_index.config_roots())
+
+
+def transcript_path(session_id, roots=None):
     """Where this session's transcript lives, in ANY config root.
 
     Not every session runs under the login in ~/.claude: some use a
@@ -441,8 +456,9 @@ def transcript_path(session_id):
     """
     if not session_id:
         return None
-    for root in ccwho_index.config_roots():
-        hits = glob.glob(os.path.join(root, "projects", "*", f"{session_id}.jsonl"))
+    for root in roots or ccwho_index.config_roots():
+        hits = glob.glob(os.path.join(glob.escape(root), "projects", "*",
+                                      f"{glob.escape(session_id)}.jsonl"))
         if hits:
             return hits[0]
     return None
@@ -455,7 +471,7 @@ def read_windows(session_id, tail_bytes=1024 * 1024, head_lines=400, cache=None)
     sessionId, holding (mtime, size). An unchanged transcript is not re-read or
     re-parsed - which is most of them, most ticks.
     """
-    path = transcript_path(session_id)
+    path = transcript_path(session_id, roots=all_roots(cache))
     if not path:
         return [], [], None
     try:
@@ -573,7 +589,7 @@ def parse_tty_map(ps_output):
 _ANSI = re.compile(r"\033(?:\][^\007\033]*(?:\007|\033\\)|\[[0-9;]*[A-Za-z])")
 # A jump target is a tty like s032 or a bare pid. Nothing else is accepted, so a
 # crafted URL cannot smuggle anything into the handler.
-_JUMP_TARGET = re.compile(r"^[A-Za-z]?[0-9]{1,8}$")
+_JUMP_TARGET = re.compile(r"^[A-Za-z]?[0-9]{1,8}\Z")
 
 
 def visible_len(text):
@@ -593,8 +609,10 @@ def jump_url(row):
     return f"ccwho://jump/{target}" if target else ""
 
 
-_SESSION_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-                         r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# A link names a session by its UUID. (It had the same name as the looser
+# _SESSION_ID further down, which replaced it: links accepted any id-shaped text.)
+_LINK_SESSION_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                              r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 
 
 def open_url(entry):
@@ -605,7 +623,7 @@ def open_url(entry):
     manifest can never talk the handler into a shell argument of its choosing.
     """
     sid = str((entry or {}).get("sessionId", "") or "")
-    return "ccwho://open/" + sid if _SESSION_ID.match(sid) else ""
+    return "ccwho://open/" + sid if _LINK_SESSION_ID.match(sid) else ""
 
 
 def parse_ccwho_url(url):
@@ -617,7 +635,7 @@ def parse_ccwho_url(url):
     """
     if not isinstance(url, str):
         return ("", "")
-    for verb, pattern in (("open", _SESSION_ID), ("jump", _JUMP_TARGET)):
+    for verb, pattern in (("open", _LINK_SESSION_ID), ("jump", _JUMP_TARGET)):
         prefix = "ccwho://%s/" % verb
         if url.startswith(prefix):
             target = url[len(prefix):].strip().rstrip("/")
@@ -635,15 +653,22 @@ def daemon_short(session_id):
     return (session_id or "")[:8]
 
 
-def attach_command(session_id):
+def attach_command(session_id, config_dir=None):
     """Put a running background session in a terminal.
 
     `claude attach <id>`: "Open the background session in this terminal." The
     session feed marks these `kind: background` - on a live fleet of fifteen,
     fourteen interactive and one background.
+
+    `claude attach` looks in the config dir it runs under, so a session found in
+    another dir is attached there: under the default one it is `No job matching`.
     """
-    return (f"claude attach {shlex.quote(daemon_short(session_id))}"
-            if session_id else "")
+    if not session_id:
+        return ""
+    cmd = f"claude attach {shlex.quote(daemon_short(session_id))}"
+    if config_dir:
+        cmd = f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} {cmd}"
+    return cmd
 
 
 def is_attach_to(command, session_id):
@@ -684,7 +709,7 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
             # not one to reopen. `claude attach` puts a running session in a
             # terminal; `claude --resume` would start a second process on a
             # live transcript.
-            return ("attach", attach_command(session_id))
+            return ("attach", attach_command(session_id, r.get("configDir")))
     for e_ in entries or []:
         if e_.get("sessionId") == session_id:
             cmd = restore_command(e_)
@@ -875,6 +900,126 @@ def find_tool(name):
     return ""
 
 
+def ps_table():
+    """pid -> (start, command) for every process, the start in the exact text a
+    session file stores as procStart. The C locale and UTC are what make them
+    comparable: a local, localised `ps` prints "Tue 22 Sep 14:45:15"."""
+    try:
+        text = subprocess.run(["ps", "-axo", "pid=,lstart=,comm="], capture_output=True,
+                              text=True, timeout=20,
+                              env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return procs.parse_ps_table(text)
+
+
+def read_procargs(pid):
+    """The allowlisted environment of one of our own processes, or None.
+
+    The kernel hands back the whole environment - tokens included - and it goes
+    straight into procs.parse_procargs, which keeps the named keys and nothing
+    else. Nothing else here looks at the buffer.
+    """
+    import ctypes
+    import ctypes.util
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        # declared, not guessed: newlen is a size_t, and an undeclared 0 goes
+        # over as a 32-bit int with whatever sits in the register's upper half
+        libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+                                ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                                ctypes.c_void_p, ctypes.c_size_t]
+        libc.sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))          # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        # sized by the kernel's own answer; one too big for ARG_MAX fails with
+        # EINVAL above rather than coming back cut short
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        return procs.parse_procargs(buf.raw[:size.value])
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+SESSION_FILE_MAX = 64 * 1024        # a session file is a few hundred bytes
+
+
+def _read_small_file(path):
+    """The bytes of a small regular file, or None. One open that neither follows a
+    symlink nor blocks on a FIFO, and every check made on THAT handle - checking a
+    path and then opening it again leaves room for the file to be swapped."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > SESSION_FILE_MAX:
+            return None
+        data = os.read(fd, SESSION_FILE_MAX + 1)
+        return None if len(data) > SESSION_FILE_MAX else data
+    finally:
+        os.close(fd)
+
+
+def _read_session_file(path):
+    """A session file's object, or None if it cannot be used. A file caught while
+    Claude Code writes it parses on the second look; one that never parses - or
+    nests deep enough to exhaust the parser - is a real problem."""
+    for _attempt in (1, 2):
+        data = _read_small_file(path)
+        if data is None:
+            return None
+        try:
+            return json.loads(data)
+        except (ValueError, RecursionError):
+            continue
+    return None
+
+
+def read_session_files(dirs, default=None):
+    """Every usable `<dir>/sessions/*.json`, each tagged with its `configDir`; and
+    how many could not be used.
+
+    The dirs are named by other processes, so a scan must finish whatever is in
+    them: only small regular files are read (see _read_small_file), glob
+    characters in a dir name are literal, and an entry that is not what Claude
+    Code writes (procs.entry_problem) counts as unusable.
+    """
+    entries, bad = [], 0
+    for d in dirs:
+        for path in glob.glob(os.path.join(glob.escape(d), "sessions", "*.json")):
+            try:
+                data = _read_session_file(path)
+            except OSError:                 # a symlink (ELOOP), gone, unreadable
+                data = None
+            if data is None or procs.entry_problem(data):
+                bad += 1
+                continue
+            # the default dir stays unnamed: its sessions run with
+            # CLAUDE_CONFIG_DIR unset, and setting it can move the login
+            entries.append(dict(data, configDir="" if d == default else d))
+    return entries, bad
+
+
+def live_file_sessions():
+    """Live sessions from every config dir, as `claude agents --json` rows; and
+    how many session files could not be read (for `ccwho doctor`).
+
+    `claude agents --json` only answers for the config dir it runs under, and
+    pointed at another one it WRITES into it. So: each running claude process
+    names its own CLAUDE_CONFIG_DIR, and each dir keeps a small file per session.
+    """
+    table = ps_table()
+    own = []
+    for pid in procs.claude_pids(table):
+        env = read_procargs(pid) or {}
+        own.append(env.get("CLAUDE_CONFIG_DIR", ""))
+    dirs = procs.config_dirs(own, ccwho_index.config_roots())
+    entries, bad = read_session_files(dirs, default=os.path.expanduser("~/.claude"))
+    return procs.live_session_files(entries, procs.claude_starts(table)), bad
+
+
 def agents_json():
     """The live session list as JSON text, or None when the SOURCE is unavailable.
 
@@ -912,11 +1057,11 @@ MANIFEST_VERSION = 1
 # A session id has to be safe in a shell line AND look like an id. shlex.quote alone
 # would already make injection impossible; refusing a malformed id as well means the
 # user is TOLD it was skipped instead of getting a command that fails obscurely.
-_SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}$")
-_MANIFEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}\.json$")
+_SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}\Z")
+_MANIFEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}\.json\Z")
 
 _MANIFEST_KEYS = ("sessionId", "cwd", "project", "topic", "first", "ask",
-                  "attention", "status", "tty", "pid", "since")
+                  "attention", "status", "tty", "pid", "since", "configDir")
 
 
 def manifest_from_rows(rows, now=None):
@@ -949,7 +1094,10 @@ def restore_command(entry):
     cwd = str(entry.get("cwd", "") or "")
     if not cwd or not _SESSION_ID.match(sid):
         return None
-    return "cd %s && claude --resume %s" % (shlex.quote(cwd), shlex.quote(sid))
+    # a session from another config dir is only found there
+    conf = str(entry.get("configDir", "") or "")
+    env = "CLAUDE_CONFIG_DIR=%s " % shlex.quote(conf) if conf else ""
+    return "cd %s && %sclaude --resume %s" % (shlex.quote(cwd), env, shlex.quote(sid))
 
 
 def manifest_entries(manifest):
@@ -972,6 +1120,15 @@ def manifest_name(now=None):
 def newest_manifest(names):
     found = sorted(n for n in (names or []) if n and _MANIFEST_NAME.match(n))
     return found[-1] if found else None
+
+
+def manifest_transcript_finder(manifest):
+    """transcript_for for check_manifest: a saved session from another config dir
+    has its transcript under that dir, not under the known roots."""
+    dirs = [e.get("configDir") for e in manifest_entries(manifest)
+            if isinstance(e.get("configDir"), str) and e.get("configDir")]
+    roots = all_roots({"_extra_roots": dirs})
+    return lambda sid: transcript_path(sid, roots=roots)
 
 
 def check_manifest(manifest, cwd_exists, transcript_for):
@@ -1282,6 +1439,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "pid": session.get("pid"),
         "sessionId": session.get("sessionId", ""),
         "cwd": session.get("cwd", ""),
+        # set only for a session found in another config dir: attach and resume
+        # have to run there, or claude answers that it has no such session
+        "configDir": session.get("configDir", ""),
     }
 
 
@@ -1322,7 +1482,7 @@ def watch_digest(session_ids, cache=None, roots=None):
     for sid in session_ids:
         path = transcript_path_cached(sid, cache)
         parts.append((sid, _mtime(path) if path else 0))
-    for directory in project_dirs(roots):
+    for directory in project_dirs(roots or all_roots(cache)):
         parts.append((directory, _mtime(directory)))
     return tuple(sorted(parts))
 
@@ -1335,7 +1495,7 @@ def transcript_path_cached(session_id, cache=None):
         return transcript_path(session_id)
     paths = cache.setdefault("_paths", {})
     if session_id not in paths:
-        paths[session_id] = transcript_path(session_id)
+        paths[session_id] = transcript_path(session_id, roots=all_roots(cache))
     return paths[session_id]
 
 
@@ -1390,7 +1550,21 @@ def collect(cache=None, status=None):
         # reachable AND fully readable. Rows we understood are still rendered; a
         # picture with a hole in it is what must not reach a caller that launches.
         status["source_ok"] = parsed is not None and read_is_complete(raw)
-    sessions = parsed or []
+    try:
+        file_rows, bad = live_file_sessions()
+    except Exception:           # a second source: its failure never blanks the list
+        file_rows, bad = [], None
+    sessions = procs.merge_sessions(parsed or [], file_rows)
+    if status is not None:
+        status["session_files_bad"] = bad
+    # a one-shot caller has no cache of its own: give the scan one, or isolated
+    # sessions' transcripts are never found
+    if cache is None:
+        cache = {}
+    extra = sorted({r["configDir"] for r in file_rows if r.get("configDir")})
+    if extra != cache.get("_extra_roots", []):
+        cache["_extra_roots"] = extra
+        cache.pop("_paths", None)           # a miss may now be a hit
     ps_out = ps_snapshot()
     ttys = parse_tty_map(tty_snapshot())
     titles = titles_cached(cache, ttys=set(ttys.values()))
@@ -1424,6 +1598,41 @@ def collect(cache=None, status=None):
         for gone in set(k for k in cache if not k.startswith("_")) - set(ids):
             cache.pop(gone, None)
     return rows, count_orphans(ps_out, home=os.path.expanduser("~"))
+
+
+def _load_beside(module):
+    """Import a module's file into a NEW module object, leaving the live one alone.
+
+    importlib.reload() executes the new source INTO the module everyone is holding.
+    An edit that parses but raises half way through - a typo in a rule, a bad
+    constant - leaves half the new definitions live and half the old ones, and
+    catching the exception does not undo that. Building the candidate beside the
+    old one means a failure changes nothing.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(module.__name__, module.__file__)
+    candidate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(candidate)          # raises before anything is swapped
+    return candidate
+
+
+def reload_all(engine):
+    """Re-read the rule modules, then the engine; return the engine to use.
+
+    The rule modules go first, because the engine imports them and reloading
+    only the engine leaves a running window on the OLD rules. A failure puts the
+    working modules back and raises, so the caller can say so and carry on.
+    """
+    import importlib
+    old = {name: sys.modules[name] for name in RELOAD_FIRST if name in sys.modules}
+    try:
+        for name, module in list(old.items()):
+            sys.modules[name] = _load_beside(module)
+        importlib.reload(engine)
+    except Exception:
+        sys.modules.update(old)         # put the working ones back
+        raise
+    return engine
 
 
 # --------------------------------------------------------------------- display

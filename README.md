@@ -141,7 +141,7 @@ shows the first fault in its header.
 
 | What | Where |
 |---|---|
-| session list, status, `waitingFor` | `claude agents --json` |
+| session list, status | `claude agents --json`, plus `sessions/<pid>.json` in every config dir |
 | the topic | `~/.claude/projects/*/<sessionId>.jsonl` (head + tail read only) |
 | the recap | the same transcript, `system` / `away_summary` records |
 | old sessions | the index, `~/.ccwho/` |
@@ -149,6 +149,16 @@ shows the first fault in its header.
 
 `sessionId` from the agents feed **is** the transcript filename, which is what makes
 the topic column possible.
+
+`claude agents --json` only lists the sessions of the config dir it runs under, so a
+session started with its own `CLAUDE_CONFIG_DIR` never showed up - measured, 2 of 17
+running sessions were missing. Each running `claude` names its config dir in its
+environment, and each config dir keeps a small file per live session, so ccwho reads
+those as well (read-only: pointed at another dir, `claude agents` writes into it). A
+file counts only while its process is alive and is still the same process - its start
+time, as `ps` prints it in UTC, must match the one the file recorded. From the
+environment ccwho keeps four named variables and drops the rest: it holds tokens, and
+ccwho's output is read by agents. `ccwho doctor` says if those files stop parsing.
 
 ## Detached work
 

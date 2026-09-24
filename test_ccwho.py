@@ -9,6 +9,25 @@ import unittest
 import ccwho_brief as brief
 import ccwho_engine as ccwho
 
+# Reading this machine's session files is machine state: a test that reaches it
+# answers differently on every laptop and every minute. Every test in this module
+# runs with a guard that fails loudly instead; a test that means to exercise the
+# real function takes it from REAL_LIVE_FILE_SESSIONS and puts the guard back.
+REAL_LIVE_FILE_SESSIONS = ccwho.live_file_sessions
+
+
+def _unpinned_live_file_sessions():
+    raise AssertionError("a test reached this machine's session files - pin "
+                         "ccwho.live_file_sessions (see MachinelessCollect)")
+
+
+def setUpModule():
+    ccwho.live_file_sessions = _unpinned_live_file_sessions
+
+
+def tearDownModule():
+    ccwho.live_file_sessions = REAL_LIVE_FILE_SESSIONS
+
 
 class MachinelessCollect(unittest.TestCase):
     """collect() reaches the machine: ps, the tty map, and an AppleScript round
@@ -16,13 +35,17 @@ class MachinelessCollect(unittest.TestCase):
     second each, and answers differently on someone else's. Pin them."""
 
     def setUp(self):
-        self._saved = (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot)
+        self._saved = (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
+                       ccwho.live_file_sessions)
         ccwho.ps_snapshot = lambda: ""
         ccwho.tty_snapshot = lambda: ""
         ccwho.titles_snapshot = lambda timeout=5.0: {}
+        # the session files of THIS machine's config dirs are machine state too
+        ccwho.live_file_sessions = lambda: ([], 0)
 
     def tearDown(self):
-        (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot) = self._saved
+        (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
+         ccwho.live_file_sessions) = self._saved
 
 
 class TestParseSessions(unittest.TestCase):
@@ -1536,19 +1559,21 @@ class TestTitlesAreCachedBetweenTicks(unittest.TestCase):
         # collect() drops cache entries for sessions that ended. The titles live
         # in the same dict and are not a session id, so a careless sweep deletes
         # them every tick and the cache never hits once.
-        real_agents, real_ps, real_ttys = (ccwho.agents_json, ccwho.ps_snapshot,
-                                           ccwho.tty_snapshot)
+        real_agents, real_ps, real_ttys, real_files = (
+            ccwho.agents_json, ccwho.ps_snapshot, ccwho.tty_snapshot,
+            ccwho.live_file_sessions)
         ccwho.agents_json = lambda: json.dumps(
             [{"sessionId": "aaa", "pid": 1, "cwd": "/x", "status": "idle"}])
         ccwho.ps_snapshot = lambda: ""
         ccwho.tty_snapshot = lambda: ""
+        ccwho.live_file_sessions = lambda: ([], 0)     # this machine's sessions stay out
         try:
             cache = {}
             ccwho.collect(cache=cache)
             ccwho.collect(cache=cache)
         finally:
-            (ccwho.agents_json, ccwho.ps_snapshot,
-             ccwho.tty_snapshot) = real_agents, real_ps, real_ttys
+            (ccwho.agents_json, ccwho.ps_snapshot, ccwho.tty_snapshot,
+             ccwho.live_file_sessions) = real_agents, real_ps, real_ttys, real_files
         self.assertEqual(len(self.calls), 1, "iTerm2 was asked twice in two ticks")
 
     def test_a_terminal_reused_by_another_session_is_not_given_the_old_name(self):
@@ -2050,14 +2075,15 @@ class TestTheCheapQuestion(unittest.TestCase):
 
     def test_a_full_scan_hands_back_the_same_answer(self):
         # or the cheap check fires again the moment a scan finishes
-        real = ccwho.agents_json
+        real, real_files = ccwho.agents_json, ccwho.live_file_sessions
         ccwho.agents_json = lambda: '[]'
+        ccwho.live_file_sessions = lambda: ([], 0)     # this machine's sessions stay out
         try:
             status = {}
             ccwho.collect(cache={}, status=status)
             self.assertEqual(status.get("watch"), ccwho.watch_digest([]))
         finally:
-            ccwho.agents_json = real
+            ccwho.agents_json, ccwho.live_file_sessions = real, real_files
 
 
 class TestAQuestionIsAQuestionWhateverTheFeedSays(unittest.TestCase):
@@ -2266,14 +2292,15 @@ class TestWhatYouHaveLookedAtSurvives(unittest.TestCase):
         ccwho.mark_reviewed("a", "t1", path=self.path)
         real = ccwho.reviewed_path
         ccwho.reviewed_path = lambda: self.path
-        real_agents = ccwho.agents_json
+        real_agents, real_files = ccwho.agents_json, ccwho.live_file_sessions
         ccwho.agents_json = lambda: "[]"
+        ccwho.live_file_sessions = lambda: ([], 0)     # this machine's sessions stay out
         try:
             status = {}
             ccwho.collect(cache={}, status=status)
         finally:
             ccwho.reviewed_path = real
-            ccwho.agents_json = real_agents
+            ccwho.agents_json, ccwho.live_file_sessions = real_agents, real_files
         self.assertEqual(status.get("reviewed"), {"a": "t1"})
 
 
@@ -2588,3 +2615,495 @@ class TestOnlyAWindowThatIsSHOWINGItCounts(unittest.TestCase):
         # the old rule rather than reporting no window at all
         self.assertEqual(ccwho.owning_tty(42, {}, {42: "ttys000"}, self.TITLES),
                          "ttys000")
+
+
+class TestCollectFindsEveryConfigDir(MachinelessCollect):
+    """`claude agents --json` lists the sessions of ONE config dir. A session run
+    with its own CLAUDE_CONFIG_DIR never appeared - not even when it needed you.
+    Measured: 2 of 17 running sessions were invisible."""
+
+    A = {"pid": 11, "sessionId": "aaaa1111-0000-4000-8000-000000000001",
+         "cwd": "/Users/x/p/app", "kind": "interactive", "name": "app", "status": "idle",
+         "startedAt": 1000}
+    B = {"pid": 22, "sessionId": "bbbb2222-0000-4000-8000-000000000002",
+         "cwd": "/Users/x/p/work", "kind": "interactive", "name": "isolated",
+         "status": "busy", "startedAt": 2000}
+
+    def setUp(self):
+        super().setUp()
+        self._agents = ccwho.agents_json
+        ccwho.agents_json = lambda: json.dumps([self.A])
+
+    def tearDown(self):
+        ccwho.agents_json = self._agents
+        super().tearDown()
+
+    def ids(self, rows):
+        return sorted(r["sessionId"][:4] for r in rows)
+
+    def test_a_session_in_another_config_dir_is_listed(self):
+        ccwho.live_file_sessions = lambda: ([self.B], 0)
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(self.ids(rows), ["aaaa", "bbbb"])
+
+    def test_no_other_dirs_changes_nothing(self):                    # regression
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(self.ids(rows), ["aaaa"])
+
+    def test_a_session_in_both_is_listed_once(self):
+        ccwho.live_file_sessions = lambda: ([dict(self.A, name="from-file")], 0)
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(self.ids(rows), ["aaaa"])
+
+    def test_unreachable_claude_still_shows_what_the_files_know(self):
+        # shown, but never trusted to launch: source_ok stays False
+        ccwho.agents_json = lambda: None
+        ccwho.live_file_sessions = lambda: ([self.B], 0)
+        status = {}
+        rows, _ = ccwho.collect(cache={}, status=status)
+        self.assertEqual(self.ids(rows), ["bbbb"])
+        self.assertFalse(status["source_ok"])
+
+    def test_unreadable_session_files_are_counted_for_doctor(self):
+        ccwho.live_file_sessions = lambda: ([], 3)
+        status = {}
+        ccwho.collect(cache={}, status=status)
+        self.assertEqual(status["session_files_bad"], 3)
+
+
+class TestLiveFileSessionsLooksWhereSessionsSayTheyAre(unittest.TestCase):
+    """The glue: a running claude names its own config dir, and that dir's
+    session files are read. Nothing here touches this machine's real dirs."""
+
+    START = "Tue Sep 22 13:45:15 2026"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.dir, "sessions"))
+        with open(os.path.join(self.dir, "sessions", "7.json"), "w") as fh:
+            json.dump({"pid": 7, "sessionId": "cccc3333-0000-4000-8000-000000000003",
+                       "procStart": self.START, "kind": "interactive",
+                       "cwd": "/Users/x/p/work", "name": "isolated", "status": "idle"}, fh)
+        self._saved = (ccwho.ps_table, ccwho.read_procargs, ccwho.ccwho_index.config_roots)
+        ccwho.ps_table = lambda: {7: (self.START, "/Users/x/.local/bin/claude"),
+                                  8: (self.START, "/bin/zsh")}
+        ccwho.ccwho_index.config_roots = lambda roots_file=None: []
+
+    def tearDown(self):
+        (ccwho.ps_table, ccwho.read_procargs, ccwho.ccwho_index.config_roots) = self._saved
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_running_sessions_own_config_dir_is_read(self):
+        ccwho.read_procargs = lambda pid: {"CLAUDE_CONFIG_DIR": self.dir} if pid == 7 else {}
+        rows, bad = REAL_LIVE_FILE_SESSIONS()
+        self.assertEqual([r["name"] for r in rows], ["isolated"])
+        self.assertEqual(bad, 0)
+
+    def test_only_claude_processes_are_asked(self):                  # control
+        asked = []
+        ccwho.read_procargs = lambda pid: asked.append(pid) or {}
+        REAL_LIVE_FILE_SESSIONS()
+        self.assertEqual(asked, [7], "a shell's environment is none of our business")
+
+    def test_without_that_dir_named_nothing_is_found(self):           # control
+        ccwho.read_procargs = lambda pid: {}
+        rows, _ = REAL_LIVE_FILE_SESSIONS()
+        self.assertEqual(rows, [])
+
+
+SID_ISO = "dddd4444-0000-4000-8000-000000000004"
+
+
+class TestAnIsolatedSessionIsReadLikeAnyOther(MachinelessCollect):
+    """Finding a session in another config dir is half the job: its transcript
+    lives under THAT dir, and without it the row has no title, no recap and no
+    way to say it needs you. Measured before this fix: a live isolated session
+    listed with an empty title and topic."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        proj = os.path.join(self.dir, "projects", "-Users-x-p-work")
+        os.makedirs(proj)
+        with open(os.path.join(proj, f"{SID_ISO}.jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "ai-title", "aiTitle": "Isolated work"}) + "\n")
+        self._agents = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        self.row = {"pid": 44, "sessionId": SID_ISO, "cwd": "/Users/x/p/work",
+                    "kind": "interactive", "status": "idle", "configDir": self.dir}
+        ccwho.live_file_sessions = lambda: ([self.row], 0)
+
+    def tearDown(self):
+        ccwho.agents_json = self._agents
+        super().tearDown()
+
+    def test_its_transcript_is_found_under_its_own_dir(self):
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["title"], "Isolated work")
+
+    def test_the_one_second_check_watches_that_dir_too(self):
+        # a session that has only just started has no id we know: its new file
+        # moves the mtime of the project dir, which must be one we watch
+        cache = {}
+        ccwho.collect(cache=cache)
+        proj = os.path.join(self.dir, "projects", "-Users-x-p-work")
+        os.utime(proj, (1000.0, 1000.0))
+        before = ccwho.watch_digest([SID_ISO], cache=cache)
+        os.utime(proj, (5000.0, 5000.0))
+        self.assertNotEqual(before, ccwho.watch_digest([SID_ISO], cache=cache),
+                            "a new session in the isolated dir went unnoticed")
+
+    def test_found_without_a_cache_too(self):
+        # the engine's own one-shot main() calls collect() with no cache
+        rows, _ = ccwho.collect()
+        self.assertEqual(rows[0]["title"], "Isolated work")
+
+    def test_restore_check_finds_a_saved_isolated_transcript(self):
+        man = {"sessions": [{"sessionId": SID_ISO, "cwd": self.dir, "configDir": self.dir}]}
+        ok, problems = ccwho.check_manifest(man, cwd_exists=os.path.isdir,
+                                            transcript_for=ccwho.manifest_transcript_finder(man))
+        self.assertTrue(ok, problems)
+
+    def test_restore_check_still_fails_a_gone_transcript(self):       # control
+        man = {"sessions": [{"sessionId": "eeee5555-0000-4000-8000-000000000005",
+                             "cwd": self.dir, "configDir": self.dir}]}
+        ok, _ = ccwho.check_manifest(man, cwd_exists=os.path.isdir,
+                                     transcript_for=ccwho.manifest_transcript_finder(man))
+        self.assertFalse(ok)
+
+    def test_without_a_config_dir_nothing_is_invented(self):         # control
+        self.row.pop("configDir")
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["title"], "")
+
+
+class TestSessionFilesAreReadCarefully(unittest.TestCase):
+    """The dirs are named by other processes. Whatever is in them, a scan must
+    finish, and what cannot be used is counted for `ccwho doctor`."""
+
+    GOOD = {"pid": 7, "sessionId": "eeee5555-0000-4000-8000-000000000005",
+            "procStart": "Tue Sep 22 13:45:15 2026"}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.sessions = os.path.join(self.dir, "sessions")
+        os.makedirs(self.sessions)
+
+    def write(self, name, body):
+        with open(os.path.join(self.sessions, name), "w") as fh:
+            fh.write(body)
+
+    def test_unusable_files_are_counted_and_the_good_one_kept(self):
+        self.write("7.json", json.dumps(self.GOOD))
+        self.write("8.json", "{not json")
+        self.write("9.json", "[1, 2]")
+        self.write("10.json", json.dumps(dict(self.GOOD, sessionId="*")))
+        entries, bad = ccwho.read_session_files([self.dir])
+        self.assertEqual(([e["pid"] for e in entries], bad), ([7], 3))
+
+    def test_each_entry_remembers_its_dir(self):
+        self.write("7.json", json.dumps(self.GOOD))
+        entries, _ = ccwho.read_session_files([self.dir])
+        self.assertEqual(entries[0]["configDir"], self.dir)
+
+    def test_no_sessions_dir_is_nothing_wrong(self):                  # control
+        self.assertEqual(ccwho.read_session_files([tempfile.mkdtemp()]), ([], 0))
+
+    def test_a_fifo_does_not_hang_the_scan(self):
+        os.mkfifo(os.path.join(self.sessions, "x.json"))
+        entries, bad = ccwho.read_session_files([self.dir])       # must return
+        self.assertEqual((entries, bad), ([], 1))
+
+    def test_an_oversized_file_is_not_read(self):
+        self.write("7.json", json.dumps(dict(self.GOOD, name="x" * 200_000)))
+        self.assertEqual(ccwho.read_session_files([self.dir]), ([], 1))
+
+    def test_a_deeply_nested_file_is_counted_not_fatal(self):
+        # small enough to pass the size cap, deep enough to exhaust the parser
+        self.write("7.json", "[" * 60000)
+        self.assertEqual(ccwho.read_session_files([self.dir]), ([], 1))
+
+    def test_a_symlink_is_not_followed(self):
+        target = os.path.join(self.dir, "elsewhere.json")
+        with open(target, "w") as fh:
+            json.dump(self.GOOD, fh)
+        os.symlink(target, os.path.join(self.sessions, "7.json"))
+        self.assertEqual(ccwho.read_session_files([self.dir]), ([], 1))
+
+    def test_glob_characters_in_a_dir_name_are_literal(self):
+        odd = os.path.join(self.dir, "we[i]rd*")
+        os.makedirs(os.path.join(odd, "sessions"))
+        with open(os.path.join(odd, "sessions", "7.json"), "w") as fh:
+            json.dump(self.GOOD, fh)
+        entries, _ = ccwho.read_session_files([odd])
+        self.assertEqual([e["pid"] for e in entries], [7])
+
+
+class TestPsSpeaksTheSessionFilesLanguage(unittest.TestCase):
+    """A session file stores its start time in the C locale, in UTC. `ps` has
+    to print it the same way, or on any machine not in UTC every isolated
+    session fails the comparison and silently vanishes."""
+
+    def test_ps_runs_in_the_c_locale_and_utc(self):
+        seen = {}
+
+        class Done:
+            stdout = ""
+
+        real = ccwho.subprocess.run
+        ccwho.subprocess.run = lambda argv, **kw: seen.update(kw, argv=argv) or Done()
+        try:
+            ccwho.ps_table()
+        finally:
+            ccwho.subprocess.run = real
+        self.assertEqual((seen["env"]["LC_ALL"], seen["env"]["TZ"]), ("C", "UTC"))
+        self.assertIn("pid=,lstart=,comm=", seen["argv"])
+
+    def test_a_ps_that_cannot_run_is_an_empty_table(self):           # control
+        def boom(*a, **k):
+            raise OSError("no ps")
+        real = ccwho.subprocess.run
+        ccwho.subprocess.run = boom
+        try:
+            self.assertEqual(ccwho.ps_table(), {})
+        finally:
+            ccwho.subprocess.run = real
+
+
+@unittest.skipUnless(os.uname().sysname == "Darwin", "KERN_PROCARGS2 is macOS")
+class TestReadProcargsOnARealProcess(unittest.TestCase):
+    """The only code that holds a real environment buffer. A child with a
+    known, fake environment: the allowlisted key comes back, the token never."""
+
+    TOKEN = "sk-ant-FAKE-real-process-must-not-leak"
+
+    def test_only_the_allowlist_comes_back(self):
+        # Not /bin/sleep: macOS hides the environment of its own system binaries
+        # (measured: 33 bytes, argv only), so a system binary an agent starts
+        # carries no mark we can read. claude, node and this Python are not.
+        import subprocess
+        import sys
+        import time
+        if sys.executable.startswith(("/usr/bin/", "/bin/", "/System/")):
+            self.skipTest("the test's own Python is a system binary: its env is hidden")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"],
+                                 env={"CLAUDE_CONFIG_DIR": "/fake/dir",
+                                      "ANTHROPIC_API_KEY": self.TOKEN, "PATH": "/bin"})
+        try:
+            got = {}
+            for _ in range(50):             # until it has exec'd
+                got = ccwho.read_procargs(child.pid) or {}
+                if got:
+                    break
+                time.sleep(0.05)
+        finally:
+            child.kill()
+            child.wait()
+        self.assertEqual(got, {"CLAUDE_CONFIG_DIR": "/fake/dir"})
+        self.assertNotIn(self.TOKEN, repr(got))
+
+    def test_a_pid_that_does_not_exist_is_none(self):                # control
+        self.assertIsNone(ccwho.read_procargs(99999999))
+
+
+class TestReloadPutsEarlierModulesBackWhenALaterOneFails(unittest.TestCase):
+    """brief is re-read first. If procs - the LAST rule module - raises, brief
+    and index were already swapped; the rollback is what stops the window
+    running a mix. Breaking brief alone never reaches the rollback."""
+
+    def test_a_late_failure_restores_the_early_modules(self):
+        import sys
+        import ccwho_procs
+        before = {n: sys.modules[n] for n in ("ccwho_brief", "ccwho_index")}
+        path = ccwho_procs.__file__
+        original = open(path).read()
+        try:
+            with open(path, "w") as fh:
+                fh.write(original + '\nraise RuntimeError("boom")\n')
+            with self.assertRaises(RuntimeError):
+                ccwho.reload_all(ccwho)
+            for name, module in before.items():
+                self.assertIs(sys.modules[name], module, f"{name} was left swapped")
+        finally:
+            with open(path, "w") as fh:
+                fh.write(original)
+            ccwho.reload_all(ccwho)
+            # a reload re-executes the engine, which rebinds the real function:
+            # the module's guard has to go back, or every later test is unguarded
+            ccwho.live_file_sessions = _unpinned_live_file_sessions
+
+
+class TestAttachUsesTheSessionsOwnConfigDir(unittest.TestCase):
+    """`claude attach` looks in the config dir it runs under. A session found in
+    another dir is not there, and the answer is `No job matching` - the very
+    error this feature started from."""
+
+    SID = "51fddd61-822b-49e0-9aeb-2145e91e1244"
+
+    def live(self, **kw):
+        return [dict({"sessionId": self.SID, "tty": "", "pid": 5, "kind": "background"}, **kw)]
+
+    def test_a_session_from_another_dir_is_attached_there(self):
+        action, cmd = ccwho.resolve_open(self.SID, self.live(configDir="/Users/x/my dir"),
+                                         [], source_ok=True)
+        self.assertEqual(action, "attach")
+        self.assertEqual(cmd, "CLAUDE_CONFIG_DIR='/Users/x/my dir' claude attach 51fddd61")
+
+    def test_a_session_from_the_agents_feed_is_attached_as_before(self):  # control
+        _, cmd = ccwho.resolve_open(self.SID, self.live(), [], source_ok=True)
+        self.assertEqual(cmd, "claude attach 51fddd61")
+
+    def test_the_window_running_it_is_still_recognised(self):
+        cmd = "CLAUDE_CONFIG_DIR=/x claude attach 51fddd61"
+        self.assertTrue(ccwho.is_attach_to(cmd, self.SID))
+
+
+class TestASessionFileCaughtMidWriteIsReadAgain(unittest.TestCase):
+    """doctor says "if it persists, the format changed". A file caught while
+    Claude Code writes it is not that: it is read once more before it counts."""
+
+    GOOD = {"pid": 7, "sessionId": "eeee5555-0000-4000-8000-000000000005",
+            "procStart": "Tue Sep 22 13:45:15 2026"}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.makedirs(os.path.join(self.dir, "sessions"))
+        with open(os.path.join(self.dir, "sessions", "7.json"), "w") as fh:
+            json.dump(self.GOOD, fh)
+        self.real = ccwho.json.loads
+        self.addCleanup(setattr, ccwho.json, "loads", self.real)
+
+    def test_one_failed_parse_is_retried(self):
+        calls = []
+
+        def flaky(data):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("caught mid-write")
+            return self.real(data)
+
+        ccwho.json.loads = flaky
+        entries, bad = ccwho.read_session_files([self.dir])
+        self.assertEqual((len(entries), bad), (1, 0))
+
+    def test_a_file_that_never_parses_still_counts(self):             # control
+        def broken(data):
+            raise ValueError("not json")
+        ccwho.json.loads = broken
+        self.assertEqual(ccwho.read_session_files([self.dir]), ([], 1))
+
+
+class TestTheConfigDirTravelsWithTheRow(MachinelessCollect):
+    """configDir is only useful if it reaches the commands. A row built by
+    collect() - not by hand - has to carry it to attach, save and restore."""
+
+    SID = "ffff6666-0000-4000-8000-000000000006"
+
+    def setUp(self):
+        super().setUp()
+        self._agents = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        ccwho.live_file_sessions = lambda: ([{
+            "pid": 66, "sessionId": self.SID, "cwd": "/Users/x/p/work",
+            "kind": "background", "status": "idle", "configDir": "/Users/x/.claude-work"}], 0)
+
+    def tearDown(self):
+        ccwho.agents_json = self._agents
+        super().tearDown()
+
+    def test_attach_from_a_collected_row_uses_its_dir(self):
+        rows, _ = ccwho.collect(cache={})
+        action, cmd = ccwho.resolve_open(self.SID, rows, [], source_ok=True)
+        self.assertEqual((action, cmd), ("attach",
+                         "CLAUDE_CONFIG_DIR=/Users/x/.claude-work claude attach ffff6666"))
+
+    def test_a_saved_session_resumes_in_its_dir(self):
+        rows, _ = ccwho.collect(cache={})
+        entry = ccwho.manifest_from_rows(rows)["sessions"][0]
+        self.assertEqual(ccwho.restore_command(entry),
+                         "cd /Users/x/p/work && CLAUDE_CONFIG_DIR=/Users/x/.claude-work"
+                         " claude --resume " + self.SID)
+
+    def test_a_default_dir_session_resumes_as_before(self):          # control
+        entry = {"sessionId": self.SID, "cwd": "/Users/x/p/work", "configDir": ""}
+        self.assertEqual(ccwho.restore_command(entry),
+                         "cd /Users/x/p/work && claude --resume " + self.SID)
+
+
+class TestIdsEndWhereTheyEnd(unittest.TestCase):
+    """`$` matches before a trailing newline. Every pattern that guards an id or a
+    file name that ends up in a command or a path uses \\Z instead."""
+
+    SID = "51fddd61-822b-49e0-9aeb-2145e91e1244"
+
+    def test_no_resume_line_for_an_id_with_a_newline(self):
+        self.assertIsNone(ccwho.restore_command({"sessionId": self.SID + "\n", "cwd": "/x"}))
+        self.assertIsNotNone(ccwho.restore_command({"sessionId": self.SID, "cwd": "/x"}))
+
+    def test_no_link_for_an_id_with_a_newline(self):
+        self.assertEqual(ccwho.open_url({"sessionId": self.SID + "\n"}), "")
+        self.assertTrue(ccwho.open_url({"sessionId": self.SID}))      # control
+
+    def test_a_manifest_name_with_a_newline_is_not_one(self):
+        self.assertFalse(ccwho._MANIFEST_NAME.match("2026-09-24T1200.json\n"))
+        self.assertTrue(ccwho._MANIFEST_NAME.match("2026-09-24T1200.json"))
+
+
+class TestTheDefaultDirIsNotSpelledOut(unittest.TestCase):
+    """A session in ~/.claude runs with CLAUDE_CONFIG_DIR unset. Setting it, even
+    to the same path, can change where Claude Code looks for its login."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.makedirs(os.path.join(self.dir, "sessions"))
+        with open(os.path.join(self.dir, "sessions", "7.json"), "w") as fh:
+            json.dump({"pid": 7, "sessionId": "eeee5555-0000-4000-8000-000000000005",
+                       "procStart": "Tue Sep 22 13:45:15 2026"}, fh)
+
+    def test_the_default_root_leaves_configdir_empty(self):
+        entries, _ = ccwho.read_session_files([self.dir], default=self.dir)
+        self.assertEqual(entries[0]["configDir"], "")
+
+    def test_another_root_is_named(self):                             # control
+        entries, _ = ccwho.read_session_files([self.dir], default="/elsewhere")
+        self.assertEqual(entries[0]["configDir"], self.dir)
+
+
+class TestAFailingFileSourceNeverBlanksTheList(MachinelessCollect):
+    """The session files are a second source. If reading them fails outright,
+    the list still shows what `claude agents` said."""
+
+    def test_the_agents_rows_survive(self):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: json.dumps([{"pid": 5, "sessionId":
+            "aaaa1111-0000-4000-8000-000000000001", "cwd": "/x", "status": "idle"}])
+
+        def boom():
+            raise RuntimeError("anything at all")
+        ccwho.live_file_sessions = boom
+        try:
+            status = {}
+            rows, _ = ccwho.collect(cache={}, status=status)
+        finally:
+            ccwho.agents_json = real
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(status["session_files_bad"], None)
+
+
+class TestALinkNamesASessionByItsUuid(unittest.TestCase):
+    """The README and parse_ccwho_url promise a UUID for ccwho://open/. A second,
+    looser pattern of the same name further down the engine used to replace it,
+    so any id-shaped string was accepted."""
+
+    def test_a_non_uuid_is_refused(self):
+        self.assertEqual(ccwho.parse_ccwho_url("ccwho://open/abcdefgh-not-a-uuid"), ("", ""))
+        self.assertEqual(ccwho.open_url({"sessionId": "abcdefgh12"}), "")
+
+    def test_a_uuid_is_accepted(self):                                # control
+        sid = "51fddd61-822b-49e0-9aeb-2145e91e1244"
+        self.assertEqual(ccwho.parse_ccwho_url("ccwho://open/" + sid), ("open", sid))
+        self.assertTrue(ccwho.open_url({"sessionId": sid}))

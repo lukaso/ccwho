@@ -15,6 +15,24 @@ import unittest
 
 import ccwho_setup as setup
 
+
+# Reading this machine's session files is machine state; see test_ccwho. Every
+# test here runs with a guard that fails loudly instead of reading them.
+REAL_LIVE_FILE_SESSIONS = setup.engine.live_file_sessions
+
+
+def _unpinned_live_file_sessions():
+    raise AssertionError("a test reached this machine's session files - pin "
+                         "live_file_sessions")
+
+
+def setUpModule():
+    setup.engine.live_file_sessions = _unpinned_live_file_sessions
+
+
+def tearDownModule():
+    setup.engine.live_file_sessions = REAL_LIVE_FILE_SESSIONS
+
 HEALTHY = {
     "claude": "/Users/x/.local/bin/claude",
     "iterm_ok": True,
@@ -24,6 +42,7 @@ HEALTHY = {
     "newest_manifest_age": 600.0,
     "cc_status_hook": True,
     "settings_path": "/Users/x/.claude/settings.json",
+    "session_files_bad": 0,
 }
 
 
@@ -64,6 +83,21 @@ class TestEachFault(unittest.TestCase):
         self.assertEqual(results[0]["name"], "claude",
                          "nothing else matters if the session list cannot be read")
         self.assertIn("PATH", r["detail"] + r["fix"])
+
+    def test_unreadable_session_files_are_a_fault(self):
+        # ccwho reads Claude Code's own session files to find sessions in other
+        # config dirs; a format change would make them vanish from the list again
+        r = self.bad("session files", session_files_bad=2)
+        self.assertIn("2", r["detail"])
+
+    def test_a_scan_that_crashed_is_a_fault(self):
+        # the failure this check exists to catch must not read as a pass
+        r = self.bad("session files", session_files_bad="error")
+        self.assertIn("could not", r["detail"])
+
+    def test_session_files_not_looked_at_is_not_a_fault(self):       # control
+        r = by_name(setup.doctor_checks(facts(session_files_bad=None)))["session files"]
+        self.assertTrue(r["ok"])
 
     def test_iterm_not_scriptable_costs_the_names_and_the_jumps(self):
         r = self.bad("iterm2", iterm_ok=False)
@@ -740,6 +774,10 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
             setattr(setup, name, lambda *a, **k: answer)
         self.addCleanup(setattr, setup.shutil, "which", setup.shutil.which)
         setup.shutil.which = lambda n: ""          # nothing on PATH at all
+        # this machine's session files are not what these tests are about
+        self.addCleanup(setattr, setup.engine, "live_file_sessions",
+                        setup.engine.live_file_sessions)
+        setup.engine.live_file_sessions = lambda: ([], 0)
 
     def test_claude_is_found_where_it_installs_itself(self):
         real = setup.engine.find_tool
@@ -747,6 +785,16 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
         setup.engine.find_tool = lambda n: "/Users/sam/.local/bin/" + n
         self.assertEqual(setup.gather(ccwho_dir=self.tmp)["claude"],
                          "/Users/sam/.local/bin/claude")
+
+    def test_a_crashing_scan_reaches_doctor_as_an_error(self):
+        def boom():
+            raise RuntimeError("scan failed")
+        setup.engine.live_file_sessions = boom
+        self.assertEqual(setup.gather(ccwho_dir=self.tmp)["session_files_bad"], "error")
+
+    def test_unreadable_session_files_reach_doctor(self):
+        setup.engine.live_file_sessions = lambda: ([], 4)
+        self.assertEqual(setup.gather(ccwho_dir=self.tmp)["session_files_bad"], 4)
 
     def test_a_machine_without_claude_still_reports_none(self):       # control
         real = setup.engine.find_tool

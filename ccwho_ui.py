@@ -37,6 +37,7 @@ from textual.widgets import Footer, Input, Static                  # noqa: E402
 from rich.text import Text                                         # noqa: E402
 
 import ccwho_engine as engine                                      # noqa: E402
+import ccwho_panel as panel                                         # noqa: E402
 
 # What each part of a row is drawn as. The engine says what a part IS; only this
 # table says what that looks like, and it is deliberately short: the first screen
@@ -221,6 +222,7 @@ class CcwhoUi(App):
 
     def on_mount(self):
         self.name_the_window()
+        self.adapter.keep_in_front()
         self.hide_search()
         self.query_one("#detail").display = False
         self.set_interval(REFRESH_EVERY, self.tick)
@@ -873,17 +875,8 @@ class Collector:
         A failed reload keeps the working modules: the candidate is built beside
         them and only swapped when it imports cleanly.
         """
-        import importlib
-        import importlib.util
-        import sys
         try:
-            for module in (engine.brief, engine.ccwho_index):
-                spec = importlib.util.spec_from_file_location(module.__name__,
-                                                              module.__file__)
-                candidate = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(candidate)
-                sys.modules[module.__name__] = candidate
-            importlib.reload(engine)
+            engine.reload_all(engine)
             self.reload_error = ""
         except Exception as ex:
             self.reload_error = f"engine reload failed: {ex}"
@@ -944,6 +937,11 @@ class Adapter:
         if done.returncode:
             return f"could not open a window: {(done.stderr or '').strip()}"
         return "attached it in a new window"
+
+    def keep_in_front(self):
+        """The hotkey panel only: take back the focus iTerm2 gives it and then
+        loses, when the key is pressed from another app. See ccwho_panel."""
+        panel.keep_in_front(os.environ)
 
     def focus(self, row, deadline=FOCUS_DEADLINE):
         # The DEVICE path, not the short form the list shows: AppleScript matches

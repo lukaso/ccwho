@@ -62,6 +62,22 @@ def doctor_checks(facts):
         f"found at {claude}" if claude else "not on PATH - no session list at all",
         "install Claude Code, or add it to PATH (launchd jobs get a minimal PATH)"))
 
+    # ccwho finds sessions in other config dirs by reading Claude Code's own
+    # session files. Unreadable ones mean that format moved, and those sessions
+    # quietly drop out of the list again.
+    bad = facts.get("session_files_bad")
+    out.append(_check(
+        "session files", not bad,
+        "not looked at" if bad is None else
+        "readable" if not bad else
+        "the scan itself could not run - sessions in other config dirs are missing"
+        if bad == "error" else
+        f"{bad} could not be read - sessions in other config dirs may be missing",
+        "" if not bad else
+        "update ccwho (brew upgrade ccwho); if it persists, report it" if bad == "error"
+        else "update ccwho (brew upgrade ccwho); if it persists, Claude Code changed the"
+        " file format - report it"))
+
     out.append(_check(
         "iterm2", bool(facts.get("iterm_ok")),
         "scriptable" if facts.get("iterm_ok") else
@@ -136,6 +152,7 @@ def gather(ccwho_dir=None, settings_path=None, now=None):
         # not shutil.which: a hotkey window and a launchd job both run without
         # a login shell, and `claude` is not on the PATH either of them gets.
         "claude": engine.find_tool("claude"),
+        "session_files_bad": _session_files_bad(),
         "iterm_ok": iterm_scriptable(),
         "handler_registered": handler_registered(),
         "launchd_loaded": launchd_loaded(),
@@ -149,6 +166,16 @@ def gather(ccwho_dir=None, settings_path=None, now=None):
         "iterm_started_at": iterm_started_at(),
         "settings_path": settings_path or os.path.expanduser("~/.claude/settings.json"),
     }
+
+
+def _session_files_bad():
+    """How many session files could not be used; "error" if the scan itself
+    failed - doctor must still run, and say so, on exactly the machine where
+    something is wrong."""
+    try:
+        return engine.live_file_sessions()[1]
+    except Exception:
+        return "error"
 
 
 def iterm_scriptable(timeout=5.0):

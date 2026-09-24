@@ -10,8 +10,6 @@ between iterations rather than held inside the engine.
 from __future__ import annotations
 
 import contextlib
-import importlib
-import importlib.util
 import io
 import json
 import os
@@ -31,40 +29,15 @@ DIM, RESET, RED = "\033[2m", "\033[0m", "\033[31m"
 AMBER = "\033[33;1m"
 
 
-def _load_beside(module):
-    """Import a module's file into a NEW module object, leaving the live one alone.
-
-    importlib.reload() executes the new source INTO the module everyone is holding.
-    An edit that parses but raises half way through - a typo in a rule, a bad
-    constant - leaves half the new definitions live and half the old ones, and
-    catching the exception does not undo that. The watch then extracts with a
-    module that is neither version, which is worse than not reloading at all.
-    Building the candidate beside the old one means a failure changes nothing.
-    """
-    spec = importlib.util.spec_from_file_location(module.__name__, module.__file__)
-    candidate = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(candidate)          # raises before anything is swapped
-    return candidate
-
-
 def reload_engine(state):
     """Re-read the engine. A broken edit keeps the last good module and says so.
 
-    The modules the engine imports go first - ccwho_brief holds half the
-    extraction rules, ccwho_index the rest - because reloading only the engine
-    would leave a running watch using the OLD rules while its file on disk says
-    otherwise, and a fix that looks like it did nothing is worse than no hot
-    reload at all.
+    engine.reload_all does the work - the rule modules first, in the order of
+    engine.RELOAD_FIRST - and is shared with the list, so the two cannot drift.
+    What stays here is the runner's own handle on the index, rebound below.
     """
-    old = {m.__name__: m for m in (engine.brief, index)}
     try:
-        for name, module in list(old.items()):
-            sys.modules[name] = _load_beside(module)
-        try:
-            importlib.reload(engine)
-        except Exception:
-            sys.modules.update(old)         # put the working ones back
-            raise
+        engine.reload_all(engine)
         # and rebind OUR handles: sys.modules is what the next import sees, but
         # this module's globals still point at the objects loaded at startup
         globals()["index"] = sys.modules[index.__name__]
@@ -170,7 +143,8 @@ def show(argv):
     """
     want_json = "--json" in argv
     query = " ".join(a for a in argv if not a.startswith("-"))
-    rows, _ = engine.collect(cache={})
+    cache = {}
+    rows, _ = engine.collect(cache=cache)
     entry = {}
     if query:
         # Not running is not gone: the transcript is still on disk, and so is the
@@ -197,7 +171,7 @@ def show(argv):
     if not hits:
         return 1
     row = hits[0]
-    head, tail, _mtime = engine.read_windows(row.get("sessionId", ""))
+    head, tail, _mtime = engine.read_windows(row.get("sessionId", ""), cache=cache)
     b = engine.brief.build(head, tail, session=row,
                            now=engine.now_iso(), as_records=engine.as_records)
     # The index read the WHOLE transcript once; the brief reads a head and a tail
@@ -1222,7 +1196,8 @@ def restore(argv):
         # both flags are given. Answering "would this work?" cannot be the thing
         # that opens seventeen windows.
         ok, problems = engine.check_manifest(
-            man, cwd_exists=os.path.isdir, transcript_for=engine.transcript_path)
+            man, cwd_exists=os.path.isdir,
+            transcript_for=engine.manifest_transcript_finder(man))
         n = len(engine.manifest_entries(man))
         if ok:
             print(f"restorable: {n} session(s) in {path}")

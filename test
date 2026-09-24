@@ -2,7 +2,7 @@
 # Every test, in one command.
 #
 # The engine, the brief, the index and the runner are stdlib and run anywhere:
-#   python3 -m unittest test_ccwho test_runner test_brief test_index test_setup \
+#   python3 -m unittest test_ccwho test_procs test_runner test_brief test_index test_setup \
 #                       test_contract
 #
 # The UI tests need Textual. uv fetches and caches it from the header in
@@ -12,7 +12,7 @@
 set -e
 cd "$(dirname "$0")"
 
-CORE="test_ccwho test_runner test_brief test_index test_setup test_contract"
+CORE="test_ccwho test_procs test_runner test_brief test_index test_setup test_contract"
 echo "== engine, brief, index, setup, runner (stdlib) =="
 python3 -m unittest $CORE "$@"
 

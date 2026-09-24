@@ -84,6 +84,10 @@ class FakeAdapter:
     def __init__(self, answer="focused s022", hang=False):
         self.answer, self.hang, self.asked = answer, hang, []
         self.attached = []
+        self.kept_in_front = 0
+
+    def keep_in_front(self):
+        self.kept_in_front += 1
 
     def attach(self, cmd, deadline=5.0):
         self.attached.append(cmd)
@@ -112,6 +116,15 @@ class UiTest(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTheList(UiTest):
+    async def test_the_panel_is_kept_in_front_from_the_start(self):
+        # the hotkey panel loses the focus iTerm2 gives it - see ccwho_panel;
+        # whether this window IS the panel is the adapter's question, not ours
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(adapter.kept_in_front, 1)
+
     async def test_it_groups_by_what_each_session_needs(self):
         app = self.app()
         async with app.run_test() as pilot:
@@ -1724,3 +1737,58 @@ class TestYouCanSeeWhichRowIsBeingOpened(UiTest):
             await pilot.pause()
             self.assertEqual([w.row["sessionId"] for w in app.query(ui.Row)
                               if w.has_class("acting")], [bg["sessionId"]])
+
+
+class TestTheListReloadsLikeTheWatch(unittest.TestCase):
+    """The hotkey window stays open for days and re-reads its rules, as the watch
+    loop does - through the SAME routine. It used to keep its own copy of the
+    module list, and that copy did not put the working modules back when a new
+    file raised half way: the window then ran rules that were neither version."""
+
+    def reload(self):
+        c = ui.Collector()
+        c.reload()
+        return c
+
+    def test_every_rule_module_is_re_read(self):
+        for mod, handle in (("ccwho_brief", "brief"), ("ccwho_index", "ccwho_index"),
+                            ("ccwho_procs", "procs")):
+            with self.subTest(module=mod):
+                m = __import__(mod)
+                path = m.__file__
+                original = open(path).read()
+                try:
+                    with open(path, "w") as fh:
+                        fh.write(original + "\n\ndef _hot_probe():\n    return 1\n")
+                    self.reload()
+                    self.assertTrue(hasattr(getattr(ui.engine, handle), "_hot_probe"),
+                                    f"the list still runs the old {mod}")
+                finally:
+                    with open(path, "w") as fh:
+                        fh.write(original)
+                    self.reload()
+
+    def test_a_half_raising_edit_leaves_the_old_rules_working(self):
+        # A guard, not a fix: this passed before the shared routine too, because a
+        # candidate that raises is never swapped in. It pins that the shared
+        # routine keeps it that way for the list as well as the watch.
+        import ccwho_brief
+        path = ccwho_brief.__file__
+        original = open(path).read()
+        try:
+            with open(path, "w") as fh:
+                fh.write(original.replace(
+                    'MAX_PROGRESS = 5', 'MAX_PROGRESS = 5\nLOW_SIGNAL = set()\n'
+                    'raise RuntimeError("boom")'))
+            c = self.reload()
+            self.assertTrue(c.reload_error, "the error has to reach the header")
+            self.assertTrue(ui.engine.brief.LOW_SIGNAL,
+                            "the half-applied edit must not become the live rule set")
+        finally:
+            with open(path, "w") as fh:
+                fh.write(original)
+            self.reload()
+
+    def test_a_good_edit_is_not_reported_as_an_error(self):             # control
+        c = self.reload()
+        self.assertEqual(c.reload_error, "")

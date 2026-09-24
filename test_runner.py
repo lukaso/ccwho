@@ -15,6 +15,24 @@ import unittest
 import ccwho as runner
 
 
+# Reading this machine's session files is machine state; see test_ccwho. Every
+# test here runs with a guard that fails loudly instead of reading them.
+REAL_LIVE_FILE_SESSIONS = runner.engine.live_file_sessions
+
+
+def _unpinned_live_file_sessions():
+    raise AssertionError("a test reached this machine's session files - pin "
+                         "live_file_sessions")
+
+
+def setUpModule():
+    runner.engine.live_file_sessions = _unpinned_live_file_sessions
+
+
+def tearDownModule():
+    runner.engine.live_file_sessions = REAL_LIVE_FILE_SESSIONS
+
+
 class TestWatchRequested(unittest.TestCase):
     def test_long_flag(self):
         self.assertTrue(runner.watch_requested(["--watch"]))
@@ -367,7 +385,7 @@ class TestRestoreCheck(unittest.TestCase):
         self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
                      "cwd": self.tmp, "project": "self", "first": "f", "topic": "t", "ask": ""}])
         real = runner.engine.transcript_path
-        runner.engine.transcript_path = lambda sid: "/tx"
+        runner.engine.transcript_path = lambda sid, roots=None: "/tx"
         try:
             rc, out = self.run_check(["--check"])
         finally:
@@ -1081,6 +1099,10 @@ class TestHotReloadCoversTheBriefModule(unittest.TestCase):
     The brief moved half the extraction rules into a second module; if only the
     engine reloads, a fix to those rules looks like it did nothing."""
 
+    def tearDown(self):
+        # a reload re-executes the engine and rebinds the real function
+        runner.engine.live_file_sessions = _unpinned_live_file_sessions
+
     def test_editing_the_brief_module_lands_on_the_next_tick(self):
         import ccwho_brief
         path = ccwho_brief.__file__
@@ -1124,9 +1146,9 @@ class TestHotReloadCoversTheBriefModule(unittest.TestCase):
             runner.reload_engine({"engine_error": ""})
 
     def test_every_hot_module_is_re_read_not_just_the_engine(self):
-        # the engine imports both of them now; a module left out of the reload is
+        # every rule module the engine imports; a module left out of the reload is
         # a module whose fix silently does not land in a running watch
-        for mod in ("ccwho_brief", "ccwho_index"):
+        for mod in ("ccwho_brief", "ccwho_index", "ccwho_procs"):
             with self.subTest(module=mod):
                 m = __import__(mod)
                 path = m.__file__
@@ -1139,7 +1161,8 @@ class TestHotReloadCoversTheBriefModule(unittest.TestCase):
                     # and the runner's own handle has to be the new module too,
                     # or `ccwho ls` keeps calling yesterday's code
                     handle = {"ccwho_brief": runner.engine.brief,
-                              "ccwho_index": runner.index}[mod]
+                              "ccwho_index": runner.index,
+                              "ccwho_procs": runner.engine.procs}[mod]
                     self.assertTrue(hasattr(handle, "_hot_probe"),
                                     f"runner still holds the old {mod}")
                 finally:

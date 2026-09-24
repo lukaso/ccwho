@@ -440,6 +440,12 @@ class TestAsksUser(unittest.TestCase):
     def test_your_call(self):
         self.assertTrue(ccwho.asks_user("It's your machine and your call; I'm not killing anything."))
 
+    def test_the_decision_is_yours(self):
+        # a real closing line, left in BUSY for 26 hours
+        self.assertTrue(ccwho.asks_user("I'm stopping here rather than starting another round. "
+                                        "The decision is yours: land the R1 fix, re-cut W1 "
+                                        "STATE-only, or park both."))
+
     def test_plain_statement_is_not_an_ask(self):
         self.assertFalse(ccwho.asks_user("Idle and ready."))
 
@@ -695,6 +701,95 @@ class TestWorkDescendants(unittest.TestCase):
     def test_a_parent_cycle_terminates(self):
         ps = "\n".join(["  PID  PPID COMMAND", " 400   401 a", " 401   400 b"])
         self.assertEqual(ccwho.work_descendants(ps, 400), 1)
+
+
+class TestBusyWithTheTurnOver(unittest.TestCase):
+    """The feed says `busy` while any background task runs, even after the turn
+    has ended. Found 2026-09-24: two sessions ended their turns with a question
+    and sat in BUSY - one for 26 hours - behind a wait loop that could never
+    stop. A finished turn is still NOT news on its own: the task will wake the
+    session, so only a question may pull the row out of BUSY.
+    """
+    SESSION = {"sessionId": "s1", "cwd": "/Users/x/projects/liveapp",
+               "status": "busy", "name": "n", "startedAt": 1788000000000}
+    T = "2026-09-24T16:33:40.601Z"
+
+    # the records Claude Code writes when a turn ends, as measured: 2235 of 2251
+    # ended turns carry turn_duration, and 0 of 44860 mid-turn steps do
+    END = [{"type": "system", "subtype": "stop_hook_summary", "timestamp": T},
+           {"type": "system", "subtype": "turn_duration", "timestamp": T},
+           {"type": "system", "subtype": "away_summary", "timestamp": T}]
+
+    def _said(self, text):
+        return {"type": "assistant", "timestamp": self.T,
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def _attention(self, tail, work=1):
+        return ccwho.build_row(self.SESSION, [], tail, mtime=0,
+                               now=1790267620.0, work=work)["attention"]
+
+    def test_a_question_at_the_end_of_the_turn_asks(self):
+        tail = [self._said("Want me to run the full gate, or stop here?")] + self.END
+        self.assertEqual(self._attention(tail), "asks")
+
+    def test_a_handback_without_a_question_mark_asks(self):
+        tail = [self._said("The decision is yours: land the R1 fix, or park both.")] + self.END
+        self.assertEqual(self._attention(tail), "asks")
+
+    def test_a_turn_that_ended_without_asking_is_running_not_news(self):
+        tail = [self._said("Suite is running in the background; I'll report.")] + self.END
+        self.assertEqual(self._attention(tail), "running")
+
+    def test_no_process_to_see_is_still_running(self):
+        # a background subagent is no child process, but the feed still knows
+        tail = [self._said("Two agents are reviewing it.")] + self.END
+        self.assertEqual(self._attention(tail, work=0), "running")
+
+    def test_a_question_mid_turn_is_busy(self):                        # control
+        tail = [self._said("Why does this fail?"),
+                {"type": "assistant", "timestamp": self.T, "message": {"content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}},
+                {"type": "user", "timestamp": self.T, "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}]
+        self.assertEqual(self._attention(tail), "busy")
+
+    def test_a_question_with_no_end_marker_is_busy(self):              # control
+        self.assertEqual(self._attention([self._said("Why does this fail?")]), "busy")
+
+    def test_you_answered_so_it_is_busy_again(self):                   # control
+        tail = ([self._said("Want me to run the full gate?")] + self.END
+                + [{"type": "user", "timestamp": self.T, "message": {"content": "yes"}}])
+        self.assertEqual(self._attention(tail), "busy")
+
+    def test_the_task_woke_it_so_it_is_busy_again(self):               # control
+        tail = ([self._said("Want me to run the full gate?")] + self.END
+                + [self._said("The suite finished; reading it.")])
+        self.assertEqual(self._attention(tail), "busy")
+
+
+class TestTurnEnded(unittest.TestCase):
+    def test_turn_duration_after_the_last_message_ends_it(self):
+        self.assertTrue(ccwho.turn_ended([
+            {"type": "assistant", "message": {"content": []}},
+            {"type": "system", "subtype": "turn_duration"}]))
+
+    def test_a_stop_hook_summary_alone_ends_it(self):
+        self.assertTrue(ccwho.turn_ended([
+            {"type": "assistant", "message": {"content": []}},
+            {"type": "system", "subtype": "stop_hook_summary"}]))
+
+    def test_other_system_records_do_not(self):                        # control
+        self.assertFalse(ccwho.turn_ended([
+            {"type": "assistant", "message": {"content": []}},
+            {"type": "system", "subtype": "away_summary"}]))
+
+    def test_a_message_after_the_marker_reopens_it(self):              # control
+        self.assertFalse(ccwho.turn_ended([
+            {"type": "system", "subtype": "turn_duration"},
+            {"type": "user", "message": {"content": "go"}}]))
+
+    def test_an_empty_tail_has_not_ended(self):
+        self.assertFalse(ccwho.turn_ended([]))
 
 
 class TestStoppedVsRunning(unittest.TestCase):

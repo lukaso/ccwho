@@ -52,7 +52,7 @@ _INFRA = re.compile(r"(npm exec\s+\S*mcp|\S*-mcp\b|mcp-server|mcp_server)|_npx/"
 # positive costs a glance while a false negative loses the session entirely.
 _ASK_PHRASES = ("tell me", "let me know", "your call", "say the word",
                 "which do you want", "shall i", "want me to", "should i",
-                "do you want", "confirm whether")
+                "do you want", "confirm whether", "decision is yours")
 _UNKNOWN_RANK = 4
 
 
@@ -352,6 +352,28 @@ def is_asking_you(lines):
     than the session feed noticing.
     """
     return any(name in HUMAN_TOOLS for name in pending_tools(lines))
+
+
+# What Claude Code writes when a turn ends. Measured over the newest 300
+# transcripts: 2235 of 2251 ended turns carry turn_duration, and 0 of 44860
+# steps inside a turn carry either.
+_TURN_END = ("turn_duration", "stop_hook_summary")
+
+
+def turn_ended(lines):
+    """Has the last turn ended, with nothing said since?
+
+    The feed says `busy` while any background task runs, turn or no turn. This is
+    how to tell a session that is working from one that has handed back to you
+    and left a task running.
+    """
+    ended = False
+    for d in as_records(lines):
+        if d.get("type") in ("assistant", "user"):
+            ended = False
+        elif d.get("type") == "system" and d.get("subtype") in _TURN_END:
+            ended = True
+    return ended
 
 
 def waiting_kind(lines):
@@ -1431,6 +1453,12 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
             attention = "asks" if ask else ("running" if work else "stopped")
     elif status != "busy" and ask:
         attention = "asks"
+    elif status == "busy" and turn_ended(tail):
+        # The turn is over and a background task keeps the feed on `busy`. The
+        # task will wake the session, so an ended turn alone is not news - only
+        # a question is. Found on a wait loop that could never end, hiding a
+        # question in BUSY for 26 hours.
+        attention = "asks" if ask else "running"
     elif status == "busy":
         attention = "busy"
     else:

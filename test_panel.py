@@ -163,5 +163,74 @@ class TheNotifications(unittest.TestCase):
         self.assertEqual(ax.raised, [])
 
 
+class Stop(BaseException):      # not Exception: the loop must survive those
+    pass
+
+
+def run_supervise(found, observe=None, rounds=10):
+    """Drive the loop with a scripted lookup; it stops when the script ends."""
+    found = list(found)
+    watched, waits = [], []
+
+    def resolve():
+        if not found:
+            raise Stop
+        return found.pop(0)
+
+    def default_observe(pid, window_id):
+        watched.append((pid, window_id))
+
+    try:
+        panel.supervise(resolve, observe or default_observe, waits.append)
+    except Stop:
+        pass
+    return watched, waits
+
+
+class ItermComesAndGoes(unittest.TestCase):
+    # Logged: iTerm2 crashed and restarted, the panel's session survived into
+    # a new window, and the watcher went on watching the dead process - the
+    # steal came back with nothing to undo it.
+
+    def test_a_new_iterm2_is_watched_after_the_old_one_is_gone(self):
+        watched, _ = run_supervise([(27269, 24246), (1178, 25033)])
+        self.assertEqual(watched, [(27269, 24246), (1178, 25033)])
+
+    def test_a_failed_lookup_is_tried_again_not_the_end(self):
+        # iTerm2 not answering yet, or the window not placed yet
+        watched, waits = run_supervise([None, None, (1178, 25033)])
+        self.assertEqual(watched, [(1178, 25033)])
+        self.assertEqual(len(waits), 2)
+
+    def test_a_failure_while_watching_is_not_the_end(self):
+        calls = []
+
+        def observe(pid, window_id):
+            calls.append(pid)
+            if len(calls) == 1:
+                raise OSError("observer could not be made")
+
+        _, waits = run_supervise([(1, 10), (2, 20)], observe=observe)
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(len(waits), 1)
+
+
+class WatchingOneIterm(unittest.TestCase):
+    def test_it_watches_while_the_process_lives(self):
+        answers, slices = [True, True, False], []
+        panel.run_while(lambda: answers.pop(0), slices.append)
+        self.assertEqual(len(slices), 2)
+
+    def test_a_process_that_exists(self):
+        import os
+        self.assertTrue(panel.pid_alive(os.getpid()))
+
+    def test_a_process_that_is_gone(self):
+        import subprocess
+        done = subprocess.Popen(["true"])
+        done.wait()
+        self.assertFalse(panel.pid_alive(done.pid))
+
+
 if __name__ == "__main__":
     unittest.main()

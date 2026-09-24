@@ -20,6 +20,7 @@ Stdlib only (ctypes), like the engine: no dependency for one window.
 """
 import ctypes
 import ctypes.util
+import os
 import subprocess
 import threading
 import time
@@ -138,6 +139,7 @@ class _Ax:
         cf.CFStringCreateWithCString.argtypes = [V, ctypes.c_char_p, ctypes.c_uint32]
         cf.CFRunLoopGetCurrent.restype = V
         cf.CFRunLoopAddSource.argtypes = [V, V, V]
+        cf.CFRunLoopRemoveSource.argtypes = [V, V, V]
         cf.CFRunLoopRunInMode.argtypes = [V, ctypes.c_double, ctypes.c_bool]
         cf.CFArrayGetCount.argtypes = [V]
         cf.CFArrayGetCount.restype = ctypes.c_long
@@ -241,36 +243,93 @@ def handle(watch, ax, app, name, element, now):
     return False
 
 
+# How often the watcher checks that the iTerm2 it watches is still there, and
+# how long it waits before looking again when there is nothing to watch yet.
+CHECK_EVERY = 5.0
+RETRY_EVERY = 5.0
+
+
+def supervise(resolve, observe, wait):
+    """Watch whichever iTerm2 is running, for as long as the panel lives.
+
+    Found once is not found for good: logged, iTerm2 crashed and restarted,
+    the panel's session survived into a new window of the new process, and
+    the watcher went on watching the dead one. So each time `observe` returns
+    - that iTerm2 is gone, or watching it failed - the process and the window
+    are looked up again. A lookup that finds nothing is tried again later:
+    iTerm2 may not answer yet, or the window may not be placed yet.
+    """
+    while True:
+        found = None
+        try:
+            found = resolve()
+            if found:
+                observe(*found)
+                continue
+        except Exception:
+            pass                     # a watcher is never worth the list
+        wait(RETRY_EVERY)
+
+
+def run_while(alive, run_slice):
+    """Run the notification loop in slices, checking between them."""
+    while alive():
+        run_slice(CHECK_EVERY)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                  # there, just not ours to signal
+    return True
+
+
+def _resolve(env):
+    uuid, pid = session_uuid(env), iterm_pid()
+    panel = panel_window_id(uuid) if uuid and pid else None
+    return (pid, panel) if pid and panel else None
+
+
+def _observe(ax, pid, panel):
+    """Watch one iTerm2 process until it is gone."""
+    app = ax.ax.AXUIElementCreateApplication(pid)
+    watch = StealWatch(panel, active=ax.frontmost(app))
+
+    # Each notification is told apart by the number it was registered
+    # with: the name macOS hands back is its own string, not ours.
+    def on_note(_observer, element, _note, ref):
+        try:
+            name = _NOTES[ref - 1] if ref else None
+            handle(watch, ax, app, name, element, time.monotonic())
+        except Exception:
+            pass                     # a watcher is never worth the list
+
+    callback = ax.Callback(on_note)
+    observer = ax.V()
+    if ax.ax.AXObserverCreate(pid, callback, ctypes.byref(observer)):
+        raise OSError(f"no Accessibility observer for pid {pid}")
+    for i, name in enumerate(_NOTES, start=1):
+        ax.ax.AXObserverAddNotification(observer.value, app, ax.s(name), ax.V(i))
+    loop = ax.cf.CFRunLoopGetCurrent()
+    source = ax.ax.AXObserverGetRunLoopSource(observer.value)
+    ax.cf.CFRunLoopAddSource(loop, source, ax.mode)
+    try:
+        run_while(lambda: pid_alive(pid),
+                  lambda seconds: ax.cf.CFRunLoopRunInMode(ax.mode, seconds, False))
+    finally:
+        ax.cf.CFRunLoopRemoveSource(loop, source, ax.mode)
+        ax.cf.CFRelease(observer.value)
+        ax.cf.CFRelease(app)
+
+
 def _watch(env):
     try:
-        uuid, pid = session_uuid(env), iterm_pid()
-        panel = panel_window_id(uuid) if uuid else None
-        if not (pid and panel):
-            return
         ax = _Ax()
-        app = ax.ax.AXUIElementCreateApplication(pid)
-        watch = StealWatch(panel, active=ax.frontmost(app))
-
-        # Each notification is told apart by the number it was registered
-        # with: the name macOS hands back is its own string, not ours.
-        def on_note(_observer, element, _note, ref):
-            try:
-                name = _NOTES[ref - 1] if ref else None
-                handle(watch, ax, app, name, element, time.monotonic())
-            except Exception:
-                pass                 # a watcher is never worth the list
-
-        callback = ax.Callback(on_note)
-        observer = ax.V()
-        if ax.ax.AXObserverCreate(pid, callback, ctypes.byref(observer)):
-            return
-        for i, name in enumerate(_NOTES, start=1):
-            ax.ax.AXObserverAddNotification(observer.value, app, ax.s(name),
-                                            ax.V(i))
-        ax.cf.CFRunLoopAddSource(ax.cf.CFRunLoopGetCurrent(),
-                                 ax.ax.AXObserverGetRunLoopSource(observer.value),
-                                 ax.mode)
-        while True:
-            ax.cf.CFRunLoopRunInMode(ax.mode, 60.0, False)
     except Exception:
-        return
+        return                       # no Accessibility library: nothing to do
+    supervise(lambda: _resolve(env),
+              lambda pid, panel: _observe(ax, pid, panel),
+              time.sleep)

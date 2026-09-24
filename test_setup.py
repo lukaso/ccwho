@@ -444,6 +444,13 @@ class TestTheHotkeyProfile(unittest.TestCase):
         # "it raises for a flash and then another window pops on top".
         self.assertFalse(self.profile()["HotKey Window Floats"])
 
+    def test_it_has_no_toolbelt(self):
+        # The profile inherits from Default, and a Default that opens the
+        # toolbelt put iTerm2's Session Status sidebar into the panel. A Dynamic
+        # Profile cannot be changed in Settings - iTerm2 says so and keeps the
+        # file's value - so the file has to say it.
+        self.assertIs(self.profile()["Open Toolbelt"], False)
+
     def test_it_is_on_whichever_space_you_are_on(self):
         self.assertEqual(self.profile()["Space"], -1,
                          "all spaces, or it is useless on space 2")

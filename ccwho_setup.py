@@ -589,6 +589,9 @@ def hotkey_profile(command, hotkey=DEFAULT_HOTKEY, name=PROFILE_NAME,
         # because iTerm2 happened to come to the front.
         "HotKey Window Reopens On Activation": False,
         "Prevent Opening in a Tab": True,      # never swallowed by a window
+        # False: Default's toolbelt (Session Status) is a sidebar the panel
+        # has no room for, and Settings cannot change a Dynamic Profile.
+        "Open Toolbelt": False,
         "Space": -1,                           # all spaces, or useless on space 2
         "Screen": -1,                          # wherever the cursor is
         "Window Type": 0,

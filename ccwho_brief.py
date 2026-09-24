@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import re
 
+import ccwho_procs as procs
+
 # Text the harness puts in a "user" turn that you did not type. Prefixes, not
 # substrings: a prompt that QUOTES one of these ("the log says 'Your claude.ai
 # usage limit has reset' - can you check?") is still your prompt.
@@ -240,11 +242,21 @@ def _unique(records):
 
 
 def _tool_hint(name, inp):
+    """One step, readable. The ONE copy: the list's `doing` column and the brief's
+    progress both print it, to people and to agents - a Bash command without a
+    description goes out as its short safe form. So does the rest: a description,
+    a pattern or a query is text the model wrote, and it can hold what it was
+    searching for."""
+    if not isinstance(inp, dict):       # a transcript line of another shape
+        return ""
     if name == "Bash":
-        return inp.get("description") or inp.get("command") or ""
+        return (procs.safe_command(inp.get("description") or "", program=False)
+                or procs.safe_command(inp.get("command") or ""))
     if name in _FILE_TOOLS:
-        return os.path.basename(inp.get("file_path") or "")
-    return inp.get("pattern") or inp.get("description") or inp.get("query") or ""
+        return procs.safe_command(os.path.basename(inp.get("file_path") or ""),
+                                  program=False)
+    return procs.safe_command(inp.get("pattern") or inp.get("description")
+                              or inp.get("query") or "", program=False)
 
 
 def progress(records, limit=MAX_PROGRESS):

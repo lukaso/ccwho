@@ -145,7 +145,8 @@ shows the first fault in its header.
 | the topic | `~/.claude/projects/*/<sessionId>.jsonl` (head + tail read only) |
 | the recap | the same transcript, `system` / `away_summary` records |
 | old sessions | the index, `~/.ccwho/` |
-| detached work | `ps`, PID-1 orphans matched by sessionId in the cmdline |
+| processes an agent started | the session id in each process's environment (`sysctl`) |
+| ports | `lsof -iTCP -sTCP:LISTEN` |
 
 `sessionId` from the agents feed **is** the transcript filename, which is what makes
 the topic column possible.
@@ -157,17 +158,64 @@ environment, and each config dir keeps a small file per live session, so ccwho r
 those as well (read-only: pointed at another dir, `claude agents` writes into it). A
 file counts only while its process is alive and is still the same process - its start
 time, as `ps` prints it in UTC, must match the one the file recorded. From the
-environment ccwho keeps four named variables and drops the rest: it holds tokens, and
+environment ccwho keeps five named variables and drops the rest: it holds tokens, and
 ccwho's output is read by agents. `ccwho doctor` says if those files stop parsing.
 
-## Detached work
+## Processes and ports
 
-Claude Code's Bash tool tracks background jobs and re-invokes the session when they
-exit. Work launched with `&`, `nohup` or `disown` is not tracked: the child is
-reparented to PID 1, and the session reports `idle` while the work runs on.
+Agents start dev servers and leave them running. The port you want is taken, and
+the session that did it may not even know. Every process Claude Code starts carries
+its session id in its environment (`CLAUDE_CODE_SESSION_ID`; Codex sets
+`CODEX_THREAD_ID`), and the mark survives the process being orphaned - so ccwho can
+say who started what:
 
-`ccwho` matches PID-1 orphans against each sessionId (scratchpad paths carry it) and
-flags the session `+N detached`. That is the blind spot the status column cannot see.
+```sh
+ccwho ps                    # every process an agent started, its session, its ports
+ccwho ps --port 3000        # who holds :3000 - exit 1 if no agent does, 3 if that is not known
+ccwho ps --all              # ...including helpers (MCP servers and the like)
+ccwho ps --json             # for scripts, and for agents told to clean up
+ccwho ps --full             # the whole command line, not the short form
+```
+
+The table (`ccwho ls`, `ccwho --watch`) says it in one dim line each, never louder
+than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
+ports on each row, and at the bottom `left behind: N processes` (sessions that have
+ended) and `codex: N processes` (Codex's own group: whether a Codex session is still
+running cannot be told cheaply, so its processes are never called left behind). A
+row's `+N detached` counts its processes that were orphaned (`&`, `nohup`) - the
+ones the session reports `idle` over while they run on. The live list does not show
+ports yet.
+
+`left behind` is the group a clean-up would kill, so nothing in doubt goes in it.
+A process whose session is gone is `not sure` instead when the session list could
+not be read in full (the agents list, a session file, a claude's environment, or a
+running `claude` that no source lists), when the claude that started it still runs
+(`CLAUDE_PID` - after `/clear` a claude keeps running under a new session id), when
+it is a `claude` itself or runs under one, or when it runs inside an app or tmux
+that an agent opened - the mark is inherited, and the user may work on in there. An app (`….app/Contents/…`) is `not sure` whoever started it: an agent that
+opens Docker Desktop has not made Docker its work. Exit 3 means "not known": ps or
+lsof failed, no environment could be read, or the port's holder could not be read.
+
+What ccwho can and cannot see: the environment is read with `sysctl` and only five
+named variables are kept - it holds tokens, and ccwho's output is read by agents.
+A command line is printed short: the program, and only the arguments whose place
+says they are harmless - flags, file names with a code or config extension, short
+words of letters and small numbers before the first flag (`npm run dev`), the value
+of `--port`/`--host`/`-m` and the like, `PORT=3000`, a package at `@latest`, a URL's
+host; the rest is `…`. A number after any other flag is `…`: after `-P` it is a PIN
+as often as a port, and the ports column already shows the ports. It fails closed:
+after the first sign of a secret - a password flag (`-a`, `-k`, `--password`, …), a
+secret-named word or key (`token`, `DB_PW=`), a header name (`Cookie:`), a program
+like `sshpass`, `echo` (its arguments are data), a flag ccwho cannot parse - nothing
+more of the line is shown. A command that reads a password
+from stdin (`--password-stdin`, `sudo -S`) shows only its program. The same short
+form is used for what a session is doing (its command, description or search). One
+shape it cannot tell from a word: a password of plain letters placed before any flag
+(`mytool hunter`) is printed. `--full` prints the whole line with secret-looking values masked - a best
+effort, so it is never the default. macOS hides the
+environment of its own system binaries, so a `/bin/sleep` an agent starts carries
+no mark ccwho can read; claude, node and Python dev servers do. A server inside a
+Docker container is not a host process, and its port belongs to Docker.
 
 ## Finding the window
 
@@ -357,6 +405,7 @@ result.
 ccwho                   # the live list (on a terminal)
 ccwho ls [words] [--all]  # the one-shot table, or every session matching
 ccwho show <anything>   # what that session was working on
+ccwho ps [--port N] [--full]  # what agents started, and their ports
 ccwho jump <tty|pid|title>  # focus that window
 ccwho open <session-id> # focus it, give it a window, or reopen it
 ccwho --watch           # the plain table, redrawn every 5s (and autosaving)

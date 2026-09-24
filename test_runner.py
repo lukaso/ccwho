@@ -15,22 +15,35 @@ import unittest
 import ccwho as runner
 
 
-# Reading this machine's session files is machine state; see test_ccwho. Every
-# test here runs with a guard that fails loudly instead of reading them.
-REAL_LIVE_FILE_SESSIONS = runner.engine.live_file_sessions
+# Reading this machine's processes, ports and session files is machine state; see
+# test_ccwho. Every test here runs with guards that fail loudly instead.
+REAL = {name: getattr(runner.engine, name) for name in ("live_file_sessions",
+                                                       "ps_table", "listen_ports")}
+REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 
 
-def _unpinned_live_file_sessions():
-    raise AssertionError("a test reached this machine's session files - pin "
-                         "live_file_sessions")
+def _guard(name):
+    def unpinned(*a, **k):
+        raise AssertionError(f"a test reached this machine through engine.{name}")
+    return unpinned
+
+
+GUARDS = {name: _guard(name) for name in REAL}
+_unpinned_live_file_sessions = GUARDS["live_file_sessions"]
+
+
+def install_guards():
+    for name, guard in GUARDS.items():
+        setattr(runner.engine, name, guard)
 
 
 def setUpModule():
-    runner.engine.live_file_sessions = _unpinned_live_file_sessions
+    install_guards()
 
 
 def tearDownModule():
-    runner.engine.live_file_sessions = REAL_LIVE_FILE_SESSIONS
+    for name, real in REAL.items():
+        setattr(runner.engine, name, real)
 
 
 class TestWatchRequested(unittest.TestCase):
@@ -1100,8 +1113,8 @@ class TestHotReloadCoversTheBriefModule(unittest.TestCase):
     engine reloads, a fix to those rules looks like it did nothing."""
 
     def tearDown(self):
-        # a reload re-executes the engine and rebinds the real function
-        runner.engine.live_file_sessions = _unpinned_live_file_sessions
+        # a reload re-executes the engine and rebinds the real functions
+        install_guards()
 
     def test_editing_the_brief_module_lands_on_the_next_tick(self):
         import ccwho_brief
@@ -2315,3 +2328,228 @@ class TestChangingTheHotkeyActuallyChangesIt(SetupHarness):
     def test_a_first_install_just_writes_it(self):                    # control
         self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
         self.assertEqual([k for k, _ in self.events], ["write"])
+
+
+
+SESSION = "aaaa1111-0000-4000-8000-000000000001"
+TOKEN_R = "sk-ant-FAKE-runner-must-never-print"
+
+
+class TestPsLists_WhatAgentsStarted(unittest.TestCase):
+    """`ccwho ps` - the plain view of every process an agent started: its session,
+    its ports, its command (redacted). The same data as the list, as text or JSON."""
+
+    def setUp(self):
+        self.real = runner.engine.collect
+        row = {"sessionId": SESSION, "project": "app", "title": "fix the navbar",
+               "tab_title": "", "name": "app-4e"}
+        fleet = {"ports_ok": True, "agent_ports": [],
+                 "by_session": {SESSION: [
+                     {"pid": 11, "ports": [5173], "command": "vite --port 5173",
+                      "command_full": "/Users/x/app/node_modules/.bin/vite --port 5173",
+                      "helper": False, "orphan": True, "harness": "claude",
+                      "session": SESSION},
+                     {"pid": 13, "ports": [9222], "command": "npm exec some-mcp",
+                      "helper": True, "orphan": False, "harness": "claude",
+                      "session": SESSION}]},
+                 "left_behind": [{"pid": 20, "ports": [3000], "helper": False,
+                                  "command": "next-server --token=***", "orphan": True,
+                                  "harness": "claude", "session": "dddd"}],
+                 "codex": [{"pid": 30, "ports": [60805], "helper": False,
+                            "command": "workerd serve", "orphan": True,
+                            "harness": "codex", "session": "01a0abc8"}]}
+        runner.engine.collect = lambda cache=None, status=None: ([row], fleet)
+        self.addCleanup(setattr, runner.engine, "collect", self.real)
+
+    def run_ps(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.main(["ps", *args])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_every_group_is_listed_with_its_ports(self):
+        rc, out, _ = self.run_ps()
+        self.assertEqual(rc, 0)
+        for text in ("fix the navbar", ":5173", "left behind", ":3000", "codex", ":60805"):
+            self.assertIn(text, out)
+
+    def test_helpers_only_with_all(self):
+        _, out, _ = self.run_ps()
+        self.assertNotIn("some-mcp", out)
+        _, out_all, _ = self.run_ps("--all")
+        self.assertIn("some-mcp", out_all)
+
+    def test_a_port_filter(self):
+        rc, out, _ = self.run_ps("--port", "3000")
+        self.assertEqual(rc, 0)
+        self.assertIn("next-server", out)
+        self.assertNotIn("vite", out)
+
+    def test_a_port_nobody_agent_holds_is_said_so(self):             # control
+        rc, _, err = self.run_ps("--port", "4444")
+        self.assertEqual(rc, 1)
+        self.assertIn(":4444", err)
+
+    def test_a_port_with_an_equals_sign_is_the_same_question(self):
+        # review 4 #5: `--port=1` listed everything with exit 0
+        self.assertEqual(self.run_ps("--port=4444")[0], 1)
+        rc, out, _ = self.run_ps("--port=3000")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("vite", out)
+        self.assertEqual(self.run_ps("--port=")[0], 2)
+        self.assertEqual(self.run_ps("--port=70000")[0], 2)          # review 5: no such port
+
+    def test_a_port_with_a_colon_is_the_same_port(self):
+        rc, out, _ = self.run_ps("--port", ":3000")
+        self.assertEqual(rc, 0)
+        self.assertIn("next-server", out)
+
+    def test_a_bad_port_is_a_usage_error(self):
+        # never a traceback, and never "everything" (adversarial F2)
+        for args in (("--port",), ("--port", "abc"), ("--port", "\u00b3")):
+            with self.subTest(args=args):
+                rc, out, err = self.run_ps(*args)
+                self.assertEqual(rc, 2)
+                self.assertIn("--port", err)
+                self.assertEqual(out, "")
+
+    def test_unknown_processes_are_not_no_processes(self):
+        fleet = dict(runner.engine.collect()[1], procs_ok=False, by_session={},
+                     left_behind=[], codex=[])
+        runner.engine.collect = lambda cache=None, status=None: ([], fleet)
+        rc, out, err = self.run_ps()
+        self.assertEqual(rc, 3)
+        self.assertIn("unknown", err)
+        self.assertNotIn("no processes", out)
+
+    def test_a_port_question_with_ports_unknown_has_its_own_answer(self):
+        # adversarial #4: exit 1 means "nobody holds it"; unknown is not that
+        row, fleet = runner.engine.collect()
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, ports_ok=False))
+        rc, out, err = self.run_ps("--port", "3000")
+        self.assertEqual(rc, 3)
+        self.assertIn("unknown", err)
+
+    def test_ports_unknown_shows_a_question_mark(self):
+        row, fleet = runner.engine.collect()
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, ports_ok=False))
+        _, out, _ = self.run_ps()
+        line = [l for l in out.splitlines() if l.startswith("11 ")][0]
+        self.assertEqual(line.split()[1], "?")
+        runner.engine.collect = lambda cache=None, status=None: (row, fleet)
+        _, out, _ = self.run_ps()
+        self.assertEqual([l for l in out.splitlines() if l.startswith("11 ")][0]
+                         .split()[1], ":5173")
+
+    def test_unsure_is_never_called_left_behind(self):
+        row, fleet = runner.engine.collect()
+        unsure = [{"pid": 50, "ports": [], "helper": False, "command": "vite",
+                   "orphan": True, "harness": "claude", "session": "dddd",
+                   "why": "the session list is incomplete"}]
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, unsure=unsure))
+        _, out, _ = self.run_ps("--json")
+        got = {p["pid"]: p["group"] for p in json.loads(out)}
+        self.assertEqual(got[50], "unsure")
+        self.assertEqual(got[20], "left behind")                          # control
+        _, out, _ = self.run_ps()
+        line = [l for l in out.splitlines() if l.startswith("50 ")][0]
+        self.assertNotIn("left behind", line)
+
+    def test_processes_unknown_has_the_unknown_exit(self):
+        # cycle 3 #7: 1 means "no agent holds it"; a script starts a server on 1
+        row, fleet = runner.engine.collect()
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, procs_ok=False))
+        for args in ((), ("--port", "3000")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_ps(*args)[0], 3)
+
+    def test_a_port_held_by_an_unreadable_process_is_unknown(self):
+        row, fleet = runner.engine.collect()
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, unknown_ports=[8080]))
+        rc, _, err = self.run_ps("--port", "8080")
+        self.assertEqual(rc, 3)
+        self.assertIn(":8080", err)
+        self.assertEqual(self.run_ps("--port", "4444")[0], 1)                # control
+
+    def test_a_port_question_sees_helpers(self):
+        # who holds :9222 - an MCP helper does, and "nobody" would be wrong
+        rc, out, _ = self.run_ps("--port", "9222")
+        self.assertEqual(rc, 0)
+        self.assertIn("some-mcp", out)
+
+    def test_left_behind_helpers_are_listed(self):
+        # cycle 3 #10: the bottom line counts them, so ps lists them: litter is
+        # litter, an MCP server whose session ended included
+        row, fleet = runner.engine.collect()
+        lb = fleet["left_behind"] + [{"pid": 21, "ports": [], "helper": True,
+                                      "command": "npx some-mcp", "orphan": True,
+                                      "harness": "claude", "session": "dddd"}]
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, left_behind=lb))
+        _, out, _ = self.run_ps()
+        self.assertIn("some-mcp", out)
+        self.assertNotIn("some-mcp exec", out)
+        self.assertNotIn("npm exec some-mcp", out)                           # control: pid 13
+
+    def test_every_listed_process_is_one_line(self):
+        _, out, _ = self.run_ps("--json")
+        n = len(json.loads(out))
+        _, out, _ = self.run_ps()
+        self.assertEqual(len(out.splitlines()), n)
+
+    def test_json_says_when_ports_are_unknown(self):
+        row, fleet = runner.engine.collect()
+        fleet = dict(fleet, ports_ok=False)
+        runner.engine.collect = lambda cache=None, status=None: (row, fleet)
+        _, out, _ = self.run_ps("--json")
+        self.assertTrue(all(p["ports"] is None for p in json.loads(out)))
+
+    def test_the_full_command_only_when_asked(self):
+        _, out, _ = self.run_ps()
+        self.assertNotIn("node_modules", out)
+        _, out, _ = self.run_ps("--full")
+        self.assertIn("node_modules/.bin/vite", out)
+
+    def test_json_has_the_full_command_only_when_asked(self):
+        _, out, _ = self.run_ps("--json")
+        self.assertNotIn("node_modules", out)
+        _, out, _ = self.run_ps("--json", "--full")
+        self.assertIn("node_modules/.bin/vite", out)
+
+    def test_json_for_scripts_and_agents(self):
+        rc, out, _ = self.run_ps("--json")
+        procs = json.loads(out)
+        self.assertEqual(sorted(p["pid"] for p in procs), [11, 20, 30])
+        self.assertEqual({p["group"] for p in procs}, {"session", "left behind", "codex"})
+
+
+class TestReapNeverPrintsASecret(unittest.TestCase):
+    """reap prints the commands it would kill; a command line can carry a token
+    (a node process can spill its environment into it). eng D5."""
+
+    def test_the_token_is_masked(self):
+        real = runner.engine.ps_snapshot_elapsed
+        runner.engine.ps_snapshot_elapsed = lambda: (
+            f"  4242     1 2-00:00:00 node leak.js --token={TOKEN_R}\n")
+        self.addCleanup(setattr, runner.engine, "ps_snapshot_elapsed", real)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["reap", "leak.js", "--older-than", "1h"])
+        self.assertIn("leak.js", out.getvalue())
+        self.assertNotIn(TOKEN_R, out.getvalue())
+
+    def test_a_token_with_no_known_shape_is_not_printed(self):
+        real = runner.engine.ps_snapshot_elapsed
+        runner.engine.ps_snapshot_elapsed = lambda: (
+            "  4242     1 2-00:00:00 node leak.js k8Hq2vX9pLm3nR7tW1yZ4bC6dF0gJ5sA\n")
+        self.addCleanup(setattr, runner.engine, "ps_snapshot_elapsed", real)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["reap", "leak.js", "--older-than", "1h"])
+        self.assertIn("leak.js", out.getvalue())                            # control
+        self.assertNotIn("k8Hq2vX9pLm3nR7tW1yZ4bC6dF0gJ5sA", out.getvalue())

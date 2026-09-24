@@ -49,10 +49,10 @@ def reload_engine(state):
 
 def tick(state, argv, color):
     eng = reload_engine(state) if state["watch"] else engine
-    rows, total_orphans = eng.collect(cache=state.setdefault("cache", {}))
+    rows, fleet = eng.collect(cache=state.setdefault("cache", {}))
     if "--blocked" in argv:
         rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
-    out = eng.render(rows, total_orphans, color=color,
+    out = eng.render(rows, fleet, color=color,
                      show_prompt="--prompt" in argv or "-p" in argv,
                      links=state.get("links", False))
     state["ticks"] += 1
@@ -678,9 +678,9 @@ def ls(argv):
     """The table. With words, the sessions that match - including ended ones."""
     query = " ".join(a for a in argv if not a.startswith("-"))
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    rows, total = engine.collect(cache={})
+    rows, fleet = engine.collect(cache={})
     if not query:
-        sys.stdout.write(engine.render(rows, total, color=color))
+        sys.stdout.write(engine.render(rows, fleet, color=color))
         return 0
     live, ended = matches(query, rows, everything="--all" in argv)
     if not live and not ended:
@@ -986,6 +986,85 @@ def positional(argv, value_flags, default):
     return default
 
 
+def ps(argv):
+    """Every process an agent started: its session, its ports, its command.
+
+    The plain view of what the list shows - for a terminal, a script, or an
+    agent told to clean up after itself (--json). Helpers (MCP servers and the
+    like) only with --all; `--port N` answers "who holds :N".
+    """
+    port = None
+    given = [a for a in argv if a.startswith("--port=")]
+    if "--port" in argv or given:
+        # `--port N` and `--port=N` ask the same question
+        raw = (given[0].split("=", 1)[1] if given else _arg(argv, "--port", "")).lstrip(":")
+        if not (raw.isascii() and raw.isdigit() and 0 < int(raw) <= 65535):
+            print("ccwho ps: --port needs a port number, e.g. --port 3000",
+                  file=sys.stderr)
+            return 2
+        port = int(raw)
+    # --full: the whole command line, redacted - best effort, so never the default
+    full = "--full" in argv
+    rows, fleet = engine.collect(cache={})
+    fleet = fleet if isinstance(fleet, dict) else {}
+    if not fleet.get("procs_ok", True):
+        # 3, the unknown exit: 1 is "no agent holds it", and a script acts on 1
+        print("ccwho ps: processes unknown - ps or the environment read failed",
+              file=sys.stderr)
+        return 3
+    titles = {r.get("sessionId"): (r.get("tab_title") or r.get("title") or r.get("name")
+                                   or "?") for r in rows}
+    project = {r.get("sessionId"): r.get("project", "?") for r in rows}
+    listed = []
+    for sid, mine in (fleet.get("by_session") or {}).items():
+        listed += [dict(p, group="session", who=f"{project.get(sid, '?')} · "
+                                                f"{titles.get(sid, '?')}") for p in mine]
+    listed += [dict(p, group="left behind", who="left behind") for p in
+               fleet.get("left_behind") or []]
+    listed += [dict(p, group="codex", who="codex") for p in fleet.get("codex") or []]
+    # its session is gone, but there is doubt (the list is incomplete, a claude
+    # ccwho does not list runs it, or it is an app): never offered as litter
+    listed += [dict(p, group="unsure", who=f"not sure: {p.get('why', '?')}")
+               for p in fleet.get("unsure") or []]
+    if "--all" not in argv and port is None:
+        # left behind keeps its helpers: an MCP server whose session ended is
+        # litter like any other, and the bottom line counts it. A port question
+        # asks about every holder
+        listed = [p for p in listed if not p.get("helper") or p["group"] == "left behind"]
+    known = fleet.get("ports_ok", True)
+    if port is not None:
+        if not known:
+            # not 1: "nobody holds it" is an answer, and this is not one
+            print(f"ccwho ps: ports unknown - lsof could not be asked, so who holds"
+                  f" :{port} is not known", file=sys.stderr)
+            return 3
+        listed = [p for p in listed if port in p.get("ports", [])]
+        if not listed and port in (fleet.get("unknown_ports") or []):
+            print(f"ccwho ps: :{port} is held by a process whose environment could not"
+                  f" be read - who started it is not known", file=sys.stderr)
+            return 3
+        if not listed:
+            print(f"ccwho ps: nothing an agent started holds :{port}", file=sys.stderr)
+            return 1
+    if "--json" in argv:
+        keep = ("pid", "ports", "command", "group", "who", "session", "harness",
+                "orphan", "helper", "why") + (("command_full",) if full else ())
+        # ports unknown is null, not [] - a script must not read "holds nothing"
+        print(json.dumps([dict({k: p.get(k) for k in keep},
+                               ports=p.get("ports") if known else None)
+                          for p in listed], indent=2))
+        return 0
+    if not listed:
+        print("no processes started by agents")
+        return 0
+    for p in listed:
+        ports = (" ".join(f":{n}" for n in p.get("ports", [])) or "-") if known else "?"
+        print(f"{p['pid']:<7} {ports:<14} {engine.truncate(p['who'], 40):<40} "
+              + (p.get("command_full", "") if full
+                 else engine.truncate(p.get("command", ""), 60)))
+    return 0
+
+
 def reap(argv):
     """Kill leaked helper processes older than a threshold. Dry run by default."""
     pattern = positional(argv, VALUE_FLAGS, "liveapp-pty-guards")
@@ -999,7 +1078,9 @@ def reap(argv):
     print(f"{len(hits)} processes match {pattern!r} and are older than {age}s "
           f"({len(roots)} orphaned roots)")
     for h in sorted(hits, key=lambda x: -x["age"])[:5]:
-        print(f"  {h['pid']:<8} {h['age'] // 3600}h  {h['command'][:88]}")
+        # a command line can carry a token; this output reaches agents too
+        print(f"  {h['pid']:<8} {h['age'] // 3600}h  "
+              f"{engine.procs.safe_command(h['command'])[:88]}")
     if len(hits) > 5:
         print(f"  ... and {len(hits) - 5} more")
     if "--kill" not in argv:
@@ -1304,6 +1385,8 @@ def main(argv=None):
         return restore(argv[1:])
     if argv and argv[0] == "ls":
         return ls(argv[1:])
+    if argv and argv[0] == "ps":
+        return ps(argv[1:])
     if argv and argv[0] == "doctor":
         return doctor(argv[1:])
     if argv and argv[0] == "setup":
@@ -1327,6 +1410,7 @@ def main(argv=None):
         print("       ccwho ls [words] [--all]                   the table, or every session matching")
         print("                                                  (--all includes sessions a program started)")
         print("       ccwho show <anything>                      what that session was working on")
+        print("       ccwho ps [--port N] [--all] [--json] [--full]  what agents started, and their ports")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY]         install what ccwho needs, once")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")

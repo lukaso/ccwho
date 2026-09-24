@@ -354,3 +354,76 @@ class TestBuildBrief(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheBriefNeverPrintsASecret(unittest.TestCase):
+    """The brief's progress lines show a Bash call's command when it has no
+    description, and `ccwho show` (text and --json) prints them to whoever
+    asked - often an agent. One _tool_hint serves the brief and the list."""
+
+    TOKEN = "sk-ant-FAKE-brief-must-never-print"
+
+    def recs(self, command):
+        return [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": command}}]}}]
+
+    def test_a_token_in_a_command_is_masked(self):
+        got = brief.progress(self.recs(f"curl -H 'Authorization: Bearer {self.TOKEN}' x"))
+        self.assertNotIn(self.TOKEN, " ".join(got))
+
+    def test_a_token_with_no_known_shape_is_not_shown(self):
+        got = brief.progress(self.recs("deploy --stage prod k8Hq2vX9pLm3nR7tW1yZ4bC6dF0gJ5sA"))
+        self.assertEqual(got, ["Bash: deploy --stage …"])
+
+    def test_no_hint_carries_a_control_character(self):
+        # a description, a pattern or a query is text the model wrote: it can
+        # hold an escape sequence that retitles the window or repaints the list
+        for name, inp in (("Bash", {"command": "x", "description": "a\x1b]0;t\x07b"}),
+                          ("Grep", {"pattern": "a\x1b[2Jb"}),
+                          ("WebSearch", {"query": "a\x9bb"})):
+            with self.subTest(name=name):
+                got = brief._tool_hint(name, inp)
+                self.assertNotRegex(got, r"[\x00-\x1f\x7f-\x9f]")
+                self.assertTrue(got)
+
+    def test_no_hint_carries_a_token(self):
+        for name, inp in (("Bash", {"command": "x", "description": f"use {self.TOKEN}"}),
+                          ("Grep", {"pattern": self.TOKEN})):
+            with self.subTest(name=name):
+                self.assertNotIn(self.TOKEN, brief._tool_hint(name, inp))
+
+    def test_what_the_model_wrote_is_shaped_too(self):
+        # cycle 3 #12: a pattern, a query or a description is printed in the
+        # default view, so it goes through the allowlist, not the blocklist
+        for name, inp in (("Grep", {"pattern": "hunter2secret"}),
+                          ("Bash", {"command": "x", "description": "Log in with db pass hunter2"}),
+                          ("WebSearch", {"query": "token abcd1234efgh"})):
+            with self.subTest(name=name):
+                got = brief._tool_hint(name, inp)
+                self.assertNotIn("hunter2", got)
+                self.assertNotIn("abcd1234efgh", got)
+
+    def test_plain_hints_stay_readable(self):                          # control
+        self.assertEqual(brief._tool_hint("Grep", {"pattern": "def collect"}), "def collect")
+        self.assertEqual(brief._tool_hint("Bash", {"command": "x",
+                                                   "description": "Run the tests"}),
+                         "Run the tests")
+
+    def test_an_input_that_is_not_a_dict_does_not_crash(self):
+        # review 6 #7: one such transcript line stopped ls, ps and the list
+        for inp in ("x", [1], 5):
+            with self.subTest(inp=inp):
+                self.assertEqual(brief._tool_hint("Grep", inp), "")
+        self.assertEqual(brief._tool_hint("Grep", {"pattern": "def x"}), "def x")  # control
+
+    def test_a_hint_that_is_not_text_does_not_crash(self):
+        # review 4 #3: a tool input of another type took collect() down with it
+        for name, inp in (("Grep", {"pattern": 5}), ("Bash", {"command": ["ls"]}),
+                          ("WebSearch", {"query": {"q": 1}})):
+            with self.subTest(name=name):
+                recs = [{"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": name, "input": inp}]}}]
+                self.assertIsInstance(brief.progress(recs), list)
+
+    def test_a_plain_command_is_shown(self):                          # control
+        self.assertEqual(brief.progress(self.recs("npm test")), ["Bash: npm test"])

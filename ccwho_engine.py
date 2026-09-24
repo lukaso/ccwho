@@ -33,7 +33,8 @@ import ccwho_procs as procs
 # The rule modules the engine imports, in the order they are re-read. One list,
 # used by the watch loop and the list alike: a module named in only one of two
 # lists is a fix that lands in one window and not the other.
-RELOAD_FIRST = ("ccwho_brief", "ccwho_index", "ccwho_procs")
+RELOAD_FIRST = ("ccwho_procs", "ccwho_brief", "ccwho_index")    # procs first:
+                                                                  # brief imports it
 
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
@@ -181,17 +182,6 @@ def extract_title(lines):
 
 
 # Tools whose most useful hint is the file they touch.
-_FILE_TOOLS = ("Edit", "Read", "Write", "NotebookEdit")
-
-
-def _tool_hint(name, inp):
-    if name == "Bash":
-        return inp.get("description") or inp.get("command") or ""
-    if name in _FILE_TOOLS:
-        return os.path.basename(inp.get("file_path") or "")
-    return inp.get("pattern") or inp.get("description") or inp.get("query") or ""
-
-
 def extract_doing(lines):
     """What the session last actually did - the final tool call, human-readable."""
     doing = ""
@@ -204,7 +194,7 @@ def extract_doing(lines):
         for b in content:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 name = b.get("name", "?")
-                hint = " ".join(str(_tool_hint(name, b.get("input", {}) or {})).split())
+                hint = " ".join(str(brief._tool_hint(name, b.get("input", {}) or {})).split())
                 doing = f"{name}: {hint}" if hint else name
     return doing
 
@@ -246,33 +236,38 @@ def since(mtime, now=None):
     return f"{secs // 86400}d"
 
 
-def attribute_orphans(ps_output, session_ids):
-    """Map sessionId -> count of processes reparented to PID 1 whose cmdline names it.
-
-    This is the detached-work blind spot: work a session launched with `&` or nohup
-    outlives it, is adopted by PID 1, and the session then reports idle.
-    """
-    counts = {sid: 0 for sid in session_ids}
+def _cmdline_orphans(ps_output, session_ids):
+    """sessionId -> pids of PID-1 processes whose command line names it."""
+    out = {sid: set() for sid in session_ids}
     for pid, ppid, cmd in _ps_rows(ps_output):
-        if ppid != 1:
+        if ppid != 1 or not pid.isdigit():
             continue
         for sid in session_ids:
             if sid and sid in cmd:
-                counts[sid] += 1
-    return counts
+                out[sid].add(int(pid))
+    return out
 
 
-def count_orphans(ps_output, home=None):
-    """Orphans reparented to PID 1. With `home`, count only work under it -
-    macOS has hundreds of system daemons on PID 1 and none of them are yours."""
-    total = 0
-    for _pid, ppid, cmd in _ps_rows(ps_output):
-        if ppid != 1:
-            continue
-        if home and home not in cmd:
-            continue
-        total += 1
-    return total
+def _fleet(att, rows, ports_ok, procs_ok=True, sessions_ok=True):
+    """What the whole machine says, for the header and the bottom lines."""
+    project = {r.get("sessionId"): r.get("project", "?") for r in rows}
+    held = []
+    for sid, mine in att["sessions"].items():
+        held += [(port, p["pid"], project.get(sid, "?")) for p in mine
+                 if not p["helper"] for port in p["ports"]]
+    held += [(port, p["pid"], "left behind") for p in att["left_behind"]
+             if not p["helper"] for port in p["ports"]]
+    held += [(port, p["pid"], "codex") for p in att["codex"]
+             if not p["helper"] for port in p["ports"]]
+    held += [(port, p["pid"], "not sure") for p in att.get("unsure", [])
+             if not p["helper"] for port in p["ports"]]
+    return {"left_behind": att["left_behind"], "codex": att["codex"],
+            "unsure": att.get("unsure", []), "sessions_ok": sessions_ok,
+            "by_session": att["sessions"], "ports_ok": ports_ok,
+            # a ps that could not run leaves no marks: "unknown", not "nothing"
+            "procs_ok": procs_ok,
+            "agent_ports": [{"port": port, "pid": pid, "who": who}
+                            for port, pid, who in sorted(set(held))]}
 
 
 def _ps_rows(ps_output):
@@ -818,7 +813,7 @@ def titles_snapshot(timeout=5.0):
     the list is still worth showing without the names on the tabs."""
     try:
         done = subprocess.run(["osascript", "-e", iterm_titles_script()],
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return {}
     return parse_titles(done.stdout) if done.returncode == 0 else {}
@@ -856,7 +851,7 @@ def titles_cached(cache, ttys=None, now=None):
 def tty_snapshot():
     try:
         return subprocess.run(["ps", "-eo", "pid,tty"], capture_output=True,
-                              text=True, timeout=20).stdout
+                              text=True, errors="replace", timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -864,7 +859,7 @@ def tty_snapshot():
 def ps_snapshot_elapsed():
     try:
         return subprocess.run(["ps", "-eo", "pid,ppid,etime,command"],
-                              capture_output=True, text=True, timeout=20).stdout
+                              capture_output=True, text=True, errors="replace", timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -872,7 +867,7 @@ def ps_snapshot_elapsed():
 def ps_snapshot():
     try:
         return subprocess.run(
-            ["ps", "-eo", "pid,ppid,command"], capture_output=True, text=True, timeout=20
+            ["ps", "-eo", "pid,ppid,command"], capture_output=True, text=True, errors="replace", timeout=20
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -906,7 +901,7 @@ def ps_table():
     comparable: a local, localised `ps` prints "Tue 22 Sep 14:45:15"."""
     try:
         text = subprocess.run(["ps", "-axo", "pid=,lstart=,comm="], capture_output=True,
-                              text=True, timeout=20,
+                              text=True, errors="replace", timeout=20,
                               env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -1002,7 +997,7 @@ def read_session_files(dirs, default=None):
     return entries, bad
 
 
-def live_file_sessions():
+def live_file_sessions(table=None):
     """Live sessions from every config dir, as `claude agents --json` rows; and
     how many session files could not be read (for `ccwho doctor`).
 
@@ -1010,7 +1005,7 @@ def live_file_sessions():
     pointed at another one it WRITES into it. So: each running claude process
     names its own CLAUDE_CONFIG_DIR, and each dir keeps a small file per session.
     """
-    table = ps_table()
+    table = ps_table() if table is None else table
     own = []
     for pid in procs.claude_pids(table):
         env = read_procargs(pid) or {}
@@ -1018,6 +1013,48 @@ def live_file_sessions():
     dirs = procs.config_dirs(own, ccwho_index.config_roots())
     entries, bad = read_session_files(dirs, default=os.path.expanduser("~/.claude"))
     return procs.live_session_files(entries, procs.claude_starts(table)), bad
+
+
+def listen_ports():
+    """pid -> listening TCP ports, or None when lsof could not be asked. None and
+    {} are different answers, as with agents_json: "ports unknown" is not "no
+    ports", and a view that says nobody holds :3000 had better have looked."""
+    try:
+        done = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"],
+                              capture_output=True, text=True, errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # lsof exits 1 both when nothing matched and on real errors; only the first
+    # comes with nothing on stderr
+    if done.returncode not in (0, 1) or (done.returncode == 1 and
+                                         (done.stderr or "").strip()):
+        return None
+    return procs.parse_lsof_listen(done.stdout)
+
+
+def proc_marks(table, cache=None):
+    """pid -> the session mark in its environment, from ps_table()'s
+    pid -> (start, command); None for one that was read and names no session,
+    absent for one that could not be read. An environment is fixed at exec, so each
+    (pid, start, command) is read once and kept in the caller's cache: a reused
+    pid has another start, and an exec keeps pid and start but not the command.
+    A read that failed is not remembered - it is tried again next scan."""
+    cache = {} if cache is None else cache
+    known = cache.get("_marks", {})
+    now, out = {}, {}
+    for pid, (start, command) in (table or {}).items():
+        key = (pid, start, command)
+        if key in known:
+            mark = known[key]
+        else:
+            env = read_procargs(pid)
+            if env is None:
+                continue
+            mark = procs.mark_of(env)
+        now[key] = mark
+        out[pid] = mark
+    cache["_marks"] = now
+    return out
 
 
 def agents_json():
@@ -1034,7 +1071,7 @@ def agents_json():
         return None
     try:
         done = subprocess.run(
-            [exe, "agents", "--json"], capture_output=True, text=True, timeout=30
+            [exe, "agents", "--json"], capture_output=True, text=True, errors="replace", timeout=30
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1412,7 +1449,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     recs = as_records(head) + as_records(tail)
     r = brief.recap(recs)
     has_window = windowed
-    return {
+    row = {
         "windowed": has_window,
         "kind": session.get("kind", ""),
         "project": project_of(session.get("cwd", "")),
@@ -1442,7 +1479,25 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # set only for a session found in another config dir: attach and resume
         # have to run there, or claude answers that it has no such session
         "configDir": session.get("configDir", ""),
+        # the session's work processes and their ports; collect() fills them in
+        "procs": 0,
+        "ports": [],
     }
+    # the text comes from transcripts, the agents feed and tab titles, and goes to
+    # a terminal and to agents: nothing in it may start an escape sequence
+    row = {k: procs.printable(v) if isinstance(v, str) else v for k, v in row.items()}
+    # and a one-line field has one line: a newline in a title printed a line of
+    # its own in `ccwho ps` - a fake pid for an agent to kill
+    for k in _ONE_LINE:
+        if isinstance(row.get(k), str):
+            row[k] = " ".join(row[k].split())
+    return row
+
+
+# every row field but the prose ones (recap, topic, first, ask)
+_ONE_LINE = ("kind", "project", "status", "attention", "waitingFor", "name", "title",
+             "doing", "since", "age", "tty", "tab_title", "recap_age", "sessionId", "cwd",
+             "configDir")
 
 
 def project_dirs(roots=None):
@@ -1546,12 +1601,14 @@ def collect(cache=None, status=None):
     could be reached at all. An empty row list means nothing without it."""
     raw = agents_json()
     parsed = parse_sessions(raw) if raw is not None else None
+    source_ok = parsed is not None and read_is_complete(raw)
     if status is not None:
         # reachable AND fully readable. Rows we understood are still rendered; a
         # picture with a hole in it is what must not reach a caller that launches.
-        status["source_ok"] = parsed is not None and read_is_complete(raw)
+        status["source_ok"] = source_ok
+    table = ps_table()
     try:
-        file_rows, bad = live_file_sessions()
+        file_rows, bad = live_file_sessions(table)
     except Exception:           # a second source: its failure never blanks the list
         file_rows, bad = [], None
     sessions = procs.merge_sessions(parsed or [], file_rows)
@@ -1569,7 +1626,37 @@ def collect(cache=None, status=None):
     ttys = parse_tty_map(tty_snapshot())
     titles = titles_cached(cache, ttys=set(ttys.values()))
     ids = [s.get("sessionId", "") for s in sessions]
-    orphans = attribute_orphans(ps_out, ids)
+    # who started what: the env mark, which survives the process being orphaned;
+    # built from the ps snapshot and start times this scan already has
+    starts = {pid: start for pid, (start, _cmd) in table.items()}
+    ptable = {}
+    for pid, ppid, cmd in _ps_rows(ps_out):
+        if pid.isdigit():
+            ptable[int(pid)] = (ppid, starts.get(int(pid), ""), cmd)
+    ports = listen_ports()
+    marks = proc_marks(table, cache)
+    # a command line that names the session still counts when the env could not
+    # be read (the old rule, kept as the fallback: eng D8) - but never a live
+    # session, a helper, or a process whose env was read (it names somebody
+    # else, or nobody). attribute lists them with the session, so the row's
+    # count and `ccwho ps` are the same processes
+    session_pids = {s.get("pid") for s in sessions}
+    named = {sid: {pid for pid in pids
+                   if pid not in session_pids and pid not in marks
+                   and not procs.is_helper(ptable.get(pid, (0, "", ""))[2])}
+             for sid, pids in _cmdline_orphans(ps_out, ids).items()}
+    # a session missing from the list may be running: while the list is not
+    # whole, nothing is called left behind. `bad` is None when the file scan
+    # crashed
+    # nor while a session file could not be read, or a claude's environment (its
+    # CLAUDE_CONFIG_DIR says where its session file is)
+    # and every running claude must be a listed session: one that is not may
+    # be the session a "left behind" process belongs to
+    running = procs.claude_pids(table)
+    sessions_ok = (source_ok and bad == 0 and all(pid in marks for pid in running)
+                   and set(running) <= {s.get("pid") for s in sessions})
+    att = procs.attribute(ptable, marks, ports or {}, sessions,
+                          sessions_known=sessions_ok, own=os.getpid(), named=named)
     reviewed = load_reviewed()
     rows = []
     parents, commands = parent_map(ps_out), command_map(ps_out)
@@ -1580,11 +1667,16 @@ def collect(cache=None, status=None):
         # process, and the window showing it belongs to an ancestor
         tty = owning_tty(s.get("pid"), parents, ttys, titles,
                          commands=commands, session_id=sid)
-        rows.append(build_row(s, head, tail, mtime, orphan_count=orphans.get(sid, 0),
+        mine = att["sessions"].get(sid, [])
+        summary = procs.row_summary(mine)
+        rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), ""),
                               reviewed=reviewed,
                               windowed=windowed(tty, titles)))
+        rows[-1]["procs"] = summary["procs"]
+        # unknown is null, not [] - a script must not read "holds nothing"
+        rows[-1]["ports"] = summary["ports"] if ports is not None else None
     rows.sort(key=sort_key)
     if status is not None:
         # The same value the cheap check computes, so finishing a scan never
@@ -1597,7 +1689,18 @@ def collect(cache=None, status=None):
         # up never hitting once while looking like it works.
         for gone in set(k for k in cache if not k.startswith("_")) - set(ids):
             cache.pop(gone, None)
-    return rows, count_orphans(ps_out, home=os.path.expanduser("~"))
+    # either scan missing leaves no marks or no parents: "unknown", not "nothing"
+    # a port held by a process whose environment could not be read: who started
+    # it is not known, and "no agent holds it" would be a guess
+    unknown_ports = sorted({port for pid, held in (ports or {}).items()
+                            if pid not in marks for port in held})
+    # any scan missing leaves no marks or no parents: "unknown", not "nothing" -
+    # and so does an environment read that failed for every process
+    fleet = _fleet(att, rows, ports is not None,
+                   procs_ok=bool(table) and bool(ps_out) and bool(marks),
+                   sessions_ok=sessions_ok)
+    fleet["unknown_ports"] = unknown_ports
+    return rows, fleet
 
 
 def _load_beside(module):
@@ -1851,7 +1954,14 @@ def ui_filter(rows, query):
     return out
 
 
-def render(rows, total_orphans, color=True, width=None, show_prompt=False, links=False):
+def _plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else ("es" if word.endswith("s") else "s"))
+
+
+def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=False):
+    """The one-shot table. `fleet` is collect()'s second answer: the ports agents
+    hold, and what was left behind; anything else (an old caller's 0) is none."""
+    fleet = fleet if isinstance(fleet, dict) else {}
     if not rows:
         return "no Claude Code sessions found\n"
     width = width or shutil.get_terminal_size((150, 24)).columns
@@ -1868,8 +1978,14 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False, links
     summary = " · ".join(f"{n} {s}" for s, n in sorted(counts.items(), key=lambda kv: _RANK.get(kv[0], 9)))
 
     out = [_paint(f"{len(rows)} sessions: {summary}", "bold", color)]
-    if total_orphans:
-        out.append(_paint(f"{total_orphans} detached processes under your home on PID 1", "dim", color))
+    # one dim line, never an alarm: NEEDS YOU owns this screen
+    if fleet and not fleet.get("ports_ok", True):
+        out.append(_paint("ports unknown - lsof could not be asked", "dim", color))
+    elif fleet.get("agent_ports"):
+        held = fleet["agent_ports"]
+        shown = " · ".join(f":{a['port']} {a['who']}" for a in held[:6])
+        more = f" · +{len(held) - 6}" if len(held) > 6 else ""
+        out.append(_paint(f"agents hold {shown}{more}", "dim", color))
     out.append("")
 
     for r in rows:
@@ -1894,24 +2010,35 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False, links
                 f"{_paint(shown_doing, 'dim', color)}"
                 f"{' ' * max(0, w_doing - len(shown_doing))}  "
                 f"{r['since']:>5}")
+        if r.get("ports"):
+            line += _paint("  " + " ".join(f":{p}" for p in r["ports"]), "dim", color)
         if r["orphans"]:
             line += _paint(f"  +{r['orphans']} detached", "waiting", color)
         out.append(line)
         if show_prompt and r["topic"]:
             out.append(_paint(f"{' ' * (w_proj + w_tty + 16)}\u21b3 {truncate(r['topic'], width - w_proj - 18)}", "dim", color))
+    left, codex = fleet.get("left_behind") or [], fleet.get("codex") or []
+    if left or codex:
+        out.append("")
+    if left:
+        n_ports = sum(len(p.get("ports", [])) for p in left)
+        out.append(_paint(f"left behind: {_plural(len(left), 'process')}, "
+                          f"{_plural(n_ports, 'port')} - ccwho ps", "dim", color))
+    if codex:
+        out.append(_paint(f"codex: {_plural(len(codex), 'process')} - ccwho ps", "dim", color))
     return "\n".join(out) + "\n"
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    rows, total_orphans = collect()
+    rows, fleet = collect()
     if "--json" in argv:
         print(json.dumps(rows, indent=2))
         return 0
     if "--blocked" in argv:
         rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    sys.stdout.write(render(rows, total_orphans, color=color))
+    sys.stdout.write(render(rows, fleet, color=color))
     return 0
 
 

@@ -3,30 +3,45 @@ import json
 import os
 import shutil
 import shlex
+import subprocess
 import tempfile
 import unittest
 
 import ccwho_brief as brief
 import ccwho_engine as ccwho
 
-# Reading this machine's session files is machine state: a test that reaches it
-# answers differently on every laptop and every minute. Every test in this module
-# runs with a guard that fails loudly instead; a test that means to exercise the
-# real function takes it from REAL_LIVE_FILE_SESSIONS and puts the guard back.
-REAL_LIVE_FILE_SESSIONS = ccwho.live_file_sessions
+# Reading this machine's processes, ports and session files is machine state: a
+# test that reaches it answers differently on every laptop and every minute. Every
+# test in this module runs with guards that fail loudly instead; a test that means
+# to exercise a real function takes it from REAL and puts the guard back.
+REAL = {name: getattr(ccwho, name) for name in ("live_file_sessions", "ps_table",
+                                                "listen_ports")}
+REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 
 
-def _unpinned_live_file_sessions():
-    raise AssertionError("a test reached this machine's session files - pin "
-                         "ccwho.live_file_sessions (see MachinelessCollect)")
+def _guard(name):
+    def unpinned(*a, **k):
+        raise AssertionError(f"a test reached this machine through ccwho.{name} - "
+                             "pin it (see MachinelessCollect)")
+    return unpinned
+
+
+GUARDS = {name: _guard(name) for name in REAL}
+_unpinned_live_file_sessions = GUARDS["live_file_sessions"]
+
+
+def install_guards():
+    for name, guard in GUARDS.items():
+        setattr(ccwho, name, guard)
 
 
 def setUpModule():
-    ccwho.live_file_sessions = _unpinned_live_file_sessions
+    install_guards()
 
 
 def tearDownModule():
-    ccwho.live_file_sessions = REAL_LIVE_FILE_SESSIONS
+    for name, real in REAL.items():
+        setattr(ccwho, name, real)
 
 
 class MachinelessCollect(unittest.TestCase):
@@ -36,16 +51,19 @@ class MachinelessCollect(unittest.TestCase):
 
     def setUp(self):
         self._saved = (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
-                       ccwho.live_file_sessions)
+                       ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports)
         ccwho.ps_snapshot = lambda: ""
         ccwho.tty_snapshot = lambda: ""
         ccwho.titles_snapshot = lambda timeout=5.0: {}
-        # the session files of THIS machine's config dirs are machine state too
-        ccwho.live_file_sessions = lambda: ([], 0)
+        # the session files, the start times and the ports of THIS machine are
+        # machine state too
+        ccwho.live_file_sessions = lambda *a, **k: ([], 0)
+        ccwho.ps_table = lambda: {}
+        ccwho.listen_ports = lambda: {}
 
     def tearDown(self):
         (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
-         ccwho.live_file_sessions) = self._saved
+         ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports) = self._saved
 
 
 class TestParseSessions(unittest.TestCase):
@@ -242,7 +260,12 @@ class TestSince(unittest.TestCase):
         self.assertEqual(ccwho.since(None, now=1.0), "?")
 
 
-class TestOrphans(unittest.TestCase):
+class TestOrphansNamedOnTheCommandLine(unittest.TestCase):
+    """The fallback for a process whose environment cannot be read: an orphan
+    whose command line names the session (a scratchpad path does) still counts
+    for it (eng D8). The PID-1 total that used to sit in the header is gone -
+    it counted every daemon under your home, agent or not."""
+
     PS = "\n".join([
         "  PID  PPID COMMAND",
         " 1000     1 bash -c scripts/check.sh > /tmp/claude-501/proj/aaa/scratchpad/g.log",
@@ -250,31 +273,15 @@ class TestOrphans(unittest.TestCase):
         " 1002   999 bash -c owned-by-a-live-parent /tmp/.../aaa/...",
     ])
 
-    def test_attributes_orphan_to_session_by_id_in_cmdline(self):
-        got = ccwho.attribute_orphans(self.PS, ["aaa", "bbb"])
-        self.assertEqual(got["aaa"], 1)
-        self.assertEqual(got.get("bbb", 0), 0)
+    def test_an_orphan_naming_the_session_is_its(self):
+        got = ccwho._cmdline_orphans(self.PS, ["aaa", "bbb"])
+        self.assertEqual(got, {"aaa": {1000}, "bbb": set()})
 
-    def test_ignores_processes_with_a_live_parent(self):
-        # pid 1002 mentions aaa but ppid is 999, so it is not detached
-        self.assertEqual(ccwho.attribute_orphans(self.PS, ["aaa"])["aaa"], 1)
-
-    def test_counts_unattributed_orphans_separately(self):
-        self.assertEqual(ccwho.count_orphans(self.PS), 2)
-
-    def test_home_filter_excludes_system_daemons(self):
-        ps = "\n".join([
-            "  PID  PPID COMMAND",
-            " 100     1 /usr/libexec/diagnosticd",
-            " 101     1 /System/Library/whatever",
-            " 102     1 node /Users/me/projects/app/thing.ts",
-        ])
-        self.assertEqual(ccwho.count_orphans(ps), 3)
-        self.assertEqual(ccwho.count_orphans(ps, home="/Users/me"), 1)
+    def test_a_process_with_a_live_parent_is_not_an_orphan(self):     # control
+        self.assertNotIn(1002, ccwho._cmdline_orphans(self.PS, ["aaa"])["aaa"])
 
     def test_empty_ps_output(self):
-        self.assertEqual(ccwho.count_orphans(""), 0)
-        self.assertEqual(ccwho.attribute_orphans("", ["aaa"]), {"aaa": 0})
+        self.assertEqual(ccwho._cmdline_orphans("", ["aaa"]), {"aaa": set()})
 
 
 class TestSorting(unittest.TestCase):
@@ -1566,7 +1573,11 @@ class TestTitlesAreCachedBetweenTicks(unittest.TestCase):
             [{"sessionId": "aaa", "pid": 1, "cwd": "/x", "status": "idle"}])
         ccwho.ps_snapshot = lambda: ""
         ccwho.tty_snapshot = lambda: ""
-        ccwho.live_file_sessions = lambda: ([], 0)     # this machine's sessions stay out
+        ccwho.live_file_sessions = lambda *a, **k: ([], 0)     # this machine's sessions stay out
+        real_table, real_ports = ccwho.ps_table, ccwho.listen_ports
+        ccwho.ps_table, ccwho.listen_ports = (lambda: {}), (lambda: {})
+        self.addCleanup(setattr, ccwho, "ps_table", real_table)
+        self.addCleanup(setattr, ccwho, "listen_ports", real_ports)
         try:
             cache = {}
             ccwho.collect(cache=cache)
@@ -2077,7 +2088,11 @@ class TestTheCheapQuestion(unittest.TestCase):
         # or the cheap check fires again the moment a scan finishes
         real, real_files = ccwho.agents_json, ccwho.live_file_sessions
         ccwho.agents_json = lambda: '[]'
-        ccwho.live_file_sessions = lambda: ([], 0)     # this machine's sessions stay out
+        ccwho.live_file_sessions = lambda *a, **k: ([], 0)     # this machine's sessions stay out
+        real_table, real_ports = ccwho.ps_table, ccwho.listen_ports
+        ccwho.ps_table, ccwho.listen_ports = (lambda: {}), (lambda: {})
+        self.addCleanup(setattr, ccwho, "ps_table", real_table)
+        self.addCleanup(setattr, ccwho, "listen_ports", real_ports)
         try:
             status = {}
             ccwho.collect(cache={}, status=status)
@@ -2294,7 +2309,11 @@ class TestWhatYouHaveLookedAtSurvives(unittest.TestCase):
         ccwho.reviewed_path = lambda: self.path
         real_agents, real_files = ccwho.agents_json, ccwho.live_file_sessions
         ccwho.agents_json = lambda: "[]"
-        ccwho.live_file_sessions = lambda: ([], 0)     # this machine's sessions stay out
+        ccwho.live_file_sessions = lambda *a, **k: ([], 0)     # this machine's sessions stay out
+        real_table, real_ports = ccwho.ps_table, ccwho.listen_ports
+        ccwho.ps_table, ccwho.listen_ports = (lambda: {}), (lambda: {})
+        self.addCleanup(setattr, ccwho, "ps_table", real_table)
+        self.addCleanup(setattr, ccwho, "listen_ports", real_ports)
         try:
             status = {}
             ccwho.collect(cache={}, status=status)
@@ -2642,7 +2661,7 @@ class TestCollectFindsEveryConfigDir(MachinelessCollect):
         return sorted(r["sessionId"][:4] for r in rows)
 
     def test_a_session_in_another_config_dir_is_listed(self):
-        ccwho.live_file_sessions = lambda: ([self.B], 0)
+        ccwho.live_file_sessions = lambda *a, **k: ([self.B], 0)
         rows, _ = ccwho.collect(cache={})
         self.assertEqual(self.ids(rows), ["aaaa", "bbbb"])
 
@@ -2651,21 +2670,21 @@ class TestCollectFindsEveryConfigDir(MachinelessCollect):
         self.assertEqual(self.ids(rows), ["aaaa"])
 
     def test_a_session_in_both_is_listed_once(self):
-        ccwho.live_file_sessions = lambda: ([dict(self.A, name="from-file")], 0)
+        ccwho.live_file_sessions = lambda *a, **k: ([dict(self.A, name="from-file")], 0)
         rows, _ = ccwho.collect(cache={})
         self.assertEqual(self.ids(rows), ["aaaa"])
 
     def test_unreachable_claude_still_shows_what_the_files_know(self):
         # shown, but never trusted to launch: source_ok stays False
         ccwho.agents_json = lambda: None
-        ccwho.live_file_sessions = lambda: ([self.B], 0)
+        ccwho.live_file_sessions = lambda *a, **k: ([self.B], 0)
         status = {}
         rows, _ = ccwho.collect(cache={}, status=status)
         self.assertEqual(self.ids(rows), ["bbbb"])
         self.assertFalse(status["source_ok"])
 
     def test_unreadable_session_files_are_counted_for_doctor(self):
-        ccwho.live_file_sessions = lambda: ([], 3)
+        ccwho.live_file_sessions = lambda *a, **k: ([], 3)
         status = {}
         ccwho.collect(cache={}, status=status)
         self.assertEqual(status["session_files_bad"], 3)
@@ -2732,7 +2751,7 @@ class TestAnIsolatedSessionIsReadLikeAnyOther(MachinelessCollect):
         ccwho.agents_json = lambda: "[]"
         self.row = {"pid": 44, "sessionId": SID_ISO, "cwd": "/Users/x/p/work",
                     "kind": "interactive", "status": "idle", "configDir": self.dir}
-        ccwho.live_file_sessions = lambda: ([self.row], 0)
+        ccwho.live_file_sessions = lambda *a, **k: ([self.row], 0)
 
     def tearDown(self):
         ccwho.agents_json = self._agents
@@ -2855,7 +2874,7 @@ class TestPsSpeaksTheSessionFilesLanguage(unittest.TestCase):
         real = ccwho.subprocess.run
         ccwho.subprocess.run = lambda argv, **kw: seen.update(kw, argv=argv) or Done()
         try:
-            ccwho.ps_table()
+            REAL["ps_table"]()
         finally:
             ccwho.subprocess.run = real
         self.assertEqual((seen["env"]["LC_ALL"], seen["env"]["TZ"]), ("C", "UTC"))
@@ -2867,7 +2886,7 @@ class TestPsSpeaksTheSessionFilesLanguage(unittest.TestCase):
         real = ccwho.subprocess.run
         ccwho.subprocess.run = boom
         try:
-            self.assertEqual(ccwho.ps_table(), {})
+            self.assertEqual(REAL["ps_table"](), {})
         finally:
             ccwho.subprocess.run = real
 
@@ -2915,9 +2934,9 @@ class TestReloadPutsEarlierModulesBackWhenALaterOneFails(unittest.TestCase):
 
     def test_a_late_failure_restores_the_early_modules(self):
         import sys
-        import ccwho_procs
-        before = {n: sys.modules[n] for n in ("ccwho_brief", "ccwho_index")}
-        path = ccwho_procs.__file__
+        *early, last = ccwho.RELOAD_FIRST       # break whichever is re-read last
+        before = {n: sys.modules[n] for n in early}
+        path = sys.modules[last].__file__
         original = open(path).read()
         try:
             with open(path, "w") as fh:
@@ -2932,7 +2951,7 @@ class TestReloadPutsEarlierModulesBackWhenALaterOneFails(unittest.TestCase):
             ccwho.reload_all(ccwho)
             # a reload re-executes the engine, which rebinds the real function:
             # the module's guard has to go back, or every later test is unguarded
-            ccwho.live_file_sessions = _unpinned_live_file_sessions
+            install_guards()
 
 
 class TestAttachUsesTheSessionsOwnConfigDir(unittest.TestCase):
@@ -3006,7 +3025,7 @@ class TestTheConfigDirTravelsWithTheRow(MachinelessCollect):
         super().setUp()
         self._agents = ccwho.agents_json
         ccwho.agents_json = lambda: "[]"
-        ccwho.live_file_sessions = lambda: ([{
+        ccwho.live_file_sessions = lambda *a, **k: ([{
             "pid": 66, "sessionId": self.SID, "cwd": "/Users/x/p/work",
             "kind": "background", "status": "idle", "configDir": "/Users/x/.claude-work"}], 0)
 
@@ -3082,7 +3101,7 @@ class TestAFailingFileSourceNeverBlanksTheList(MachinelessCollect):
         ccwho.agents_json = lambda: json.dumps([{"pid": 5, "sessionId":
             "aaaa1111-0000-4000-8000-000000000001", "cwd": "/x", "status": "idle"}])
 
-        def boom():
+        def boom(*a, **k):
             raise RuntimeError("anything at all")
         ccwho.live_file_sessions = boom
         try:
@@ -3107,3 +3126,442 @@ class TestALinkNamesASessionByItsUuid(unittest.TestCase):
         sid = "51fddd61-822b-49e0-9aeb-2145e91e1244"
         self.assertEqual(ccwho.parse_ccwho_url("ccwho://open/" + sid), ("open", sid))
         self.assertTrue(ccwho.open_url({"sessionId": sid}))
+
+
+TOKEN_E = "sk-ant-FAKE-engine-must-never-print"
+LIVE = "aaaa1111-0000-4000-8000-000000000001"
+DEAD = "dddd4444-0000-4000-8000-000000000004"
+START = "Tue Sep 22 13:45:15 2026"
+
+
+class TestMarksAreReadOncePerProcess(unittest.TestCase):
+    """A process's environment is fixed at exec: read it once per (pid, start,
+    command), keep it in the caller's cache, forget it when the process is gone.
+    The command is part of the key because an exec keeps the pid and the start."""
+
+    def setUp(self):
+        self.reads = []
+        self.real = ccwho.read_procargs
+        ccwho.read_procargs = lambda pid: self.reads.append(pid) or {
+            "CLAUDE_CODE_SESSION_ID": LIVE}
+        self.addCleanup(setattr, ccwho, "read_procargs", self.real)
+
+    def test_a_second_scan_reads_nothing_new(self):
+        cache, table = {}, {7: (START, "node"), 8: (START, "node")}
+        first = ccwho.proc_marks(table, cache)
+        ccwho.proc_marks(table, cache)
+        self.assertEqual(sorted(self.reads), [7, 8])
+        self.assertEqual(first[7], ("claude", LIVE))
+
+    def test_a_reused_pid_is_read_again(self):
+        cache = {}
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        ccwho.proc_marks({7: ("Wed Sep 23 09:00:00 2026", "node")}, cache)
+        self.assertEqual(self.reads, [7, 7])
+
+    def test_an_exec_is_read_again(self):
+        # same pid, same start, another program: the fork read the parent
+        cache = {}
+        ccwho.proc_marks({7: (START, "claude")}, cache)
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        self.assertEqual(self.reads, [7, 7])
+
+    def test_a_failed_read_is_not_remembered(self):
+        ccwho.read_procargs = lambda pid: self.reads.append(pid) or None
+        cache = {}
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        self.assertEqual(self.reads, [7, 7])
+
+    def test_an_unmarked_read_is_remembered(self):                    # control
+        ccwho.read_procargs = lambda pid: self.reads.append(pid) or {}
+        cache = {}
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        self.assertEqual(self.reads, [7])
+
+    def test_read_and_unmarked_is_not_unreadable(self):
+        # None: the environment was read and names no session. Absent: it could
+        # not be read. Only the second may fall back to the command line (#8)
+        ccwho.read_procargs = lambda pid: {} if pid == 7 else None
+        got = ccwho.proc_marks({7: (START, "node"), 8: (START, "bash")}, {})
+        self.assertEqual(got, {7: None})
+
+    def test_a_gone_process_is_forgotten(self):                       # control
+        cache = {}
+        ccwho.proc_marks({7: (START, "node"), 8: (START, "node")}, cache)
+        ccwho.proc_marks({7: (START, "node")}, cache)
+        self.assertEqual(sorted(cache["_marks"]), [(7, START, "node")])
+
+
+class TestListenPorts(unittest.TestCase):
+    def run_with(self, fake):
+        real = ccwho.subprocess.run
+        ccwho.subprocess.run = fake
+        try:
+            return REAL["listen_ports"]()
+        finally:
+            ccwho.subprocess.run = real
+
+    def test_parsed(self):
+        class Done:
+            returncode, stdout, stderr = 0, "p5\nn*:3000\n", ""
+        self.assertEqual(self.run_with(lambda *a, **k: Done()), {5: [3000]})
+
+    def test_a_failed_lsof_is_unknown_not_empty(self):
+        # "ports unknown" and "no ports" are different answers, like agents_json
+        def boom(*a, **k):
+            raise OSError("no lsof")
+        self.assertIsNone(self.run_with(boom))
+
+    def test_an_lsof_error_is_unknown(self):
+        # lsof exits 1 for "nothing matched" AND for real errors: stderr tells
+        class Done:
+            returncode, stdout, stderr = 1, "", "lsof: WARNING: can't stat()"
+        self.assertIsNone(self.run_with(lambda *a, **k: Done()))
+
+    def test_nothing_listening_is_empty(self):                        # control
+        class Done:
+            returncode, stdout, stderr = 1, "", ""   # 1 with no error: nothing matched
+        self.assertEqual(self.run_with(lambda *a, **k: Done()), {})
+
+
+class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
+    """The processes a session started, their ports, and what was left behind -
+    from the environment mark, which survives the process being orphaned."""
+
+    PS = ("  10     1 claude\n"
+          "  11    10 node server.js\n"
+          "  12     1 vite --port 5173\n"
+          "  13    10 npm exec chrome-devtools-mcp@latest\n"
+          "  20     1 next-server (v15)\n"
+          "  30     1 workerd serve\n"
+          "  40     1 python3 -m http.server\n"
+          f"  41     1 bash -c sleep 9 {LIVE}\n")
+
+    def setUp(self):
+        super().setUp()
+        self._agents, self._read = ccwho.agents_json, ccwho.read_procargs
+        ccwho.agents_json = lambda: json.dumps([{"pid": 10, "sessionId": LIVE,
+                                                 "cwd": "/Users/x/p/app", "status": "idle"}])
+        ccwho.ps_snapshot = lambda: self.PS
+        ccwho.ps_table = lambda: {pid: (START, "claude" if pid == 10 else "node")
+                                  for pid in (10, 11, 12, 13, 20, 30, 40, 41)}
+        env = {11: {"CLAUDE_CODE_SESSION_ID": LIVE}, 12: {"CLAUDE_CODE_SESSION_ID": LIVE},
+               13: {"CLAUDE_CODE_SESSION_ID": LIVE}, 20: {"CLAUDE_CODE_SESSION_ID": DEAD},
+               30: {"CODEX_THREAD_ID": "01a0abc8-x"}}
+        ccwho.read_procargs = lambda pid: env.get(pid, {})
+        ccwho.listen_ports = lambda: {12: [5173], 13: [9222], 20: [3000], 30: [60805]}
+
+    def tearDown(self):
+        ccwho.agents_json, ccwho.read_procargs = self._agents, self._read
+        super().tearDown()
+
+    def collect(self):
+        return ccwho.collect(cache={})
+
+    def test_a_row_knows_its_work_and_ports(self):
+        rows, _ = self.collect()
+        r = rows[0]
+        self.assertEqual((r["procs"], r["ports"]), (2, [5173]),
+                         "the MCP helper's :9222 is not the session's work")
+
+    def test_left_behind_and_codex_reach_the_fleet(self):
+        _, fleet = self.collect()
+        self.assertEqual([p["pid"] for p in fleet["left_behind"]], [20])
+        self.assertEqual([p["pid"] for p in fleet["codex"]], [30])
+        self.assertTrue(fleet["ports_ok"])
+
+    def test_the_header_names_the_ports_agents_hold(self):
+        _, fleet = self.collect()
+        self.assertEqual([(a["port"], a["pid"]) for a in fleet["agent_ports"]],
+                         [(3000, 20), (5173, 12), (60805, 30)])
+
+    def test_ports_unknown_is_said_so(self):
+        ccwho.listen_ports = lambda: None
+        rows, fleet = self.collect()
+        self.assertFalse(fleet["ports_ok"])
+        # adversarial #5: null, not [] - a script must not read "holds nothing"
+        self.assertIsNone(rows[0]["ports"])
+
+    # the regression contract for the old "detached" counts (eng D8)
+    def test_d8_1_a_cmdline_named_orphan_still_counts(self):
+        # 41's env is unreadable here (/bin/bash), but its command names the session
+        ccwho.ps_snapshot = lambda: f"  10     1 claude\n  41     1 bash -c sleep 9 {LIVE}\n"
+        ccwho.read_procargs = lambda pid: None if pid == 41 else {}
+        rows, _ = self.collect()
+        self.assertEqual(rows[0]["orphans"], 1)
+
+    def test_d8_1_control_an_unrelated_orphan_does_not(self):
+        ccwho.ps_snapshot = lambda: "  10     1 claude\n  40     1 python3 -m http.server\n"
+        rows, _ = self.collect()
+        self.assertEqual(rows[0]["orphans"], 0)
+
+    def test_d8_2_an_env_marked_orphan_counts(self):
+        # 12 names no session in its command line: today's count missed it
+        ccwho.ps_snapshot = lambda: "  10     1 claude\n  12     1 vite --port 5173\n"
+        rows, _ = self.collect()
+        self.assertEqual(rows[0]["orphans"], 1)
+
+    def test_d8_the_fallback_never_counts_someone_elses_process(self):
+        # the command names LIVE, but the env says another session started it,
+        # or it is a helper, or it is the session itself (adversarial F7)
+        other = "eeee5555-0000-4000-8000-000000000005"
+        ccwho.ps_snapshot = lambda: (f"  10     1 claude --resume {LIVE}\n"
+                                     f"  42     1 node x {LIVE}\n"
+                                     f"  43     1 npm exec some-mcp {LIVE}\n")
+        ccwho.ps_table = lambda: {10: (START, "claude"), 42: (START, "node"),
+                                  43: (START, "node")}
+        ccwho.read_procargs = lambda pid: ({"CLAUDE_CODE_SESSION_ID": other}
+                                           if pid == 42 else {})
+        rows, _ = self.collect()
+        self.assertEqual(rows[0]["orphans"], 0)
+
+    def test_a_failed_process_scan_is_unknown_not_nothing(self):
+        ccwho.ps_table = lambda: {}
+        _, fleet = self.collect()
+        self.assertFalse(fleet["procs_ok"])
+
+    def test_a_failed_parent_scan_is_unknown_too(self):
+        # adversarial #3: no ps snapshot means no parents and no commands
+        ccwho.ps_snapshot = lambda: ""
+        _, fleet = self.collect()
+        self.assertFalse(fleet["procs_ok"])
+
+    def test_both_scans_working_is_known(self):                      # control
+        _, fleet = self.collect()
+        self.assertTrue(fleet["procs_ok"])
+
+    def test_with_the_agents_list_down_nothing_is_left_behind(self):
+        # adversarial #1: the live sessions are not known, so a process whose
+        # session is missing may belong to one that is running
+        ccwho.agents_json = lambda: None
+        _, fleet = self.collect()
+        self.assertEqual(fleet["left_behind"], [])
+        self.assertIn(20, [p["pid"] for p in fleet["unsure"]])
+        self.assertFalse(fleet["sessions_ok"])
+        self.assertNotIn("left behind", {a["who"] for a in fleet["agent_ports"]})
+        # the port is still held, and the header still says so
+        self.assertIn((3000, "not sure"),
+                      {(a["port"], a["who"]) for a in fleet["agent_ports"]})
+
+    def test_a_running_claude_that_is_not_listed_means_the_list_is_incomplete(self):
+        # review 4 #4: pid 50 is a claude no source lists; 20's session may be it
+        ccwho.ps_snapshot = lambda: self.PS + "  50     1 claude -p fix it\n"
+        table = {**ccwho.ps_table(), 50: (START, "claude")}
+        ccwho.ps_table = lambda: table
+        _, fleet = self.collect()
+        self.assertFalse(fleet["sessions_ok"])
+        self.assertEqual(fleet["left_behind"], [])
+
+    def test_with_a_session_file_unreadable_nothing_is_left_behind(self):
+        # cycle 3 #2: one file that could not be read may be the session that
+        # started 20
+        ccwho.live_file_sessions = lambda *a, **k: ([], 1)
+        _, fleet = self.collect()
+        self.assertEqual(fleet["left_behind"], [])
+        self.assertFalse(fleet["sessions_ok"])
+
+    def test_with_a_claudes_env_unreadable_nothing_is_left_behind(self):
+        # its CLAUDE_CONFIG_DIR is where its session file is: not read, not found
+        real = ccwho.read_procargs
+        ccwho.read_procargs = lambda pid: None if pid == 10 else real(pid)
+        _, fleet = self.collect()
+        self.assertEqual(fleet["left_behind"], [])
+        self.assertFalse(fleet["sessions_ok"])
+
+    def test_no_environment_readable_at_all_is_unknown(self):
+        # cycle 3 #7: every read failed - "no processes" would be a lie
+        ccwho.read_procargs = lambda pid: None
+        _, fleet = self.collect()
+        self.assertFalse(fleet["procs_ok"])
+
+    def test_a_port_whose_holder_could_not_be_read_is_unknown(self):
+        # lsof says 40 holds :8080; 40's environment could not be read
+        real = ccwho.read_procargs
+        ccwho.read_procargs = lambda pid: None if pid == 40 else real(pid)
+        ccwho.listen_ports = lambda: {12: [5173], 40: [8080]}
+        _, fleet = self.collect()
+        self.assertEqual(fleet["unknown_ports"], [8080])
+
+    def test_a_port_whose_holder_was_read_is_known(self):             # control
+        ccwho.listen_ports = lambda: {12: [5173], 40: [8080]}
+        _, fleet = self.collect()
+        self.assertEqual(fleet["unknown_ports"], [])
+
+    def test_with_the_file_scan_crashed_nothing_is_left_behind(self):
+        def crash(*a, **k):
+            raise OSError("scan failed")
+        ccwho.live_file_sessions = crash
+        _, fleet = self.collect()
+        self.assertEqual(fleet["left_behind"], [])
+        self.assertFalse(fleet["sessions_ok"])
+
+    def test_with_the_agents_list_up_left_behind_is_left_behind(self):  # control
+        _, fleet = self.collect()
+        self.assertEqual([p["pid"] for p in fleet["left_behind"]], [20])
+        self.assertTrue(fleet["sessions_ok"])
+
+    def test_ccwho_is_not_its_own_callers_work(self):
+        # adversarial #2: `ccwho ps` run from a session lists itself
+        me = os.getpid()
+        ccwho.ps_snapshot = lambda: self.PS + f"  {me}    10 python3 ccwho.py ps\n"
+        table = {pid: (START, "claude" if pid == 10 else "node")
+                 for pid in (10, 11, 12, 13, 20, 30, 40, 41, me)}
+        ccwho.ps_table = lambda: table
+        real = ccwho.read_procargs
+        ccwho.read_procargs = lambda pid: ({"CLAUDE_CODE_SESSION_ID": LIVE} if pid == me
+                                           else real(pid))
+        _, fleet = self.collect()
+        self.assertNotIn(me, [p["pid"] for p in fleet["by_session"][LIVE]])
+        self.assertIn(11, [p["pid"] for p in fleet["by_session"][LIVE]])      # control
+
+    def test_the_named_fallback_is_listed_where_it_is_counted(self):
+        # adversarial #8: the row's "+1 detached" and `ccwho ps` must agree
+        ccwho.ps_snapshot = lambda: f"  10     1 claude\n  41     1 bash -c sleep 9 {LIVE}\n"
+        ccwho.read_procargs = lambda pid: None           # /bin/bash hides its env
+        rows, fleet = self.collect()
+        self.assertEqual(rows[0]["orphans"], 1)
+        self.assertEqual([p["pid"] for p in fleet["by_session"][LIVE]], [41])
+
+    def test_a_readable_unmarked_env_is_not_the_named_fallback(self):
+        # its environment was read and names no session: nobody's, whatever its
+        # command line says
+        ccwho.ps_snapshot = lambda: f"  10     1 claude\n  41     1 node x {LIVE}\n"
+        ccwho.read_procargs = lambda pid: {}
+        rows, fleet = self.collect()
+        self.assertEqual(rows[0]["orphans"], 0)
+
+    def test_d8_4_the_header_no_longer_counts_pid1(self):
+        rows, fleet = self.collect()
+        out = ccwho.render(rows, fleet, color=False, width=200)
+        self.assertNotIn("under your home on PID 1", out)
+
+    def test_d9_process_data_changes_no_state_or_order(self):
+        rows_with, _ = self.collect()
+        ccwho.read_procargs = lambda pid: {}
+        ccwho.listen_ports = lambda: {}
+        rows_without, _ = self.collect()
+        pick = lambda rows: [(r["sessionId"], r.get("attention"), r["status"]) for r in rows]
+        self.assertEqual(pick(rows_with), pick(rows_without))
+
+
+class TestTheTableSaysWhatAgentsHold(unittest.TestCase):
+    """One dim header line for the ports agents hold, one line each at the bottom
+    for Left behind and Codex - and nothing at all when there is nothing."""
+
+    ROW = {"project": "app", "status": "idle", "attention": "stopped", "name": "n",
+           "title": "t", "doing": "", "since": "1m", "tty": "", "orphans": 0,
+           "sessionId": LIVE, "ports": [5173], "procs": 1}
+    FLEET = {"ports_ok": True,
+             "agent_ports": [{"port": 3000, "pid": 20, "who": "left behind"},
+                             {"port": 5173, "pid": 12, "who": "app"}],
+             "left_behind": [{"pid": 20, "ports": [3000], "command": "next-server"}],
+             "codex": [{"pid": 30, "ports": [60805], "command": "workerd serve"}]}
+
+    def out(self, fleet):
+        return ccwho.render([dict(self.ROW)], fleet, color=False, width=200)
+
+    def test_ports_left_behind_and_codex_are_each_one_line(self):
+        out = self.out(self.FLEET)
+        self.assertIn("agents hold :3000 left behind · :5173 app", out)
+        self.assertIn("left behind: 1 process, 1 port", out)
+        self.assertIn("codex: 1 process", out)
+
+    def test_the_row_shows_its_own_ports(self):
+        out = ccwho.render([dict(self.ROW)], {}, color=False, width=200)
+        line = [l for l in out.splitlines() if "app" in l and "sessions" not in l][0]
+        self.assertIn(":5173", line)
+
+    def test_nothing_to_say_says_nothing(self):                       # control
+        out = self.out({"ports_ok": True, "agent_ports": [], "left_behind": [],
+                        "codex": []})
+        for word in ("agents hold", "left behind", "codex:"):
+            self.assertNotIn(word, out)
+
+    def test_unsure_is_not_counted_as_left_behind(self):
+        fleet = dict(self.FLEET, left_behind=[], agent_ports=[], unsure=[
+            {"pid": 20, "ports": [3000], "command": "next-server", "why": "x"}])
+        self.assertNotIn("left behind", self.out(fleet))
+
+    def test_a_row_with_ports_unknown_still_renders(self):
+        row = dict(self.ROW, ports=None)
+        out = ccwho.render([row], {}, color=False, width=200)
+        self.assertIn("app", out)
+
+    def test_ports_unknown_is_not_ports_none(self):
+        out = self.out({"ports_ok": False, "agent_ports": [], "left_behind": [],
+                        "codex": []})
+        self.assertIn("ports unknown", out)
+
+    def test_the_old_integer_still_renders(self):                     # compat
+        self.assertIn("1 sessions", ccwho.render([dict(self.ROW)], 0, color=False, width=200))
+
+
+class TestDoingNeverPrintsASecret(unittest.TestCase):
+    """The `doing` column shows a Bash call's command when it has no description;
+    that text reaches agents (eng D10)."""
+
+    def lines(self, command, description=None):
+        inp = {"command": command}
+        if description:
+            inp["description"] = description
+        return [json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": inp}]}})]
+
+    def test_a_token_in_the_command_is_masked(self):
+        got = ccwho.extract_doing(self.lines(f"curl -H 'Authorization: Bearer {TOKEN_E}' x"))
+        self.assertNotIn(TOKEN_E, got)
+
+    def test_a_plain_command_is_shown(self):                          # control
+        self.assertEqual(ccwho.extract_doing(self.lines("npm test")), "Bash: npm test")
+
+
+class TestNonUtf8ProcessesDoNotCrash(unittest.TestCase):
+    """cycle 3 #11: one process with a non-UTF-8 argv (any agent can start one)
+    made `ps` output undecodable, and collect() raised - blanking `ccwho ps`."""
+
+    def test_ps_output_with_a_bad_byte_is_text(self):
+        probe = subprocess.Popen([b"ccprobe\xff", b"5"], executable="/bin/sleep")
+        self.addCleanup(probe.wait)
+        self.addCleanup(probe.kill)
+        out = ccwho.ps_snapshot()
+        self.assertIn(str(probe.pid), out)                                  # control
+        self.assertIn(str(probe.pid), " ".join(map(str, REAL["ps_table"]())))
+
+
+class TestNoRowCarriesAControlCharacter(unittest.TestCase):
+    """A row's text comes from files and programs ccwho does not control: the
+    title Claude Code generated, the agents feed, the tab title. An escape
+    sequence in one retitles the window or repaints the list, and the JSON goes
+    to agents. Each becomes `?` (review cycle 2, adversarial #9)."""
+
+    ESC = "a\x1b]0;pwned\x07b\x9bc"
+
+    def row(self, esc):
+        session = {"sessionId": LIVE, "pid": 10, "status": "idle", "name": esc,
+                   "cwd": f"/Users/x/{esc}", "waitingFor": esc}
+        tail = [json.dumps({"type": "ai-title", "aiTitle": esc})]
+        return ccwho.build_row(session, [], tail, mtime=1788203600, tty="",
+                               tab_title=esc)
+
+    def test_no_text_field_carries_one(self):
+        row = self.row(self.ESC)
+        for k in ("name", "title", "tab_title", "project", "cwd", "waitingFor"):
+            with self.subTest(field=k):
+                self.assertNotRegex(str(row[k]), r"[\x00-\x1f\x7f-\x9f]")
+                self.assertIn("b", str(row[k]))
+
+    def test_a_one_line_field_has_one_line(self):
+        # cycle 3 #6: a newline in a title fakes a line in `ccwho ps` - such as a
+        # "left behind" pid for an agent to kill
+        row = self.row("x\n4242    :3000   left behind")
+        for k in ("name", "title", "tab_title", "project", "cwd", "waitingFor"):
+            with self.subTest(field=k):
+                self.assertNotIn("\n", row[k])
+                self.assertIn("left behind", row[k])
+
+    def test_plain_text_is_untouched(self):                            # control
+        row = self.row("fix the navbar")
+        self.assertEqual((row["name"], row["title"], row["tab_title"]),
+                         ("fix the navbar",) * 3)

@@ -27,6 +27,7 @@ ROW_KEYS = {
     "windowed",           # added 2026-09-22: is there a window to go to at all
     "kind",               # added 2026-09-22: interactive, or a background session
     "configDir",          # added 2026-09-24: set for a session in another config dir
+    "procs", "ports",     # added 2026-09-24: the session's work processes, their ports
 }
 
 # Every key a manifest session entry has ever carried. Append only.

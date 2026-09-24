@@ -21,7 +21,18 @@ or with a subcommand, it is the one-shot table above.
 
 ## Install
 
-macOS, iTerm2 and Claude Code. `uv` for the live list (`brew install uv`).
+macOS, iTerm2 and Claude Code.
+
+```sh
+brew install lukaso/ccwho/ccwho
+ccwho setup
+```
+
+`brew upgrade ccwho` takes you to the newest release. Brew brings `uv`, which the
+live list runs under.
+
+To work on ccwho itself, run it from a clone instead - the engine hot-reloads, so
+edits show up in a running list:
 
 ```sh
 git clone https://github.com/lukaso/ccwho ~/projects/ccwho

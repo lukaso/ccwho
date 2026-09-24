@@ -297,23 +297,38 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestGateLine(unittest.TestCase):
-    def setUp(self):
-        import tempfile
-        self.dir = tempfile.mkdtemp()
+class TestTheHeaderHasNoGateLine(unittest.TestCase):
+    """ccgate was removed: never used outside the session that built it. The
+    header must not consult a gate module even when one is importable and holds
+    a slot - a stale copy on sys.path would otherwise put the line back."""
 
-    def test_empty_when_no_slots_held(self):
-        self.assertEqual(ccwho.gate_line(self.dir), "")
+    def test_a_held_slot_is_not_reported(self):
+        import sys
+        import types
+        fake = types.ModuleType("ccgate")
+        fake.GATE_DIR = "/nonexistent"
+        fake.gate_status = lambda d: [{"label": "liveapp gate", "since": 0, "alive": True}]
+        saved = sys.modules.get("ccgate")
+        sys.modules["ccgate"] = fake
+        try:
+            out = ccwho.render([self.row()], 0, color=False, width=200)
+        finally:
+            if saved is None:
+                sys.modules.pop("ccgate", None)
+            else:
+                sys.modules["ccgate"] = saved
+        self.assertNotIn("gate", out)
 
-    def test_names_holders_and_count(self):
-        import ccgate
-        ccgate.claim_slot(self.dir, 2, pid=os.getpid(), label="liveapp gate")
-        got = ccwho.gate_line(self.dir)
-        self.assertIn("1 gate", got)
-        self.assertIn("liveapp gate", got)
+    def test_the_header_is_still_drawn(self):                          # control
+        # with no rows render() returns before the header, which made the
+        # assertion above pass without reaching the code it is about
+        self.assertIn("1 sessions", ccwho.render([self.row()], 0, color=False,
+                                                 width=200))
 
-    def test_missing_dir_is_not_an_error(self):
-        self.assertEqual(ccwho.gate_line("/nonexistent/path/xyz"), "")
+    def row(self):
+        session = {"pid": 4242, "cwd": "/Users/x/projects/app", "sessionId": "abc",
+                   "name": "app-4e", "status": "idle", "startedAt": 1788200000000}
+        return ccwho.build_row(session, [], [], mtime=1788203600, tty="")
 
 
 class TestWaitingKind(unittest.TestCase):

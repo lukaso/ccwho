@@ -977,7 +977,7 @@ class TestLaunchClaim(unittest.TestCase):
     world and launches too. A new session also takes a moment to show up in
     `claude agents`, so the window is real even for one caller in a hurry.
 
-    Same idiom as ccgate's slots: O_CREAT|O_EXCL, and a claim whose holder is gone
+    O_CREAT|O_EXCL, and a claim whose holder is gone
     is reclaimed rather than blocking forever.
     """
 

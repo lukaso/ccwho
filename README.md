@@ -37,7 +37,6 @@ edits show up in a running list:
 ```sh
 git clone https://github.com/lukaso/ccwho ~/projects/ccwho
 ln -s ~/projects/ccwho/ccwho.py  ~/.local/bin/ccwho
-ln -s ~/projects/ccwho/ccgate.py ~/.local/bin/ccgate
 ccwho setup
 ```
 
@@ -159,35 +158,6 @@ reparented to PID 1, and the session reports `idle` while the work runs on.
 
 `ccwho` matches PID-1 orphans against each sessionId (scratchpad paths carry it) and
 flags the session `+N detached`. That is the blind spot the status column cannot see.
-
-## ccgate - stop every session gating at once
-
-N sessions each decide to run the deploy gate. All N start together, the box
-thrashes, several fail on timing, and then every session sits waiting for the
-machine to quieten - having burned the work twice.
-
-`ccgate` puts a slot semaphore and a load ceiling in front of the command:
-
-```sh
-ccgate -- bash scripts/check.sh                       # 2 slots, load ceiling cores*0.75
-ccgate --slots 3 --label "liveapp gate" -- bash scripts/check.sh
-ccgate --status                                       # who holds a slot, and the load
-```
-
-Slots are files claimed with `O_CREAT|O_EXCL` under `~/.ccwho/gates/`, so it works
-across unrelated processes with no daemon. A slot whose holder died is reclaimed.
-Waiters jitter their retry so they don't wake in lockstep, and announce who is
-ahead of them. `ccwho` shows held slots in its header.
-
-Measured: 5 concurrent gates against 2 slots never exceeded 2 at once, all 5 ran,
-and every slot was released.
-
-To adopt it without changing habits, point the repo's gate command at it - one line
-in the project's CLAUDE.md:
-
-    Run the gate as `ccgate -- bash scripts/check.sh`, never bare.
-
-Env: `CCGATE_SLOTS`, `CCGATE_LOAD_FACTOR` (0 disables the ceiling), `CCGATE_DIR`.
 
 ## Finding the window
 

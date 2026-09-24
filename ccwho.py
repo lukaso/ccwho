@@ -881,7 +881,7 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
     exists to prevent. A new session also takes a moment to appear in
     `claude agents --json`, so the window is real even for one hurried human.
 
-    Same idiom as ccgate's slots: O_CREAT|O_EXCL under $HOME, no daemon. A claim
+    O_CREAT|O_EXCL under $HOME, no daemon. A claim
     whose owner died, whose record is unreadable, or that is older than the launch
     itself could take is reclaimed - a crashed launcher must not lock a session
     out forever.

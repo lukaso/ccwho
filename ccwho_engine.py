@@ -376,21 +376,6 @@ def waiting_kind(lines):
     return "blocked" if pending else "ready"
 
 
-def gate_line(gate_dir=None):
-    """One line naming who currently holds a ccgate slot, if anyone does."""
-    try:
-        import ccgate
-    except ImportError:
-        return ""
-    gate_dir = gate_dir if gate_dir is not None else ccgate.GATE_DIR
-    held = [h for h in ccgate.gate_status(gate_dir) if h.get("alive", True)]
-    if not held:
-        return ""
-    who = ", ".join(f"{h.get('label') or '?'}({int(time.time() - h.get('since', time.time()))}s)"
-                    for h in held)
-    return f"{len(held)} gate slot(s) held: {who}"
-
-
 def work_descendants(ps_output, pid):
     """How many non-infrastructure processes this session has running under it.
 
@@ -1676,9 +1661,6 @@ def render(rows, total_orphans, color=True, width=None, show_prompt=False, links
     out = [_paint(f"{len(rows)} sessions: {summary}", "bold", color)]
     if total_orphans:
         out.append(_paint(f"{total_orphans} detached processes under your home on PID 1", "dim", color))
-    gates = gate_line()
-    if gates:
-        out.append(_paint(gates, "busy", color))
     out.append("")
 
     for r in rows:

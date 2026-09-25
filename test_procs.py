@@ -618,6 +618,90 @@ class TestAttribute(unittest.TestCase):
         w = procs.attribute(table, {pid: ("claude", DEAD_SID) for pid in table}, {}, [])
         self.assertEqual([p["pid"] for p in w["left_behind"]], [103])        # 103: control
 
+    def test_a_shared_user_daemon_is_not_left_behind(self):
+        # issue #9: `git commit -S`, `git push` with ControlPersist or the
+        # credential cache start a per-user daemon from inside an agent's command.
+        # It inherits the mark and serves the whole login: killing it as litter
+        # drops cached passphrases and loaded keys
+        daemons = ("gpg-agent --homedir /Users/u/.gnupg --use-standard-socket --daemon",
+                   "ssh: /Users/u/.ssh/cm-git@github.com:22 [mux]",
+                   "git credential-cache--daemon /Users/u/.cache/git/credential/socket",
+                   "/opt/homebrew/bin/gpg-agent --daemon",
+                   "dirmngr --daemon --homedir /Users/u/.gnupg", "scdaemon --multi-server",
+                   "keyboxd --homedir /Users/u/.gnupg --daemon",
+                   # review: a control path with spaces, the dashed git spelling,
+                   # and the per-user services an ordinary command starts
+                   "ssh: /Users/u/Library/Application Support/ssh/cm-abc [mux]",
+                   "git-credential-cache--daemon /Users/u/.cache/git/credential/socket",
+                   "/Library/Developer/CommandLineTools/usr/libexec/git-core/"
+                   "git-credential-cache--daemon /x/socket",
+                   "watchman --foreground --logfile=/x/log --sockname=/x/sock",
+                   "/opt/homebrew/bin/watchman --foreground",
+                   "limactl hostagent --pidfile /x/ha.pid --socket /x/ha.sock colima",
+                   "ollama serve", "/usr/local/bin/ollama serve")
+        for cmd in daemons:
+            with self.subTest(cmd=cmd):
+                w = procs.attribute({60: (1, "t", cmd)}, {60: ("claude", DEAD_SID)}, {}, [])
+                self.assertEqual(w["left_behind"], [])
+                self.assertEqual([(p["pid"], p["why"]) for p in w["unsure"]],
+                                 [(60, "it is a shared user daemon")])
+        w = procs.attribute({61: (1, "t", "node server.js")},                 # control
+                            {61: ("claude", DEAD_SID)}, {}, [])
+        self.assertEqual([p["pid"] for p in w["left_behind"]], [61])
+
+    def test_what_a_shared_daemon_runs_is_not_left_behind(self):
+        # killing pinentry closes a passphrase dialog; a model runner or a VM's
+        # port forward serve the whole login like their parent
+        for daemon, child in (("gpg-agent --homedir /Users/u/.gnupg --daemon",
+                               "/opt/homebrew/bin/pinentry-mac"),
+                              ("ollama serve", "/Applications/Ollama.app/x/ollama runner --model m"),
+                              ("limactl hostagent --pidfile /x/ha.pid colima",
+                               "ssh -F /dev/null -N -L 2375:127.0.0.1:2375 lima")):
+            with self.subTest(child=child):
+                w = procs.attribute({70: (1, "t", daemon), 71: (70, "t", child)},
+                                    {70: ("claude", DEAD_SID), 71: ("claude", DEAD_SID)}, {}, [])
+                self.assertEqual(w["left_behind"], [])
+                self.assertEqual({p["pid"]: p["why"] for p in w["unsure"]},
+                                 {70: "it is a shared user daemon",
+                                  71: "it runs under a shared user daemon"})
+        w = procs.attribute({72: (1, "t", "node server.js"),                   # control
+                             73: (72, "t", "python3 worker.py")},
+                            {72: ("claude", DEAD_SID), 73: ("claude", DEAD_SID)}, {}, [])
+        self.assertEqual(sorted(p["pid"] for p in w["left_behind"]), [72, 73])
+
+    def test_an_orphaned_ssh_transport_is_not_left_behind(self):
+        # measured (second review, real /usr/bin/ssh with ControlPersist): the
+        # ProxyJump or ProxyCommand of a mux master is NOT its child - it is an
+        # orphan at ppid 1. Killing it drops the master and every session on it
+        for cmd in ("ssh -W [github.com]:22 bastion",
+                    "/usr/bin/ssh -o BatchMode=yes -p 2222 -W 127.0.0.1:22 bastion",
+                    "ssh -W %h:%p jump.example.com",
+                    "/usr/bin/nc 127.0.0.1 22999", "nc -X connect -x proxy:8080 github.com 22",
+                    "cloudflared access ssh --hostname git.example.com",
+                    "/opt/homebrew/bin/colima daemon start default --inotify"):
+            with self.subTest(cmd=cmd):
+                w = procs.attribute({60: (1, "t", cmd)}, {60: ("claude", DEAD_SID)}, {}, [])
+                self.assertEqual(w["left_behind"], [], cmd)
+        for cmd in ("ssh -N -L 3000:localhost:3000 host", "nc -l 3000", "nc -lk 8080",   # control
+                    "colima list", "ssh host uptime", "cloudflared tunnel run x"):
+            with self.subTest(control=cmd):
+                w = procs.attribute({61: (1, "t", cmd)}, {61: ("claude", DEAD_SID)}, {}, [])
+                self.assertEqual([p["pid"] for p in w["left_behind"]], [61], cmd)
+
+    def test_a_program_named_like_a_daemon_is_not_one(self):             # control
+        for cmd in ("node gpg-agent-mock.js", "vim ssh-agent.md", "python3 ssh.py",
+                    "man gpg-agent", "grep -r ssh-agent src", "echo ssh: x [mux]",
+                    # the edges of each pattern
+                    "gpg-agent-mock --daemon", "python3 /x/gpg-agent",
+                    "grep -r git credential-cache--daemon src", "ssh: x [mux] extra",
+                    "node watchman-mock.js", "ollama run llama3", "limactl list",
+                    # an agent's own `eval $(ssh-agent)` is its own litter: the
+                    # login's agent is launchd's, and carries no mark
+                    "ssh-agent -s", "ssh-agent npm run dev"):
+            with self.subTest(cmd=cmd):
+                w = procs.attribute({62: (1, "t", cmd)}, {62: ("claude", DEAD_SID)}, {}, [])
+                self.assertEqual([p["pid"] for p in w["left_behind"]], [62])
+
     def test_unsure_says_why(self):
         w = self.world_with(sessions_known=False)
         self.assertTrue(all(p.get("why") for p in w["unsure"]))

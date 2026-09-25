@@ -313,11 +313,51 @@ _CLAUDE_IN_COMMAND = re.compile(r"(?:^|/)(?:claude|\d+\.\d+\.\d+)(?:\s|\Z)")
 _MULTIPLEXER = re.compile(r"^(?:\S*/)?(?:tmux|screen|zellij)(?:\s|\Z)", re.I)
 
 
+# per-user services a command starts on first use (`git commit -S`, `git push`
+# with ControlPersist, the credential cache, jest's watchman, `colima start`,
+# ollama): they inherit the agent's mark and then serve the whole login - its
+# passphrases, keys, containers, models. The program itself, not a file that
+# mentions one. Not ssh-agent: an agent's `eval $(ssh-agent)` is its own, and
+# the login's agent is launchd's, which carries no mark
+_SHARED_DAEMON = re.compile(
+    r"^(?:\S*/)?(?:gpg-agent|dirmngr|scdaemon|keyboxd|watchman)(?:\s|\Z)"
+    r"|^(?:\S*/)?git[ -]credential-cache--daemon(?:\s|\Z)"
+    r"|^(?:\S*/)?(?:limactl hostagent|colima daemon)(?:\s|\Z)"
+    r"|^(?:\S*/)?ollama serve(?:\s|\Z)"
+    r"|^ssh: .+ \[mux\]\Z")
+
+
+# the transport of an ssh ControlMaster: its ProxyJump (`ssh -W host:port`) or
+# ProxyCommand (`nc host port`, `cloudflared access ssh`). Measured: it is NOT
+# the master's child but an orphan at ppid 1, so only its own shape tells.
+# Killing it drops the master and every session on it
+_SSH_JUMP = re.compile(r"^(?:\S*/)?ssh\s(?:.*\s)?-W\s*\S")
+_SSH_PROXY = re.compile(r"^(?:\S*/)?cloudflared access ssh(?:\s|\Z)")
+_NC = re.compile(r"^(?:\S*/)?nc\s")
+
+
+def _ssh_transport(cmd):
+    if _SSH_JUMP.search(cmd) or _SSH_PROXY.search(cmd):
+        return True
+    # nc connecting, not listening: `nc -l 3000` is a server an agent started
+    return bool(_NC.search(cmd)) and not any(
+        re.fullmatch(r"-\w*l\w*", t) for t in cmd.split()[1:])
+
+
 def _unsure_why(table, pid, cmd, sessions_known, starter=None, over_claude=()):
     """Why a process whose session is gone may still not be litter - or None.
     `left behind` is the group a clean-up agent kills: anything in doubt is not."""
     if not sessions_known:
         return "the session list is incomplete"
+    if _SHARED_DAEMON.search(cmd):
+        return "it is a shared user daemon"
+    if _ssh_transport(cmd):
+        return "it carries an ssh connection"
+    parents = [table[a][2] for a in _ancestors(table, pid)]
+    # what one runs is part of it: pinentry under gpg-agent, a model runner
+    # under ollama, a port forward under a VM's host agent
+    if any(_SHARED_DAEMON.search(c) for c in parents):
+        return "it runs under a shared user daemon"
     # after /clear the claude runs on under a new session id; its work keeps the old
     if starter and starter in table and _CLAUDE_IN_COMMAND.search(table[starter][2]):
         return "the claude that started it is still running"
@@ -326,7 +366,6 @@ def _unsure_why(table, pid, cmd, sessions_known, starter=None, over_claude=()):
     # `caffeinate -i claude`, `script … claude`: killing it kills the claude under it
     if pid in over_claude:
         return "a claude runs under it"
-    parents = [table[a][2] for a in _ancestors(table, pid)]
     if any(_CLAUDE_IN_COMMAND.search(c) for c in parents):
         return "it runs under a claude that ccwho does not list"
     # the mark is inherited: in an app or tmux an agent opened, the user works on

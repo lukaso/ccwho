@@ -2163,13 +2163,15 @@ def ui_row_cells(row, width=100):
         more = f" (+{len(loops) - 1} more)" if len(loops) > 1 else ""
         mark = (f"loop {loops[0]['pid']} waits on {', '.join(loops[0]['tasks'])}, "
                 f"which has ended{more} · ")
-    room = width - len(pad) - sum(visible_len(t) for t, _ in act)
+    # in screen cells, as _fit cuts the line: a CJK recap counted in characters
+    # ran twice as wide, and the cut dropped the kill at the end of the line
+    room = width - _cells(pad) - sum(_cells(t) for t, _ in act)
     if loops:
         # what to do about it comes first; the recap only where it can be read
-        mark = truncate(mark, max(8, room))
-        body = body if room - visible_len(mark) >= 20 else ""
+        mark = _cut(mark, max(8, room))
+        body = body if room - _cells(mark) >= 20 else ""
     second = [(pad, "pad"), (mark, "age")] + (
-        [(truncate(body, max(8, room - visible_len(mark))), "recap")] if body else []) + act
+        [(_cut(body, max(8, room - _cells(mark))), "recap")] if body else []) + act
     return (_fit(first, width), _fit(second, width))
 
 
@@ -2178,9 +2180,10 @@ def ui_action_at(row, width, line, col):
     which case the click does what a click on the row always does."""
     at = 0
     for text, role in ui_row_cells(row, width)[line] if line in (0, 1) else ():
-        if role == "action" and at <= col < at + visible_len(text):
+        # a click lands in screen cells, where a CJK character takes two
+        if role == "action" and at <= col < at + _cells(text):
             return "kill"
-        at += visible_len(text)
+        at += _cells(text)
     return None
 
 

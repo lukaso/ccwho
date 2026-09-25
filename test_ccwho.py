@@ -856,6 +856,23 @@ class TestStuckOnScreen(unittest.TestCase):
         self.assertEqual(ccwho.ui_action_at(self._row(), 100, 1, col), "kill")
         self.assertEqual(ccwho.ui_action_at(self._row(), 100, 1, col + 10), "kill")
 
+    def test_a_wide_recap_keeps_the_kill_where_it_is_drawn(self):
+        # the recap was cut in characters and the line in cells: a CJK recap ran
+        # twice as wide, the cut dropped the kill, and the click zone was counted
+        # in characters while the screen counts cells
+        row = dict(self._row(), recap="把持久化文件移到状态目录并验证每一个游标的恢复路径都能工作" * 3)
+        for width in (80, 100, 140):
+            with self.subTest(width=width):
+                _, second = ccwho.ui_row_cells(row, width=width)
+                self.assertIn("action", [r for _, r in second])
+                col = 0
+                for text, role in second:
+                    if role == "action":
+                        break
+                    col += ccwho._cells(text)
+                self.assertEqual(ccwho.ui_action_at(row, width, 1, col), "kill")
+                self.assertIsNone(ccwho.ui_action_at(row, width, 1, col - 3))
+
     def test_a_click_anywhere_else_is_no_action(self):                   # control
         self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 0, 30))
         self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 1, 3))

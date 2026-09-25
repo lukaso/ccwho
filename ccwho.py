@@ -56,7 +56,7 @@ def tick(state, argv, color):
     rows, fleet = eng.collect(cache=state.setdefault("cache", {}))
     fleet = with_usage(rows, fleet)
     if "--blocked" in argv:
-        rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
+        rows = eng.only_blocked(rows)
     out = eng.render(rows, fleet, color=color,
                      show_prompt="--prompt" in argv or "-p" in argv,
                      links=state.get("links", False))
@@ -959,6 +959,9 @@ def open_session(argv):
             return 1
         print(f"attached {sid} in a new window")
         return 0
+    if action == "program":
+        print(f"ccwho open: {value}", file=sys.stderr)
+        return 1
     if action == "unknown":
         print(f"ccwho open: {value} - not reopening anything.", file=sys.stderr)
         print("  Check that `claude` is on PATH and `claude agents --json` answers.",
@@ -1794,8 +1797,8 @@ def restore(argv):
                 continue          # one process per transcript, however the manifest got two
             seen.add(sid)
             action, _v = engine.resolve_open(sid, live, [e_], source_ok=True)
-            if action in ("jump", "attach"):
-                running.append(e_)
+            if action in ("jump", "attach", "program"):
+                running.append((e_, action))
             elif action == "resume":
                 why = resume_problem(e_)
                 if why:
@@ -1806,7 +1809,10 @@ def restore(argv):
                     starting.append(e_)   # another ccwho is already opening this one
             else:
                 unusable.append(e_)   # no resume line builds from it - say so, don't drop it
-        for e_ in running:
+        for e_, action in running:
+            if action == "program":         # running, but nothing of yours to open
+                print(f"{e_.get('project') or e_.get('sessionId')}: a program runs it")
+                continue
             print(f"already open: {e_.get('project') or e_.get('sessionId')}"
                   f" - focus it with `ccwho open {e_.get('sessionId', '')}`")
         for e_ in starting:

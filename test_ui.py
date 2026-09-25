@@ -2800,6 +2800,31 @@ class TestKillingAStuckLoop(UiTest):
             await pilot.pause(0.2)
             self.assertIsNone(collector.killed)
 
+    async def test_x_on_a_program_mid_turn_does_nothing(self):
+        # its agent may be about to deal with the loop: a program's row is no
+        # more a kill than a busy one of yours
+        program = dict(STUCK, attention="program")
+        collector = FakeCollector(fleet=ui.Fleet([LIVE, program], True, "12:00:00"))
+        app = self.app(collector=collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            await pilot.pause()
+            self.assertIsNone(app.armed, "one x must not even ask")
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            self.assertIsNone(collector.killed)
+
+    async def test_an_arm_ends_when_the_row_becomes_a_program(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            for r in app.fleet.rows:
+                if r["sessionId"] == STUCK["sessionId"]:
+                    r["attention"] = "program"
+            self.assertEqual(app.still_armed(), "")
+
     async def test_moving_away_disarms_it(self):                         # control
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:

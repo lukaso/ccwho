@@ -154,6 +154,11 @@ class TestLiveSessionFiles(unittest.TestCase):
                                        {101: " Tue Sep 22 13:45:15 2026  "})
         self.assertEqual(len(got), 1)
 
+    def test_who_started_it_is_kept(self):
+        row = procs.live_session_files([entry(101, SID, entrypoint="sdk-cli")],
+                                       self.STARTS)[0]
+        self.assertEqual(row["entrypoint"], "sdk-cli")
+
     def test_rows_come_out_in_the_agents_shape(self):
         bg = entry(101, SID, kind="bg", jobId="51fddd61")
         row = procs.live_session_files([bg], self.STARTS)[0]
@@ -273,6 +278,14 @@ class TestMergeSessions(unittest.TestCase):
         dup = dict(self.A, name="from-file", status="idle")
         got = procs.merge_sessions([self.A], [dup])
         self.assertEqual(got, [self.A])
+
+    def test_the_agents_row_learns_who_started_it_from_the_file(self):
+        # `claude agents --json` has no entrypoint; the session file has. A
+        # session a program started must not lose that on the way in
+        got = procs.merge_sessions([self.A], [dict(self.A, entrypoint="sdk-cli",
+                                                   status="idle")])
+        self.assertEqual(got[0]["entrypoint"], "sdk-cli")
+        self.assertEqual(got[0]["status"], "busy", "the agents row still wins")
 
     def test_no_files_changes_nothing(self):                         # regression
         self.assertEqual(procs.merge_sessions([self.A], []), [self.A])

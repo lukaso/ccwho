@@ -1028,6 +1028,14 @@ class TestOpenNeverForksALiveSession(unittest.TestCase):
         self.assertNotIn("--resume", script,
                          "a running session must never be resumed")
 
+    def test_a_session_a_program_runs_is_neither_attached_nor_reopened(self):
+        self.live = [{"sessionId": self.SID, "tty": "", "pid": 90267,
+                      "attention": "program"}]
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [], "no window: a program runs it")
+        self.assertIn("a program runs it", out)
+
     def test_an_unreadable_fleet_opens_nothing(self):
         self.source_ok = False
         rc, out = self._open(self.SID)
@@ -1121,6 +1129,18 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
         rc, out = self._restore_open()
         self.assertEqual(rc, 0)
         self.assertNotIn(self.LIVE_SID, self._script())
+
+    def test_a_session_a_program_runs_is_also_skipped(self):
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "", "pid": 8,
+                      "attention": "program"}]
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.LIVE_SID, self._script())
+        self.assertIn("claude --resume " + self.DEAD_SID, self._script(), "control")
+        # running, and said so - not "cannot be reopened", and no advice to open it
+        self.assertIn("a: a program runs it", out)
+        self.assertNotIn("cannot be reopened", out)
+        self.assertNotIn("ccwho open " + self.LIVE_SID, out)
 
     def test_an_unreadable_fleet_opens_nothing_at_all(self):
         self.source_ok = False

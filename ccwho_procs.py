@@ -146,7 +146,7 @@ def live_session_files(entries, starts):
             continue
         seen.add(sid)
         row = {k: e[k] for k in ("pid", "sessionId", "cwd", "startedAt", "name",
-                                 "status", "waitingFor", "configDir")
+                                 "status", "waitingFor", "configDir", "entrypoint")
                if e.get(k) is not None}
         if "status" in row:
             row["status"] = _STATUS.get(row["status"], row["status"])
@@ -161,8 +161,13 @@ def merge_sessions(agent_rows, file_rows):
     """The agents list, plus sessions only the files know about. A session in both
     keeps its agents row: that one is Claude Code's documented answer."""
     have = {r.get("sessionId") for r in agent_rows or []}
-    return list(agent_rows or []) + [r for r in file_rows or []
-                                     if r.get("sessionId") not in have]
+    # except who started it: the agents list does not say, and a file does
+    started = {r.get("sessionId"): r["entrypoint"] for r in file_rows or []
+               if r.get("entrypoint")}
+    agents = [dict(r, entrypoint=started[r.get("sessionId")])
+              if not r.get("entrypoint") and r.get("sessionId") in started else r
+              for r in agent_rows or []]
+    return agents + [r for r in file_rows or [] if r.get("sessionId") not in have]
 
 
 def parse_ps_table(text):

@@ -29,6 +29,7 @@ ROW_KEYS = {
     "configDir",          # added 2026-09-24: set for a session in another config dir
     "procs", "ports",     # added 2026-09-24: the session's work processes, their ports
     "dead_loops",         # added 2026-09-24: its wait loops that can never end
+    "entrypoint",         # added 2026-09-26: who started it - cli, or a program (sdk-*)
 }
 
 # Every key a manifest session entry has ever carried. Append only.

@@ -47,7 +47,7 @@ RELOAD_FIRST = ("ccwho_text", "ccwho_procs", "ccwho_brief", "ccwho_index", "ccwh
 # waiting on a machine, not on you, so it sorts last. `stuck` needs you too - to
 # kill a loop that cannot end - but less than anything that finished or asked.
 _RANK = {"blocked": 0, "waiting": 0, "asks": 1, "review": 2, "stuck": 2.5, "stopped": 3,
-         "busy": 4, "ready": 5, "shell": 6, "idle": 7, "running": 8}
+         "busy": 4, "ready": 5, "shell": 6, "idle": 7, "running": 8, "program": 9}
 
 # Descendants that are session infrastructure rather than work. An idle session
 # keeps its MCP servers alive; counting them would make every session look busy.
@@ -842,6 +842,7 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
                               NOT a resume: "I cannot see a window" is not "it is not
                               running", and resuming a live session forks the
                               conversation into two processes writing one transcript.
+    ("program", why)          a program runs it, with no window - nothing to open.
     ("resume", cmd)           it is not running - reopen it.
     ("unknown", why)          we could not read the live fleet at all. An empty list
                               from a failed read looks exactly like "nothing is
@@ -859,6 +860,10 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
             tty = short_tty(r.get("tty", ""))
             if tty:
                 return ("jump", tty)
+            # A program runs it, and was never a job the daemon can attach: a
+            # window on it would fail, or take it from the program
+            if is_program(r):
+                return ("program", no_window_note(r))
             # Running, with no window we can find - which is a session to OPEN,
             # not one to reopen. `claude attach` puts a running session in a
             # terminal; `claude --resume` would start a second process on a
@@ -1608,6 +1613,43 @@ def windowed(tty, titles):
     return short_tty_full(tty) in titles
 
 
+def entrypoint_of(session, head, tail):
+    """Who started a session: the session file says, and so does every transcript
+    record - the agents feed does not. The session file wins: it is the process
+    running now. Else the newest record, as in the index: a session a program
+    started and you resumed at a terminal is yours now."""
+    if session.get("entrypoint"):
+        return str(session["entrypoint"])
+    for d in reversed(as_records(head) + as_records(tail)):
+        if isinstance(d.get("entrypoint"), str) and d["entrypoint"]:
+            return d["entrypoint"]
+    return ""
+
+
+def only_blocked(rows):
+    """`--blocked`: what waits on you, or left something behind. A program's
+    session waits on the program."""
+    return [r for r in rows if (r.get("status") == "waiting"
+                                and r.get("attention") != "program") or r.get("orphans")]
+
+
+def is_program(row):
+    """Did a program start this row's session? Its entrypoint says so, and a
+    row's state may say only "stuck"; a row that already says "program" is one."""
+    return (row.get("entrypoint") in ccwho_index.AGENT_ENTRYPOINTS
+            or row.get("attention") == "program")
+
+
+def no_window_note(row):
+    """What Enter says on a live row with no window to go to."""
+    sid = row.get("sessionId", "")
+    if is_program(row):
+        # resuming it would be a second process in a conversation the program runs
+        return f"{brief.short_id(sid)} has no window - a program runs it."
+    return (f"{brief.short_id(sid)} has no window - it runs in the background."
+            f"  resume it: claude --resume {sid}")
+
+
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
               tab_title="", reviewed=None, windowed=None, dead_loops=()):
     """One display row from one session's data. Pure: no disk, no subprocess.
@@ -1653,6 +1695,13 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     if attention == "stopped" and ts and (reviewed or {}).get(
             session.get("sessionId", "")) != ts:
         attention = "review"
+    # A program started it, so the program answers it: an unanswered tool call is
+    # the program's to answer, and no window is how it was born. Its own state,
+    # so nothing that counts what needs you can count it.
+    # A loop that can never end is the exception: the program waits on it too.
+    ep = entrypoint_of(session, head, tail)
+    if ep in ccwho_index.AGENT_ENTRYPOINTS and attention != "stuck":
+        attention = "program"
     # The recap comes off the windows this function was already given: the list's
     # second line is "what is this about", and the harness already answered it.
     recs = as_records(head) + as_records(tail)
@@ -1661,6 +1710,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     row = {
         "windowed": has_window,
         "kind": session.get("kind", ""),
+        "entrypoint": ep,
         "project": project_of(session.get("cwd", "")),
         "status": status,
         "attention": attention,
@@ -1705,7 +1755,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
 
 
 # every row field but the prose ones (recap, topic, first, ask)
-_ONE_LINE = ("kind", "project", "status", "attention", "waitingFor", "name", "title",
+_ONE_LINE = ("kind", "entrypoint", "project", "status", "attention", "waitingFor", "name", "title",
              "doing", "since", "age", "tty", "tab_title", "recap_age", "sessionId", "cwd",
              "configDir")
 
@@ -1956,7 +2006,7 @@ _C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[33m",
       "review": "\033[33m", "stuck": "\033[31;1m",
       "running": "\033[2m", "ready": "\033[33m", "waiting": "\033[33;1m",
       "busy": "\033[36m", "idle": "\033[2m",
-      "shell": "\033[35m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
+      "shell": "\033[35m", "program": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
 
 def _paint(text, key, color):
@@ -1973,7 +2023,7 @@ def now_iso(now=None):
 _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
           "review": "FINISHED", "ready": "stopped", "stuck": "STUCK",
           "stopped": "STOPPED", "busy": "busy", "running": "running",
-          "ready": "ready", "shell": "shell", "idle": "idle"}
+          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program"}
 
 
 def render_brief(b, row=None, color=True):
@@ -2037,7 +2087,9 @@ UI_GROUPS = (("NEEDS YOU", ("blocked", "waiting", "asks", "review")),
              # its own group: a loop to kill is not a question to answer
              ("STUCK", ("stuck",)),
              ("STOPPED", ("stopped", "ready", "shell", "idle")),
-             ("BUSY", ("busy", "running")))
+             ("BUSY", ("busy", "running")),
+             # started by a program, which answers it: last, and never a question
+             ("PROGRAMS", ("program",)))
 
 UI_WIDE = 140            # below this, the detail replaces the list instead of
                          # sitting beside it
@@ -2065,11 +2117,11 @@ def ui_groups(rows):
 # carries the state; the words stay plain.
 UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△", "stuck": "◆",
                  "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
-                 "busy": "●", "running": "●"}
+                 "busy": "●", "running": "●", "program": "·"}
 UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
                   "review": "review", "stuck": "needs",
                   "stopped": "quiet", "ready": "quiet", "shell": "quiet",
-                  "idle": "quiet", "busy": "busy", "running": "busy"}
+                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet"}
 UI_UNKNOWN_MARK = "·"
 
 # What a part of a row IS, so the screen can decide how to draw it. The engine
@@ -2089,6 +2141,13 @@ def ui_state_style(row):
     return UI_STATE_STYLE.get(row.get("attention", ""), "quiet")
 
 
+def loop_kill_offered(row):
+    """Is a dead loop on this row the list's to kill? Not mid-turn: the agent
+    may be about to deal with it - said, not offered. A program's session is
+    never known to be past its turn (a loop it cannot end makes it stuck)."""
+    return bool(row.get("dead_loops")) and row.get("attention") not in ("busy", "program")
+
+
 def ui_row_cells(row, width=100, tag=""):
     """The two lines a session gets, in parts, each part saying what it is.
 
@@ -2104,6 +2163,10 @@ def ui_row_cells(row, width=100, tag=""):
         # not "no window", which reads as broken: this is a session you can
         # open, with `claude attach`
         tail += " · background"
+    elif is_program(row) and (row.get("windowed") is False
+                                                 or not row.get("tty")):
+        # a program's session never had a window: that is what it is, not a fault
+        tail += " · program"
     elif row.get("windowed") is False:
         # there is nothing to go to, and a row that does not say so is a row
         # that quietly does nothing when you press Enter on it
@@ -2146,8 +2209,7 @@ def ui_row_cells(row, width=100, tag=""):
     pad = "        "
     loops = row.get("dead_loops") or []
     # mid-turn the agent may be about to deal with it: said, not offered
-    act = [("  ", "pad"), (UI_KILL, "action")] if loops and row.get(
-        "attention") != "busy" else []
+    act = [("  ", "pad"), (UI_KILL, "action")] if loop_kill_offered(row) else []
     if loops:
         more = f" (+{len(loops) - 1} more)" if len(loops) > 1 else ""
         mark = (f"loop {loops[0]['pid']} waits on {', '.join(loops[0]['tasks'])}, "
@@ -2453,7 +2515,7 @@ def main(argv=None):
         print(json.dumps(rows, indent=2))
         return 0
     if "--blocked" in argv:
-        rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
+        rows = only_blocked(rows)
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
     sys.stdout.write(render(rows, fleet, color=color))
     return 0

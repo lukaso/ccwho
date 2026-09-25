@@ -3106,6 +3106,226 @@ class TestASessionWithNoWindowSaysSo(unittest.TestCase):
         self.assertNotIn("no window", "".join(t for t, _ in first))
 
 
+class TestASessionAProgramStartedNeverNeedsYou(unittest.TestCase):
+    """NEEDS YOU and "~app · no window", now and then, for a few seconds. It was a
+    session the liveapp eval harness started with the SDK in a folder named
+    `app`: mid tool call, so its tool_use had no answer yet - which is what a
+    permission prompt looks like. But the program answers its own prompts, and
+    it has no window because it never had one. ccwho's own index already says
+    such sessions are not yours (AGENT_ENTRYPOINTS); the live list did not ask.
+    """
+
+    PENDING = [json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}})]
+
+    def row(self, entrypoint="", tail_entrypoint=None, windowed=False):
+        session = {"sessionId": "a", "status": "waiting", "pid": 1,
+                   "cwd": "/private/var/folders/x/T/la-eval-quiet-abc/app", "name": "app-4e"}
+        if entrypoint:
+            session["entrypoint"] = entrypoint
+        tail = list(self.PENDING)
+        if tail_entrypoint is not None:
+            rec = json.loads(tail[0])
+            rec["entrypoint"] = tail_entrypoint
+            tail = [json.dumps(rec)]
+        return ccwho.build_row(session, [], tail, None, tty="", windowed=windowed)
+
+    def test_you_at_a_terminal_blocked_needs_you(self):                 # control
+        self.assertEqual(self.row("cli")["attention"], "blocked")
+
+    def test_a_program_blocked_does_not(self):
+        self.assertEqual(self.row("sdk-cli")["attention"], "program")
+
+    def test_every_program_entrypoint_counts(self):
+        for ep in ccwho.ccwho_index.AGENT_ENTRYPOINTS:
+            self.assertEqual(self.row(ep)["attention"], "program", ep)
+
+    def test_the_transcript_says_so_when_the_feed_does_not(self):
+        self.assertEqual(self.row(tail_entrypoint="sdk-py")["attention"], "program")
+
+    def test_a_transcript_from_a_terminal_still_needs_you(self):        # control
+        self.assertEqual(self.row(tail_entrypoint="cli")["attention"], "blocked")
+
+    def test_it_is_never_under_needs_you(self):
+        groups = ccwho.ui_groups([self.row("cli"), self.row("sdk-cli")])
+        self.assertEqual([g["heading"] for g in groups], ["NEEDS YOU", "PROGRAMS"])
+        self.assertEqual([r["attention"] for r in groups[0]["rows"]], ["blocked"])
+
+    def test_programs_come_last(self):
+        busy = dict(self.row("cli"), attention="running")
+        groups = ccwho.ui_groups([self.row("sdk-cli"), busy])
+        self.assertEqual([g["heading"] for g in groups], ["BUSY", "PROGRAMS"])
+
+    def test_it_does_not_say_no_window(self):
+        first, _ = ccwho.ui_row_cells(self.row("sdk-cli"), width=100)
+        text = "".join(t for t, _ in first)
+        self.assertNotIn("no window", text)
+        self.assertIn("program", text)
+
+    def test_yours_with_no_window_still_says_so(self):                   # control
+        first, _ = ccwho.ui_row_cells(self.row("cli"), width=100)
+        self.assertIn("no window", "".join(t for t, _ in first))
+
+    def test_the_table_does_not_say_needs_you(self):
+        out = ccwho.render([self.row("sdk-cli")], {}, color=False, width=200)
+        self.assertNotIn("NEEDS YOU", out)
+
+    def test_the_table_still_says_it_for_yours(self):                   # control
+        out = ccwho.render([self.row("cli")], {}, color=False, width=200)
+        self.assertIn("NEEDS YOU", out)
+
+    def test_the_newest_entrypoint_wins(self):
+        # started by a program, then resumed by you at a terminal: the question
+        # at the end is yours
+        head = [json.dumps({"type": "user", "entrypoint": "sdk-cli",
+                            "message": {"content": "go"}})]
+        tail = [json.dumps(dict(json.loads(self.PENDING[0]), entrypoint="cli"))]
+        row = ccwho.build_row({"sessionId": "a", "status": "waiting", "pid": 1},
+                              head, tail, None, tty="", windowed=False)
+        self.assertEqual(row["attention"], "blocked")
+
+    def test_and_the_other_way_round(self):
+        head = [json.dumps({"type": "user", "entrypoint": "cli",
+                            "message": {"content": "go"}})]
+        tail = [json.dumps(dict(json.loads(self.PENDING[0]), entrypoint="sdk-cli"))]
+        row = ccwho.build_row({"sessionId": "a", "status": "waiting", "pid": 1},
+                              head, tail, None, tty="", windowed=False)
+        self.assertEqual(row["attention"], "program")
+
+    def test_a_loop_that_cannot_end_is_still_stuck(self):
+        # the program waits on the loop too: nobody but you will kill it
+        ended = [json.dumps({"type": "system", "subtype": "turn_duration"})]
+        session = {"sessionId": "a", "status": "busy", "pid": 1, "entrypoint": "sdk-cli"}
+        stuck = ccwho.build_row(session, [], ended, None, dead_loops=[{"pid": 9}])
+        self.assertEqual(stuck["attention"], "stuck")
+        self.assertEqual(ccwho.build_row(session, [], ended, None)["attention"],
+                         "program", "control: no dead loop, a program")
+
+    def test_a_program_with_a_window_shows_its_tty(self):
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1,
+                               "entrypoint": "sdk-py"}, [], [], None,
+                              tty="/dev/ttys003", windowed=True)
+        first, _ = ccwho.ui_row_cells(row, width=100)
+        self.assertIn(ccwho.short_tty("/dev/ttys003"), "".join(t for t, _ in first))
+
+    def test_not_knowing_about_windows_still_shows_its_tty(self):
+        # iTerm2 shut: every other row shows its tty, and so does this one
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1,
+                               "entrypoint": "sdk-py"}, [], [], None,
+                              tty="/dev/ttys012", windowed=None)
+        first, _ = ccwho.ui_row_cells(row, width=100)
+        text = "".join(t for t, _ in first)
+        self.assertIn(ccwho.short_tty("/dev/ttys012"), text)
+        self.assertNotIn("program", text.split(ccwho.short_tty("/dev/ttys012"))[-1])
+
+    def loops_row(self, entrypoint, ended):
+        tail = [json.dumps({"type": "system", "subtype": "turn_duration"})] if ended else []
+        return ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1,
+                                "entrypoint": entrypoint}, [], tail, None,
+                               dead_loops=[{"pid": 123, "tasks": ["t1"]}])
+
+    def actions(self, row):
+        _, second = ccwho.ui_row_cells(row, width=120)
+        return [t for t, r in second if r == "action"]
+
+    def test_mid_turn_a_program_is_not_offered_a_kill(self):
+        # mid-turn its agent may be about to deal with the loop, as with yours
+        row = self.loops_row("sdk-cli", ended=False)
+        self.assertEqual(row["attention"], "program")
+        self.assertFalse(ccwho.loop_kill_offered(row))
+        self.assertEqual(self.actions(row), [])
+
+    def test_nor_is_yours_mid_turn(self):                                # control
+        row = self.loops_row("cli", ended=False)
+        self.assertEqual(row["attention"], "busy")
+        self.assertFalse(ccwho.loop_kill_offered(row))
+
+    def test_a_stuck_program_is(self):                                   # control
+        row = self.loops_row("sdk-cli", ended=True)
+        self.assertEqual(row["attention"], "stuck")
+        self.assertTrue(ccwho.loop_kill_offered(row))
+        self.assertEqual(self.actions(row), [ccwho.UI_KILL])
+
+    def test_a_stuck_program_says_program_not_no_window(self):
+        row = self.loops_row("sdk-cli", ended=True)
+        first, _ = ccwho.ui_row_cells(row, width=120)
+        text = "".join(t for t, _ in first)
+        self.assertIn("program", text)
+        self.assertNotIn("no window", text)
+
+    def test_the_session_file_beats_the_transcript(self):
+        # the file belongs to the process running now: you resumed it at a
+        # terminal, and it wrote "cli", whatever the transcript began as
+        tail = [json.dumps(dict(json.loads(self.PENDING[0]), entrypoint="sdk-cli"))]
+        row = ccwho.build_row({"sessionId": "a", "status": "waiting", "pid": 1,
+                               "entrypoint": "cli"}, [], tail, None, tty="")
+        self.assertEqual(row["attention"], "blocked")
+
+    def test_enter_does_not_say_resume_a_program(self):
+        note = ccwho.no_window_note(self.row("sdk-cli"))
+        self.assertNotIn("claude --resume", note)
+        self.assertIn("program", note)
+
+    def test_enter_on_yours_still_says_resume(self):                      # control
+        self.assertIn("claude --resume a", ccwho.no_window_note(self.row("cli")))
+
+    def test_the_engine_main_blocked_leaves_it_out_too(self):
+        import contextlib, io
+        rows = [self.row("cli"), dict(self.row("sdk-cli"), title="PROGRAMROW")]
+        for r in rows:
+            r["title"] = r["title"] or r["name"]
+        saved = ccwho.collect
+        ccwho.collect = lambda *a, **k: (rows, {})
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                ccwho.main(["--blocked", "--no-color"])
+        finally:
+            ccwho.collect = saved
+        self.assertNotIn("PROGRAMROW", buf.getvalue())
+        self.assertIn("1 sessions", buf.getvalue(), "control: yours is listed")
+
+    def test_blocked_leaves_it_out(self):
+        rows = [self.row("cli"), self.row("sdk-cli")]
+        self.assertEqual([r["attention"] for r in ccwho.only_blocked(rows)], ["blocked"])
+
+
+class TestOpeningASessionAProgramRuns(unittest.TestCase):
+    """A program's session with no tty was "attached": `claude attach` in a new
+    window, on a session that is no daemon job - it fails, or it takes the
+    session from the program. Nothing opens it; ccwho says who runs it."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def test_it_is_not_attached(self):
+        live = [{"sessionId": self.SID, "tty": "", "pid": 91, "attention": "program"}]
+        action, value = ccwho.resolve_open(self.SID, live, [])
+        self.assertEqual(action, "program")
+        self.assertEqual(value, ccwho.no_window_note(live[0]))
+
+    def test_a_background_session_still_is(self):                        # control
+        live = [{"sessionId": self.SID, "tty": "", "pid": 91, "kind": "background",
+                 "attention": "busy"}]
+        self.assertEqual(ccwho.resolve_open(self.SID, live, [])[0], "attach")
+
+    def test_a_stuck_one_is_not_attached_either(self):
+        # a loop that cannot end keeps it in STUCK - it is still a program's
+        live = [{"sessionId": self.SID, "tty": "", "pid": 91, "attention": "stuck",
+                 "entrypoint": "sdk-py"}]
+        self.assertEqual(ccwho.resolve_open(self.SID, live, [])[0], "program")
+        self.assertNotIn("claude --resume", ccwho.no_window_note(live[0]))
+
+    def test_a_stuck_one_of_yours_still_is(self):                         # control
+        live = [{"sessionId": self.SID, "tty": "", "pid": 91, "attention": "stuck",
+                 "entrypoint": "cli"}]
+        self.assertEqual(ccwho.resolve_open(self.SID, live, [])[0], "attach")
+
+    def test_one_with_a_window_is_still_a_jump(self):                     # control
+        live = [{"sessionId": self.SID, "tty": "ttys032", "pid": 91,
+                 "attention": "program"}]
+        self.assertEqual(ccwho.resolve_open(self.SID, live, []), ("jump", "s032"))
+
+
 class TestFindingTheWindowASessionIsShownIn(unittest.TestCase):
     """Measured on this machine, on a session running under the Claude Code
     daemon:

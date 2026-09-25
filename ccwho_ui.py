@@ -862,8 +862,7 @@ class CcwhoUi(App):
         if self.detail_open and self.detail_mode == "procs":
             return      # that screen is not about the selected row
         row = self.selected_row()
-        loops = (row or {}).get("dead_loops") or []
-        if not loops or row.get("attention") == "busy":
+        if not engine.loop_kill_offered(row or {}):
             return
         if self.acting:
             # a kill moves rows, and nothing moves while a window opens
@@ -898,7 +897,7 @@ class CcwhoUi(App):
         sid, pids, since = self.armed
         row = next((r for r in self.fleet.rows if r.get("sessionId") == sid), None)
         if (self.clock() - since > ARM_SECS or row is None or self._pids(row) != pids
-                or row.get("attention") == "busy"):
+                or not engine.loop_kill_offered(row)):
             self.armed = None
             return ""
         return f"x or click again to kill loop {', '.join(str(p) for p in pids)}"
@@ -1036,6 +1035,9 @@ class CcwhoUi(App):
         action, value = engine.resolve_open(row.get("sessionId", ""),
                                             self.fleet.rows, [],
                                             source_ok=self.fleet.source_ok)
+        if action == "program":
+            self.said(value)
+            return
         if action == "attach":
             # running, with no window: give it one. The same guard the command
             # line uses decides this, so neither can resume a live session.
@@ -1050,9 +1052,7 @@ class CcwhoUi(App):
             # session is alive with nowhere to go to - `claude bg-spare` does
             # this. Asking iTerm2 anyway returns "not found: /dev/ttys042",
             # which is not an answer anyone can act on.
-            self.said(f"{engine.brief.short_id(row.get('sessionId', ''))} has no"
-                      f" window - it runs in the background."
-                      f"  resume it: claude --resume {row.get('sessionId', '')}")
+            self.said(engine.no_window_note(row))
             return
         self.mark_acting(row.get("sessionId", ""))
         self.paint_header(self.fleet.groups(self.filter_text))

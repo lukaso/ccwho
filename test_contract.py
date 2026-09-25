@@ -39,7 +39,7 @@ MANIFEST_SESSION_KEYS = {
                           # manifests lack it and resume in the default dir
 }
 
-MANIFEST_TOP_KEYS = {"version", "savedAt", "count", "skipped", "sessions"}
+MANIFEST_TOP_KEYS = {"version", "savedAt", "count", "skipped", "skippedWhy", "sessions"}
 
 SESSION = {"pid": 4242, "cwd": "/Users/x/projects/liveapp", "kind": "interactive",
            "startedAt": 1788200000000, "sessionId": "4f2b91ac-1111-4222-8333-abc",

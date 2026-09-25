@@ -13,10 +13,12 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -889,6 +891,17 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
     return True
 
 
+def resume_problem(entry):
+    """Why `claude --resume` would fail for this saved session, or "".
+
+    Asked by everything that launches one - `open` and `restore --open` - right
+    before it does. A saved cwd in a temp dir is gone after the next cleanup, and
+    a headless worker leaves no transcript: both opened a window onto an error.
+    """
+    finder = engine.manifest_transcript_finder({"sessions": [entry]})
+    return engine.entry_problem(entry, os.path.isdir, finder)
+
+
 def open_session(argv):
     """Get me to this session: focus its window if it is up, reopen it if not.
 
@@ -921,6 +934,11 @@ def open_session(argv):
               file=sys.stderr)
         return 1
     if action == "resume":
+        entry = next((e_ for e_ in known_entries() if e_.get("sessionId") == sid), {})
+        why = resume_problem(entry)
+        if why:
+            print(f"ccwho open: not reopening {sid} - {why}", file=sys.stderr)
+            return 1
         if not claim_launch(sid):
             print(f"ccwho open: {sid} is already starting in another window"
                   " - not launching it twice.", file=sys.stderr)
@@ -1116,6 +1134,22 @@ def restore_dir():
     return os.path.join(ccwho_dir(), "restore")
 
 
+def temp_roots():
+    """Where a cwd does not outlive the reboot a save is for. liveapp's test runs
+    put a whole claude session - its own CLAUDE_CONFIG_DIR - in $TMPDIR."""
+    return [tempfile.gettempdir(), "/tmp", "/private/var/folders"]
+
+
+def save_problem(row):
+    """Why this live session is not worth saving, or "". Not saved: a session
+    no restore could reopen, which is what every restore then showed as an error."""
+    cwd = row.get("cwd", "") or ""
+    roots = [os.path.realpath(r) for r in temp_roots()]
+    if engine.in_temp_dir(os.path.realpath(cwd), roots) or engine.in_temp_dir(cwd, roots):
+        return "cwd is in a temp dir"
+    return resume_problem(row)
+
+
 def save(argv):
     """Capture the live fleet so a reboot stops being a one-way door."""
     status = {}
@@ -1128,7 +1162,7 @@ def save(argv):
               file=sys.stderr)
         print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
         return 1
-    man = engine.manifest_from_rows(rows)
+    man = engine.manifest_from_rows(rows, why_not=save_problem)
     if man["count"] == 0:
         # Writing this would only push a manifest that HAS something out of the
         # keep-20 window. Nothing to restore is not something to record.
@@ -1161,7 +1195,9 @@ def save(argv):
             os.unlink(os.path.join(d, stale))
     except OSError:
         pass                      # housekeeping never fails the save it follows
-    note = f", {man['skipped']} not capturable" if man["skipped"] else ""
+    why = man.get("skippedWhy") or {}
+    note = (", %d not saved (%s)" % (man["skipped"], "; ".join(
+        "%d %s" % (n, w) for w, n in sorted(why.items()))) if man["skipped"] else "")
     print(f"saved {man['count']} session(s){note} -> {out}")
     print("after the reboot:  ccwho restore        (add --open to reopen them)")
     return 0
@@ -1226,8 +1262,11 @@ def reopen_saved():
     if rc:
         tail = [l for l in out.getvalue().splitlines() if l.strip()]
         return "could not reopen: " + (tail[-1] if tail else "see `ccwho restore --open`")
-    opened = sum(1 for l in out.getvalue().splitlines() if "reopen" in l.lower())
-    return f"reopened {opened} session(s)" if opened else "reopened the last save"
+    text = out.getvalue()
+    m = re.search(r"^opened (\d+) window", text, re.M)
+    left = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: not reopening"))
+    said = f"reopened {m.group(1)} session(s)" if m else "reopened the last save"
+    return said + (f", {left} left out - they could not resume" if left else "")
 
 
 def restore(argv):
@@ -1289,6 +1328,7 @@ def restore(argv):
                   " and here it would be every one of them.", file=sys.stderr)
             return 1
         openable, running, unusable, starting, seen = [], [], [], [], set()
+        gone = []
         for e_ in entries:
             sid = e_.get("sessionId", "")
             if sid in seen:
@@ -1298,7 +1338,10 @@ def restore(argv):
             if action in ("jump", "attach"):
                 running.append(e_)
             elif action == "resume":
-                if claim_launch(sid):
+                why = resume_problem(e_)
+                if why:
+                    gone.append((e_, why))    # checked BEFORE the claim: not opening it
+                elif claim_launch(sid):
                     openable.append(e_)
                 else:
                     starting.append(e_)   # another ccwho is already opening this one
@@ -1310,11 +1353,14 @@ def restore(argv):
         for e_ in starting:
             print(f"already starting: {e_.get('project') or e_.get('sessionId')}"
                   " - another ccwho is opening it")
+        for e_, why in gone:
+            print(f"ccwho restore: not reopening {e_.get('project') or e_.get('sessionId')}"
+                  f" - {why}", file=sys.stderr)
         for e_ in unusable:
             print(f"ccwho restore: {e_.get('project') or e_.get('sessionId') or '?'}"
                   " cannot be reopened from this manifest", file=sys.stderr)
         script = engine.iterm_open_script(openable)
-        if not script and (running or starting) and not unusable:
+        if not script and (running or starting) and not (unusable or gone):
             print(f"all {len(running) + len(starting)} session(s) in that manifest"
                   " are already running or starting.")
             return 0

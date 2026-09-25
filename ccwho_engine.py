@@ -1288,21 +1288,43 @@ _MANIFEST_KEYS = ("sessionId", "cwd", "project", "topic", "first", "ask",
                   "attention", "status", "tty", "pid", "since", "configDir")
 
 
-def manifest_from_rows(rows, now=None):
+def in_temp_dir(path, temp_roots):
+    """Is this path inside one of temp_roots? Pure: the caller resolves symlinks
+    (/tmp is /private/tmp) and names the roots. A root's sibling that shares its
+    prefix - /private/tmpfoo - is not inside it."""
+    if not path:
+        return False
+    for root in temp_roots or []:
+        root = root.rstrip("/")
+        if root and (path == root or path.startswith(root + "/")):
+            return True
+    return False
+
+
+def manifest_from_rows(rows, now=None, why_not=None):
     """Capture the live fleet. Pure: the caller supplies the rows and the clock.
 
     Order is the caller's (collect() sorts needs-you first), so the restore list
     reads in the same order as the dashboard the user was looking at.
+
+    why_not(row) -> "" or the reason this session could never be resumed. Such a
+    row is counted in `skipped`, under its reason in `skippedWhy`, and not saved:
+    a restore would only open a window onto the error.
     """
     now = int(time.time() if now is None else now)
-    kept, skipped = [], 0
+    kept, why_count = [], {}
     for r in rows or []:
         if not r.get("sessionId") or not r.get("cwd"):
-            skipped += 1          # no id to resume, or nowhere to cd: not restorable
+            why = "no id or no cwd"   # no id to resume, or nowhere to cd
+        else:
+            why = why_not(r) if why_not else ""
+        if why:
+            why_count[why] = why_count.get(why, 0) + 1
             continue
         kept.append({k: r.get(k, "") for k in _MANIFEST_KEYS})
-    return {"version": MANIFEST_VERSION, "savedAt": now,
-            "count": len(kept), "skipped": skipped, "sessions": kept}
+    return {"version": MANIFEST_VERSION, "savedAt": now, "count": len(kept),
+            "skipped": sum(why_count.values()), "skippedWhy": why_count,
+            "sessions": kept}
 
 
 def restore_command(entry):
@@ -1369,16 +1391,25 @@ def check_manifest(manifest, cwd_exists, transcript_for):
         return False, [("(manifest)", "no sessions in it - run `ccwho save` while they are open")]
     problems = []
     for e_ in entries:
-        who = e_.get("project") or e_.get("sessionId", "?")[:8] or "?"
-        if not restore_command(e_):
-            problems.append((who, "no resume line can be built (bad session id, or no cwd)"))
-            continue
-        if not cwd_exists(e_.get("cwd", "")):
-            problems.append((who, "cwd is gone: %s" % e_.get("cwd", "")))
-            continue
-        if not transcript_for(e_.get("sessionId", "")):
-            problems.append((who, "transcript is gone - nothing left to resume"))
+        why = entry_problem(e_, cwd_exists, transcript_for)
+        if why:
+            problems.append((e_.get("project") or e_.get("sessionId", "?")[:8] or "?", why))
     return (not problems), problems
+
+
+def entry_problem(entry, cwd_exists, transcript_for):
+    """Why this one saved session would NOT resume, or "" if it would.
+
+    One answer for `--check` and `--open`: when only the check asked, a restore
+    opened eight windows the check had already failed.
+    """
+    if not restore_command(entry):
+        return "no resume line can be built (bad session id, or no cwd)"
+    if not cwd_exists(entry.get("cwd", "")):
+        return "cwd is gone: %s" % entry.get("cwd", "")
+    if not transcript_for(entry.get("sessionId", "")):
+        return "transcript is gone - nothing left to resume"
+    return ""
 
 
 def render_restore(manifest, color=True, width=None, links=False):
@@ -1425,7 +1456,13 @@ def render_restore(manifest, color=True, width=None, links=False):
             out.append("      %sno resume line (bad id or no cwd) - find it with: claude --resume%s\n"
                        % (c["dim"], c["reset"]))
     skipped = m.get("skipped") or 0
-    if skipped:
+    why = m.get("skippedWhy")
+    if skipped and isinstance(why, dict) and why:
+        # a manifest from before skippedWhy only ever skipped for the one reason
+        reasons = "; ".join("%s %s" % (n, w) for w, n in sorted(why.items()))
+        out.append("\n%s%d live session(s) not saved - they could not be resumed: %s%s\n"
+                   % (c["dim"], skipped, reasons, c["reset"]))
+    elif skipped:
         out.append("\n%s%d live session(s) could not be captured (no id or no cwd)%s\n"
                    % (c["dim"], skipped, c["reset"]))
     return "".join(out)

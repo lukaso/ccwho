@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -184,6 +185,10 @@ class TestSaveAndRestore(unittest.TestCase):
              "first": "", "pid": 2}]
 
     def setUp(self):
+        # about the manifest FILE, not the disk: TestSaveSkipsWhatCannotResume
+        # covers which sessions are worth saving
+        self.real_save_problem = runner.save_problem
+        runner.save_problem = lambda row: ""
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         self.real_collect = runner.engine.collect
@@ -195,6 +200,7 @@ class TestSaveAndRestore(unittest.TestCase):
         runner.engine.collect = fake_collect
 
     def tearDown(self):
+        runner.save_problem = self.real_save_problem
         runner.engine.collect = self.real_collect
         os.environ.pop("CCWHO_DIR", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -369,6 +375,103 @@ class TestPruneManifests(unittest.TestCase):
         self.assertEqual(runner.prune_manifests(self.names(25), keep=-5), [])
 
 
+class TestSaveSkipsWhatCannotResume(unittest.TestCase):
+    """A save at 04:25 held 21 sessions; 8 of them could never resume - five
+    liveapp test runs in a $TMPDIR that was deleted before the reboot, three
+    headless workers that never wrote a transcript. The restore opened a window
+    onto an error for each. None of them was part of the fleet to begin with."""
+
+    GOOD = "11111111-1111-4111-8111-111111111111"
+    TEMP = "22222222-2222-4222-8222-222222222222"
+    GONE = "33333333-3333-4333-8333-333333333333"
+    HEADLESS = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        os.environ["CCWHO_DIR"] = os.path.join(self.tmp, "ccwho")
+        self.temp_root = os.path.join(self.tmp, "T")
+        for d in ("p/good", "T/vr-x/liveapp-d1-y/app"):
+            os.makedirs(os.path.join(self.tmp, d))
+        self.real_temp_roots = runner.temp_roots
+        runner.temp_roots = lambda: [self.temp_root]
+        self.on_disk = {self.GOOD, self.TEMP, self.GONE}
+        self.real_transcript_path = runner.engine.transcript_path
+        runner.engine.transcript_path = (
+            lambda sid, roots=None: "/tx/%s.jsonl" % sid if sid in self.on_disk else None)
+        self.rows = [self.row(self.GOOD, "p/good", "good"),
+                     self.row(self.TEMP, "T/vr-x/liveapp-d1-y/app", "app"),
+                     self.row(self.GONE, "p/deleted", "gone"),
+                     self.row(self.HEADLESS, "p/good", "headless")]
+        self.real_collect = runner.engine.collect
+
+        def fake_collect(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True
+            return (list(self.rows), 0)
+
+        runner.engine.collect = fake_collect
+
+    def tearDown(self):
+        runner.engine.collect = self.real_collect
+        runner.engine.transcript_path = self.real_transcript_path
+        runner.temp_roots = self.real_temp_roots
+        os.environ.pop("CCWHO_DIR", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def row(self, sid, rel, project):
+        return {"sessionId": sid, "cwd": os.path.join(self.tmp, rel), "project": project,
+                "topic": "t", "first": "f", "ask": "", "attention": "stopped",
+                "tty": "", "since": "1h", "status": "idle", "pid": 1, "configDir": ""}
+
+    def _save(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.save([])
+        return rc, out.getvalue() + err.getvalue()
+
+    def _saved(self):
+        d = runner.restore_dir()
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json")) if os.path.isdir(d) else []
+        if not names:
+            return None
+        with open(os.path.join(d, names[-1])) as fh:
+            return json.load(fh)
+
+    def test_only_what_would_resume_is_saved_and_the_rest_is_named(self):
+        rc, out = self._save()
+        self.assertEqual(rc, 0, out)
+        man = self._saved()
+        self.assertEqual([e["sessionId"] for e in man["sessions"]], [self.GOOD])
+        self.assertEqual(man["skipped"], 3)
+        self.assertEqual(man["skippedWhy"].get("cwd is in a temp dir"), 1)
+        self.assertEqual(sum(man["skippedWhy"].values()), 3)
+        self.assertIn("temp dir", out)
+        self.assertIn("transcript is gone", out)
+
+    def test_a_fleet_that_would_all_resume_is_all_saved(self):          # control
+        self.rows = [self.row(self.GOOD, "p/good", "good"),
+                     self.row(self.GONE, "p/good", "also good")]
+        rc, out = self._save()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self._saved()["count"], 2)
+        self.assertEqual(self._saved()["skipped"], 0)
+
+    def test_a_temp_dir_reached_through_a_symlink_is_still_a_temp_dir(self):
+        # /tmp is a symlink to /private/tmp: the saved cwd may name either
+        os.symlink(self.temp_root, os.path.join(self.tmp, "tmplink"))
+        self.rows = [self.row(self.GOOD, "p/good", "good"),
+                     self.row(self.TEMP, "tmplink/vr-x/liveapp-d1-y/app", "app")]
+        self._save()
+        self.assertEqual([e["sessionId"] for e in self._saved()["sessions"]], [self.GOOD])
+
+    def test_a_fleet_of_only_test_runs_writes_nothing(self):
+        # an all-skipped manifest would still push a real one out of the keep-20
+        self.rows = [self.row(self.TEMP, "T/vr-x/liveapp-d1-y/app", "app")]
+        rc, out = self._save()
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self._saved())
+
+
 class TestRestoreCheck(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -443,6 +546,10 @@ class TestSaveRefusesAnUnsourcedManifest(unittest.TestCase):
              "tty": "s032", "since": "2h", "status": "waiting", "first": "", "pid": 1}]
 
     def setUp(self):
+        # about the manifest FILE, not the disk: TestSaveSkipsWhatCannotResume
+        # covers which sessions are worth saving
+        self.real_save_problem = runner.save_problem
+        runner.save_problem = lambda row: ""
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         self.real_collect = runner.engine.collect
@@ -457,6 +564,7 @@ class TestSaveRefusesAnUnsourcedManifest(unittest.TestCase):
         runner.engine.collect = fake_collect
 
     def tearDown(self):
+        runner.save_problem = self.real_save_problem
         runner.engine.collect = self.real_collect
         os.environ.pop("CCWHO_DIR", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -554,9 +662,13 @@ class TestOpenSession(unittest.TestCase):
         os.environ["CCWHO_DIR"] = self.tmp
         d = os.path.join(self.tmp, "restore")
         os.makedirs(d)
-        with open(os.path.join(d, "2026-08-01T0001.json"), "w") as fh:
-            json.dump({"version": 1, "savedAt": 1788213090, "count": 1,
-                       "skipped": 0, "sessions": [self.ENTRY]}, fh)
+        self.cwd = os.path.join(self.tmp, "liveapp")
+        os.makedirs(self.cwd)
+        self.write_entry(dict(self.ENTRY, cwd=self.cwd))
+        self.on_disk = True
+        self.real_transcript_path = runner.engine.transcript_path
+        runner.engine.transcript_path = (
+            lambda sid, roots=None: "/tx/%s.jsonl" % sid if self.on_disk else None)
         self.live = []
         self.real_collect = runner.engine.collect
         # a reachable, parseable source: these cases are about WHAT is running,
@@ -575,8 +687,14 @@ class TestOpenSession(unittest.TestCase):
 
         runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
 
+    def write_entry(self, entry):
+        with open(os.path.join(self.tmp, "restore", "2026-08-01T0001.json"), "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": 1,
+                       "skipped": 0, "sessions": [entry]}, fh)
+
     def tearDown(self):
         runner.engine.collect = self.real_collect
+        runner.engine.transcript_path = self.real_transcript_path
         runner.subprocess.run = self.real_run
         os.environ.pop("CCWHO_DIR", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -607,6 +725,22 @@ class TestOpenSession(unittest.TestCase):
         rc, out = self._open("deadbeef-0000-0000-0000-000000000000")
         self.assertEqual(rc, 1)
         self.assertEqual(self.runs, [])
+
+    # A link in an old restore list outlives its temp dir and its transcript.
+    # Clicking it must say why, not open a window onto a failed command.
+    def test_a_saved_session_whose_cwd_is_gone_opens_nothing_and_says_why(self):
+        self.write_entry(dict(self.ENTRY, cwd="/definitely/not/here"))
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [])
+        self.assertIn("cwd is gone", out)
+
+    def test_a_saved_session_whose_transcript_is_gone_opens_nothing_and_says_why(self):
+        self.on_disk = False
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [])
+        self.assertIn("transcript is gone", out)
 
 
 class TestManifestList(unittest.TestCase):
@@ -683,6 +817,10 @@ class TestOpenLooksAcrossManifests(unittest.TestCase):
     NEW = "22222222-1111-4222-8333-abcdefabcdef"
 
     def setUp(self):
+        # about WHAT is running and which record wins, not about the disk: the
+        # disk check has its own tests in TestOpenSession
+        self.real_resume_problem = runner.resume_problem
+        runner.resume_problem = lambda entry: ""
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         self.d = os.path.join(self.tmp, "restore")
@@ -705,6 +843,7 @@ class TestOpenLooksAcrossManifests(unittest.TestCase):
         runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
 
     def tearDown(self):
+        runner.resume_problem = self.real_resume_problem
         runner.engine.collect = self.real_collect
         runner.subprocess.run = self.real_run
         os.environ.pop("CCWHO_DIR", None)
@@ -817,6 +956,10 @@ class TestOpenNeverForksALiveSession(unittest.TestCase):
     ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
 
     def setUp(self):
+        # about WHAT is running and which record wins, not about the disk: the
+        # disk check has its own tests in TestOpenSession
+        self.real_resume_problem = runner.resume_problem
+        runner.resume_problem = lambda entry: ""
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         d = os.path.join(self.tmp, "restore")
@@ -842,6 +985,7 @@ class TestOpenNeverForksALiveSession(unittest.TestCase):
         runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
 
     def tearDown(self):
+        runner.resume_problem = self.real_resume_problem
         runner.engine.collect = self.real_collect
         runner.subprocess.run = self.real_run
         os.environ.pop("CCWHO_DIR", None)
@@ -894,13 +1038,17 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
         d = os.path.join(self.tmp, "restore")
         os.makedirs(d)
         self.man = os.path.join(d, "2026-08-01T0001.json")
-        with open(self.man, "w") as fh:
-            json.dump({"version": 1, "savedAt": 1788213090, "count": 2, "skipped": 0,
-                       "sessions": [
-                           {"sessionId": self.LIVE_SID, "cwd": "/Users/x/p/a",
-                            "project": "a"},
-                           {"sessionId": self.DEAD_SID, "cwd": "/Users/x/p/b",
-                            "project": "b"}]}, fh)
+        # Real directories and transcripts: --open reopens only what would resume,
+        # so an entry pointing nowhere is no longer a fair stand-in for a good one.
+        for proj in ("a", "b", "c"):
+            os.makedirs(os.path.join(self.tmp, "p", proj))
+        self.cwd = lambda proj: os.path.join(self.tmp, "p", proj)
+        self.on_disk = {self.LIVE_SID, self.DEAD_SID}
+        self.real_transcript_path = runner.engine.transcript_path
+        runner.engine.transcript_path = (
+            lambda sid, roots=None: "/tx/%s.jsonl" % sid if sid in self.on_disk else None)
+        self.write_manifest([{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+                             {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
         self.live, self.source_ok = [], True
         self.real_collect = runner.engine.collect
 
@@ -918,8 +1066,14 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
 
         runner.subprocess.run = lambda *a, **k: self.runs.append(a) or Done()
 
+    def write_manifest(self, sessions):
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1788213090, "count": len(sessions),
+                       "skipped": 0, "sessions": sessions}, fh)
+
     def tearDown(self):
         runner.engine.collect = self.real_collect
+        runner.engine.transcript_path = self.real_transcript_path
         runner.subprocess.run = self.real_run
         os.environ.pop("CCWHO_DIR", None)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -965,13 +1119,8 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
     def test_the_same_session_twice_in_a_manifest_opens_once(self):
         # a hand-edited or double-written manifest must not start two processes
         # on one transcript - the exact harm this guard exists to prevent
-        with open(self.man, "w") as fh:
-            json.dump({"version": 1, "savedAt": 1788213090, "count": 2, "skipped": 0,
-                       "sessions": [
-                           {"sessionId": self.DEAD_SID, "cwd": "/Users/x/p/b",
-                            "project": "b"},
-                           {"sessionId": self.DEAD_SID, "cwd": "/Users/x/p/b",
-                            "project": "b"}]}, fh)
+        self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"},
+                             {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
         rc, out = self._restore_open()
         self.assertEqual(rc, 0)
         self.assertEqual(self._script().count("claude --resume " + self.DEAD_SID), 1)
@@ -981,18 +1130,52 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
 
     def test_an_entry_that_cannot_be_rebuilt_is_reported_not_swallowed(self):
         # one running + one unusable is not "all of them are already running"
-        with open(self.man, "w") as fh:
-            json.dump({"version": 1, "savedAt": 1788213090, "count": 2, "skipped": 0,
-                       "sessions": [
-                           {"sessionId": self.LIVE_SID, "cwd": "/Users/x/p/a",
-                            "project": "a"},
-                           {"sessionId": "not a session id", "cwd": "/Users/x/p/c",
-                            "project": "c"}]}, fh)
+        self.write_manifest([{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+                             {"sessionId": "not a session id", "cwd": self.cwd("c"),
+                              "project": "c"}])
         self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7}]
         rc, out = self._restore_open()
         self.assertEqual(self.runs, [])
         self.assertEqual(rc, 1, "nothing opened and something was unusable")
         self.assertIn("cannot be reopened", out)
+
+    # --check already knew these would fail; --open launched them anyway. A real
+    # restore opened eight windows onto `cd: no such file or directory` and
+    # "No conversation found": test runs in a deleted $TMPDIR, and headless
+    # workers that never wrote a transcript.
+    def test_a_gone_cwd_is_not_opened_and_is_named(self):
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": "/definitely/not/here", "project": "reaped"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0, out)
+        script = self._script()
+        self.assertNotIn(self.LIVE_SID, script, "a window onto a failed cd is left behind")
+        self.assertIn("claude --resume " + self.DEAD_SID, script)
+        self.assertIn("reaped", out)
+        self.assertIn("cwd is gone", out)
+
+    def test_a_gone_transcript_is_not_opened_and_is_named(self):
+        self.on_disk = {self.DEAD_SID}
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0, out)
+        script = self._script()
+        self.assertNotIn(self.LIVE_SID, script, "--resume has nothing to find")
+        self.assertIn("claude --resume " + self.DEAD_SID, script)
+        self.assertIn("transcript is gone", out)
+
+    def test_nothing_that_would_resume_opens_nothing_and_fails(self):
+        self.on_disk = set()
+        rc, out = self._restore_open()
+        self.assertEqual(self.runs, [])
+        self.assertEqual(rc, 1, out)
+
+    def test_a_session_it_will_not_open_is_not_claimed(self):
+        # a claim is "I am opening this"; holding one for a window never opened
+        # would make the next, legitimate open report "already starting"
+        self.on_disk = {self.DEAD_SID}
+        self._restore_open()
+        self.assertTrue(runner.claim_launch(self.LIVE_SID))
 
     def test_every_session_live_opens_nothing_and_says_so(self):
         self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7},
@@ -1059,6 +1242,10 @@ class TestOpenUsesTheLaunchClaim(unittest.TestCase):
     ENTRY = {"sessionId": SID, "cwd": "/Users/x/p/liveapp", "project": "liveapp"}
 
     def setUp(self):
+        # about WHAT is running and which record wins, not about the disk: the
+        # disk check has its own tests in TestOpenSession
+        self.real_resume_problem = runner.resume_problem
+        runner.resume_problem = lambda entry: ""
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         d = os.path.join(self.tmp, "restore")
@@ -1083,6 +1270,7 @@ class TestOpenUsesTheLaunchClaim(unittest.TestCase):
         runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
 
     def tearDown(self):
+        runner.resume_problem = self.real_resume_problem
         runner.engine.collect = self.real_collect
         runner.subprocess.run = self.real_run
         os.environ.pop("CCWHO_DIR", None)
@@ -2227,6 +2415,25 @@ class TestTheUiCanReopenTheLastSave(unittest.TestCase):
             runner.restore = real
         self.assertEqual(seen, [["--open"]])
         self.assertIn("reopen", said.lower())
+
+    def test_it_counts_the_windows_opened_not_the_ones_it_would_not_open(self):
+        # the count used to be every line containing "reopen" - which is also
+        # what a session it refused to reopen prints
+        def fake(argv):
+            for p in ("app", "app", "football"):
+                print(f"ccwho restore: not reopening {p} - cwd is gone: /x", file=sys.stderr)
+            print("opening 13 iTerm2 window(s)...")
+            print("opened 13 window(s). each is at its project, resuming its own session.")
+            return 0
+        real = runner.restore
+        runner.restore = fake
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertIn("13", said)
+        self.assertIn("3", said.replace("13", ""), "the ones left out are named as a number")
+        self.assertNotIn("reopened 3 ", said)
 
     def test_it_says_when_the_restore_refused(self):
         real = runner.restore

@@ -1480,6 +1480,26 @@ class TestReapCandidates(unittest.TestCase):
 # A reboot is a one-way door today: the sessions survive on disk but nothing says
 # which was which. These cover the capture, the resume line, and the read-back.
 
+class InTempDir(unittest.TestCase):
+    ROOTS = ["/private/var/folders", "/private/tmp"]
+
+    def test_a_test_run_dir_is_in_a_temp_dir(self):
+        self.assertTrue(ccwho.in_temp_dir(
+            "/private/var/folders/vx/_rt/T/vr-lrgkV6/liveapp-d1-BKYLPk/app", self.ROOTS))
+
+    def test_the_root_itself_is_in_it(self):
+        self.assertTrue(ccwho.in_temp_dir("/private/tmp", self.ROOTS))
+
+    def test_a_project_is_not(self):                                    # control
+        self.assertFalse(ccwho.in_temp_dir("/Users/x/projects/liveapp", self.ROOTS))
+
+    def test_a_sibling_that_shares_the_prefix_is_not(self):
+        self.assertFalse(ccwho.in_temp_dir("/private/tmpfoo/app", self.ROOTS))
+
+    def test_no_path_is_not(self):
+        self.assertFalse(ccwho.in_temp_dir("", self.ROOTS))
+
+
 class ManifestFromRows(unittest.TestCase):
     def row(self, **kw):
         base = dict(sessionId="4f2b91ac-1111-4222-8333-abcdefabcdef",
@@ -1512,6 +1532,27 @@ class ManifestFromRows(unittest.TestCase):
         m = ccwho.manifest_from_rows([self.row(cwd=""), self.row()], now=1)
         self.assertEqual(len(m["sessions"]), 1)
         self.assertEqual(m["skipped"], 1)
+
+    # A restore opened eight windows onto errors: liveapp test runs whose
+    # $TMPDIR was deleted, and headless workers with no transcript. A session
+    # that can never resume is not part of the fleet to save.
+    def test_a_session_the_caller_rules_out_is_skipped_with_its_reason(self):
+        gone = self.row(sessionId="1" * 8 + "-2222-4333-8444-" + "5" * 12, project="gone")
+        why = lambda r: "cwd is in a temp dir" if r["project"] == "gone" else ""
+        m = ccwho.manifest_from_rows([gone, self.row()], now=1, why_not=why)
+        self.assertEqual([s["project"] for s in m["sessions"]], ["liveapp"])
+        self.assertEqual(m["skipped"], 1)
+        self.assertEqual(m["skippedWhy"], {"cwd is in a temp dir": 1})
+
+    def test_no_reason_keeps_every_session(self):                       # control
+        m = ccwho.manifest_from_rows([self.row(), self.row(project="b")], now=1,
+                                     why_not=lambda r: "")
+        self.assertEqual(m["count"], 2)
+        self.assertEqual(m["skipped"], 0)
+
+    def test_the_reason_for_no_id_is_recorded_too(self):
+        m = ccwho.manifest_from_rows([self.row(sessionId="")], now=1)
+        self.assertEqual(sum(m["skippedWhy"].values()), m["skipped"])
 
     def test_keeps_the_order_it_was_given(self):
         rows = [self.row(project="a", sessionId="1" * 8 + "-2222-4333-8444-" + "5" * 12),
@@ -1600,6 +1641,13 @@ class RenderRestore(unittest.TestCase):
     def test_reports_sessions_it_could_not_capture(self):
         self.assertIn("1", ccwho.render_restore(self.man(skipped=1), color=False))
         self.assertNotIn("skipped", ccwho.render_restore(self.man(skipped=0), color=False).lower())
+
+    def test_says_why_each_skipped_session_was_not_saved(self):
+        m = dict(self.man(skipped=5), skippedWhy={"cwd is in a temp dir": 5})
+        out = ccwho.render_restore(m, color=False)
+        self.assertIn("5", out)
+        self.assertIn("cwd is in a temp dir", out)
+        self.assertNotIn("no id or no cwd", out, "that is not why these were left out")
 
     def test_an_empty_manifest_says_so_rather_than_printing_nothing(self):
         out = ccwho.render_restore({"version": 1, "savedAt": 1, "count": 0,

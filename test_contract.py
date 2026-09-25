@@ -28,6 +28,7 @@ ROW_KEYS = {
     "kind",               # added 2026-09-22: interactive, or a background session
     "configDir",          # added 2026-09-24: set for a session in another config dir
     "procs", "ports",     # added 2026-09-24: the session's work processes, their ports
+    "dead_loops",         # added 2026-09-24: its wait loops that can never end
 }
 
 # Every key a manifest session entry has ever carried. Append only.

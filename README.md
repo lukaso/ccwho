@@ -71,6 +71,7 @@ ccwho                         # on a terminal
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
 | `p` | every process agents started, grouped: each session, left behind, Codex, not sure |
+| `x` `x` | on a STUCK row: kill its wait loop that cannot end (or click `[kill loop]` twice) |
 | `o` | reopen the last saved fleet - only offered when nothing is running |
 | `r` | restart the list |
 | `q` | quit |
@@ -452,13 +453,49 @@ So `ccwho` derives the state instead:
 | state | how it is decided | label |
 |---|---|---|
 | blocked | an unanswered `tool_use` in the transcript | NEEDS YOU |
-| asks | the closing line is a question or a request | ASKED YOU |
+| asks | the closing line of an **ended** turn is a question or a request - even while the harness says busy | ASKED YOU |
+| stuck | harness says busy, the turn has ended, and a wait loop under it can never end | STUCK |
 | stopped | not busy, and **nothing running under it** | STOPPED |
-| busy | harness says busy | busy |
-| running | not busy, but background work is in flight | running |
+| busy | harness says busy, mid-turn | busy |
+| running | background work is in flight: not busy, or busy with the turn over | running |
 
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.
+
+### Busy, but the turn is over
+
+The harness says `busy` while any background task runs - even after the turn has
+ended. Two sessions ended their turns with a question and sat in BUSY, one for 26
+hours, behind a wait loop like `until grep -q "Test Files" <task>.output; do sleep
+5; done` on a test run that had ended without printing that line. So a turn is
+over when `turn_duration` or `stop_hook_summary` follows the last message
+(measured over 300 transcripts: 2235 of 2251 ended turns carry one, and 0 of 44860
+steps inside a turn do). Then a question is ASKED YOU, whatever is running; a
+finished turn without one stays in BUSY as running - the task will wake it, so it
+is not news.
+
+Unless the task cannot end. Only one loop shape is judged: `until grep ...
+<task>.output; do sleep N; done` (or `while ! grep`), where the grep is the whole
+condition, its files are all task outputs, the sleep is the whole body, and
+nothing but that sleep or grep runs under it. When every file it polls ends in
+Claude Code's `[exited with code N]` or `[killed]`, has not changed for two
+minutes - or the loop's own sleep plus one, if that is longer - and the loop's
+own grep, asked again, still does not find its line, it can never stop: the line
+it waits for can no longer arrive. (If grep does find it, the loop has ended and
+its shell has moved on.) Only grep's `-q -E -F -i -s -e` are allowed, and a
+pattern the shell would expand (`$X`, `$(..)`, backticks), or that uses an escape
+only some greps know (`\d`, `\s`, `\w`, `\|`), is not judged - so the question
+asked again, by `/usr/bin/grep` in both the C and UTF-8 locales (found in either
+is found), is the same question. The answer
+is kept: a finished file does not change. Any other shape is unknown,
+because the process a loop runs in is the Bash tool's shell, and it runs the rest
+of the command too. That session is
+**STUCK**, its own group after NEEDS YOU, and the row names the loop. `x` twice,
+or `[kill loop]` clicked twice, kills it; the first only asks, for ten seconds, and
+moving away cancels it; the kill looks again first and signals only a pid that
+is still that session's dead loop. Killing it reports the task
+as failed to the session, which wakes the agent. A file that cannot be read, or
+has no end line, is never called dead.
 
 ### Stopped, or waiting on a machine
 

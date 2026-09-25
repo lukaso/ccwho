@@ -11,6 +11,7 @@ machine runs today.
 from __future__ import annotations
 
 import re
+import shlex
 import struct
 
 # The only environment variables ccwho ever keeps. Two ids (which session started
@@ -397,6 +398,189 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
 
 def is_helper(command):
     return bool(_HELPER.search(command or ""))
+
+
+# ------------------------------------------------ a wait loop that cannot end
+
+# A background Bash task's output file. Absolute, with no `.` or `..` part: a
+# relative one would be read against ccwho's own directory, not the loop's.
+_TASK_OUTPUT = re.compile(r"^/(?:[^/\s]+/)*tasks/[\w-]+\.output\Z")
+_UP = re.compile(r"(?:^|/)\.\.?(?:/|\Z)")
+# the one loop shape that can be judged: a condition, and a body of one sleep
+_LOOP = re.compile(r"\b(until|while)\s+(.+?);\s*do\s+sleep\s+(\S+?)\s*;\s*done\b", re.S)
+# an assignment the shell makes as written: at the start of a command, and a
+# value with nothing in it to expand - `echo F=/x` sets nothing, `F=/$D/x` sets
+# something ccwho cannot see
+_ASSIGN_PATH = re.compile(r"(?:^|(?<=[;&|\n]))\s*(?:export\s+)?([A-Za-z_]\w*)="
+                          r"(/[^\s;'\"$`&|()<>]+)(?=[\s;&|]|\Z)")
+_SECONDS = re.compile(r"^\d+(?:\.\d+)?\Z")
+# the grep options that keep the question plain - "is this line in the file" -
+# and so can be asked again by ccwho. -v, -L, -c, -z, -r and the rest ask
+# something else, and a condition ccwho cannot re-ask is not judged
+_GREP_PLAIN = set("qEFis")
+# the last line Claude Code writes when a background task is over. Measured on
+# 587 task files: 472 end in `exited with code N`, 24 in `killed`, the other 91
+# in neither (still running, or never closed) - and those stay unknown
+_TASK_END = re.compile(r"(?:^|\n)\[(?:exited with code -?\d+|killed)\]\s*\Z")
+
+
+_VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+# escapes one grep knows and another does not (GNU's \d \s \w \b \| \+ ...):
+# asked again by a different grep, the answer could differ
+_UNPORTABLE_ESCAPE = re.compile(r"\\[A-Za-z0-9|+?<>{}`']")
+
+
+def _expand(cond, names):
+    """`cond` with each known $NAME replaced by its path, or None when anything
+    else would be expanded by the shell - `$X`, `$'..'`, `$(..)`, backticks. The
+    shell's value of those is not in the command line, and a pattern asked again
+    without it asks a different question."""
+    out, i, quote = [], 0, ""
+    while i < len(cond):
+        c = cond[i]
+        if quote == "'":
+            quote = "" if c == "'" else quote
+        elif c == "\\":
+            out.append(cond[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = "" if quote == c else (quote or c)
+        elif c == "`":
+            return None
+        elif c == "$":
+            m = _VAR.match(cond, i)
+            name = m and (m.group(1) or m.group(2))
+            if name not in names:
+                return None
+            out.append(names[name])
+            i = m.end()
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _grep(cond, names):
+    """(grep argv without files, files) for a condition that is ONE plain grep
+    and nothing else, or None."""
+    cond = _expand(cond, names)
+    if cond is None:
+        return None
+    try:
+        lex = shlex.shlex(cond, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return None
+    # a redirect of grep's noise is all that may follow it
+    while len(words) >= 3 and words[-2] == ">" and words[-1] == "/dev/null":
+        words = words[:-3] if words[-3] == "2" else words[:-2]
+    # an operator, or a second command, is one more "file": it fails the check
+    # that every file is a task output
+    if words[:1] != ["grep"]:
+        return None
+    args, flags, pattern, files, i = words[1:], [], None, [], 0
+    while i < len(args):
+        w = args[i]
+        if w.startswith("-") and len(w) > 1 and pattern is None:
+            letters = w[1:]
+            last_e = letters.endswith("e")
+            if not set(letters.rstrip("e") if last_e else letters) <= _GREP_PLAIN \
+                    or "e" in letters[:-1]:
+                return None
+            flags += ["-" + c for c in (letters[:-1] if last_e else letters)]
+            if last_e:
+                if i + 1 >= len(args):
+                    return None
+                pattern, i = args[i + 1], i + 2
+                continue
+        elif pattern is None:
+            pattern = w
+        else:
+            files.append(w)
+        i += 1
+    if pattern is None or _UNPORTABLE_ESCAPE.search(pattern) \
+            or ("-i" in flags and not pattern.isascii()):
+        return None
+    return flags + ["-e", pattern], files
+
+
+def _names_before(cmd, at):
+    """Variables set to a path before `at`, where set exactly once: the loop
+    reads the value it had when it started, and two values is a guess."""
+    seen = {}
+    for m in _ASSIGN_PATH.finditer(cmd[:at]):
+        seen.setdefault(m.group(1), []).append(m.group(2))
+    return {k: v[0] for k, v in seen.items() if len(v) == 1}
+
+
+_EVAL = re.compile(r"\beval\s+(?=')")
+
+
+def _unwrap_eval(cmd):
+    """The command inside the Bash tool's `eval '...'`, quoting undone - the
+    grep ccwho asks again must get the pattern the loop's grep got."""
+    m = _EVAL.search(cmd)
+    if not m:
+        return cmd
+    try:
+        lex = shlex.shlex(cmd[m.end():], posix=True)
+        lex.whitespace_split = True
+        return lex.get_token() or cmd
+    except ValueError:
+        return cmd
+
+
+def wait_loop(cmd):
+    """{"files", "sleep", "grep"} for a loop that waits on task outputs, else
+    None. `grep` is the condition's own options and pattern, to ask it again.
+
+    Only `until grep ... <task>.output; do sleep N; done`, or `while ! grep`:
+    one grep on task outputs as the whole condition, one plain sleep as the whole
+    body. Found 2026-09-24 - two such loops polled for a vitest summary that
+    their test runs never printed, and kept their sessions `busy` for a day. Any
+    other shape is not judged: the process a loop runs in is the Bash tool's
+    shell, and it runs everything else in the command too.
+    """
+    if not cmd:
+        return None
+    cmd = _unwrap_eval(cmd)
+    for m in _LOOP.finditer(cmd):
+        kind, cond, secs = m.groups()
+        # `done &`: the shell ccwho would signal is not the one looping
+        after = cmd[m.end():].lstrip()
+        if after.startswith("&") and not after.startswith("&&"):
+            continue
+        cond = cond.strip()
+        if kind == "while":
+            if not cond.startswith("! "):
+                continue                # waits while the line IS there
+            cond = cond[2:].strip()
+        elif cond.startswith("!"):
+            continue
+        if not _SECONDS.match(secs):
+            continue
+        got = _grep(cond, _names_before(cmd, m.start()))
+        if not got:
+            continue
+        argv, files = got
+        if files and all(_TASK_OUTPUT.match(f) and not _UP.search(f) for f in files):
+            return {"files": files, "sleep": float(secs), "grep": argv}
+    return None
+
+
+def cannot_end(files, grace):
+    """Can a loop on these files never stop? `files` is one (tail, age seconds)
+    per file it polls, or None where the file could not be read.
+
+    Only when every file is finished and has stayed so for `grace` - longer than
+    a loop sleeps, so it has had its look. Unknown is never "cannot end": the
+    cost of a wrong yes is a live loop called dead.
+    """
+    if not files or any(f is None for f in files):
+        return False
+    return all(_TASK_END.search(tail or "") and age >= grace for tail, age in files)
 
 
 def row_summary(mine):

@@ -79,6 +79,12 @@ class FakeCollector:
     def brief(self, row):
         return self.brief_value
 
+    killed = None
+
+    def kill_loops(self, row):
+        self.killed = (self.killed or []) + [row.get("sessionId")]
+        return "killed loop 86246"
+
 
 class FakeAdapter:
     def __init__(self, answer="focused s022", hang=False):
@@ -2032,3 +2038,222 @@ class TestTheProcessScreenReview(UiTest):
                     box = app.query_one("#brief")
                     for line in str(box.content).splitlines():
                         self.assertLessEqual(len(line), box.content_size.width)
+
+
+STUCK = row("cccc3333-0000-4000-8000-000000000003", "stuck", status="busy", pid=73787,
+            title="Blabberate", tab_title="✳ Blabberate (claude)",
+            dead_loops=[{"pid": 86246, "tasks": ["bscl8fc6k"]}])
+
+
+class TestKillingAStuckLoop(UiTest):
+    """A loop that can never end is killed from the list: `x` twice, or the
+    [kill loop] part of the row clicked twice. Once only arms it - a kill is
+    not undone - and the row's other clicks still go to the session."""
+
+    def setUp(self):
+        self.collector = FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00"))
+        self.adapter = FakeAdapter()
+
+    def stuck_row(self, app):
+        return [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
+
+    def kill_offset(self, widget):
+        """Where [kill loop] is drawn, in the row's own coordinates."""
+        text = "".join(t for t, _ in widget.spans())
+        line = text.split("\n")[1]
+        # the row's left border and padding come before its text; one column in
+        return (line.index("[kill loop]") + 2 + 1, 1)
+
+    async def test_the_stuck_row_has_its_own_heading(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            text = self.screen_text(app)
+            self.assertIn("STUCK", text)
+            self.assertIn("[kill loop]", text)
+
+    async def test_one_x_only_asks(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            await pilot.pause()
+            self.assertIsNone(self.collector.killed)
+            self.assertIn("86246", app.status)
+
+    async def test_two_x_kill_it(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "x")
+            await pilot.pause(0.2)
+            self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
+
+    async def test_x_on_a_row_with_no_dead_loop_does_nothing(self):      # control
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("x", "x")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+
+    async def test_mid_turn_x_does_nothing(self):                        # control
+        # mid-turn the agent may be about to deal with the loop itself
+        busy = dict(STUCK, attention="busy")
+        collector = FakeCollector(fleet=ui.Fleet([LIVE, busy], True, "12:00:00"))
+        app = self.app(collector=collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "x")
+            await pilot.pause(0.2)
+            self.assertIsNone(collector.killed)
+
+    async def test_moving_away_disarms_it(self):                         # control
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "k", "j", "x")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+
+    async def test_one_click_on_the_kill_only_asks_and_does_not_go(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            w = self.stuck_row(app)
+            await pilot.click(w, offset=self.kill_offset(w))
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+            self.assertEqual(self.adapter.asked, [])
+            self.assertIn("86246", app.status)
+
+    async def test_two_clicks_on_the_kill_kill_it(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            w = self.stuck_row(app)
+            await pilot.click(w, offset=self.kill_offset(w))
+            await pilot.pause()
+            w = self.stuck_row(app)
+            await pilot.click(w, offset=self.kill_offset(w))
+            await pilot.pause(0.2)
+            self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
+            self.assertEqual(self.adapter.asked, [])
+
+    # review round 1: the arm outlived what the screen said
+    async def test_an_arm_expires(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            now = [1000.0]
+            app.clock = lambda: now[0]
+            await pilot.press("j", "x")
+            now[0] += ui.ARM_SECS + 1
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+            self.assertIn("86246", app.status, "it asks again")
+
+    async def test_the_question_goes_when_the_arm_does(self):
+        # review round 2: an expired arm must not leave its question on screen
+        was, ui.ARM_SECS = ui.ARM_SECS, 0.2
+        try:
+            app = self.app(collector=self.collector, adapter=self.adapter)
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press("j", "x")
+                self.assertIn("86246", app.status)
+                await pilot.pause(0.6)
+                self.assertNotIn("86246", app.status)
+        finally:
+            ui.ARM_SECS = was
+
+    async def test_x_on_the_process_screen_does_nothing(self):
+        # that screen is not about the selected row: you cannot see what x hits
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "p", "x", "x")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+            self.assertNotIn("86246", app.status)
+
+    async def test_a_refresh_keeps_the_question_on_screen(self):        # control
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            app.show(ui.Fleet([LIVE, STUCK], True, "12:00:05"))
+            await pilot.pause()
+            self.assertIn("86246", app.status)
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
+
+    async def test_a_refresh_with_other_loops_disarms(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            moved = dict(STUCK, dead_loops=[{"pid": 99999, "tasks": ["b9"]}])
+            app.show(ui.Fleet([LIVE, moved], True, "12:00:05"))
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+
+    async def test_a_click_on_another_row_disarms(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            live = [w for w in app.query(ui.Row) if w.row["sessionId"] == LIVE["sessionId"]][0]
+            await pilot.click(live, offset=(20, 0))
+            await pilot.pause()
+            w = self.stuck_row(app)
+            await pilot.click(w, offset=self.kill_offset(w))
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+
+    async def test_what_the_kill_did_stays_said(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "x")
+            await pilot.pause(0.3)
+            self.assertIn("killed loop 86246", app.status)
+
+    async def test_a_click_on_the_name_still_goes(self):                 # control
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.click(self.stuck_row(app), offset=(20, 0))
+            await pilot.pause(0.2)
+            self.assertEqual(self.adapter.asked, [STUCK["sessionId"]])
+            self.assertIsNone(self.collector.killed)
+
+
+
+class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
+    def kill(self, killed):
+        real = ui.engine.kill_dead_loops
+        asked = []
+
+        def fake(session_pid, pids):
+            asked.append((session_pid, pids))
+            return killed
+        ui.engine.kill_dead_loops = fake
+        try:
+            said = ui.Collector().kill_loops(STUCK)
+        finally:
+            ui.engine.kill_dead_loops = real
+        return asked, said
+
+    def test_the_session_and_its_loops_are_passed(self):
+        asked, said = self.kill([86246])
+        self.assertEqual(asked, [(73787, [86246])])
+        self.assertEqual(said, "killed loop 86246")
+
+    def test_nothing_killed_says_so(self):                               # control
+        _, said = self.kill([])
+        self.assertNotIn("killed loop", said)

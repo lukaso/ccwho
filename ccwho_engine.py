@@ -21,6 +21,7 @@ import datetime
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -39,8 +40,9 @@ RELOAD_FIRST = ("ccwho_procs", "ccwho_brief", "ccwho_index")    # procs first:
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
 # busy one is fine. `running` is not busy but has background work in flight - it is
-# waiting on a machine, not on you, so it sorts last.
-_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "review": 2, "stopped": 3,
+# waiting on a machine, not on you, so it sorts last. `stuck` needs you too - to
+# kill a loop that cannot end - but less than anything that finished or asked.
+_RANK = {"blocked": 0, "waiting": 0, "asks": 1, "review": 2, "stuck": 2.5, "stopped": 3,
          "busy": 4, "ready": 5, "shell": 6, "idle": 7, "running": 8}
 
 # Descendants that are session infrastructure rather than work. An idle session
@@ -398,6 +400,138 @@ def waiting_kind(lines):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     pending.discard(b.get("tool_use_id"))
     return "blocked" if pending else "ready"
+
+
+# How long a finished task output must stay unchanged before a loop on it counts
+# as dead: longer than any loop sleeps between looks (the real ones slept 5s).
+DEAD_LOOP_GRACE = 120
+_TASK_TAIL = 400
+
+
+def task_file(path, now=None):
+    """(the last bytes, seconds since it changed) of a task output, or None.
+
+    A regular file only: a subagent's task output is a symlink to its whole
+    transcript. Checked on the file that was opened, not on the path - a FIFO
+    swapped in between a check and the open would hang the scan.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        os.lseek(fd, max(0, st.st_size - _TASK_TAIL), os.SEEK_SET)
+        tail = os.read(fd, _TASK_TAIL).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return tail, (time.time() if now is None else now) - st.st_mtime
+
+
+# what a wait loop runs while it waits: between looks nothing, or its sleep, and
+# during one its grep. Anything else under it means it is past the loop.
+_WAITING = re.compile(r"^(?:\S*/)?(?:sleep|grep)(?:\s|\Z)")
+
+
+# One grep, nothing from ccwho's own environment (GREP_OPTIONS, a gnubin PATH):
+# the same question gets the same answer on every scan. Asked in both locales a
+# loop's shell may have run in - `.` is one byte in C and one character in UTF-8
+_GREP_LOCALES = ("C", "en_US.UTF-8")
+_GREP_KEEP = 256
+
+
+def grep_matches(argv, files, timeout=5, run=None):
+    """Ask a loop's own grep again: True if its line is there, False if not,
+    None when grep could not say. `argv` ends in `-e PATTERN`, so neither the
+    pattern nor a file can be read as an option."""
+    said = set()
+    for locale in _GREP_LOCALES:
+        try:
+            done = (run or subprocess.run)(
+                ["/usr/bin/grep", *argv, "--", *files], capture_output=True,
+                timeout=timeout, env={"LC_ALL": locale, "PATH": "/usr/bin:/bin"})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        said.add({0: True, 1: False}.get(done.returncode))
+    # found in either is found: the loop may have seen it that way
+    return None if None in said else True in said
+
+
+def find_dead_loops(pid, ptable, read=task_file, grace=DEAD_LOOP_GRACE,
+                    matches=None, cache=None):
+    """A session's wait loops that cannot end: [{"pid", "tasks"}].
+
+    Walked down the session's own process tree, not taken from procs.attribute:
+    a Bash tool shell is the claude's own child and carries no session mark
+    (measured 2026-09-24), so that list never has it. `ptable` is pid -> (ppid,
+    start, command); `tasks` are the ids of the task outputs the loop polls.
+    """
+    kids = {}
+    for cpid, (ppid, _start, cmd) in (ptable or {}).items():
+        kids.setdefault(ppid, []).append((cpid, cmd))
+    ask = matches or grep_matches
+    # a finished file does not change, so neither does grep's answer: asked
+    # once, not on every scan (a slow pattern or a big file costs each time)
+    kept = {} if cache is None else cache.setdefault("_greps", {})
+    if len(kept) > _GREP_KEEP:
+        kept.clear()
+    found, stack, seen = [], [pid], {pid}
+    while stack:
+        parent = stack.pop()
+        parent_cmd = (ptable or {}).get(parent, (0, "", None))[2]
+        for cpid, cmd in sorted(kids.get(parent, [])):
+            if cpid in seen:
+                continue
+            seen.add(cpid)
+            stack.append(cpid)
+            if cmd == parent_cmd:
+                continue                # a fork of the loop is the same loop
+            loop = procs.wait_loop(cmd)
+            if not loop or not all(_WAITING.match(c) for _, c in kids.get(cpid, [])
+                                   if c != cmd):
+                continue
+            # it has had its look: the file ended longer ago than it sleeps
+            wait = max(grace, loop["sleep"] + 60)
+            facts = [read(x) for x in loop["files"]]
+            if not procs.cannot_end(facts, wait):
+                continue
+            # and its line is not there: a loop whose line IS there has ended,
+            # and its shell has gone on to whatever came after it
+            key = (tuple(loop["grep"]), tuple(loop["files"]), tuple(t for t, _ in facts))
+            answer = kept.get(key)
+            if answer is None:              # never asked, or it could not say
+                answer = kept[key] = ask(loop["grep"], loop["files"])
+            if answer is False:
+                found.append({"pid": cpid, "tasks": [
+                    os.path.basename(x)[:-len(".output")] for x in loop["files"]]})
+    return found
+
+
+def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
+                    matches=None):
+    """SIGTERM each of `pids` that is STILL a dead loop of that session.
+
+    Looked for again, not taken from the last scan: by the time you press the
+    key the loop may have ended and its pid gone to something else. Returns the
+    pids that got the signal.
+    """
+    ptable = {int(pid): (ppid, "", cmd) for pid, ppid, cmd in
+              _ps_rows((ps or ps_snapshot)()) if pid.isdigit()}
+    wanted = set(pids or ())
+    killed = []
+    for d in find_dead_loops(session_pid, ptable, read, matches=matches):
+        if d["pid"] not in wanted:
+            continue
+        try:
+            (kill or os.kill)(d["pid"], signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+        killed.append(d["pid"])
+    return killed
 
 
 def work_descendants(ps_output, pid):
@@ -1429,7 +1563,7 @@ def windowed(tty, titles):
 
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
-              tab_title="", reviewed=None, windowed=None):
+              tab_title="", reviewed=None, windowed=None, dead_loops=()):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -1457,8 +1591,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # The turn is over and a background task keeps the feed on `busy`. The
         # task will wake the session, so an ended turn alone is not news - only
         # a question is. Found on a wait loop that could never end, hiding a
-        # question in BUSY for 26 hours.
-        attention = "asks" if ask else "running"
+        # question in BUSY for 26 hours. A loop that cannot end will never wake
+        # it: then it is stuck, not running.
+        attention = "asks" if ask else ("stuck" if dead_loops else "running")
     elif status == "busy":
         attention = "busy"
     else:
@@ -1494,6 +1629,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "first": first,
         "age": age(session.get("startedAt"), now=None if now is None else int(now * 1000)),
         "orphans": orphan_count,
+        "dead_loops": list(dead_loops),
         "work": work,
         "tty": tty,
         "tab_title": tab_title,
@@ -1697,11 +1833,13 @@ def collect(cache=None, status=None):
                          commands=commands, session_id=sid)
         mine = att["sessions"].get(sid, [])
         summary = procs.row_summary(mine)
+        dead = find_dead_loops(s.get("pid"), ptable, cache=cache)
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), ""),
                               reviewed=reviewed,
-                              windowed=windowed(tty, titles)))
+                              windowed=windowed(tty, titles),
+                              dead_loops=dead))
         rows[-1]["procs"] = summary["procs"]
         # unknown is null, not [] - a script must not read "holds nothing"
         rows[-1]["ports"] = summary["ports"] if ports is not None else None
@@ -1769,7 +1907,7 @@ def reload_all(engine):
 # --------------------------------------------------------------------- display
 
 _C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[33m",
-      "review": "\033[33m",
+      "review": "\033[33m", "stuck": "\033[31;1m",
       "running": "\033[2m", "ready": "\033[33m", "waiting": "\033[33;1m",
       "busy": "\033[36m", "idle": "\033[2m",
       "shell": "\033[35m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
@@ -1787,7 +1925,7 @@ def now_iso(now=None):
 
 
 _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
-          "review": "FINISHED", "ready": "stopped",
+          "review": "FINISHED", "ready": "stopped", "stuck": "STUCK",
           "stopped": "STOPPED", "busy": "busy", "running": "running",
           "ready": "ready", "shell": "shell", "idle": "idle"}
 
@@ -1850,6 +1988,8 @@ def render_brief(b, row=None, color=True):
 # lesser event than one that asked a question - you want to review it either
 # way - it is just less pressing.
 UI_GROUPS = (("NEEDS YOU", ("blocked", "waiting", "asks", "review")),
+             # its own group: a loop to kill is not a question to answer
+             ("STUCK", ("stuck",)),
              ("STOPPED", ("stopped", "ready", "shell", "idle")),
              ("BUSY", ("busy", "running")))
 
@@ -1877,18 +2017,19 @@ def ui_groups(rows):
 # state made three of the four states the same colour over most of the screen:
 # the colour stopped meaning anything and the text got harder to read. The mark
 # carries the state; the words stay plain.
-UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△",
+UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△", "stuck": "◆",
                  "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
                  "busy": "●", "running": "●"}
 UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
-                  "review": "review",
+                  "review": "review", "stuck": "needs",
                   "stopped": "quiet", "ready": "quiet", "shell": "quiet",
                   "idle": "quiet", "busy": "busy", "running": "busy"}
 UI_UNKNOWN_MARK = "·"
 
 # What a part of a row IS, so the screen can decide how to draw it. The engine
 # never names a colour: a terminal's palette is not its business.
-UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad")
+UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action")
+UI_KILL = "[kill loop]"
 
 
 def ui_state_style(row):
@@ -1945,9 +2086,33 @@ def ui_row_cells(row, width=100):
         mark = ""
         body = "(no recap yet) " + (row.get("doing") or "")
     pad = "        "
-    second = [(pad, "pad"), (mark, "age"),
-              (truncate(body, max(8, width - len(pad) - visible_len(mark))), "recap")]
+    loops = row.get("dead_loops") or []
+    # mid-turn the agent may be about to deal with it: said, not offered
+    act = [("  ", "pad"), (UI_KILL, "action")] if loops and row.get(
+        "attention") != "busy" else []
+    if loops:
+        more = f" (+{len(loops) - 1} more)" if len(loops) > 1 else ""
+        mark = (f"loop {loops[0]['pid']} waits on {', '.join(loops[0]['tasks'])}, "
+                f"which has ended{more} · ")
+    room = width - len(pad) - sum(visible_len(t) for t, _ in act)
+    if loops:
+        # what to do about it comes first; the recap only where it can be read
+        mark = truncate(mark, max(8, room))
+        body = body if room - visible_len(mark) >= 20 else ""
+    second = [(pad, "pad"), (mark, "age")] + (
+        [(truncate(body, max(8, room - visible_len(mark))), "recap")] if body else []) + act
     return (_fit(first, width), _fit(second, width))
+
+
+def ui_action_at(row, width, line, col):
+    """What a click at (line, col) of a row's text does on its own, or None - in
+    which case the click does what a click on the row always does."""
+    at = 0
+    for text, role in ui_row_cells(row, width)[line] if line in (0, 1) else ():
+        if role == "action" and at <= col < at + visible_len(text):
+            return "kill"
+        at += visible_len(text)
+    return None
 
 
 def _fit(cells, width):

@@ -767,6 +767,430 @@ class TestBusyWithTheTurnOver(unittest.TestCase):
         self.assertEqual(self._attention(tail), "busy")
 
 
+class TestStuckOnALoopThatCannotEnd(unittest.TestCase):
+    """The case 8cc8093 left in BUSY: the turn ended without a question, and the
+    only thing keeping the feed on `busy` is a wait loop that can never stop.
+    Nothing will wake that session, so it is not running - it is stuck."""
+    SESSION, T, END = (TestBusyWithTheTurnOver.SESSION, TestBusyWithTheTurnOver.T,
+                       TestBusyWithTheTurnOver.END)
+    _said = TestBusyWithTheTurnOver._said
+
+    LOOP = {"pid": 86246, "tasks": ["bscl8fc6k"]}
+
+    def _stuck(self, tail, dead=None):
+        return ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1790267620.0,
+                               work=2, dead_loops=[self.LOOP] if dead is None else dead)
+
+    def test_ended_turn_and_a_dead_loop_is_stuck(self):
+        tail = [self._said("Three things remain stated-but-unclosed.")] + self.END
+        self.assertEqual(self._stuck(tail)["attention"], "stuck")
+
+    def test_no_dead_loop_is_still_running(self):                     # control
+        tail = [self._said("Three things remain stated-but-unclosed.")] + self.END
+        self.assertEqual(self._stuck(tail, dead=[])["attention"], "running")
+
+    def test_a_question_still_asks(self):
+        # a dead loop - or a watcher on it - never hides a question
+        tail = [self._said("Want me to run the full gate?")] + self.END
+        self.assertEqual(self._stuck(tail)["attention"], "asks")
+
+    def test_mid_turn_it_is_busy(self):                                # control
+        self.assertEqual(self._stuck([self._said("Checking.")])["attention"], "busy")
+
+    def test_the_row_says_which(self):
+        tail = [self._said("Want me to run the full gate?")] + self.END
+        self.assertEqual(self._stuck(tail)["dead_loops"], [self.LOOP])
+
+
+class TestStuckOnScreen(unittest.TestCase):
+    """STUCK is its own group, after NEEDS YOU: the session needs you - to kill
+    the loop - but less urgently than a question. Its second line says which
+    loop, and carries the one part of any row that can be clicked on its own."""
+    LOOP = {"pid": 86246, "tasks": ["bscl8fc6k"]}
+
+    def _row(self, attention="stuck", loops=None):
+        return {"sessionId": "e0e2a7c1-c7c4-499c-a72d-27d9c11b3211", "project": "liveapp",
+                "attention": attention, "since": "3h", "title": "Blabberate",
+                "recap": "Goal was moving files into STATE", "recap_age": "3h",
+                "dead_loops": [self.LOOP] if loops is None else loops}
+
+    def test_its_own_group_after_needs_you(self):
+        rows = [self._row("stopped"), self._row(), self._row("asks")]
+        self.assertEqual([g["heading"] for g in ccwho.ui_groups(rows)],
+                         ["NEEDS YOU", "STUCK", "STOPPED"])
+
+    def test_it_sorts_after_a_question_and_before_stopped(self):
+        rank = ccwho._RANK
+        self.assertLess(rank["review"], rank["stuck"])
+        self.assertLess(rank["stuck"], rank["stopped"])
+
+    def test_the_second_line_names_the_loop_and_offers_the_kill(self):
+        _, second = ccwho.ui_row_cells(self._row(), width=100)
+        text = "".join(t for t, _ in second)
+        self.assertIn("loop 86246", text)
+        self.assertIn("bscl8fc6k", text)
+        self.assertEqual([t for t, r in second if r == "action"], ["[kill loop]"])
+
+    def test_the_kill_survives_a_narrow_window(self):
+        _, second = ccwho.ui_row_cells(self._row(), width=40)
+        self.assertEqual([t for t, r in second if r == "action"], ["[kill loop]"])
+
+    def test_no_other_row_has_anything_to_click(self):                   # control
+        for att in ("asks", "busy", "running", "stopped"):
+            with self.subTest(att=att):
+                first, second = ccwho.ui_row_cells(self._row(att, loops=[]), width=100)
+                self.assertNotIn("action", [r for _, r in first + second])
+
+    def test_a_busy_row_with_a_dead_loop_shows_it_but_offers_nothing(self):
+        # mid-turn the agent may be about to deal with it: said, not offered
+        _, second = ccwho.ui_row_cells(self._row("busy"), width=100)
+        self.assertNotIn("action", [r for _, r in second])
+
+    def test_the_click_lands_on_the_kill(self):
+        _, second = ccwho.ui_row_cells(self._row(), width=100)
+        col = 0
+        for text, role in second:
+            if role == "action":
+                break
+            col += len(text)
+        self.assertEqual(ccwho.ui_action_at(self._row(), 100, 1, col), "kill")
+        self.assertEqual(ccwho.ui_action_at(self._row(), 100, 1, col + 10), "kill")
+
+    def test_a_click_anywhere_else_is_no_action(self):                   # control
+        self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 0, 30))
+        self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 1, 3))
+        self.assertIsNone(ccwho.ui_action_at(self._row("asks", loops=[]), 100, 1, 90))
+
+
+class TestKillDeadLoops(unittest.TestCase):
+    """The kill looks again first. Between the scan and the key press a loop can
+    end, and its pid can go to something else: only a pid that is STILL a dead
+    loop of that session gets the signal."""
+    TASKS = "/private/tmp/claude-501/p/s/tasks/"
+    LOOP = "until grep -q 'Test Files' " + TASKS + "bscl8fc6k.output; do sleep 5; done"
+    ENDED = ("x\n[exited with code 0]\n", 600)
+
+    def _kill(self, ps, pids, fact=None):
+        sent = []
+        got = ccwho.kill_dead_loops(73787, pids, ps=lambda: ps,
+                                    read=lambda path: fact or self.ENDED, matches=lambda argv, files: False,
+                                    kill=lambda pid, sig: sent.append((pid, sig)))
+        return got, sent
+
+    def test_it_kills_the_loop(self):
+        got, sent = self._kill(f"73787 1 claude\n86246 73787 {self.LOOP}\n", [86246])
+        self.assertEqual(got, [86246])
+        self.assertEqual(sent, [(86246, ccwho.signal.SIGTERM)])
+
+    def test_a_reused_pid_is_left_alone(self):                           # control
+        got, sent = self._kill("73787 1 claude\n86246 73787 vim notes.md\n", [86246])
+        self.assertEqual((got, sent), ([], []))
+
+    def test_a_loop_that_is_live_again_is_left_alone(self):              # control
+        got, sent = self._kill(f"73787 1 claude\n86246 73787 {self.LOOP}\n", [86246],
+                               fact=("still running\n", 600))
+        self.assertEqual(sent, [])
+
+    def test_only_what_was_asked(self):                                  # control
+        ps = (f"73787 1 claude\n86246 73787 {self.LOOP}\n"
+              f"86247 73787 {self.LOOP}\n")
+        _, sent = self._kill(ps, [86246])
+        self.assertEqual([pid for pid, _ in sent], [86246])
+
+    def test_another_sessions_loop_is_left_alone(self):                  # control
+        got, sent = self._kill(f"73787 1 claude\n86246 555 {self.LOOP}\n", [86246])
+        self.assertEqual(sent, [])
+
+    def test_a_loop_whose_line_came_since_is_left_alone(self):          # control
+        sent = []
+        got = ccwho.kill_dead_loops(73787, [86246],
+                                    ps=lambda: f"73787 1 claude\n86246 73787 {self.LOOP}\n",
+                                    read=lambda path: self.ENDED,
+                                    kill=lambda pid, sig: sent.append(pid),
+                                    matches=lambda argv, files: True)
+        self.assertEqual((got, sent), ([], []))
+
+    def test_a_loop_already_gone_is_not_an_error(self):
+        sent = []
+
+        def kill(pid, sig):
+            raise ProcessLookupError
+        got = ccwho.kill_dead_loops(73787, [86246],
+                                    ps=lambda: f"73787 1 claude\n86246 73787 {self.LOOP}\n",
+                                    read=lambda path: self.ENDED, kill=kill,
+                                    matches=lambda argv, files: False)
+        self.assertEqual(got, [])
+
+
+class TestTaskFile(unittest.TestCase):
+    """The two facts the dead-loop rule needs about a task output: how it ends,
+    and how long ago it last changed. Read from the end, from a regular file
+    only: a subagent's output is a symlink to its whole transcript."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.path = os.path.join(self.dir, "b1.output")
+        with open(self.path, "w") as f:
+            f.write("x" * 5000 + "\n[exited with code 0]\n")
+        os.utime(self.path, (1000, 1000))
+
+    def test_the_end_and_the_age(self):
+        tail, age = ccwho.task_file(self.path, now=1600)
+        self.assertTrue(tail.endswith("[exited with code 0]\n"))
+        self.assertEqual(age, 600)
+
+    def test_only_the_end_is_read(self):
+        tail, _ = ccwho.task_file(self.path, now=1600)
+        self.assertLess(len(tail), 1000)
+
+    def test_a_symlink_is_not_followed(self):
+        link = os.path.join(self.dir, "a1.output")
+        os.symlink(self.path, link)
+        self.assertIsNone(ccwho.task_file(link, now=1600))
+
+    def test_a_missing_file_is_unknown(self):
+        self.assertIsNone(ccwho.task_file(self.path + ".gone", now=1600))
+
+    def test_a_fifo_is_not_waited_on(self):
+        # swapped in after a check, opening one for reading would hang the scan
+        import threading
+        fifo = os.path.join(self.dir, "b2.output")
+        os.mkfifo(fifo)
+        # the race: any check by path saw the regular file that was there before
+        real_lstat, regular = os.lstat, os.lstat(self.path)
+        os.lstat = lambda p, *a, **k: regular if p == fifo else real_lstat(p, *a, **k)
+        got = []
+        t = threading.Thread(target=lambda: got.append(ccwho.task_file(fifo, now=1600)),
+                             daemon=True)
+        try:
+            t.start()
+            t.join(2)
+        finally:
+            os.lstat = real_lstat
+        blocked = t.is_alive()
+        if blocked:                     # unblock the reader so the suite can end
+            with open(fifo, "w"):
+                pass
+        self.assertFalse(blocked, "task_file blocked on a FIFO")
+        self.assertEqual(got, [None])
+
+    def test_a_fifo_with_something_in_it_is_not_read(self):
+        fifo = os.path.join(self.dir, "b3.output")
+        os.mkfifo(fifo)
+        keep = os.open(fifo, os.O_RDWR)          # a writer, so there is data
+        self.addCleanup(os.close, keep)
+        os.write(keep, b"[exited with code 0]\n")
+        self.assertIsNone(ccwho.task_file(fifo, now=1600))
+
+
+class TestGrepMatches(unittest.TestCase):
+    """Asking the loop's grep again, on the file it polls: True, False, or None
+    when grep could not answer."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.path = os.path.join(self.dir, "b1.output")
+        with open(self.path, "w") as f:
+            f.write(" Test Files  3 passed (3)\n[exited with code 0]\n")
+
+    def test_a_line_that_is_there(self):
+        self.assertIs(ccwho.grep_matches(["-q", "-E", "-e", "^ *(Test Files|Tests) "],
+                                         [self.path]), True)
+
+    def test_a_line_that_is_not(self):                                 # control
+        self.assertIs(ccwho.grep_matches(["-q", "-e", "never printed"], [self.path]), False)
+
+    def test_a_pattern_that_looks_like_an_option_stays_a_pattern(self):
+        self.assertIs(ccwho.grep_matches(["-q", "-e", "--version"], [self.path]), False)
+
+    def test_a_file_that_is_not_there_is_unknown(self):
+        self.assertIsNone(ccwho.grep_matches(["-q", "-e", "x"], [self.path + ".gone"]))
+
+    def test_a_match_in_either_locale_is_a_match(self):
+        # review round 4: the loop's shell ran in UTF-8, where "." is one "·";
+        # in the C locale it is one byte of two, and the line is not found
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("Tests·passed\n[exited with code 0]\n")
+        self.assertIs(ccwho.grep_matches(["-q", "-e", "^Tests.passed$"], [self.path]), True)
+
+    def test_no_match_in_both_is_no_match(self):                         # control
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("Tests·failed\n[exited with code 0]\n")
+        self.assertIs(ccwho.grep_matches(["-q", "-e", "^Tests.passed$"], [self.path]), False)
+
+    def test_one_locale_that_cannot_answer_is_unknown(self):
+        answers = iter([1, 2])
+        run = lambda argv, **kw: subprocess.CompletedProcess(argv, next(answers))
+        self.assertIsNone(ccwho.grep_matches(["-q", "-e", "x"], [self.path], run=run))
+
+    def test_the_same_grep_every_time(self):
+        # review round 3: not whatever grep, locale or PATH ccwho was started with
+        seen = {}
+
+        def run(argv, **kw):
+            seen.update(argv=argv, env=kw.get("env"))
+            return subprocess.CompletedProcess(argv, 1)
+        ccwho.grep_matches(["-q", "-e", "x"], [self.path], run=run)
+        self.assertEqual(seen["argv"][0], "/usr/bin/grep")
+        self.assertIn(seen["env"]["LC_ALL"], ("C", "en_US.UTF-8"))
+        self.assertNotIn("GREP_OPTIONS", seen["env"])
+
+    def test_a_file_that_looks_like_an_option_is_a_file(self):
+        # without `--`, "-v" would turn "never printed" into "any other line"
+        self.assertIsNone(ccwho.grep_matches(["-q", "-e", "never printed"],
+                                             ["-v", self.path]))
+
+
+class TestFindDeadLoops(unittest.TestCase):
+    """A session's wait loops that cannot end. Found by walking the session's own
+    process tree: a Bash tool shell carries no session mark (measured), so the
+    list procs.attribute builds never has it."""
+    TASKS = "/private/tmp/claude-501/p/s/tasks/"
+    LOOP = ("until grep -q 'Test Files' " + TASKS + "bf6yb2pu5.output; "
+            "do sleep 5; done")
+    ENDED = ("partial\n[exited with code 0]\n", 600)
+
+    def _find(self, cmd, fact, ppid=55625, session=55625):
+        ptable = {55625: (1, "", "claude"), 27737: (ppid, "", cmd),
+                  42386: (27737, "", "sleep 5")}
+        seen = []
+
+        def read(path):
+            seen.append(path)
+            return fact
+        return ccwho.find_dead_loops(session, ptable, read, matches=lambda argv, files: False), seen
+
+    def test_a_loop_on_a_finished_task_is_found(self):
+        found, seen = self._find(self.LOOP, self.ENDED)
+        self.assertEqual(found, [{"pid": 27737, "tasks": ["bf6yb2pu5"]}])
+        self.assertEqual(seen, [self.TASKS + "bf6yb2pu5.output"])
+
+    def test_deeper_in_the_tree_too(self):
+        ptable = {55625: (1, "", "claude"), 60: (55625, "", "bash"),
+                  27737: (60, "", self.LOOP)}
+        self.assertEqual([d["pid"] for d in ccwho.find_dead_loops(
+            55625, ptable, lambda path: self.ENDED, matches=lambda argv, files: False)], [27737])
+
+    def test_another_sessions_loop_is_not_this_ones(self):             # control
+        found, seen = self._find(self.LOOP, self.ENDED, ppid=999)
+        self.assertEqual(found, [])
+        self.assertEqual(seen, [])
+
+    def test_a_loop_on_a_live_task_is_not(self):                      # control
+        found, _ = self._find(self.LOOP, ("running\n", 600))
+        self.assertEqual(found, [])
+
+    def test_an_unreadable_file_is_not(self):                         # control
+        found, _ = self._find(self.LOOP, None)
+        self.assertEqual(found, [])
+
+    def test_anything_that_is_not_a_wait_loop_is_never_read(self):    # control
+        found, seen = self._find("vitest run", self.ENDED)
+        self.assertEqual((found, seen), ([], []))
+
+    def test_no_session_pid_finds_nothing(self):
+        self.assertEqual(self._find(self.LOOP, self.ENDED, session=None)[0], [])
+
+    def _tree(self, *kids, loop=None, age=600, matches=lambda argv, files: False):
+        ptable = {55625: (1, "", "claude"), 27737: (55625, "", loop or self.LOOP)}
+        for i, (ppid, cmd) in enumerate(kids):
+            ptable[90000 + i] = (ppid, "", cmd)
+        fact = ("partial\n[exited with code 0]\n", age)
+        return [d["pid"] for d in ccwho.find_dead_loops(55625, ptable, lambda p: fact,
+                                                        matches=matches)]
+
+    def test_between_looks_it_is_found(self):                         # control
+        self.assertEqual(self._tree(), [27737])
+
+    def test_mid_look_it_is_found(self):                              # control
+        self.assertEqual(self._tree((27737, "grep -q Test Files x")), [27737])
+
+    def test_a_loop_with_other_work_under_it_is_not(self):
+        # the loop ended and the shell went on to the rest of its command
+        self.assertEqual(self._tree((27737, "npm run e2e")), [])
+
+    def test_a_forked_copy_is_the_same_loop(self):
+        # zsh forks for a pipeline stage or $(...), with the same argv
+        self.assertEqual(self._tree((27737, self.LOOP), (90000, "sleep 5")), [27737])
+
+    def test_a_long_sleep_gets_its_look_first(self):
+        loop = "until grep -q DONE " + self.TASKS + "b1.output; do sleep 600; done"
+        self.assertEqual(self._tree(loop=loop, age=150), [])
+
+    def test_a_long_sleep_long_after_is_found(self):                  # control
+        loop = "until grep -q DONE " + self.TASKS + "b1.output; do sleep 600; done"
+        self.assertEqual(self._tree(loop=loop, age=700), [27737])
+
+    # review round 2: a loop that ended, in a shell that went on to more
+    AFTER = ("until grep -q ok /private/tmp/claude-501/p/s/tasks/b1.output; "
+             "do sleep 5; done; sleep 3600; ./deploy")
+
+    def test_a_loop_whose_line_is_there_has_ended(self):
+        self.assertEqual(self._tree((27737, "sleep 3600"), loop=self.AFTER,
+                                    matches=lambda argv, files: True), [])
+
+    def test_a_loop_whose_line_is_not_there_cannot_end(self):         # control
+        self.assertEqual(self._tree((27737, "sleep 5"), loop=self.AFTER), [27737])
+
+    def test_a_grep_that_could_not_answer_is_unknown(self):
+        self.assertEqual(self._tree(matches=lambda argv, files: None), [])
+
+    def test_the_question_is_the_loops_own(self):
+        asked = []
+        self._tree(loop=self.AFTER,
+                   matches=lambda argv, files: asked.append((argv, files)) or False)
+        self.assertEqual(asked, [(["-q", "-e", "ok"],
+                                  ["/private/tmp/claude-501/p/s/tasks/b1.output"])])
+
+    def test_a_finished_file_is_asked_once(self):
+        # review round 3: a finished file does not change, nor does its answer
+        asked, cache = [], {}
+        ptable = {55625: (1, "", "claude"), 27737: (55625, "", self.LOOP)}
+        fact = ("partial\n[exited with code 0]\n", 600)
+        for _ in range(3):
+            ccwho.find_dead_loops(55625, ptable, lambda p: fact, cache=cache,
+                                  matches=lambda a, f: asked.append(1) or False)
+        self.assertEqual(len(asked), 1)
+
+    def test_a_file_that_changed_is_asked_again(self):                # control
+        asked, cache = [], {}
+        ptable = {55625: (1, "", "claude"), 27737: (55625, "", self.LOOP)}
+        for tail in ("a\n[exited with code 0]\n", "b\n[exited with code 0]\n"):
+            ccwho.find_dead_loops(55625, ptable, lambda p: (tail, 600), cache=cache,
+                                  matches=lambda a, f: asked.append(1) or False)
+        self.assertEqual(len(asked), 2)
+
+    def test_the_answer_kept_is_the_answer(self):
+        cache = {}
+        ptable = {55625: (1, "", "claude"), 27737: (55625, "", self.LOOP)}
+        fact = ("partial\n[exited with code 0]\n", 600)
+        first = ccwho.find_dead_loops(55625, ptable, lambda p: fact, cache=cache,
+                                      matches=lambda a, f: True)
+        again = ccwho.find_dead_loops(55625, ptable, lambda p: fact, cache=cache,
+                                      matches=lambda a, f: False)
+        self.assertEqual((first, again), ([], []))
+
+    def test_grep_that_could_not_answer_is_asked_again(self):
+        # review round 4: a fork that failed once must not hide the loop for good
+        answers, cache = iter([None, False]), {}
+        ptable = {55625: (1, "", "claude"), 27737: (55625, "", self.LOOP)}
+        fact = ("partial\n[exited with code 0]\n", 600)
+        got = [ccwho.find_dead_loops(55625, ptable, lambda p: fact, cache=cache,
+                                     matches=lambda a, f: next(answers))
+               for _ in range(2)]
+        self.assertEqual([[d["pid"] for d in g] for g in got], [[], [27737]])
+
+    def test_a_short_sleep_needs_only_the_grace(self):                # control
+        self.assertEqual(self._tree(age=150), [27737])
+
+    def test_a_parent_cycle_terminates(self):
+        ptable = {1: (3, "", "claude"), 2: (1, "", self.LOOP), 3: (2, "", "sleep 5")}
+        self.assertEqual([d["pid"] for d in ccwho.find_dead_loops(
+            1, ptable, lambda path: self.ENDED, matches=lambda argv, files: False)], [2])
+
+
 class TestTurnEnded(unittest.TestCase):
     def test_turn_duration_after_the_last_message_ends_it(self):
         self.assertTrue(ccwho.turn_ended([
@@ -3378,6 +3802,42 @@ class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
         self.assertFalse(fleet["ports_ok"])
         # adversarial #5: null, not [] - a script must not read "holds nothing"
         self.assertIsNone(rows[0]["ports"])
+
+    def _loop_on(self, text):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        path = os.path.join(d, "tasks", "bf6yb2pu5.output")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            f.write(text)
+        os.utime(path, (1, 1))
+        ccwho.ps_snapshot = lambda: (
+            "  10     1 claude\n"
+            f"  50    10 /bin/zsh -c until grep -q 'Test Files' {path}; do sleep 5; done\n")
+        ccwho.ps_table = lambda: {10: (START, "claude"), 50: (START, "zsh")}
+        # as measured 2026-09-24: a Bash tool shell is the claude's own child and
+        # carries NO session mark, so procs.attribute never lists it
+        ccwho.read_procargs = lambda pid: {}
+        rows, _ = self.collect()
+        return len(rows[0]["dead_loops"])
+
+    def test_a_loop_on_a_finished_task_reaches_the_row(self):
+        self.assertEqual(self._loop_on("partial\n[exited with code 0]\n"), 1)
+
+    def test_a_loop_on_a_running_task_does_not(self):                 # control
+        self.assertEqual(self._loop_on(" ✓ test/a.test.ts (3)\n"), 0)
+
+    def test_the_scan_keeps_what_grep_said(self):
+        real, calls = ccwho.grep_matches, []
+        ccwho.grep_matches = lambda argv, files: calls.append(1) or False
+        try:
+            cache = {}
+            self.collect = lambda: ccwho.collect(cache=cache)
+            self._loop_on("partial\n[exited with code 0]\n")
+            ccwho.collect(cache=cache)
+        finally:
+            ccwho.grep_matches = real
+        self.assertEqual(len(calls), 1)
 
     # the regression contract for the old "detached" counts (eng D8)
     def test_d8_1_a_cmdline_named_orphan_still_counts(self):

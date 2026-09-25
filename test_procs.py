@@ -916,3 +916,229 @@ class TestSafeCommand(unittest.TestCase):
 
     def test_nothing_is_nothing(self):
         self.assertEqual(procs.safe_command(""), "")
+
+
+# The two real wait loops of 2026-09-24, as `ps -o command` showed them. Each
+# polled a task output for a vitest summary that its test run never printed.
+_WRAP = ("/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1-a.sh "
+         "2>/dev/null || true && eval '{}' < /dev/null && pwd -P >| /tmp/claude-c8ee-cwd")
+TASKS = "/private/tmp/claude-501/-Users-x-projects-liveapp/c9080000/tasks/"
+LOOP_VAR = _WRAP.format(
+    "F=" + TASKS + "bf6yb2pu5.output; until grep -qE \"^      Tests |Test Files \" \"$F\" "
+    "2>/dev/null; do sleep 5; done; grep -E \"^      Tests \" \"$F\" | head -8")
+LOOP_ARG = _WRAP.format(
+    "until grep -qE '\"'\"'^ *(Test Files|Tests) '\"'\"' " + TASKS + "bscl8fc6k.output "
+    "2>/dev/null; do sleep 5; done; echo READY")
+
+
+class TestWaitLoop(unittest.TestCase):
+    """Only the one shape that can be judged: a loop whose condition is a single
+    grep on task outputs and whose body is only a sleep. Anything else - another
+    exit test, a counter, work after it - is unknown, and unknown is never dead:
+    the flagged pid is the Bash tool's shell, and it runs the WHOLE command."""
+
+    def test_the_real_loop_with_its_file_in_a_variable(self):
+        self.assertEqual(procs.wait_loop(LOOP_VAR),
+                         {"files": [TASKS + "bf6yb2pu5.output"], "sleep": 5.0,
+                          "grep": ["-q", "-E", "-e", "^      Tests |Test Files "]})
+
+    def test_the_real_loop_with_its_file_as_an_argument(self):
+        self.assertEqual(procs.wait_loop(LOOP_ARG),
+                         {"files": [TASKS + "bscl8fc6k.output"], "sleep": 5.0,
+                          # the pattern as grep got it, out of the eval's quoting:
+                          # ccwho asks grep again, and a wrong pattern never matches
+                          "grep": ["-q", "-E", "-e", "^ *(Test Files|Tests) "]})
+
+    def test_while_not_grep_is_the_same_loop(self):
+        cmd = "while ! grep -q done " + TASKS + "b1.output; do sleep 2; done"
+        self.assertEqual(procs.wait_loop(cmd), {"files": [TASKS + "b1.output"], "sleep": 2.0,
+                                                "grep": ["-q", "-e", "done"]})
+
+    def test_the_sleep_is_measured(self):
+        cmd = "until grep -q DONE " + TASKS + "b1.output; do sleep 600; done"
+        self.assertEqual(procs.wait_loop(cmd)["sleep"], 600.0)
+
+    # the review's cases: each was called dead, and one would have killed e2e
+    def test_a_loop_on_something_else_after_reading_a_task_file(self):
+        cmd = ("tail -3 " + TASKS + "abc.output; while ! curl -s localhost:3000; "
+               "do sleep 1; done; npm run e2e")
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_read_loop_and_a_long_sleep(self):
+        cmd = ("grep FAIL " + TASKS + "abc.output; while read l; do echo $l; done "
+               "< list; sleep 900")
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_bounded_loop_ends_by_itself(self):
+        cmd = ("until grep -q ok " + TASKS + "abc.output || [ $n -ge 60 ]; "
+               "do sleep 5; n=$((n+1)); done")
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_body_that_does_more_than_sleep(self):
+        cmd = "until grep -q ok " + TASKS + "b1.output; do sleep 5; make; done"
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_condition_on_a_file_that_is_not_a_task_output(self):
+        cmd = ("until grep -q ok " + TASKS + "b1.output /tmp/other.log; "
+               "do sleep 5; done")
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_two_greps_are_not_judged(self):
+        cmd = ("until grep -q x " + TASKS + "b1.output && grep -q y " + TASKS
+               + "b2.output; do sleep 5; done")
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_while_grep_waits_for_the_opposite(self):
+        # loops while the line IS there: whether it can end depends on content
+        cmd = "while grep -q running " + TASKS + "b1.output; do sleep 5; done"
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_sleep_that_is_not_plain_seconds_is_unknown(self):
+        for body in ("sleep 5m", "sleep $X"):
+            with self.subTest(body=body):
+                cmd = "until grep -q x " + TASKS + "b1.output; do " + body + "; done"
+                self.assertIsNone(procs.wait_loop(cmd))
+
+    # review round 2
+    def test_only_options_that_keep_the_question_plain(self):
+        # -v, -L, -c, -z, -r ask something else: the condition could be true
+        for opts in ("-vq", "-q -L", "-qc", "-qz", "-qr", "-q -m 1"):
+            with self.subTest(opts=opts):
+                cmd = "until grep " + opts + " ok " + TASKS + "b1.output; do sleep 5; done"
+                self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_the_options_that_do_are_kept(self):                       # control
+        cmd = "until grep -qiF -s ok " + TASKS + "b1.output; do sleep 5; done"
+        self.assertEqual(procs.wait_loop(cmd)["grep"], ["-q", "-i", "-F", "-s", "-e", "ok"])
+
+    def test_the_assignment_before_the_loop_is_the_one(self):
+        cmd = ("F=" + TASKS + "abc.output; until grep -q ok $F; do sleep 5; done; "
+               "F=/x/tasks/b.output")
+        self.assertEqual(procs.wait_loop(cmd)["files"], [TASKS + "abc.output"])
+
+    def test_two_assignments_before_the_loop_are_unknown(self):
+        cmd = ("F=" + TASKS + "a.output; F=" + TASKS + "b.output; "
+               "until grep -q ok $F; do sleep 5; done")
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_loop_sent_to_the_background_is_unknown(self):
+        # the shell that runs it is not the loop: killing it misses the loop
+        cmd = "until grep -q ok " + TASKS + "b1.output; do sleep 5; done & wait; echo hi"
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_and_then_is_not_the_background(self):                     # control
+        cmd = "until grep -q ok " + TASKS + "b1.output; do sleep 5; done && echo hi"
+        self.assertIsNotNone(procs.wait_loop(cmd))
+
+    # review round 3: what the shell expands, ccwho cannot ask again
+    def test_a_pattern_the_shell_expands_is_unknown(self):
+        for pat in ('"$X"', "$X", "$'ok\\x20line'", '"$(cat p)"', "`cat p`", '"${X}"',
+                    '"`cat p`"'):
+            with self.subTest(pat=pat):
+                cmd = "until grep -q " + pat + " " + TASKS + "b1.output; do sleep 5; done"
+                self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_dollar_in_single_quotes_is_a_dollar(self):              # control
+        cmd = "until grep -q 'Done$' " + TASKS + "b1.output; do sleep 5; done"
+        self.assertEqual(procs.wait_loop(cmd)["grep"], ["-q", "-e", "Done$"])
+
+    def test_a_variable_set_to_a_task_file_is_still_the_file(self):    # control
+        cmd = ("F=" + TASKS + "b1.output; until grep -q ok \"${F}\"; do sleep 5; done")
+        self.assertEqual(procs.wait_loop(cmd)["files"], [TASKS + "b1.output"])
+
+    def test_an_escape_only_some_greps_know_is_unknown(self):
+        for pat in (r"'\d+ passed'", r"'a\sb'", r"'\bword'", r"'\w+'", r"'a\|b'", r"'a\+'"):
+            with self.subTest(pat=pat):
+                cmd = "until grep -qE " + pat + " " + TASKS + "b1.output; do sleep 5; done"
+                self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_a_posix_escape_is_fine(self):                              # control
+        cmd = r"until grep -q 'v1\.0 \(3\)' " + TASKS + "b1.output; do sleep 5; done"
+        self.assertEqual(procs.wait_loop(cmd)["grep"], ["-q", "-e", r"v1\.0 \(3\)"])
+
+    def test_ignoring_case_beyond_ascii_is_unknown(self):
+        cmd = "until grep -qi 'Ünïcode' " + TASKS + "b1.output; do sleep 5; done"
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_ignoring_case_in_ascii_is_fine(self):                      # control
+        cmd = "until grep -qi 'done' " + TASKS + "b1.output; do sleep 5; done"
+        self.assertIsNotNone(procs.wait_loop(cmd))
+
+    # review round 4: an assignment is only one the shell would make as written
+    def test_an_assigned_path_the_shell_would_expand_is_unknown(self):
+        for val in ("/a/`id`/tasks/b.output", "/a/$(id)/tasks/b.output", "/a/$D/tasks/b.output"):
+            with self.subTest(val=val):
+                cmd = "F=" + val + "; until grep -q ok $F; do sleep 5; done"
+                self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_text_that_only_looks_like_an_assignment_is_not_one(self):
+        for pre in ("echo F=" + TASKS + "b.output; ", "echo 'F=" + TASKS + "b.output'; "):
+            with self.subTest(pre=pre):
+                self.assertIsNone(procs.wait_loop(
+                    pre + "until grep -q ok $F; do sleep 5; done"))
+
+    def test_an_exported_assignment_is_one(self):                        # control
+        cmd = "export F=" + TASKS + "b1.output && until grep -q ok $F; do sleep 5; done"
+        self.assertEqual(procs.wait_loop(cmd)["files"], [TASKS + "b1.output"])
+
+    def test_a_pattern_read_from_a_file_is_unknown(self):
+        cmd = "until grep -qf pats " + TASKS + "b1.output; do sleep 5; done"
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_reading_a_task_file_once_is_not_a_loop(self):             # control
+        self.assertIsNone(procs.wait_loop("tail -5 " + TASKS + "b1.output"))
+
+    def test_a_relative_path_is_not_taken(self):
+        # it would be read against ccwho's own directory, not the loop's
+        self.assertIsNone(procs.wait_loop("until grep -q x tasks/b1.output; do sleep 5; done"))
+
+    def test_a_path_that_climbs_out_is_not_taken(self):
+        cmd = "until grep -q x /tmp/s/tasks/../../etc/tasks/b1.output; do sleep 5; done"
+        self.assertIsNone(procs.wait_loop(cmd))
+
+    def test_nothing_is_nothing(self):
+        self.assertIsNone(procs.wait_loop(""))
+        self.assertIsNone(procs.wait_loop(None))
+
+
+class TestCannotEnd(unittest.TestCase):
+    """A loop cannot end when every file it polls is finished - Claude Code wrote
+    its last line - and has stayed that way longer than any loop sleeps. Unknown
+    is never "cannot end": a file not read is a loop that may be fine."""
+    ENDED = "   × §1 the real repo\n\n[exited with code 0]\n"
+
+    def test_a_finished_file_left_alone_cannot_end(self):
+        self.assertTrue(procs.cannot_end([(self.ENDED, 600)], grace=120))
+
+    def test_a_killed_task_is_finished_too(self):
+        self.assertTrue(procs.cannot_end([("partial\n[killed]\n", 600)], grace=120))
+
+    def test_any_exit_code(self):
+        self.assertTrue(procs.cannot_end([("x\n[exited with code 137]", 600)], grace=120))
+
+    def test_a_file_still_being_written_can(self):                    # control
+        self.assertFalse(procs.cannot_end([(" ✓ test/a.test.ts (3)\n", 600)], grace=120))
+
+    def test_just_finished_gives_the_loop_its_next_look(self):        # control
+        self.assertFalse(procs.cannot_end([(self.ENDED, 30)], grace=120))
+
+    def test_a_marker_quoted_mid_file_is_not_the_end(self):           # control
+        self.assertFalse(procs.cannot_end(
+            [("echo '[exited with code 0]'\nstill going\n", 600)], grace=120))
+
+    def test_a_marker_on_its_own_line_mid_file_is_not_the_end(self):  # control
+        # a running task that prints another task's output
+        self.assertFalse(procs.cannot_end(
+            [("[exited with code 0]\nstill going\n", 600)], grace=120))
+
+    def test_one_file_still_open_keeps_it_alive(self):                # control
+        self.assertFalse(procs.cannot_end(
+            [(self.ENDED, 600), ("running\n", 600)], grace=120))
+
+    def test_a_file_it_could_not_read_is_unknown(self):               # control
+        self.assertFalse(procs.cannot_end([None], grace=120))
+        self.assertFalse(procs.cannot_end([(self.ENDED, 600), None], grace=120))
+
+    def test_no_files_is_not_a_dead_loop(self):
+        self.assertFalse(procs.cannot_end([], grace=120))
+

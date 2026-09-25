@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
@@ -48,6 +49,7 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "project": "bold",
               "name": "",              # plain: this is the thing you are reading
               "meta": "dim",
+              "action": "bold underline",   # the one part of a row you click on its own
               "age": "bold",           # inside a dim line, the age stands out
               "recap": "dim",
               "pad": ""}
@@ -84,6 +86,7 @@ PULSE_EVERY = 0.45             # the blink on a row that is being opened
 # fifteen changed four times a minute, and acting on every change is ~4% of a
 # core.
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
+ARM_SECS = 10.0                # a kill asked for once is confirmed within this
 
 
 class Fleet:
@@ -196,6 +199,7 @@ class CcwhoUi(App):
         Binding("j,down", "next", "down", show=False),
         Binding("k,up", "prev", "up", show=False),
         Binding("o", "reopen", "reopen", show=False),
+        Binding("x", "kill_loop", "kill loop", show=False),
         Binding("r", "restart", "restart", show=False),
         Binding("q", "quit", "quit"),
     ]
@@ -215,6 +219,10 @@ class CcwhoUi(App):
         self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
         self.acting = ""        # the session a window is being opened for
+        # (session, its loop pids, when): what the next x or click kills. Only
+        # while the question is on screen: a kill is not undone
+        self.armed = None
+        self.clock = time.monotonic
         self.pulsing = False
 
     # ------------------------------------------------------------------ layout
@@ -272,11 +280,16 @@ class CcwhoUi(App):
         of the world that is already wrong. Each carries a number, and show()
         keeps the highest.
         """
-        self.started += 1
-        mine = self.started
+        # numbered on the UI thread: two workers adding at once can share a
+        # number, and then the older picture can win
+        mine = self.call_from_thread(self.next_seq)
         fleet = self.collector.fleet()
         fleet.seq = mine
         self.call_from_thread(self.show, fleet)
+
+    def next_seq(self):
+        self.started += 1
+        return self.started
 
     def tick(self):
         if not self.collector.due():
@@ -319,7 +332,7 @@ class CcwhoUi(App):
             return                      # a slower collection, finishing late
         self.shown = max(self.shown, seq)
         self.fleet = fleet
-        self.status = ""
+        self.status = self.still_armed() or ""
         self.rebuild()
 
     # ---------------------------------------------------------------- painting
@@ -681,7 +694,67 @@ class CcwhoUi(App):
         self.selected = widget.row.get("sessionId", "")
         self.mark_selected()
         widget.focus()
+        if self.armed and self.armed[0] != self.selected:
+            self.armed = None
+        at = event.get_content_offset(widget)
+        if at is not None and engine.ui_action_at(
+                widget.row, max(40, widget.width - 4), at.y, at.x) == "kill":
+            self.action_kill_loop()
+            return
         self.action_go()
+
+    def action_kill_loop(self):
+        """Kill the selected session's wait loops that cannot end - on the second
+        ask. The first only says what the second will do: a kill is not undone."""
+        if self.detail_open and self.detail_mode == "procs":
+            return      # that screen is not about the selected row
+        row = self.selected_row()
+        loops = (row or {}).get("dead_loops") or []
+        if not loops or row.get("attention") == "busy":
+            return
+        if self.still_armed() and self.armed[0] == row.get("sessionId", ""):
+            self.armed = None
+            self.status = "killing..."
+            self.paint_header(self.fleet.groups(self.filter_text))
+            self.killing(row)
+            return
+        self.armed = (row.get("sessionId", ""), self._pids(row), self.clock())
+        self.status = self.still_armed()
+        self.paint_header(self.fleet.groups(self.filter_text))
+        # the question goes when the arm does: one left on screen would be false
+        self.set_timer(ARM_SECS + 0.05, self.arm_expired)
+
+    def arm_expired(self):
+        if self.status.startswith("x or click again") and not self.still_armed():
+            self.status = ""
+            self.paint_header(self.fleet.groups(self.filter_text))
+
+    @staticmethod
+    def _pids(row):
+        return tuple(d["pid"] for d in (row or {}).get("dead_loops") or [])
+
+    def still_armed(self):
+        """The question, while the kill it asks about still stands; else ""."""
+        if not self.armed:
+            return ""
+        sid, pids, since = self.armed
+        row = next((r for r in self.fleet.rows if r.get("sessionId") == sid), None)
+        if (self.clock() - since > ARM_SECS or row is None or self._pids(row) != pids
+                or row.get("attention") == "busy"):
+            self.armed = None
+            return ""
+        return f"x or click again to kill loop {', '.join(str(p) for p in pids)}"
+
+    @work(thread=True)
+    def killing(self, row):
+        said = self.collector.kill_loops(row)
+        # the list after the kill, and THEN what the kill did: the other order
+        # has the refresh wipe the answer before it can be read
+        mine = self.call_from_thread(self.next_seq)
+        fleet = self.collector.fleet()
+        fleet.seq = mine
+        self.call_from_thread(self.show, fleet)
+        self.call_from_thread(self.said, said)
 
     @on(events.DescendantFocus)
     def followed_focus(self, event):
@@ -701,6 +774,7 @@ class CcwhoUi(App):
         self.move(-1)
 
     def move(self, step):
+        self.armed = None       # a kill is armed for the row you were on, only
         if self.detail_open and self.detail_mode == "procs":
             # the process screen is not about the selected session: these keys
             # scroll it, and never move a selection you cannot see
@@ -985,6 +1059,16 @@ class Collector:
             return runner.reopen_saved()
         except Exception as ex:
             return f"could not reopen: {ex}"
+
+    def kill_loops(self, row):
+        pids = [d["pid"] for d in row.get("dead_loops") or []]
+        try:
+            killed = engine.kill_dead_loops(row.get("pid"), pids)
+        except Exception as ex:
+            return f"could not kill: {ex}"
+        if not killed:
+            return "nothing killed: no loop there is stuck any more"
+        return "killed loop " + ", ".join(str(p) for p in killed)
 
     def brief(self, row):
         head, tail, _ = engine.read_windows(row.get("sessionId", ""), cache=self.cache)

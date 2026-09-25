@@ -296,7 +296,7 @@ def _ancestors(table, pid):
     seen = {pid}
     while True:
         pid = (table or {}).get(pid, (0,))[0]
-        if pid in seen or pid <= 1 or pid not in table:
+        if not isinstance(pid, int) or pid in seen or pid <= 1 or pid not in table:
             return
         seen.add(pid)
         yield pid
@@ -324,6 +324,9 @@ _SHARED_DAEMON = re.compile(
     r"|^(?:\S*/)?git[ -]credential-cache--daemon(?:\s|\Z)"
     r"|^(?:\S*/)?(?:limactl hostagent|colima daemon)(?:\s|\Z)"
     r"|^(?:\S*/)?ollama serve(?:\s|\Z)"
+    r"|^(?:\S*/)?adb\s.*fork-server|org\.gradle\.launcher\.daemon"
+    r"|^(?:\S*/)?(?:gvproxy|vfkit|sccache)(?:\s|\Z)|^(?:\S*/)?qemu-system-\S+"
+    r"|^(?:\S*/)?emacs\s(?:.*\s)?--(?:bg-|fg-)?daemon|^(?:\S*/)?mutagen daemon"
     r"|^ssh: .+ \[mux\]\Z")
 
 
@@ -359,14 +362,14 @@ def _unsure_why(table, pid, cmd, sessions_known, starter=None, over_claude=()):
     if any(_SHARED_DAEMON.search(c) for c in parents):
         return "it runs under a shared user daemon"
     # after /clear the claude runs on under a new session id; its work keeps the old
-    if starter and starter in table and _CLAUDE_IN_COMMAND.search(table[starter][2]):
+    if starter and starter in table and _is_a_claude(table[starter][2]):
         return "the claude that started it is still running"
-    if _CLAUDE_IN_COMMAND.search(cmd):
+    if _is_a_claude(cmd):
         return "it is a claude that ccwho does not list"
     # `caffeinate -i claude`, `script … claude`: killing it kills the claude under it
     if pid in over_claude:
-        return "a claude runs under it"
-    if any(_CLAUDE_IN_COMMAND.search(c) for c in parents):
+        return f"a {over_claude[pid] if isinstance(over_claude, dict) else 'claude'} runs under it"
+    if any(_is_a_claude(c) for c in parents):
         return "it runs under a claude that ccwho does not list"
     # the mark is inherited: in an app or tmux an agent opened, the user works on
     if _MULTIPLEXER.match(cmd) or any(_APP_BUNDLE.search(c) or _MULTIPLEXER.match(c)
@@ -392,15 +395,21 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
     the row's count and `ccwho ps` are the same processes.
     """
     live = {s.get("sessionId"): s.get("pid") for s in sessions or []}
+    by_pid = {p: s for s, p in live.items() if p}
     # a live session is never anybody's work: a claude started from another
     # session's shell carries that session's mark, and listing it as work - or
     # as left behind - would hand a clean-up agent a live session to kill
     session_pids = {pid for pid in live.values() if pid}
     out = {"sessions": {sid: [] for sid in live}, "left_behind": [], "codex": [],
            "unsure": []}
-    # every process with a running claude somewhere under it
-    over_claude = {a for p, (_pp, _st, c) in (table or {}).items()
-                   if _CLAUDE_IN_COMMAND.search(c) for a in _ancestors(table, p)}
+    # every process with a running claude somewhere under it: one that looks
+    # like claude, or a live session whatever its command (a dev build, a
+    # symlink name) - killing the `script` above one hangs it up
+    over_claude = {}
+    for p, (_pp, _st, c) in (table or {}).items():
+        kind = _agent_kind(c) or ("claude" if p in session_pids else None)
+        for a in _ancestors(table, p) if kind else ():
+            over_claude.setdefault(a, kind)
     marks = dict(marks or {})
     for sid, pids in (named or {}).items():
         if sid in live:
@@ -414,16 +423,37 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
             continue
         ppid, start, cmd = table[pid]
         harness, sid = mark[:2]
+        # one rule: a process belongs to the NEAREST agent above it - a listed
+        # live session, or any claude or Codex agent ccwho does not list (the
+        # Agent SDK, `claude -p`, codex). The process tree outranks the mark:
+        # an agent started from a session's shell passes its mark on
+        nearest = None
+        for a in _ancestors(table, pid):
+            if a in by_pid or _is_an_agent(table[a][2]):
+                nearest = a
+                break
+        marked = sid
+        if harness == "claude" and nearest in by_pid:
+            sid = by_pid[nearest]
         starter = mark[2] if len(mark) > 2 else None
         p = {"pid": pid, "ppid": ppid, "start": start, "command": safe_command(cmd),
              "command_full": redact_command(cmd),
              "ports": list((ports or {}).get(pid, [])), "orphan": ppid == 1,
              "helper": is_helper(cmd), "harness": harness,
-             "session": sid}
+             "session": sid, "marked": marked}
         if _APP_BUNDLE.search(cmd):
             # an app an agent opened (measured: Docker Desktop, from Codex) is
             # the user's app now: never work to stop, never litter to clean
             out["unsure"].append(dict(p, why="it is an app"))
+        elif _is_an_agent(cmd):
+            out["unsure"].append(dict(p, why=f"it is a {_agent_kind(cmd)} that ccwho does not list"))
+        elif nearest is not None and nearest not in by_pid:
+            kind = _agent_kind(table[nearest][2])
+            if harness == "codex" and kind == "Codex agent":
+                out["codex"].append(p)      # Codex's own work: the codex line says it
+            else:
+                out["unsure"].append(dict(p, why=f"it runs under a {kind} that ccwho"
+                                                 f" does not list"))
         elif harness == "codex":
             out["codex"].append(p)
         elif sid in live:
@@ -836,3 +866,513 @@ def safe_command(cmd, program=True):
         if not (w == "…" and collapsed and collapsed[-1] == "…"):
             collapsed.append(w)
     return " ".join(collapsed)
+
+
+# ------------------------------------------------------------ what a kill takes
+
+# every way Claude Code runs: the `claude` binary or its versioned copy
+# (_CLAUDE_IN_COMMAND), and the npm package under node or npx
+# An agent is known by the program that runs, never by a path among its
+# arguments: `cd ~/src/codex && npm run dev` is no agent.
+#  - an executable: claude, claude-code, claude.exe, .../claude/versions/N.N.N,
+#    codex, or a file inside the agent's npm package (codex's vendor binary);
+#  - a runtime (node, tsx, deno, bun) running the agent's script: the package's
+#    cli.js, or .../bin/claude or .../bin/codex, anywhere among its arguments
+#    (`node --require x.js .../cli.js` too);
+#  - a package runner (npx, bunx; npm, pnpm, yarn with exec or dlx) running the
+#    agent's package spec, after the flags and the values they take.
+_RUNTIMES = {"node", "tsx", "ts-node", "deno", "bun"}
+_PKG_RUNNERS = {"npx", "bunx", "npm", "pnpm", "yarn"}
+_RUN_VERBS = {"exec", "dlx", "x"}
+_RUNTIME_VALUE_FLAGS = {"-r", "--require", "--import", "--loader", "--experimental-loader",
+                        "--max-old-space-size", "--inspect-port", "--conditions", "-C",
+                        "--env-file", "--config"}
+_VALUE_FLAGS = {"--prefix", "--cwd", "-C", "--filter", "-F", "-w", "--workspace", "--dir",
+                "-p", "--package", "--registry", "--userconfig", "--cache"}
+_CLAUDE_EXEC = re.compile(r"^claude(?:-code|\.exe)?\Z")
+_CLAUDE_VERSION = re.compile(r"/claude/versions/\d+\.\d+\.\d+\Z")
+_CLAUDE_PKG = re.compile(r"@anthropic-ai/(?:claude-code|claude-agent-sdk)(?:@[\w.^~-]+)?(?:/|\Z)")
+_CODEX_PKG = re.compile(r"@openai/codex(?:@[\w.^~-]+)?(?:/|\Z)")
+_AGENT_BIN = re.compile(r"/\.?bin/(claude|codex)\Z")
+
+
+def _program(toks):
+    """The executable, and how many words it takes: `ps` shows a path with
+    spaces unquoted (~/Library/Application Support/...), so an absolute path
+    goes on across words that start with a capital - `git clone https://...`
+    stays git."""
+    head = [toks[0]]
+    if toks[0].startswith("/"):
+        run = []
+        for t in toks[1:8]:
+            if not t[:1].isupper():
+                break
+            run.append(t)
+        # `claude Fix the login bug` is a prompt, not a path with spaces
+        while run and "/" not in " ".join(run):
+            run.pop()
+        while run and "/" not in run[-1] and not run[-1][:1].isupper():
+            run.pop()
+        head += run
+    return " ".join(head), len(head)
+
+
+def _kind_of_package(word):
+    if _CLAUDE_PKG.search(word):
+        return "claude"
+    if _CODEX_PKG.search(word):
+        return "Codex agent"
+    return None
+
+
+def _kind_of_script(word):
+    m = _AGENT_BIN.search(word)
+    if m:
+        return "claude" if m.group(1) == "claude" else "Codex agent"
+    return _kind_of_package(word)
+
+
+def _agent_kind(cmd):
+    """"claude" or "Codex agent" when the program that runs is one - else None."""
+    toks = (cmd or "").split()
+    if not toks:
+        return None
+    prog, used = _program(toks)
+    base = prog.rsplit("/", 1)[-1]
+    if _CLAUDE_EXEC.match(base) or _CLAUDE_VERSION.search(prog):
+        return "claude"
+    if base == "codex":
+        return "Codex agent"
+    if kind := _kind_of_package(prog):
+        return kind
+    rest = toks[used:]
+    if base in _PKG_RUNNERS or (base == "bun" and rest[:1] == ["x"]):
+        words, skip, verb_seen = [], None, base in ("npx", "bunx")
+        for t in rest:
+            if skip:
+                # `-p`/`--package` names the package itself: `npx -p pkg cmd`
+                if skip in ("-p", "--package") and (kind := _kind_of_package(t)):
+                    return kind
+                skip = None
+            elif t in _VALUE_FLAGS:
+                skip = t
+            elif not t.startswith("-"):
+                words.append(t)
+        if not verb_seen:
+            if not words or words[0] not in _RUN_VERBS:
+                return None
+            words = words[1:]
+        return _kind_of_package(words[0]) if words else None
+    if base in _RUNTIMES:
+        skip = False
+        for t in rest:
+            if skip:
+                skip = False
+            elif t in _RUNTIME_VALUE_FLAGS:
+                skip = True
+            elif t.startswith("-") or t in ("run", "x"):
+                continue
+            else:
+                return _kind_of_script(t)       # the script, and only it
+    return None
+
+
+def _is_an_agent(cmd):
+    return _agent_kind(cmd) is not None
+
+
+def _is_a_claude(cmd):
+    return _agent_kind(cmd) == "claude"
+
+
+def _doubt(table, pid, cmd, below=None):
+    """Why a process is not litter by its own shape, whatever its session: a
+    shared daemon, an ssh connection, what a daemon runs, an app, tmux - or
+    None. A LIVE session's work gets no other doubt from attribute().
+
+    `below`: the session's own claude. Only what is between it and the process
+    counts: the terminal app above every claude is no reason to doubt its work."""
+    if _SHARED_DAEMON.search(cmd):
+        return "it is a shared user daemon"
+    if _ssh_transport(cmd):
+        return "it carries an ssh connection"
+    if _APP_BUNDLE.search(cmd):
+        return "it is an app"
+    parents = []
+    for a in _ancestors(table, pid):
+        if a == below:
+            break
+        parents.append(table[a][2])
+    if any(_SHARED_DAEMON.search(c) for c in parents):
+        return "it runs under a shared user daemon"
+    if _MULTIPLEXER.match(cmd) or any(_APP_BUNDLE.search(c) or _MULTIPLEXER.match(c)
+                                      for c in parents):
+        return "it runs in an app or tmux"
+    return None
+
+
+_SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh",
+           "pwsh"}
+_SHELL_VALUE_OPTS = {"--rcfile", "--init-file", "-o", "+o", "-O", "+O"}
+
+
+def _person_shell(cmd):
+    """A shell someone may be typing in: a login shell (`-zsh`), or one run
+    with only options - no script, no `-c`. Only its LEADING options count: a
+    tool shell's eval text (`grep -i`, `sed -i`) is not its options."""
+    toks = (cmd or "").split()
+    if not toks:
+        return False
+    if toks[0].startswith("-") and toks[0][1:].rsplit("/", 1)[-1] in _SHELLS:
+        return True
+    if toks[0].rsplit("/", 1)[-1] not in _SHELLS:
+        return False
+    args, k = toks[1:], 0
+    while k < len(args):
+        a = args[k]
+        if a in _SHELL_VALUE_OPTS:
+            k += 2
+        elif a.startswith("--"):
+            k += 1                      # --norc, --login: `c` in a long option is no -c
+        elif a[:1] in "-+" and len(a) > 1:
+            if "c" in a[1:]:
+                return False            # a command: a tool call
+            if "i" in a[1:]:
+                return True
+            k += 1
+        else:
+            return False                # a script
+    return True
+
+
+# refusal only: an agent's package or binary anywhere in a member's command. A
+# false positive costs a refusal; a miss would cost an agent
+_ANY_AGENT = re.compile(r"@anthropic-ai/(?:claude-code|claude-agent-sdk)|@openai/codex"
+                        r"|/claude-code/|/claude/versions/|/\.?bin/(?:claude|codex)(?:\s|\Z)")
+
+
+def _name(cmd):
+    return (safe_command(cmd).split() or ["?"])[0]
+
+
+def kill_plan(mode, target, world):
+    """What a kill would signal, and why everything else is spared - from one
+    scan, before anything is signalled. Returns {"kill": [proc], "spare": [proc
+    with "why"]} and, for a plan that takes nothing for one reason, "why"; each
+    proc has pid, start, command (short form), ports, and the mark (harness,
+    session) the signaller checks again before it signals. A kill may carry a
+    "note" to say with it.
+
+    mode "pid": `target` is {"pid", "start"} as the caller listed it. Named:
+        it acts, unless the pid is gone, cannot be proved the same process, or
+        is one of the never-killed below; what killing it means is its note.
+    mode "port": `target` is a port. Its agent-started holders; an unmarked or
+        not-sure holder, or a live session's helper, is named, never killed.
+    mode "clean": everything left behind.
+    mode "session": `target` is a live session id; its work, helpers out.
+
+    Never, in any mode: a live session, any claude (the binary, its versions,
+    the npm package), a process with a claude under it, ccwho, or a process
+    above or below ccwho (the shell that runs it). Never in a computed mode or
+    by port: what _doubt() protects - shared daemons, ssh connections, apps,
+    tmux - even in a live session's work. A computed mode takes nothing when
+    ccwho cannot find itself in the scan, or when the pipes were not read.
+
+    `world`: "table" pid -> (ppid, start, command), "att" (attribute's answer
+    for the same scan), "sessions" (live), "own" (ccwho's pid), "ports" pid ->
+    [ports], "pipes" pid -> pids holding the other end of its stdin/stdout,
+    read at kill time (None: not read). A process whose pipe leads to a live
+    process not also being killed is spared (an ssh mux's ProxyCommand is an
+    orphan feeding the master, and no list of names covers every tool); in
+    "pid" mode that is said as a note.
+    """
+    # one clean view of the world: a malformed row or entry is skipped, never raised
+    table = {k: (v[0] if isinstance(v[0], int) else 0, str(v[1] or ""), str(v[2] or ""))
+             for k, v in (world.get("table") or {}).items()
+             if isinstance(k, int) and isinstance(v, (tuple, list)) and len(v) >= 3}
+    raw_att = world.get("att") if isinstance(world.get("att"), dict) else {}
+
+    def entries(items):
+        return [p for p in items or [] if isinstance(p, dict) and isinstance(p.get("pid"), int)]
+    att = {name: entries(raw_att.get(name)) for name in ("left_behind", "codex", "unsure")}
+    att["sessions"] = {sid: entries(mine) for sid, mine in
+                       (raw_att.get("sessions") or {}).items()}
+    ports = {k: v for k, v in (world.get("ports") or {}).items() if isinstance(v, (list, tuple))}
+    own = world.get("own")
+    pipes = world.get("pipes")
+    marks = world.get("marks")
+    sessions = [s for s in world.get("sessions") or [] if isinstance(s, dict)]
+    live = {s.get("pid") for s in sessions if s.get("pid")}
+    live_ids = {s.get("sessionId") for s in sessions if s.get("sessionId")}
+    group = {}
+    for sid, mine in (att.get("sessions") or {}).items():
+        for p in mine:
+            group[p["pid"]] = ("session", sid, p)
+    for name in ("left_behind", "codex", "unsure"):
+        for p in att.get(name) or []:
+            group[p["pid"]] = (name, p.get("session"), p)
+    above_ccwho = set(_ancestors(table, own)) if own in table else set()
+    # an ancestor of any agent, or of a live session whatever its command:
+    # killing it ends or hangs up what runs under it
+    over_agent = {}
+    for q, (_pp, _st, c) in table.items():
+        kind = _agent_kind(c) or ("claude" if q in live else None)
+        for a in _ancestors(table, q) if kind else ():
+            over_agent.setdefault(a, kind)
+    session_pid = {s.get("sessionId"): s.get("pid") for s in sessions}
+
+    def doubt_of(pid):
+        # a live session's work: only what is below its claude counts
+        kind = group.get(pid)
+        below = session_pid.get(kind[1]) if kind and kind[0] == "session" else None
+        return _doubt(table, pid, cmd_of(pid), below)
+    codex_note = "ccwho cannot tell whether the Codex session that started it is still running"
+
+    def nothing(why):
+        return {"kill": [], "spare": [], "why": why}
+
+    def cmd_of(pid):
+        return table.get(pid, (0, "", ""))[2]
+
+    def proc(pid):
+        _ppid, start, cmd = table.get(pid, (0, "", ""))
+        kind = group.get(pid)
+        return {"pid": pid, "ppid": _ppid, "start": start, "command": safe_command(cmd),
+                "ports": list(ports.get(pid) or []),
+                "harness": kind[2].get("harness") if kind else None,
+                "session": kind[1] if kind else None,
+                # the mark in its environment: what the signaller checks again
+                "marked": kind[2].get("marked", kind[1]) if kind else None}
+
+    def spare(pid, why):
+        return dict(proc(pid), why=why)
+
+    def untouchable(pid):
+        if pid in live:
+            return f"{pid} is a live Claude session - ccwho does not kill a session"
+        if own and (pid == own or own in _ancestors(table, pid)):
+            return f"{pid} is part of this ccwho run"
+        if pid in above_ccwho:
+            return f"{pid} runs ccwho - killing it would end this command"
+        kind = _agent_kind(cmd_of(pid))
+        if kind:
+            return f"{pid} looks like a {kind} - ccwho does not kill an agent"
+        if pid in over_agent:
+            return f"a {over_agent[pid]} runs under {pid} - killing it would end it"
+        return None
+
+    def live_peers(pid, kill):
+        # pipes are read at kill time: a peer there is alive, in the scan or
+        # not - and a peer that is not a pid at all is not known to be gone.
+        # Any live peer, an agent included: `claude -p | tee` dies with its tee
+        return [q for q in sorted((pipes or {}).get(pid) or (), key=str)
+                if q != pid and q not in kill]
+
+    def feeds(pid, q):
+        name = _name(cmd_of(q)) if q in table else "a process newer than the scan"
+        q = printable(str(q))[:12]
+        return f"{pid} feeds {q} ({name}), which is still running"
+
+    if own is None or own not in table:
+        # the shell that runs ccwho is only known through ccwho's own process
+        return nothing("ccwho cannot find its own process in the scan - nothing killed")
+    if mode == "pid":
+        target = target if isinstance(target, dict) else {"pid": target}
+        raw = target.get("pid")
+        # a whole number, or text of one: 20.9 is not a pid (True is 1, refused below)
+        text = raw.strip() if isinstance(raw, str) else ""
+        if not (isinstance(raw, int) or (text.isascii() and text.isdigit() and len(text) < 8)):
+            return nothing("no pid given")
+        pid = int(raw)
+        if pid <= 1:
+            return nothing("that is no process ccwho would kill")
+        if pid not in table:
+            return {"kill": [], "spare": [dict(pid=pid, start="", command="", ports=[],
+                                               why=f"{pid} already exited - nothing to do")]}
+        listed, now = _norm(str(target.get("start") or "")), _norm(table[pid][1])
+        if not listed or not now:
+            return {"kill": [], "spare": [spare(pid, f"cannot prove {pid} is the same process"
+                                                     " - not killed; run ccwho ps again")]}
+        if listed != now:
+            return {"kill": [], "spare": [spare(pid, f"{pid} is now a different process"
+                                                     " - not killed; run ccwho ps again")]}
+        why = untouchable(pid)
+        if why:
+            return {"kill": [], "spare": [spare(pid, why)]}
+        notes = []
+        kind = group.get(pid) or ("",)
+        if kind[0] == "codex":
+            notes.append(codex_note)
+        # attribute's own doubt first (a /clear starter, an incomplete list),
+        # then the shape of the process itself
+        doubt = (kind[2].get("why") if kind[0] == "unsure" else None) or doubt_of(pid)
+        if doubt:
+            notes.append(f"not sure: {doubt}")
+        alive = live_peers(pid, {pid})
+        if alive:
+            notes.append(feeds(pid, alive[0]))
+        elif pipes is None:
+            notes.append("its pipes were not read - it may feed a process that is still running")
+        k = proc(pid)
+        if notes:
+            k["note"] = "; ".join(notes)
+        return {"kill": [k], "spare": []}
+
+    if mode == "session":
+        # v1 (after 8 review rounds): which processes a LIVE session owns has too
+        # long a tail of shapes to kill them unnamed
+        return nothing("ccwho does not kill a live session's work yet - name each"
+                       " process: ccwho kill <pid>")
+    if mode not in ("port", "clean"):
+        return nothing(f"unknown kind of kill: {printable(str(mode))[:20]}")
+    if not isinstance(marks, dict):
+        # "read, no mark" (someone else started it) cannot be told from "not
+        # readable" without them
+        return nothing("the environments were not read - nothing killed")
+    spared = []
+    # v1: unnamed, ccwho takes only what an ended session left as a whole: an
+    # ORPHAN (reparented to launchd, its session gone, no agent above it) and
+    # everything under it. SIGTERM to a `zsh -c` tool shell is not passed on,
+    # so killing the orphan alone left its dev server holding the port
+    litter = {p["pid"] for p in att.get("left_behind") or []
+              if table.get(p["pid"], (0,))[0] == 1}
+    children = {}
+    for q, row in table.items():
+        children.setdefault(row[0] if row else None, []).append(q)
+
+    def subtree(root):
+        out, todo, seen = [], [root], set()
+        while todo:
+            q = todo.pop(0)
+            if q in seen:
+                continue
+            seen.add(q)
+            out.append(q)
+            todo += sorted(children.get(q, []))
+        return out
+
+    def marked_of(q):
+        kind = group.get(q)
+        return kind[2].get("marked", kind[1]) if kind else None
+
+    def verdict(root):
+        """(members, None) when the whole tree may go; (None, why) when not."""
+        members = subtree(root)
+        mark = marked_of(root)
+        for q in members:
+            cmd = cmd_of(q)
+            kind = group.get(q)
+            why = untouchable(q)
+            if why is None and not (table.get(q, (0, ""))[1] or "").strip():
+                why = f"cannot prove {q} is the same process"
+            if why is None and (pipes is None or q not in pipes):
+                why = f"{q}: its pipes were not read"
+            if why is None and kind is None and q in marks and not marks[q]:
+                # its environment was read and names no session: a person or
+                # another program started it, under the orphan or not
+                why = f"{q} {_name(cmd)}: no agent started it"
+            if why is None and _ANY_AGENT.search(cmd):
+                why = f"{q} may be an agent"
+            if why is None and (reason := _doubt(table, q, cmd)):
+                why = f"{q} is not sure: {reason}"
+            if why is None and _person_shell(cmd):
+                why = f"{q} is a shell someone may be working in"
+            if why is None and kind and kind[0] in ("session", "codex", "unsure"):
+                why = (f"{q} is not sure: {kind[2].get('why', '?')}" if kind[0] == "unsure"
+                       else f"{q} belongs to " + ("a live session" if kind[0] == "session"
+                                                  else "Codex"))
+            if why is None and marked_of(q) not in (None, mark):
+                why = f"an agent runs here - {q} carries another session's mark"
+            if why:
+                return None, why
+        return members, None
+
+    def root_of(pid):
+        chain = [pid] + list(_ancestors(table, pid))
+        return chain[-1] if table.get(chain[-1], (0,))[0] == 1 else None
+
+    trees, notes = {}, {}
+    if mode == "port":
+        try:
+            text = str(target).lstrip(":")
+            port = int(text) if text.isascii() and text.isdigit() else None
+        except (TypeError, ValueError):
+            port = None
+        if port is None:
+            return nothing("not a port number")
+        for pid in sorted(p for p, held in ports.items() if port in (held or [])):
+            kind = group.get(pid)
+            name = _name(cmd_of(pid))
+            root = root_of(pid)
+            why = untouchable(pid)
+            if why is None and "com.docker" in cmd_of(pid):
+                why = (f":{port} is held by Docker (a container) - ccwho cannot tell which"
+                       f" agent started it")
+            elif why is None and root in litter:
+                members, bad = verdict(root)
+                if members:
+                    trees[root] = members
+                    continue
+                why = (f":{port} is held by {pid} {name}, which ccwho will not take: {bad}"
+                       f" - ccwho kill {pid} if you mean it")
+            elif why is None and kind is None:
+                why = (f":{port} is held by {pid} {name}, which no agent started"
+                       f" - ccwho kill {pid} if you mean it")
+            elif why is None and (kind[0] == "unsure" or doubt_of(pid)):
+                reason = kind[2].get("why") if kind[0] == "unsure" else doubt_of(pid)
+                why = (f":{port} is held by {pid} {name}, which is not sure: {reason}"
+                       f" - ccwho kill {pid} if you mean it")
+            elif why is None and kind[0] == "session":
+                why = (f":{port} is held by {pid} {name}, work of a live session"
+                       f" - ccwho kill {pid} if you mean it")
+            elif why is None and kind[0] == "codex":
+                why = (f":{port} is held by {pid} {name}, started by Codex - {codex_note}"
+                       f" - ccwho kill {pid} if you mean it")
+            elif why is None:
+                why = (f":{port} is held by {pid} {name}, which is not an orphan"
+                       f" - ccwho kill {pid} if you mean it")
+            spared.append(spare(pid, why))
+    else:                                               # clean
+        refused = set()
+        for root in sorted(litter):
+            members, bad = verdict(root)
+            if members:
+                trees[root] = members
+            else:
+                spared.append(spare(root, f"{root} and what runs under it: {bad}"))
+                for q in subtree(root)[1:]:
+                    refused.add(q)
+                    spared.append(spare(q, f"{q} is in {root}'s tree, which is spared: {bad}"))
+        in_trees = {q for m in trees.values() for q in m} | litter | refused
+        spared += [spare(p["pid"], f"{p['pid']} is not sure: {p.get('why', '?')}")
+                   for p in att.get("unsure") or [] if p["pid"] not in in_trees]
+        spared += [spare(p["pid"], f"{p['pid']} was started by Codex - {codex_note};"
+                                   f" ccwho kill {p['pid']} one at a time")
+                   for p in att.get("codex") or [] if p["pid"] not in in_trees]
+        spared += [spare(p["pid"], f"{p['pid']} is not an orphan - ccwho kill {p['pid']} if"
+                                   f" you mean it")
+                   for p in att.get("left_behind") or [] if p["pid"] not in in_trees]
+    # the pipe rule, per tree and to a fixed point: a member whose pipe leads out
+    # of everything being killed spares its whole tree - and a tree spared
+    # stays alive, so what feeds IT is spared too
+    changed = True
+    while changed:
+        changed = False
+        taking = {q for m in trees.values() for q in m}
+        for root, members in list(trees.items()):
+            for q in members:
+                alive = live_peers(q, taking)
+                if alive:
+                    del trees[root]
+                    spared.append(spare(root, f"{root} and what runs under it: "
+                                              f"{feeds(q, alive[0])} - not killed"))
+                    changed = True
+                    break
+            if changed:
+                break
+    kill = [(root, q) for root in sorted(trees) for q in trees[root]]
+    plan = {"kill": [dict(proc(q), root=root, **({"note": notes[q]} if q in notes else {}))
+                     for root, q in kill], "spare": spared}
+    if not kill and not spared:         # nothing to do still says so
+        plan["why"] = f"nothing holds :{port}" if mode == "port" else "nothing was left behind"
+    return plan

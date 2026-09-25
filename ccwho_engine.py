@@ -29,14 +29,17 @@ import time
 
 import ccwho_brief as brief
 import ccwho_index
+import ccwho_text
+from ccwho_text import ANSI as _ANSI, cells as _cells, cut as _cut  # noqa: E402,F401
 import ccwho_usage  # noqa: F401 - in RELOAD_FIRST; the list reads usage through the engine
 import ccwho_procs as procs
 
 # The rule modules the engine imports, in the order they are re-read. One list,
 # used by the watch loop and the list alike: a module named in only one of two
 # lists is a fix that lands in one window and not the other.
-RELOAD_FIRST = ("ccwho_procs", "ccwho_brief", "ccwho_index", "ccwho_usage")    # procs first:
-                                                                  # brief imports it
+# Dependencies first: ccwho_text before ccwho_usage (which imports it), procs
+# before brief (which imports procs).
+RELOAD_FIRST = ("ccwho_text", "ccwho_procs", "ccwho_brief", "ccwho_index", "ccwho_usage")
 
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
@@ -738,7 +741,6 @@ def parse_tty_map(ps_output):
     return out
 
 
-_ANSI = re.compile(r"\033(?:\][^\007\033]*(?:\007|\033\\)|\[[0-9;]*[A-Za-z])")
 # A jump target is a tty like s032 or a bare pid. Nothing else is accepted, so a
 # crafted URL cannot smuggle anything into the handler.
 _JUMP_TARGET = re.compile(r"^[A-Za-z]?[0-9]{1,8}\Z")
@@ -747,37 +749,6 @@ _JUMP_TARGET = re.compile(r"^[A-Za-z]?[0-9]{1,8}\Z")
 def visible_len(text):
     """Length as rendered: escape sequences occupy no columns."""
     return len(_ANSI.sub("", text or ""))
-
-
-try:        # the live list is drawn by Rich: count cells the way it does
-    from rich.cells import cell_len as _rich_cell_len
-except ImportError:                 # the command line has no Rich, and no need
-    _rich_cell_len = None
-
-
-def _cells(text):
-    """Screen cells, not characters: a CJK character or an emoji takes two, a
-    combining mark none. What a row must fit, where a name can be anything."""
-    text = _ANSI.sub("", text or "")
-    if _rich_cell_len is not None:
-        return _rich_cell_len(text)
-    import unicodedata
-    return sum(0 if unicodedata.combining(c) else
-               2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
-
-
-def _cut(text, cells):
-    """`text` in at most `cells` screen cells, `…` marking a cut."""
-    text = text or ""
-    if _cells(text) <= cells:
-        return text
-    out = ""
-    for c in text:
-        # the whole prefix, not char by char: a ZWJ family is one glyph
-        if _cells(out + c) > cells - 1:
-            break
-        out += c
-    return out + "…" if cells > 0 else ""
 
 
 def osc8(label, url, enabled=True):

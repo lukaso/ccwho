@@ -132,9 +132,28 @@ class Row(Static):
         self.can_focus = True
         self.add_class("row")
 
+    def text_width(self):
+        """The cells the text is drawn in. Once laid out that is the row's own
+        content width - which the list's scrollbar makes narrower: laid out any
+        wider, a full line lost its end, a [kill loop] button included."""
+        try:
+            drawn = self.content_region.width
+        except Exception:       # the text is first built before the widget exists
+            drawn = 0
+        return drawn if drawn > 0 else max(40, self.width - 4)
+
+    def spans_lines(self):
+        """The two lines, each as (text, role) parts, at the width laid out."""
+        return engine.ui_row_cells(self.row, width=self.text_width())
+
+    def on_resize(self, event):
+        # the scrollbar came or went: lay the text out at the width it now has
+        if self.words(self.width) != self.painted:
+            self.refresh_text(self.width)
+
     def spans(self):
         """(text, role) for every part on both lines - what the tests read."""
-        first, second = engine.ui_row_cells(self.row, width=max(40, self.width - 4))
+        first, second = self.spans_lines()
         return list(first) + [("\n", "pad")] + list(second)
 
     def words(self, width):
@@ -698,7 +717,7 @@ class CcwhoUi(App):
             self.armed = None
         at = event.get_content_offset(widget)
         if at is not None and engine.ui_action_at(
-                widget.row, max(40, widget.width - 4), at.y, at.x) == "kill":
+                widget.row, widget.text_width(), at.y, at.x) == "kill":
             self.action_kill_loop()
             return
         self._go()          # a click names its row, whatever the pane shows

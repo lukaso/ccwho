@@ -2403,3 +2403,75 @@ class TestAClickStillGoesThere(UiTest):
             await pilot.click(row)
             await pilot.pause(0.2)
             self.assertEqual(adapter.asked, [BUSY["sessionId"]])
+
+
+class TestTheKillButtonOnAScrollingList(UiTest):
+    """The list's scrollbar takes cells from every row. Laid out wider than its
+    content, a full second line lost its end - `[kill` with `loop]` cut away -
+    and the blank cells where it had been still armed a kill."""
+
+    FILLERS = [row(f"ffff{i:04d}-0000-4000-8000-000000000000", "busy", title=f"filler {i}")
+               for i in range(30)]
+
+    def stuck(self, recap):
+        return dict(STUCK, recap=recap, recap_age="3h")
+
+    def button(self, widget):
+        """The cells [kill loop] is drawn in, in the row's own coordinates."""
+        from rich.cells import cell_len
+        _, second = widget.spans_lines()
+        col = 0
+        for text, role in second:
+            if role == "action":
+                return col, cell_len(text)
+            col += cell_len(text)
+        return None, 0
+
+    async def check(self, recap, size=(120, 30), detail=False):
+        collector = FakeCollector(fleet=ui.Fleet([self.stuck(recap)] + self.FILLERS, True, "12:00:00"))
+        app = self.app(collector=collector, adapter=FakeAdapter())
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            self.assertTrue(app.query_one("#list").scrollbars_enabled[0], "the list scrolls")
+            if detail:
+                # wide, the brief takes 38%: the list narrows with no refresh
+                await pilot.press("right")
+                await pilot.pause()
+                await self.assert_button(app, pilot)
+                await pilot.press("left")
+                await pilot.pause()
+            await self.assert_button(app, pilot)
+
+    async def assert_button(self, app, pilot):
+        from rich.cells import cell_len
+        if True:
+            widget = [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
+            # what is PAINTED is laid out at the width it is drawn in, whole
+            painted = widget.painted.split("\n")[1]
+            self.assertLessEqual(cell_len(painted), widget.content_region.width)
+            self.assertIn("[kill loop]", painted)
+            col, width = self.button(widget)
+            self.assertEqual(width, len("[kill loop]"))
+            gutter = widget.content_region.x - widget.region.x
+            for cell in range(width):
+                app.armed = None
+                await pilot.click(widget, offset=(gutter + col + cell, 1))
+                await pilot.pause()
+                self.assertTrue(app.armed, f"cell {cell} of the button arms it")
+            app.armed = None
+            await pilot.click(widget, offset=(gutter + col + width, 1))           # control
+            await pilot.pause()
+            self.assertFalse(app.armed)
+
+    async def test_an_ascii_recap(self):
+        await self.check("Goal was moving the durable files into STATE; " * 6)
+
+    async def test_a_cjk_recap(self):
+        # an odd width: at an even one a double-width cut leaves a spare cell and
+        # the old layout happened to fit (this test was green without the fix)
+        await self.check("把持久化文件移到状态目录并验证每一个游标的恢复路径都能工作" * 3,
+                         size=(121, 30))
+
+    async def test_the_brief_opening_narrows_the_row(self):
+        await self.check("Goal was moving the durable files into STATE; " * 6,
+                         size=(160, 30), detail=True)

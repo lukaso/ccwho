@@ -17,6 +17,7 @@ Release 2 decision with its own diff-and-confirm rules.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import plistlib
@@ -122,7 +123,133 @@ def doctor_checks(facts):
         "re-run iTerm2's Claude Code integration setup (it rewrites settings.json;"
         " ccwho will not write that file for you)"))
 
+    out += usage_checks(facts.get("usage_roots"), facts.get("usage_newest_age"))
     return out
+
+
+def usage_checks(roots, newest_age=None):
+    """One check per interactive config dir: is ccwho's statusLine there? None
+    when setup's facts were not gathered - then there is nothing to say."""
+    out = []
+    for r in roots or []:
+        name = f"usage ({r['root']})"
+        state = r.get("state")
+        if r.get("opted_out") and state != "ours":
+            out.append(_check(name, True, "off (your choice) - ccwho setup --usage turns it on", ""))
+        elif state == "ours":
+            out.append(_check(name, True, f"on, newest reading {age_words(newest_age)}"
+                              + ("" if newest_age is None else " ago"), ""))
+        elif state == "other":
+            out.append(_check(name, True, "another statusLine is set - ccwho leaves it,"
+                              " so no usage info from this dir", ""))
+        elif state == "invalid":
+            out.append(_check(name, False, "settings.json is not valid JSON",
+                              "fix the file; ccwho will not write a file it cannot read"))
+        else:
+            out.append(_check(name, False, "no statusLine - no usage info from this dir",
+                              "ccwho setup"))
+    return out
+
+
+# ------------------------------------------------- the usage statusLine
+# The one place ccwho writes another tool's file (owner decision, 2026-09-25):
+# only a missing statusLine is added, only its own is ever removed, and the
+# runner shows the diff and asks first. What is ours is decided here, purely.
+
+def statusline_command(ccwho):
+    return f"{shlex.quote(ccwho)} statusline"
+
+
+def is_ours(command):
+    """A ccwho running `statusline`, and nothing else on the line."""
+    if not isinstance(command, str):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return (len(words) == 2 and words[1] == "statusline"
+            and os.path.basename(words[0]) in ("ccwho", "ccwho.py"))
+
+
+def _settings(text):
+    """The parsed settings, {} for no file, None when it is not a JSON object."""
+    if text is None or not text.strip():
+        return {}                 # no file, or an empty one: no settings yet
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def statusline_state(text):
+    """"missing", "ours", "other" or "invalid" for a settings.json's text."""
+    data = _settings(text)
+    if data is None:
+        return "invalid"
+    if "statusLine" not in data:
+        return "missing"
+    line = data["statusLine"]
+    return "ours" if isinstance(line, dict) and is_ours(line.get("command")) else "other"
+
+
+def _dump(data):
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def add_statusline(text, command):
+    """The new text with ccwho's statusLine added, or None if it must not be."""
+    if statusline_state(text) != "missing":
+        return None
+    data = _settings(text)
+    data["statusLine"] = {"type": "command", "command": command}
+    return _dump(data)
+
+
+def remove_statusline(text):
+    """The new text without ccwho's statusLine, or None if there is none of ours."""
+    if statusline_state(text) != "ours":
+        return None
+    data = _settings(text)
+    del data["statusLine"]
+    return _dump(data)
+
+
+def settings_diff(old, new, path):
+    return "".join(difflib.unified_diff(
+        (old or "").splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=path, tofile=path))
+
+
+def interactive_roots(entries, candidates):
+    """(dirs where a person ran claude, the others). The evidence is an indexed
+    session whose entrypoint is exactly "cli": a missing one does not count, so
+    a dir a program owns is never written."""
+    seen = set()
+    for e in entries or []:
+        if not isinstance(e, dict) or e.get("entrypoint") != "cli":
+            continue
+        path = e.get("path")
+        if not isinstance(path, str):
+            continue
+        for root in candidates:
+            if path.startswith(os.path.join(root, "projects") + os.sep):
+                seen.add(root)
+    yes = [r for r in candidates if r in seen]
+    return yes, [r for r in candidates if r not in seen]
+
+
+def parse_opt_out(text):
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return set()
+    return {d for d in data if isinstance(d, str)} if isinstance(data, list) else set()
+
+
+def render_opt_out(dirs):
+    return json.dumps(sorted(dirs), indent=2) + "\n"
 
 
 def _check(name, ok, detail, fix):

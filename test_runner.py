@@ -1507,8 +1507,12 @@ class TestDoctorVerb(unittest.TestCase):
                       "cc_status_hook": True,
                       "settings_path": "/Users/x/.claude/settings.json"}
         runner.setup.gather = lambda **kw: dict(self.facts)
+        self.real_usage_facts = runner.usage_facts
+        self.usage = {"usage_roots": [], "usage_newest_age": None}
+        runner.usage_facts = lambda now=None: dict(self.usage)
 
     def tearDown(self):
+        runner.usage_facts = self.real_usage_facts
         runner.setup.gather = self.real_gather
 
     def _doctor(self, *argv):
@@ -1559,6 +1563,18 @@ class TestWatchShowsTheWorstFault(unittest.TestCase):
         self.assertEqual(line.count("\n"), 0, "a header has room for one line")
 
 
+class TestDoctorSaysUsage(TestDoctorVerb):
+    def test_a_dir_without_the_statusline_is_bad_with_the_fix(self):
+        self.usage = {"usage_roots": [{"root": "/h/.claude", "state": "missing",
+                                       "opted_out": False}], "usage_newest_age": None}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = runner.doctor([])
+        self.assertEqual(rc, 1)
+        self.assertIn("usage (/h/.claude)", out.getvalue())
+        self.assertIn("ccwho setup", out.getvalue())
+
+
 class TestWatchBannerIsCheap(unittest.TestCase):
     """The watch header should say when something drifted, but the checks shell
     out to launchctl, osascript and plutil. At a 5s tick that is three processes
@@ -1567,6 +1583,8 @@ class TestWatchBannerIsCheap(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.real = runner.setup.gather
+        self.real_usage_facts = runner.usage_facts
+        runner.usage_facts = lambda now=None: {"usage_roots": [], "usage_newest_age": None}
         runner.setup.gather = lambda **kw: self.calls.append(1) or {
             "claude": "", "iterm_ok": True, "handler_registered": True,
             "launchd_loaded": True, "last_run_age": 10.0,
@@ -1574,6 +1592,7 @@ class TestWatchBannerIsCheap(unittest.TestCase):
             "settings_path": "/x"}
 
     def tearDown(self):
+        runner.usage_facts = self.real_usage_facts
         runner.setup.gather = self.real
 
     def test_the_banner_names_the_fault(self):
@@ -1852,8 +1871,13 @@ class SetupHarness(unittest.TestCase):
                       "last_run_age": 60.0, "newest_manifest_age": 60.0,
                       "cc_status_hook": True, "settings_path": "s.json"}
         runner.setup.gather = lambda **k: dict(self.facts)
+        # Which config dirs are interactive reads the machine (ps, the index).
+        self.real_usage_roots = runner.usage_roots
+        self.usage_dirs = ([], [])
+        runner.usage_roots = lambda: self.usage_dirs
 
     def tearDown(self):
+        runner.usage_roots = self.real_usage_roots
         runner.subprocess.run = self.real_run
         runner.setup.gather = self.real_gather
         runner.shutil.which = self.real_which
@@ -2916,3 +2940,458 @@ class TestStatusline(unittest.TestCase):
         os.utime(old, (stamp, stamp))
         runner.prune_usage()
         self.assertFalse(os.path.exists(old))
+
+
+class TestUsageSetup(unittest.TestCase):
+    """The first time ccwho writes another tool's file. Every guard is here:
+    only where no statusLine is set, the diff shown, y/N asked, a backup kept,
+    nothing written if the file moved under us, and a no remembered."""
+
+    OURS = "/opt/homebrew/bin/ccwho statusline"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.environ.get("CCWHO_DIR")
+        os.environ["CCWHO_DIR"] = os.path.join(self.tmp, "ccwho")
+        self.root = os.path.join(self.tmp, ".claude")
+        os.makedirs(self.root)
+        self.settings = os.path.join(self.root, "settings.json")
+        self.asked = []
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("CCWHO_DIR", None)
+        else:
+            os.environ["CCWHO_DIR"] = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, obj):
+        with open(self.settings, "w") as fh:
+            fh.write(obj if isinstance(obj, str) else json.dumps(obj, indent=2))
+
+    def read(self):
+        with open(self.settings) as fh:
+            return json.load(fh)
+
+    def answer(self, reply):
+        def ask(prompt):
+            self.asked.append(prompt)
+            return reply
+        return ask
+
+    def run_setup(self, reply="y", yes=False, mode="", roots=None, skipped=()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = runner.usage_setup(roots if roots is not None else [self.root],
+                                    list(skipped), yes=yes, mode=mode,
+                                    ask=self.answer(reply), ccwho="/opt/homebrew/bin/ccwho")
+        return rc, out.getvalue()
+
+    def backups(self):
+        return [n for n in os.listdir(self.root) if n.startswith("settings.json.bak-ccwho")]
+
+    def test_yes_adds_it_keeps_the_rest_and_a_backup(self):
+        self.write({"hooks": {"Stop": [1]}, "model": "opus"})
+        rc, out = self.run_setup("y")
+        self.assertEqual(rc, 0)
+        data = self.read()
+        self.assertEqual(data["statusLine"], {"type": "command", "command": self.OURS})
+        self.assertEqual(data["hooks"], {"Stop": [1]})
+        self.assertEqual(len(self.backups()), 1)
+        self.assertIn('+  "statusLine"', out)                 # the diff was shown
+        self.assertIn("Without this, you won't get usage info.", self.asked[0])
+
+    def test_no_writes_nothing_and_is_remembered(self):
+        self.write({"model": "opus"})
+        rc, out = self.run_setup("n")
+        self.assertEqual(self.read(), {"model": "opus"})
+        self.assertEqual(self.backups(), [])
+        self.asked.clear()
+        rc, out = self.run_setup("y")                          # a later setup
+        self.assertEqual(self.asked, [])                       # does not ask again
+        self.assertEqual(self.read(), {"model": "opus"})
+        self.assertIn("your choice", out)
+
+    def test_an_empty_answer_is_no(self):
+        self.write({})
+        self.run_setup("")
+        self.assertNotIn("statusLine", self.read())
+
+    def test_cannot_ask_writes_nothing_and_remembers_nothing(self):
+        self.write({})
+        rc, out = self.run_setup(None)
+        self.assertNotIn("statusLine", self.read())
+        self.run_setup("y")
+        self.assertIn("statusLine", self.read())               # it was not an opt-out
+
+    def test_yes_flag_skips_the_question(self):
+        self.write({})
+        self.run_setup(None, yes=True)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.read()["statusLine"]["command"], self.OURS)
+
+    def test_yes_flag_never_overrides_an_opt_out(self):
+        self.write({})
+        self.run_setup("n")
+        self.run_setup(None, yes=True)
+        self.assertNotIn("statusLine", self.read())
+
+    def test_no_settings_file_is_created(self):
+        self.run_setup("y")
+        self.assertEqual(self.read()["statusLine"]["command"], self.OURS)
+
+    def test_a_file_changed_while_asking_is_left_alone(self):
+        self.write({"model": "opus"})
+        def ask(prompt):
+            self.write({"model": "sonnet"})                    # another tool wrote it
+            return "y"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = runner.usage_setup([self.root], [], ask=ask, ccwho="/opt/homebrew/bin/ccwho")
+        self.assertEqual(self.read(), {"model": "sonnet"})
+        self.assertIn("changed", out.getvalue())
+        self.assertEqual(rc, 1)
+
+    def test_another_statusline_is_never_touched(self):
+        self.write({"statusLine": {"type": "command", "command": "~/sl.sh"}})
+        rc, out = self.run_setup("y")
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.read()["statusLine"]["command"], "~/sl.sh")
+        self.assertIn("another statusLine", out)
+
+    def test_invalid_json_is_never_touched(self):
+        self.write("{nope")
+        rc, out = self.run_setup("y")
+        with open(self.settings) as fh:
+            self.assertEqual(fh.read(), "{nope")
+        self.assertEqual(self.asked, [])
+
+    def test_a_second_run_changes_nothing(self):
+        self.write({})
+        self.run_setup("y")
+        with open(self.settings) as fh:
+            before = fh.read()
+        self.asked.clear()
+        rc, out = self.run_setup("y")
+        self.assertEqual(self.asked, [])
+        with open(self.settings) as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_a_symlinked_settings_file_is_written_through_the_link(self):
+        real = os.path.join(self.tmp, "dotfiles-settings.json")
+        with open(real, "w") as fh:
+            fh.write("{}")
+        os.symlink(real, self.settings)
+        self.run_setup("y")
+        self.assertTrue(os.path.islink(self.settings))
+        with open(real) as fh:
+            self.assertIn("statusLine", json.load(fh))
+
+    def test_skipped_dirs_are_named_with_the_fix(self):
+        rc, out = self.run_setup("y", roots=[], skipped=["/h/.liveapp"])
+        self.assertIn("/h/.liveapp", out)
+        self.assertIn("run ccwho setup again", out)
+
+    def test_no_usage_removes_ours_and_opts_every_dir_out(self):
+        self.write({"model": "opus"})
+        self.run_setup("y")
+        rc, out = self.run_setup("y", mode="off")
+        self.assertEqual(self.read(), {"model": "opus"})
+        self.asked.clear()
+        self.run_setup("y")
+        self.assertEqual(self.asked, [])
+        self.assertNotIn("statusLine", self.read())
+
+    def test_no_usage_never_removes_another_statusline(self):
+        self.write({"statusLine": {"type": "command", "command": "~/sl.sh"}})
+        self.run_setup("y", mode="off")
+        self.assertEqual(self.read()["statusLine"]["command"], "~/sl.sh")
+
+    def test_no_usage_declined_keeps_it_but_still_opts_out(self):
+        self.write({})
+        self.run_setup("y")
+        self.run_setup("n", mode="off")
+        self.assertIn("statusLine", self.read())
+
+    def test_a_private_settings_file_stays_private_and_so_does_its_backup(self):
+        self.write({"env": {"SECRET": "x"}})
+        os.chmod(self.settings, 0o600)
+        self.run_setup("y")
+        self.assertEqual(os.stat(self.settings).st_mode & 0o777, 0o600)
+        backup = os.path.join(self.root, self.backups()[0])
+        self.assertEqual(os.stat(backup).st_mode & 0o777, 0o600)
+
+    def test_two_writes_in_one_second_keep_two_backups(self):
+        self.write({"model": "opus"})
+        real = runner.time.strftime
+        runner.time.strftime = lambda fmt, *a: "20260925-120000"
+        try:
+            self.run_setup("y")
+            self.run_setup("y", mode="off")
+        finally:
+            runner.time.strftime = real
+        self.assertEqual(len(self.backups()), 2)
+        texts = []
+        for name in self.backups():
+            with open(os.path.join(self.root, name)) as fh:
+                texts.append(json.load(fh))
+        self.assertIn({"model": "opus"}, texts)             # the original survives
+
+    def test_a_settings_file_that_is_not_utf8_is_never_touched(self):
+        with open(self.settings, "wb") as fh:
+            fh.write(b'{"note": "caf\xe9"}')
+        rc, out = self.run_setup("y")
+        with open(self.settings, "rb") as fh:
+            self.assertEqual(fh.read(), b'{"note": "caf\xe9"}')
+        self.assertIn("not valid", out)
+
+    def test_an_empty_settings_file_is_treated_as_no_settings(self):
+        self.write("  \n")
+        self.run_setup("y")
+        self.assertEqual(self.read()["statusLine"]["command"], self.OURS)
+
+    def test_a_dangling_settings_link_is_never_written(self):
+        gone = os.path.join(self.tmp, "moved", "settings.json")
+        os.symlink(gone, self.settings)
+        rc, out = self.run_setup("y")
+        self.assertFalse(os.path.exists(os.path.dirname(gone)))
+        self.assertIn("broken link", out)
+        self.assertEqual(self.asked, [])
+
+    def test_a_root_with_a_trailing_slash_is_the_same_dir(self):
+        self.write({})
+        self.run_setup("n", roots=[self.root + "/"])
+        self.asked.clear()
+        self.run_setup("y", roots=[self.root])
+        self.assertEqual(self.asked, [])
+        self.assertNotIn("statusLine", self.read())
+
+    def test_a_no_for_a_dir_holds_when_it_comes_back_with_a_slash(self):
+        self.write({})
+        self.run_setup("n", roots=[self.root])
+        self.asked.clear()
+        self.run_setup("y", roots=[self.root + "/"])
+        self.assertEqual(self.asked, [])
+        self.assertNotIn("statusLine", self.read())
+
+    def test_no_usage_without_a_terminal_does_not_claim_off(self):
+        self.write({})
+        self.run_setup("y")
+        rc, out = self.run_setup(None, mode="off")
+        self.assertTrue(runner.setup.is_ours(self.read()["statusLine"]["command"]))
+        self.assertNotIn("usage info: off", out)
+        self.assertIn("still on", out)
+
+    def test_no_usage_declined_does_not_claim_off(self):
+        self.write({})
+        self.run_setup("y")
+        rc, out = self.run_setup("n", mode="off")
+        self.assertIn("still on", out)
+
+    def test_a_new_settings_file_follows_the_umask(self):
+        old = os.umask(0o077)
+        try:
+            self.run_setup("y")
+        finally:
+            os.umask(old)
+        self.assertEqual(os.stat(self.settings).st_mode & 0o777, 0o600)
+
+    def test_a_backup_that_fails_to_write_leaves_nothing(self):
+        path = os.path.join(self.root, "settings.json")
+        with self.assertRaises(ValueError):
+            runner._backup(path, "\udc80", 0o600)       # cannot be encoded
+        self.assertEqual(self.backups(), [])
+
+    def open_fds(self):
+        return len(os.listdir("/dev/fd"))
+
+    def test_a_failing_chmod_leaks_no_file_descriptor(self):
+        real = runner.os.fchmod
+        def boom(fd, mode):
+            raise PermissionError("EPERM")
+        before = self.open_fds()
+        runner.os.fchmod = boom
+        try:
+            with self.assertRaises(PermissionError):
+                runner._backup(os.path.join(self.root, "settings.json"), "{}", 0o600)
+            with self.assertRaises(PermissionError):
+                runner.write_atomic(os.path.join(self.root, "x.json"), "{}", mode=0o600)
+        finally:
+            runner.os.fchmod = real
+        self.assertEqual(self.open_fds(), before)
+
+    def test_no_usage_names_a_file_it_could_not_read_and_does_not_claim_off(self):
+        with open(self.settings, "wb") as fh:
+            fh.write(b'{"statusLine": "caf\xe9"}')
+        rc, out = self.run_setup("y", mode="off", yes=True)
+        self.assertIn("not checked", out)
+        self.assertIn(self.settings, out)
+        self.assertNotIn("usage info: off", out)
+        self.assertNotIn("--yes", out)            # --yes was given; it cannot help
+        self.assertIn("not valid UTF-8", out.splitlines()[-1])
+        self.assertEqual(rc, 1)
+
+    def test_no_usage_that_removed_it_says_off(self):                  # control
+        self.write({})
+        self.run_setup("y")
+        rc, out = self.run_setup("y", mode="off")
+        self.assertIn("usage info: off", out)
+
+    def test_usage_flag_clears_the_opt_out(self):
+        self.write({})
+        self.run_setup("n")
+        self.run_setup("y", mode="on")
+        self.assertIn("statusLine", self.read())
+
+
+class TestSetupOffersUsage(SetupHarness):
+    def call(self, argv):
+        seen = []
+        real = runner.usage_setup
+        runner.usage_setup = lambda roots, skipped, **k: seen.append((roots, skipped, k)) or 0
+        try:
+            rc, out = self.run_setup(argv)
+        finally:
+            runner.usage_setup = real
+        return rc, out, seen
+
+    def test_setup_offers_it_for_the_interactive_dirs(self):
+        self.usage_dirs = (["/h/.claude"], ["/h/.la"])
+        rc, out, seen = self.call(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(seen, [(["/h/.claude"], ["/h/.la"], {"yes": True, "mode": ""})])
+
+    def test_no_usage_and_usage_are_modes(self):
+        _, _, seen = self.call(["--no-usage", "--no-hotkey", "--no-list"])
+        self.assertEqual(seen[0][2]["mode"], "off")
+        _, _, seen = self.call(["--usage", "--no-hotkey", "--no-list"])
+        self.assertEqual(seen[0][2]["mode"], "on")
+
+    def test_both_at_once_is_refused(self):
+        rc, out, seen = self.call(["--usage", "--no-usage", "--no-list"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(seen, [])
+
+    def test_the_real_thing_writes_into_a_dir_setup_found(self):
+        root = os.path.join(self.home, ".claude")
+        os.makedirs(root)
+        self.usage_dirs = ([root], [])
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        with open(os.path.join(root, "settings.json")) as fh:
+            self.assertTrue(runner.setup.is_ours(json.load(fh)["statusLine"]["command"]))
+
+
+class TestWhichDirsAreInteractive(unittest.TestCase):
+    """Setup refreshes the saved index for the known roots, and scans the dirs
+    running sessions name WITHOUT saving them - the index drops every path it
+    was not given, so saving them would rescan them on every refresh."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.old = os.environ.get("CCWHO_DIR")
+        os.environ["CCWHO_DIR"] = os.path.join(self.tmp, "ccwho")
+        self.known = self.root("known", "cli")
+        self.extra = self.root("extra", "cli")
+        self.program = self.root("program", "sdk-cli")
+        self.real = (runner.engine.config_dirs_now, runner.index.config_roots)
+        runner.engine.config_dirs_now = lambda table=None: [self.known, self.extra,
+                                                             self.program]
+        runner.index.config_roots = lambda roots_file=None: [self.known]
+
+    def tearDown(self):
+        runner.engine.config_dirs_now, runner.index.config_roots = self.real
+        if self.old is None:
+            os.environ.pop("CCWHO_DIR", None)
+        else:
+            os.environ["CCWHO_DIR"] = self.old
+
+    def root(self, name, entrypoint):
+        d = os.path.join(self.tmp, name)
+        p = os.path.join(d, "projects", "-x")
+        os.makedirs(p)
+        sid = {"known": "1", "extra": "2", "program": "3"}[name] * 8 + "-0000-0000-0000-000000000000"
+        with open(os.path.join(p, sid + ".jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "sessionId": sid, "entrypoint": entrypoint,
+                                 "timestamp": "2026-09-25T10:00:00.000Z", "cwd": "/x",
+                                 "message": {"role": "user", "content": "hello there"}}) + "\n")
+        return d
+
+    def test_interactive_dirs_found_program_dirs_skipped(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            yes, skipped = runner.usage_roots()
+        self.assertEqual(yes, [self.known, self.extra])
+        self.assertEqual(skipped, [self.program])
+
+    def test_only_the_known_roots_are_saved_in_the_index(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            runner.usage_roots()
+        paths = [e["path"] for e in runner.index.load(runner.index_path()).values()]
+        self.assertTrue(paths)                                              # control
+        self.assertTrue(all(p.startswith(self.known) for p in paths), paths)
+
+    def test_a_process_table_that_cannot_be_read_falls_back_to_the_known_roots(self):
+        def broken(table=None):
+            raise OSError("ps")
+        runner.engine.config_dirs_now = broken
+        with contextlib.redirect_stderr(io.StringIO()):
+            yes, skipped = runner.usage_roots()
+        self.assertEqual((yes, skipped), ([self.known], []))
+
+
+class TestDoctorGathersUsage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.old = os.environ.get("CCWHO_DIR")
+        os.environ["CCWHO_DIR"] = os.path.join(self.tmp, "ccwho")
+        os.makedirs(os.path.join(self.tmp, "ccwho", "usage"))
+        self.root = os.path.join(self.tmp, ".claude")
+        os.makedirs(self.root)
+        self.real = runner.index.config_roots
+        runner.index.config_roots = lambda roots_file=None: [self.root]
+
+    def tearDown(self):
+        runner.index.config_roots = self.real
+        if self.old is None:
+            os.environ.pop("CCWHO_DIR", None)
+        else:
+            os.environ["CCWHO_DIR"] = self.old
+
+    def test_a_dir_with_ours_is_reported_even_without_the_index(self):
+        with open(os.path.join(self.root, "settings.json"), "w") as fh:
+            json.dump({"statusLine": {"type": "command", "command": "ccwho statusline"}}, fh)
+        f = runner.usage_facts()
+        self.assertEqual(f["usage_roots"], [{"root": self.root, "state": "ours",
+                                             "opted_out": False}])
+        self.assertIsNone(f["usage_newest_age"])
+
+    def test_a_dir_with_nothing_and_no_interactive_session_is_not_reported(self):
+        self.assertEqual(runner.usage_facts()["usage_roots"], [])
+
+    def test_an_opted_out_dir_is_reported_as_such(self):
+        with open(runner.opt_out_path(), "w") as fh:
+            json.dump([self.root], fh)
+        f = runner.usage_facts()
+        self.assertEqual(f["usage_roots"][0]["opted_out"], True)
+
+    def test_a_settings_file_that_is_not_utf8_is_invalid_not_a_crash(self):
+        with open(os.path.join(self.root, "settings.json"), "wb") as fh:
+            fh.write(b'{"statusLine": "caf\xe9"}')
+        with open(runner.opt_out_path(), "w") as fh:
+            json.dump([self.root], fh)
+        f = runner.usage_facts()
+        self.assertEqual(f["usage_roots"][0]["state"], "invalid")
+
+    def test_a_trailing_slash_root_still_finds_its_opt_out(self):
+        runner.index.config_roots = lambda roots_file=None: [self.root + "/"]
+        with open(runner.opt_out_path(), "w") as fh:
+            json.dump([self.root], fh)
+        f = runner.usage_facts()
+        self.assertEqual(f["usage_roots"], [{"root": self.root, "state": "missing",
+                                             "opted_out": True}])
+
+    def test_the_newest_reading_age(self):
+        with open(os.path.join(self.tmp, "ccwho", "usage", "abc.json"), "w") as fh:
+            json.dump({"received_at": time.time() - 120, "session_id": "abc"}, fh)
+        self.assertAlmostEqual(runner.usage_facts()["usage_newest_age"], 120, delta=5)

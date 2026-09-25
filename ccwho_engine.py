@@ -29,6 +29,7 @@ import time
 
 import ccwho_brief as brief
 import ccwho_index
+import ccwho_usage  # noqa: F401 - in RELOAD_FIRST; the list reads usage through the engine
 import ccwho_procs as procs
 
 # The rule modules the engine imports, in the order they are re-read. One list,
@@ -1184,6 +1185,16 @@ def read_session_files(dirs, default=None):
     return entries, bad
 
 
+def config_dirs_now(table=None):
+    """Every config dir: the known roots, and any a running claude names."""
+    table = ps_table() if table is None else table
+    own = []
+    for pid in procs.claude_pids(table):
+        env = read_procargs(pid) or {}
+        own.append(env.get("CLAUDE_CONFIG_DIR", ""))
+    return procs.config_dirs(own, ccwho_index.config_roots())
+
+
 def live_file_sessions(table=None):
     """Live sessions from every config dir, as `claude agents --json` rows; and
     how many session files could not be read (for `ccwho doctor`).
@@ -1193,11 +1204,7 @@ def live_file_sessions(table=None):
     names its own CLAUDE_CONFIG_DIR, and each dir keeps a small file per session.
     """
     table = ps_table() if table is None else table
-    own = []
-    for pid in procs.claude_pids(table):
-        env = read_procargs(pid) or {}
-        own.append(env.get("CLAUDE_CONFIG_DIR", ""))
-    dirs = procs.config_dirs(own, ccwho_index.config_roots())
+    dirs = config_dirs_now(table)
     entries, bad = read_session_files(dirs, default=os.path.expanduser("~/.claude"))
     return procs.live_session_files(entries, procs.claude_starts(table)), bad
 

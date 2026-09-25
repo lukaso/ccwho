@@ -279,7 +279,8 @@ def ccwho_bin():
     return os.path.realpath(__file__)
 
 
-SETUP_FLAGS = {"--yes", "-y", "--no-hotkey", "--no-list", "--hotkey", "--proof"}
+SETUP_FLAGS = {"--yes", "-y", "--no-hotkey", "--no-list", "--hotkey", "--proof",
+               "--usage", "--no-usage"}
 
 
 def setup_cmd(argv):
@@ -293,7 +294,10 @@ def setup_cmd(argv):
     if unknown:
         print(f"ccwho setup: unknown option(s): {' '.join(unknown)}", file=sys.stderr)
         print(f"usage: ccwho setup [--yes] [--hotkey {setup.DEFAULT_HOTKEY}]"
-              " [--no-hotkey] [--no-list]", file=sys.stderr)
+              " [--no-hotkey] [--no-list] [--usage | --no-usage]", file=sys.stderr)
+        return 2
+    if "--usage" in argv and "--no-usage" in argv:
+        print("ccwho setup: --usage and --no-usage cannot both be meant", file=sys.stderr)
         return 2
     # Run BY the hotkey window, not by a person: record the nonce setup is
     # waiting on, then become the list, so the first press is already useful.
@@ -368,6 +372,12 @@ def setup_cmd(argv):
 
     for line in did:
         print(line)
+
+    # Subscription usage comes from a statusLine in each interactive config dir.
+    # The one step that writes another tool's file: it shows the diff and asks.
+    roots, skipped = usage_roots()
+    usage_setup(roots, skipped, yes=yes,
+                mode="off" if "--no-usage" in argv else "on" if "--usage" in argv else "")
 
     # Said, never done: quitting iTerm2 ends every session running in it, which
     # is the user's call and nobody else's.
@@ -519,12 +529,23 @@ def install_autosave(home):
     return 0
 
 
-def write_atomic(path, text):
+def write_atomic(path, text, mode=None):
     """Temp + replace. A crash half way through must not leave half a file, and
-    must never lose the one that was there."""
+    must never lose the one that was there. With `mode`, the temp file has it
+    from the start: a private file is never readable for a moment."""
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(tmp, "w") as fh:
+        if mode is None:
+            fh = open(tmp, "w", encoding="utf-8")
+        else:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            try:
+                os.fchmod(fd, mode)   # a leftover temp file keeps its old mode
+                fh = os.fdopen(fd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(fd)
+                raise
+        with fh:
             fh.write(text)
         os.replace(tmp, path)
     finally:
@@ -707,7 +728,9 @@ def doctor(argv):
     vanishing from settings.json - was silent for weeks, and a tool that repairs
     another tool's config without asking is how that happened in the first place.
     """
-    checks = setup.doctor_checks(setup.gather(ccwho_dir=ccwho_dir()))
+    facts = setup.gather(ccwho_dir=ccwho_dir())
+    facts.update(usage_facts())
+    checks = setup.doctor_checks(facts)
     if "--json" in argv:
         print(json.dumps({"ok": setup.doctor_verdict(checks) == 0,
                           "checks": checks}, indent=2))
@@ -737,7 +760,9 @@ def doctor_banner_cached(state, now=None):
     now = time.time() if now is None else now
     ts, line = state.get("_doctor", (None, ""))
     if ts is None or now - ts >= DOCTOR_TTL:
-        line = setup.doctor_banner(setup.doctor_checks(setup.gather(ccwho_dir=ccwho_dir())))
+        facts = setup.gather(ccwho_dir=ccwho_dir())
+        facts.update(usage_facts(now))
+        line = setup.doctor_banner(setup.doctor_checks(facts))
         state["_doctor"] = (now, line)
     return line
 
@@ -1216,6 +1241,268 @@ def accounts(argv):
     return 0
 
 
+def usage_roots():
+    """(interactive config dirs, the others), for setup.
+
+    The known roots go through the saved index, refreshed. Dirs only a running
+    session names are scanned but NOT saved: the index drops every path it was
+    not given, so saving them would rescan them on every later refresh.
+    """
+    try:
+        dirs = engine.config_dirs_now()
+    except Exception:             # noqa: BLE001 - ps unreadable: the known roots
+        dirs = index.config_roots()
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    known = set(index.config_roots())
+    entries = list(fresh_index().values())
+    extra = [d for d in dirs if d not in known]
+    if extra:
+        entries += list(index.update({}, index.transcripts(roots=extra)).values())
+    return setup.interactive_roots(entries, dirs)
+
+
+def usage_facts(now=None):
+    """What doctor says about usage. Read-only and cheap: the saved index as it
+    is, and the settings files. A dir is reported when it is interactive, holds
+    ccwho's statusLine, or was opted out."""
+    now = time.time() if now is None else now
+    dirs = []
+    for d in index.config_roots():
+        d = os.path.normpath(d)
+        if d not in dirs and os.path.isdir(d):
+            dirs.append(d)
+    yes, _ = setup.interactive_roots(index.load(index_path()).values(), dirs)
+    try:
+        opted = {os.path.normpath(d) for d in
+                 setup.parse_opt_out(_text_or_none(opt_out_path()))}
+    except (OSError, ValueError):
+        opted = set()
+    roots = []
+    for d in dirs:
+        text, problem = read_settings(os.path.join(d, "settings.json"))
+        state = "invalid" if problem else setup.statusline_state(text)
+        if d in yes or state == "ours" or d in opted:
+            roots.append({"root": d, "state": state, "opted_out": d in opted})
+    readings = usage.load_readings(usage_dir(), now)
+    newest = max((r["received_at"] for r in readings), default=None)
+    return {"usage_roots": roots,
+            "usage_newest_age": None if newest is None else max(0.0, now - newest)}
+
+
+def opt_out_path():
+    return os.path.join(ccwho_dir(), "usage-opt-out")
+
+
+def _text_or_none(path):
+    """A file's text, or None when there is no file - unlike read_text, an
+    empty settings.json and a missing one are different answers here."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def read_settings(path):
+    """(text, problem) for a settings.json. A problem means: do not touch it."""
+    if os.path.islink(path) and not os.path.exists(path):
+        return None, "is a broken link - not touched"
+    try:
+        return _text_or_none(os.path.realpath(path)), ""
+    except UnicodeDecodeError:
+        return None, "is not valid UTF-8 - not touched"
+    except OSError as ex:
+        return None, f"cannot be read ({ex.strerror}) - not touched"
+
+
+def _new_file_mode():
+    """What open() would give a new file under the user's umask."""
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+def _backup(path, text, mode):
+    """Keep the text we replace, beside the file, never over an older backup:
+    the first one holds what was there before ccwho ever touched it."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(1, 100):
+        name = f"{path}.bak-ccwho-{stamp}" + (f"-{n}" if n > 1 else "")
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            continue
+        try:
+            try:
+                os.fchmod(fd, mode)
+                fh = os.fdopen(fd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(fd)
+                raise
+            with fh:
+                fh.write(text)
+        except BaseException:
+            # half a backup looks like the first one and holds the wrong text
+            os.unlink(name)
+            raise
+        return name
+    raise OSError("no free backup name")
+
+
+def _ask_tty(prompt):
+    """y/N on a terminal; None when nobody is there to answer."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
+def _said_yes(reply):
+    return (reply or "").strip().lower() in ("y", "yes")
+
+
+def guarded_write(path, before, new):
+    """Replace a settings file we read as `before` with `new`, or say why not.
+
+    The file is read again first: another tool may have written it while we
+    were asking, and writing over that is exactly the silent breakage doctor
+    exists for. A symlinked file is written through its link, and the old text
+    is kept beside it.
+    """
+    target = os.path.realpath(path)
+    try:
+        now = _text_or_none(target)
+        mode = os.stat(target).st_mode & 0o777 if now is not None else _new_file_mode()
+    except (OSError, ValueError) as ex:
+        print(f"  {path}: cannot read it again ({ex}) - not written")
+        return 1
+    if now != before:
+        print(f"  {path} changed while ccwho was asking - not written."
+              " Run ccwho setup again.")
+        return 1
+    try:
+        if before is not None:
+            _backup(path, before, mode)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        write_atomic(target, new, mode=mode)
+        with open(target, encoding="utf-8") as fh:
+            ok = json.load(fh) == json.loads(new)
+    except (OSError, ValueError) as ex:
+        print(f"  {path}: could not write it ({ex})")
+        return 1
+    if not ok:
+        print(f"  {path}: read back different from what was written")
+        return 1
+    print(f"  wrote {path}")
+    return 0
+
+
+USAGE_WHY = "Without this, you won't get usage info."
+
+
+def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
+    """ccwho's statusLine in each interactive config dir, asked for dir by dir.
+
+    It is only added where no statusLine is set, and a no is remembered for
+    that dir: a later setup does not ask again, and --yes does not override it.
+    mode "on" (--usage) forgets every no; mode "off" (--no-usage) says no for
+    every dir and takes ccwho's own statusLine back out, with the same care.
+    """
+    ask = ask or _ask_tty
+    command = setup.statusline_command(ccwho or ccwho_bin())
+    # one spelling per dir: CLAUDE_CONFIG_DIR=/x/ and /x are the same dir
+    roots = [os.path.normpath(r) for r in roots]
+    skipped = [os.path.normpath(r) for r in skipped]
+    try:
+        opted = {os.path.normpath(d) for d in
+                 setup.parse_opt_out(_text_or_none(opt_out_path()))}
+    except (OSError, ValueError):
+        opted = set()
+
+    def remember():
+        os.makedirs(ccwho_dir(), exist_ok=True)
+        write_atomic(opt_out_path(), setup.render_opt_out(opted))
+
+    rc = 0
+    if mode == "off":
+        opted |= set(roots) | set(skipped)
+        remember()
+        still_on, unknown = [], []
+        for root in list(roots) + list(skipped):
+            path = os.path.join(root, "settings.json")
+            before, problem = read_settings(path)
+            if problem:
+                # unknown content: it may hold ours, so "off" cannot be said
+                print(f"  not checked: {path} {problem}")
+                unknown.append(f"{path} {problem}")
+                rc = 1
+                continue
+            new = setup.remove_statusline(before)
+            if new is None:
+                continue
+            print(setup.settings_diff(before, new, path), end="")
+            if yes or _said_yes(ask(f"Remove ccwho's statusLine from {path}? [y/N] ")):
+                if guarded_write(path, before, new) == 0:
+                    continue
+                rc = 1
+            still_on.append(path)
+        if still_on:
+            # Remembered as a no, but the statusLine is still there: saying "off"
+            # here would be the false all-clear doctor exists to avoid.
+            print("usage info: still on - ccwho's statusLine was not taken out of "
+                  + ", ".join(still_on)
+                  + " (answer y in a terminal, or add --yes, to take it out)")
+        if unknown:
+            # --yes cannot help here: the file itself has to be fixed first
+            print("usage info: not known - fix, then run ccwho setup --no-usage again: "
+                  + "; ".join(unknown))
+        if not still_on and not unknown:
+            print("usage info: off (ccwho setup --usage turns it back on)")
+        return rc
+    if mode == "on" and opted:
+        opted = set()
+        remember()
+
+    for root in skipped:
+        print(f"note usage               skipped {root}: no interactive session there"
+              " yet - run ccwho setup again after you use it")
+    for root in roots:
+        path = os.path.join(root, "settings.json")
+        label = f"usage ({root})"
+        before, problem = read_settings(path)
+        if problem:
+            print(f"note {label:<20} settings.json {problem}")
+            continue
+        state = setup.statusline_state(before)
+        if state == "ours":
+            print(f"ok   {label:<20} on")
+        elif state == "other":
+            print(f"note {label:<20} another statusLine is set - left alone,"
+                  " so no usage info from this dir")
+        elif state == "invalid":
+            print(f"note {label:<20} settings.json is not valid JSON - not touched")
+        elif root in opted:
+            print(f"ok   {label:<20} off (your choice) - ccwho setup --usage turns it on")
+        else:
+            new = setup.add_statusline(before, command)
+            print(f"todo {label:<20} add ccwho's statusLine:")
+            print(setup.settings_diff(before, new, path), end="")
+            if not yes:
+                reply = ask(f"{USAGE_WHY} Add it to {path}? [y/N] ")
+                if reply is None:
+                    print("  not asked (no terminal) - run ccwho setup in a terminal to add it")
+                    continue
+                if not _said_yes(reply):
+                    opted.add(root)
+                    remember()
+                    print("  off (your choice) - ccwho setup --usage turns it on")
+                    continue
+            rc |= guarded_write(path, before, new)
+    return rc
+
+
 def restore_dir():
     return os.path.join(ccwho_dir(), "restore")
 
@@ -1536,6 +1823,7 @@ def main(argv=None):
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY]         install what ccwho needs, once")
+        print("       ccwho setup --no-usage | --usage           turn usage info off / back on")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")

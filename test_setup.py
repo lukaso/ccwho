@@ -1131,3 +1131,175 @@ class TestBothCommandsKnowAboutIt(unittest.TestCase):
             self.facts(iterm_granted_at=3000.0))}["hotkey reach"]
         self.assertFalse(step["todo"], "ccwho does not quit iTerm2 for you")
         self.assertIn("restart", step["fix"].lower())
+
+
+class TestTheStatusLineIsOursOrNot(unittest.TestCase):
+    """ccwho adds a statusLine only where there is none, and only ever removes
+    its own. Deciding which is which is pure over the file's text."""
+
+    CCWHO = "/opt/homebrew/bin/ccwho"
+
+    def test_the_command_runs_ccwho_statusline(self):
+        self.assertEqual(setup.statusline_command(self.CCWHO),
+                         "/opt/homebrew/bin/ccwho statusline")
+        self.assertEqual(setup.statusline_command("/Users/a b/ccwho.py"),
+                         "'/Users/a b/ccwho.py' statusline")
+
+    def test_ours_is_any_ccwho_running_statusline(self):
+        for cmd in ("/opt/homebrew/bin/ccwho statusline", "ccwho statusline",
+                    "'/Users/a b/ccwho.py' statusline", "/x/ccwho.py statusline"):
+            self.assertTrue(setup.is_ours(cmd), cmd)
+        for cmd in ("~/.claude/statusline.sh", "ccwho ls", "ccwho statusline; rm -rf x",
+                    "notccwho statusline", "", None, 3, "python3 ccwho.py statusline",
+                    "'unterminated"):
+            self.assertFalse(setup.is_ours(cmd), cmd)
+
+    def test_state_of_a_settings_file(self):
+        ours = json.dumps({"statusLine": {"type": "command", "command": "ccwho statusline"}})
+        other = json.dumps({"statusLine": {"type": "command", "command": "~/sl.sh"}})
+        self.assertEqual(setup.statusline_state(None), "missing")
+        self.assertEqual(setup.statusline_state("{}"), "missing")
+        self.assertEqual(setup.statusline_state(json.dumps({"hooks": {}})), "missing")
+        self.assertEqual(setup.statusline_state(ours), "ours")
+        self.assertEqual(setup.statusline_state(other), "other")
+        self.assertEqual(setup.statusline_state(json.dumps({"statusLine": "x"})), "other")
+        self.assertEqual(setup.statusline_state(""), "missing")
+        self.assertEqual(setup.statusline_state("  \n"), "missing")
+        for bad in ("{nope", "[]", "null", "\ufeff{}"):
+            self.assertEqual(setup.statusline_state(bad), "invalid", bad)
+
+    def test_adding_keeps_every_other_key(self):
+        text = json.dumps({"hooks": {"Stop": [{"x": 1}]}, "model": "opus",
+                           "env": {"A": "1"}})
+        new = setup.add_statusline(text, "ccwho statusline")
+        data = json.loads(new)
+        self.assertEqual(data["statusLine"], {"type": "command",
+                                              "command": "ccwho statusline"})
+        del data["statusLine"]
+        self.assertEqual(data, json.loads(text))
+        self.assertTrue(new.endswith("\n"))
+
+    def test_adding_changes_no_other_line_of_a_file_claude_code_wrote(self):
+        """Claude Code writes indent=2 and keeps non-ASCII as it is. Measured: the
+        first version escaped "—", and the diff showed 22 changed lines."""
+        text = json.dumps({"permissions": {"allow": ["Bash(ls)"]},
+                           "note": "private — café 日本"},
+                          indent=2, ensure_ascii=False) + "\n"
+        new = setup.add_statusline(text, "ccwho statusline")
+        diff = setup.settings_diff(text, new, "s.json")
+        removed = [l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
+        # only the last key's line changes: it gains a comma
+        self.assertLessEqual(len(removed), 1, diff)
+        self.assertIn("—", new)
+        self.assertNotIn("\\u2014", new)
+
+    def test_removing_keeps_non_ascii_as_it_is(self):
+        text = json.dumps({"statusLine": {"type": "command", "command": "ccwho statusline"},
+                           "note": "—"}, indent=2, ensure_ascii=False)
+        self.assertIn("—", setup.remove_statusline(text))
+
+    def test_adding_to_no_file_makes_one(self):
+        self.assertEqual(json.loads(setup.add_statusline(None, "ccwho statusline")),
+                         {"statusLine": {"type": "command", "command": "ccwho statusline"}})
+
+    def test_adding_where_one_exists_or_the_file_is_bad_is_refused(self):
+        other = json.dumps({"statusLine": {"type": "command", "command": "~/sl.sh"}})
+        self.assertIsNone(setup.add_statusline(other, "ccwho statusline"))
+        self.assertIsNone(setup.add_statusline("{nope", "ccwho statusline"))
+
+    def test_removing_takes_only_ours(self):
+        ours = json.dumps({"statusLine": {"type": "command", "command": "ccwho statusline"},
+                           "model": "opus"})
+        self.assertEqual(json.loads(setup.remove_statusline(ours)), {"model": "opus"})
+        other = json.dumps({"statusLine": {"type": "command", "command": "~/sl.sh"}})
+        self.assertIsNone(setup.remove_statusline(other))
+        self.assertIsNone(setup.remove_statusline("{}"))
+        self.assertIsNone(setup.remove_statusline("{nope"))
+
+    def test_the_diff_shows_the_added_lines(self):
+        new = setup.add_statusline("{}", "ccwho statusline")
+        diff = setup.settings_diff("{}", new, "/x/settings.json")
+        self.assertIn("/x/settings.json", diff)
+        self.assertIn('+  "statusLine"', diff)
+
+
+class TestInteractiveConfigDirs(unittest.TestCase):
+    """Only dirs where a person has run claude get a statusLine: program runs
+    (`claude -p`) never run one, and their dirs belong to the program."""
+
+    def entry(self, root, ep):
+        return {"path": f"{root}/projects/-p/abc.jsonl", "entrypoint": ep}
+
+    def test_a_dir_with_a_cli_session_qualifies_even_mixed(self):
+        entries = [self.entry("/h/.claude", "sdk-cli"), self.entry("/h/.claude", "cli"),
+                   self.entry("/h/.claude-work", "cli")]
+        yes, skipped = setup.interactive_roots(entries, ["/h/.claude", "/h/.claude-work"])
+        self.assertEqual(yes, ["/h/.claude", "/h/.claude-work"])
+        self.assertEqual(skipped, [])
+
+    def test_program_only_and_unknown_entrypoints_do_not_qualify(self):
+        entries = [self.entry("/h/.la", "sdk-cli"), self.entry("/h/.la", "sdk-py"),
+                   self.entry("/h/.old", ""), {"path": "/h/.old/projects/-p/x.jsonl"}]
+        yes, skipped = setup.interactive_roots(entries, ["/h/.la", "/h/.old", "/h/.new"])
+        self.assertEqual(yes, [])
+        self.assertEqual(skipped, ["/h/.la", "/h/.old", "/h/.new"])
+
+    def test_a_dir_whose_name_starts_like_another_is_not_confused(self):
+        entries = [self.entry("/h/.claude-work", "cli")]
+        yes, skipped = setup.interactive_roots(entries, ["/h/.claude", "/h/.claude-work"])
+        self.assertEqual(yes, ["/h/.claude-work"])
+        self.assertEqual(skipped, ["/h/.claude"])
+
+    def test_junk_entries_are_skipped(self):
+        yes, _ = setup.interactive_roots([None, "x", {"path": 3, "entrypoint": "cli"}],
+                                         ["/h/.claude"])
+        self.assertEqual(yes, [])
+
+
+class TestTheOptOutIsPerDir(unittest.TestCase):
+    def test_round_trip(self):
+        text = setup.render_opt_out({"/h/.claude", "/h/.w"})
+        self.assertEqual(setup.parse_opt_out(text), {"/h/.claude", "/h/.w"})
+
+    def test_junk_is_no_opt_out(self):
+        for junk in (None, "", "{nope", "{}", "[1, 2]", '"x"'):
+            self.assertEqual(setup.parse_opt_out(junk), set(), junk)
+
+
+class TestDoctorSaysWhereUsageComesFrom(unittest.TestCase):
+    def check(self, roots, newest=None):
+        return by_name(setup.doctor_checks(facts(usage_roots=roots,
+                                                 usage_newest_age=newest)))
+
+    def test_on_is_ok_and_says_the_newest_reading(self):
+        c = self.check([{"root": "/h/.claude", "state": "ours", "opted_out": False}], 180)
+        self.assertTrue(c["usage (/h/.claude)"]["ok"])
+        self.assertIn("3m", c["usage (/h/.claude)"]["detail"])
+
+    def test_on_with_no_reading_yet_says_never(self):
+        c = self.check([{"root": "/h/.claude", "state": "ours", "opted_out": False}])
+        self.assertIn("never", c["usage (/h/.claude)"]["detail"])
+
+    def test_missing_is_bad_with_the_fix(self):
+        c = self.check([{"root": "/h/.claude", "state": "missing", "opted_out": False}])
+        self.assertFalse(c["usage (/h/.claude)"]["ok"])
+        self.assertIn("no usage info", c["usage (/h/.claude)"]["detail"])
+        self.assertEqual(c["usage (/h/.claude)"]["fix"], "ccwho setup")
+
+    def test_opted_out_is_ok_and_says_so(self):
+        c = self.check([{"root": "/h/.claude", "state": "missing", "opted_out": True}])
+        self.assertTrue(c["usage (/h/.claude)"]["ok"])
+        self.assertIn("your choice", c["usage (/h/.claude)"]["detail"])
+
+    def test_another_statusline_is_not_a_fault(self):
+        c = self.check([{"root": "/h/.claude", "state": "other", "opted_out": False}])
+        self.assertTrue(c["usage (/h/.claude)"]["ok"])
+        self.assertIn("another statusLine", c["usage (/h/.claude)"]["detail"])
+
+    def test_an_invalid_settings_file_is_bad(self):
+        c = self.check([{"root": "/h/.claude", "state": "invalid", "opted_out": False}])
+        self.assertFalse(c["usage (/h/.claude)"]["ok"])
+
+    def test_no_usage_facts_adds_no_check(self):
+        names = by_name(setup.doctor_checks(facts()))
+        self.assertFalse([n for n in names if n.startswith("usage")])

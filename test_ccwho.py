@@ -1,5 +1,6 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
 import json
+import re
 import os
 import shutil
 import shlex
@@ -4437,3 +4438,150 @@ class TestTheListSaysWhatAgentsHoldRound3(unittest.TestCase):
                 self.assertEqual(len(ccwho.session_procs_lines(fleet, "s")), 1)
                 ccwho.render_ps_screen(ccwho.ps_listing([], fleet), fleet, width=80)
                 ccwho.bottom_lines(fleet)
+
+
+class TestRowsWithUsage(unittest.TestCase):
+    """Usage adds a line under the header and, with 2+ accounts, a tag at the end
+    of each row. A row with no tag must be EXACTLY what it was before usage
+    existed: test_fixture_rows_before_usage.json was captured from the engine
+    before this change (critical regression contract, eng review 2026-09-25)."""
+
+    @classmethod
+    def setUpClass(cls):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "test_fixture_rows_before_usage.json"),
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+        cls.rows, cls.expected = data["rows"], data["expected"]
+
+    def as_json(self, value):
+        return json.loads(json.dumps(value, ensure_ascii=False))
+
+    def test_rows_without_a_tag_are_byte_identical_to_before(self):
+        for w, want in self.expected["cells"].items():
+            got = [ccwho.ui_row_cells(r, width=int(w)) for r in self.rows]
+            self.assertEqual(self.as_json(got), want, f"width {w}")
+            got = [ccwho.ui_row_cells(r, width=int(w), tag="") for r in self.rows]
+            self.assertEqual(self.as_json(got), want, f"width {w}, empty tag")
+
+    def test_the_table_without_usage_is_byte_identical_to_before(self):
+        for key, want in self.expected["render"].items():
+            w, color = int(key.rstrip("c")), key.endswith("c")
+            self.assertEqual(ccwho.render(self.rows, {}, color=color, width=w), want, key)
+
+    def test_a_tag_is_the_last_cell_and_the_name_gives_way(self):
+        row = self.rows[0]
+        for w in (60, 100, 160):
+            first, _ = ccwho.ui_row_cells(row, width=w, tag="1a2b")
+            self.assertEqual(first[-1], (" · 1a2b", "account"))
+            self.assertEqual(first[0][1], "mark")
+            self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), w)
+            plain, _ = ccwho.ui_row_cells(row, width=w)
+            self.assertEqual(first[:3], plain[:3])       # mark, id, project untouched
+
+    def test_a_long_name_gives_way_and_the_tag_stays_whole(self):
+        row = dict(self.rows[0], tab_title="a very long tab title " * 6)
+        for w in (60, 100):
+            first, _ = ccwho.ui_row_cells(row, width=w, tag="lukaso@gmail")
+            self.assertEqual(first[-1], (" · lukaso@gmail", "account"))
+            name = [t for t, role in first if role == "name"][0]
+            self.assertTrue(name.endswith("…"), name)
+            self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), w)
+
+    def usage_snap(self):
+        import ccwho_usage as usage
+        now = 1790340000.0
+        rows = [{"id": "login:a", "kind": "login", "email": "lukaso@gmail.com", "brand": "ant",
+                 "label": "", "sessions": 1, "age": 5,
+                 "five_hour": {"state": "ok", "pct": 42, "resets_at": now + 7200, "age": 5},
+                 "seven_day": None},
+                {"id": "token:1a2b3c4d", "kind": "token", "email": "", "brand": "ant",
+                 "label": "", "sessions": 1, "age": 5,
+                 "five_hour": {"state": "ok", "pct": 0, "resets_at": None, "age": 5},
+                 "seven_day": None}]
+        names = usage.short_names(rows, {})
+        return {"state": "ok", "accounts": usage.ordered(rows, names), "names": names,
+                "sessions": {self.rows[0]["sessionId"]: "login:a",
+                             self.rows[2]["sessionId"]: "token:1a2b3c4d"}, "now": now}
+
+    def test_the_table_shows_the_usage_line_under_the_header_and_tags(self):
+        out = ccwho.render(self.rows, {"usage": self.usage_snap()}, color=False, width=150)
+        lines = out.splitlines()
+        self.assertTrue(lines[1].startswith("usage  ant lukaso 5h 42%"), lines[1])
+        body = [l for l in lines if l.startswith(("liveapp", "ccwho", "marketing"))]
+        before = [l for l in self.expected["render"]["150"].splitlines()
+                  if l.startswith(("liveapp", "ccwho", "marketing"))]
+        # the tag follows the age column; the doing column gives up its width,
+        # so a row is exactly as wide as it was
+        for row, line, old, tag in zip(self.rows, body, before, ("lukaso", "?", "1a2b")):
+            self.assertIn(f"{row['since']:>5}  {tag}", line)
+            self.assertEqual(ccwho._cells(line), ccwho._cells(old), line)
+
+    def test_a_broken_usage_snapshot_never_breaks_the_table(self):
+        out = ccwho.render(self.rows, {"usage": {"state": "ok", "accounts": [{"id": 3}]}},
+                           color=False, width=150)
+        self.assertIn("usage  unknown", out)
+        rows_part = out.split("\n", 3)[3]
+        self.assertIn("liveapp", rows_part)
+
+    def test_usage_off_adds_nothing(self):
+        out = ccwho.render(self.rows, {"usage": {"state": "off"}}, color=False, width=150)
+        self.assertEqual(out, self.expected["render"]["150"])
+
+
+class TestTableTagWidth(unittest.TestCase):
+    ROWS = TestRowsWithUsage
+
+    def setUp(self):
+        TestRowsWithUsage.setUpClass()
+        self.rows, self.expected = TestRowsWithUsage.rows, TestRowsWithUsage.expected
+
+    def snap(self, names):
+        import ccwho_usage as usage
+        accts = [{"id": aid, "kind": "login", "email": "", "brand": "ant", "label": "",
+                  "sessions": 1, "age": 1,
+                  "five_hour": {"state": "ok", "pct": 1, "resets_at": None, "age": 1},
+                  "seven_day": None} for aid in names]
+        return {"state": "ok", "accounts": accts, "names": dict(names),
+                "sessions": {self.rows[0]["sessionId"]: list(names)[0],
+                             self.rows[2]["sessionId"]: list(names)[1]}, "now": 0}
+
+    def body(self, out):
+        return [l for l in out.splitlines() if l.startswith(("liveapp", "ccwho", "marketing"))]
+
+    def test_a_wide_tag_takes_the_same_cells_on_every_row(self):
+        """The tag column, measured in cells: a CJK tag is 2 cells per character.
+        (A CJK title already put the old table out of line; that is not this.)"""
+        out = ccwho.render(self.rows, {"usage": self.snap({"a": "日本語", "b": "bb"})},
+                           color=False, width=150)
+        cols = set()
+        for row, line in zip(self.rows, self.body(out)):
+            after = line.split(f"{row['since']:>5}", 1)[1]
+            tag_part = re.split(r"  (?=[:+])", after)[0]
+            cols.add(ccwho._cells(tag_part))
+        self.assertEqual(len(cols), 1, self.body(out))
+        self.assertIn("日本語", self.body(out)[0])      # whole, when there is room
+
+    def test_a_long_tag_never_makes_a_row_wider_than_before(self):
+        names = {"a": "someone.with.a.long.name@example-company.com", "b": "bb"}
+        for w in (80, 150):
+            out = ccwho.render(self.rows, {"usage": self.snap(names)}, color=False, width=w)
+            old = [l for l in self.expected["render"][str(w)].splitlines()
+                   if l.startswith(("liveapp", "ccwho", "marketing"))]
+            for new, before in zip(self.body(out), old):
+                self.assertLessEqual(ccwho._cells(new), ccwho._cells(before), new)
+
+
+class TestShortTagsKeepTheirColumn(unittest.TestCase):
+    def test_one_cell_tags_are_shown(self):
+        TestRowsWithUsage.setUpClass()
+        rows = TestRowsWithUsage.rows
+        accts = [{"id": a, "kind": "login", "email": "", "brand": "ant", "label": "",
+                  "sessions": 1, "age": 1,
+                  "five_hour": {"state": "ok", "pct": 1, "resets_at": None, "age": 1},
+                  "seven_day": None} for a in ("q", "r")]
+        snap = {"state": "ok", "accounts": accts, "names": {"q": "q", "r": "r"},
+                "sessions": {rows[0]["sessionId"]: "q", rows[2]["sessionId"]: "r"}, "now": 0}
+        out = ccwho.render(rows, {"usage": snap}, color=False, width=150)
+        self.assertIn(f"{rows[0]['since']:>5}  q", out)
+        self.assertIn(f"{rows[2]['since']:>5}  r", out)

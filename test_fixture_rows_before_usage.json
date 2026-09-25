@@ -1,0 +1,542 @@
+{
+ "rows": [
+  {
+   "sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
+   "project": "liveapp",
+   "tab_title": "liveapp-4e",
+   "title": "Laptop crash",
+   "name": "liveapp-4e",
+   "since": "1m",
+   "tty": "/dev/ttys017",
+   "attention": "asks",
+   "status": "waiting",
+   "ask": "AskUserQuestion",
+   "doing": "AskUserQuestion",
+   "recap": "checking the kernel panic log",
+   "recap_age": "4m",
+   "turns_since_recap": 2,
+   "ports": [
+    3000
+   ],
+   "procs": 1,
+   "dead_loops": [],
+   "orphans": 0
+  },
+  {
+   "sessionId": "9a9a9a9a-2222-4222-8333-abcdefabcdef",
+   "project": "marketing-site-long-name",
+   "tab_title": "",
+   "title": "日本語のタイトル very long title that goes on",
+   "name": "m",
+   "since": "14d",
+   "tty": "",
+   "windowed": false,
+   "attention": "stopped",
+   "status": "idle",
+   "doing": "Edit: engagement.md",
+   "recap": "",
+   "ports": [],
+   "procs": 0,
+   "dead_loops": [],
+   "orphans": 0
+  },
+  {
+   "sessionId": "77777777-3333-4222-8333-abcdefabcdef",
+   "project": "ccwho",
+   "tab_title": "ccwho-s044",
+   "title": "t",
+   "name": "n",
+   "since": "6s",
+   "tty": "/dev/ttys044",
+   "attention": "busy",
+   "status": "busy",
+   "doing": "Bash: Read layout",
+   "recap": "reading the layout",
+   "recap_age": "1m",
+   "ports": [
+    5173,
+    8080,
+    9000,
+    9001
+   ],
+   "procs": 4,
+   "dead_loops": [
+    {
+     "pid": 123,
+     "tasks": [
+      "t1"
+     ]
+    }
+   ],
+   "orphans": 2,
+   "kind": "background",
+   "windowed": false
+  }
+ ],
+ "expected": {
+  "cells": {
+   "40": [
+    [
+     [
+      [
+       "▲ ",
+       "mark"
+      ],
+      [
+       "4f2b  ",
+       "id"
+      ],
+      [
+       "liveapp  ",
+       "project"
+      ],
+      [
+       "liveapp-4e",
+       "name"
+      ],
+      [
+       " · 1m · s017",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "4m, 2 turns · ",
+       "age"
+      ],
+      [
+       "checking the kern…",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "· ",
+       "mark"
+      ],
+      [
+       "9a9a  ",
+       "id"
+      ],
+      [
+       "marketing-si  ",
+       "project"
+      ],
+      [
+       "~日本語…",
+       "name"
+      ],
+      [
+       " · 14d · …",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "",
+       "age"
+      ],
+      [
+       "(no recap yet) Edit: engagement…",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "● ",
+       "mark"
+      ],
+      [
+       "7777  ",
+       "id"
+      ],
+      [
+       "ccwho  ",
+       "project"
+      ],
+      [
+       "ccwho-s…",
+       "name"
+      ],
+      [
+       " · 6s · backgrou…",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "loop 123 waits on t1, which has…",
+       "age"
+      ]
+     ]
+    ]
+   ],
+   "60": [
+    [
+     [
+      [
+       "▲ ",
+       "mark"
+      ],
+      [
+       "4f2b  ",
+       "id"
+      ],
+      [
+       "liveapp  ",
+       "project"
+      ],
+      [
+       "liveapp-4e",
+       "name"
+      ],
+      [
+       " · 1m · s017 · :3000",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "4m, 2 turns · ",
+       "age"
+      ],
+      [
+       "checking the kernel panic log",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "· ",
+       "mark"
+      ],
+      [
+       "9a9a  ",
+       "id"
+      ],
+      [
+       "marketing-si  ",
+       "project"
+      ],
+      [
+       "~日本語のタイトル v…",
+       "name"
+      ],
+      [
+       " · 14d · no window",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "",
+       "age"
+      ],
+      [
+       "(no recap yet) Edit: engagement.md",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "● ",
+       "mark"
+      ],
+      [
+       "7777  ",
+       "id"
+      ],
+      [
+       "ccwho  ",
+       "project"
+      ],
+      [
+       "ccwho-s044",
+       "name"
+      ],
+      [
+       " · 6s · background",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "loop 123 waits on t1, which has ended · ",
+       "age"
+      ]
+     ]
+    ]
+   ],
+   "100": [
+    [
+     [
+      [
+       "▲ ",
+       "mark"
+      ],
+      [
+       "4f2b  ",
+       "id"
+      ],
+      [
+       "liveapp  ",
+       "project"
+      ],
+      [
+       "liveapp-4e",
+       "name"
+      ],
+      [
+       " · 1m · s017 · :3000",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "4m, 2 turns · ",
+       "age"
+      ],
+      [
+       "checking the kernel panic log",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "· ",
+       "mark"
+      ],
+      [
+       "9a9a  ",
+       "id"
+      ],
+      [
+       "marketing-si  ",
+       "project"
+      ],
+      [
+       "~日本語のタイトル very long title that goes on",
+       "name"
+      ],
+      [
+       " · 14d · no window",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "",
+       "age"
+      ],
+      [
+       "(no recap yet) Edit: engagement.md",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "● ",
+       "mark"
+      ],
+      [
+       "7777  ",
+       "id"
+      ],
+      [
+       "ccwho  ",
+       "project"
+      ],
+      [
+       "ccwho-s044",
+       "name"
+      ],
+      [
+       " · 6s · background · :5173 :8080 :9000 +1",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "loop 123 waits on t1, which has ended · ",
+       "age"
+      ],
+      [
+       "reading the layout",
+       "recap"
+      ]
+     ]
+    ]
+   ],
+   "160": [
+    [
+     [
+      [
+       "▲ ",
+       "mark"
+      ],
+      [
+       "4f2b  ",
+       "id"
+      ],
+      [
+       "liveapp  ",
+       "project"
+      ],
+      [
+       "liveapp-4e",
+       "name"
+      ],
+      [
+       " · 1m · s017 · :3000",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "4m, 2 turns · ",
+       "age"
+      ],
+      [
+       "checking the kernel panic log",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "· ",
+       "mark"
+      ],
+      [
+       "9a9a  ",
+       "id"
+      ],
+      [
+       "marketing-si  ",
+       "project"
+      ],
+      [
+       "~日本語のタイトル very long title that goes on",
+       "name"
+      ],
+      [
+       " · 14d · no window",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "",
+       "age"
+      ],
+      [
+       "(no recap yet) Edit: engagement.md",
+       "recap"
+      ]
+     ]
+    ],
+    [
+     [
+      [
+       "● ",
+       "mark"
+      ],
+      [
+       "7777  ",
+       "id"
+      ],
+      [
+       "ccwho  ",
+       "project"
+      ],
+      [
+       "ccwho-s044",
+       "name"
+      ],
+      [
+       " · 6s · background · :5173 :8080 :9000 +1",
+       "meta"
+      ]
+     ],
+     [
+      [
+       "        ",
+       "pad"
+      ],
+      [
+       "loop 123 waits on t1, which has ended · ",
+       "age"
+      ],
+      [
+       "reading the layout",
+       "recap"
+      ]
+     ]
+    ]
+   ]
+  },
+  "render": {
+   "80": "3 sessions: 1 asks · 1 stopped · 1 busy\n\nliveapp        s017  ASKED YOU   liveapp-4e          AskUserQuestion        1m  :3000\nmarketing-site-long-name  -     STOPPED     ~日本語のタイトル very lo…  Edit: engagement.…    14d\nccwho          s044  busy        ccwho-s044          Bash: Read layout      6s  :5173 :8080 :9000 :9001  +2 detached\n",
+   "80c": "\u001b[1m3 sessions: 1 asks · 1 stopped · 1 busy\u001b[0m\n\nliveapp        \u001b[2ms017\u001b[0m  \u001b[35;1mASKED YOU \u001b[0m  liveapp-4e          \u001b[2mAskUserQuestion\u001b[0m        1m\u001b[2m  :3000\u001b[0m\nmarketing-site-long-name  \u001b[2m-   \u001b[0m  \u001b[33mSTOPPED   \u001b[0m  ~日本語のタイトル very lo…  \u001b[2mEdit: engagement.…\u001b[0m    14d\nccwho          \u001b[2ms044\u001b[0m  \u001b[36mbusy      \u001b[0m  ccwho-s044          \u001b[2mBash: Read layout\u001b[0m      6s\u001b[2m  :5173 :8080 :9000 :9001\u001b[0m\u001b[33;1m  +2 detached\u001b[0m\n",
+   "150": "3 sessions: 1 asks · 1 stopped · 1 busy\n\nliveapp        s017  ASKED YOU   liveapp-4e                          AskUserQuestion                                                              1m  :3000\nmarketing-site-long-name  -     STOPPED     ~日本語のタイトル very long title that go…  Edit: engagement.md                                                         14d\nccwho          s044  busy        ccwho-s044                          Bash: Read layout                                                            6s  :5173 :8080 :9000 :9001  +2 detached\n",
+   "150c": "\u001b[1m3 sessions: 1 asks · 1 stopped · 1 busy\u001b[0m\n\nliveapp        \u001b[2ms017\u001b[0m  \u001b[35;1mASKED YOU \u001b[0m  liveapp-4e                          \u001b[2mAskUserQuestion\u001b[0m                                                              1m\u001b[2m  :3000\u001b[0m\nmarketing-site-long-name  \u001b[2m-   \u001b[0m  \u001b[33mSTOPPED   \u001b[0m  ~日本語のタイトル very long title that go…  \u001b[2mEdit: engagement.md\u001b[0m                                                         14d\nccwho          \u001b[2ms044\u001b[0m  \u001b[36mbusy      \u001b[0m  ccwho-s044                          \u001b[2mBash: Read layout\u001b[0m                                                            6s\u001b[2m  :5173 :8080 :9000 :9001\u001b[0m\u001b[33;1m  +2 detached\u001b[0m\n"
+  }
+ }
+}

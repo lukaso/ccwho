@@ -2083,7 +2083,7 @@ def ui_state_style(row):
     return UI_STATE_STYLE.get(row.get("attention", ""), "quiet")
 
 
-def ui_row_cells(row, width=100):
+def ui_row_cells(row, width=100, tag=""):
     """The two lines a session gets, in parts, each part saying what it is.
 
     Line one is what the session IS: a mark for its state, then plain text.
@@ -2113,13 +2113,17 @@ def ui_row_cells(row, width=100):
         f" · {_plural(row['procs'], 'proc')}" if row.get("procs") else "")
     glyph = UI_STATE_MARK.get(row.get("attention", ""), UI_UNKNOWN_MARK) + " "
     head = f"{sid}  {row.get('project', '?')[:12]}  "
-    room = max(8, width - _cells(glyph) - _cells(head) - _cells(tail))
+    # the account this row spends (usage, 2+ accounts only): last, and the name
+    # gives way for it - never the mark, the id or the project
+    account = [(f" · {tag}", "account")] if tag else []
+    room = max(8, width - _cells(glyph) - _cells(head) - _cells(tail)
+               - sum(_cells(t) for t, _ in account))
     shown = _cut(name, room)
     if _cells(shown) + _cells(held) <= room:
         tail += held
     first = [(glyph, "mark"), (f"{sid}  ", "id"),
              (f"{row.get('project', '?')[:12]}  ", "project"),
-             (shown, "name"), (tail, "meta")]
+             (shown, "name"), (tail, "meta")] + account
 
     # The age goes FIRST. At the end of a long recap it is the first thing
     # truncation eats, and a recap whose age you cannot see reads as the current
@@ -2234,6 +2238,23 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
     summary = " · ".join(f"{n} {s}" for s, n in sorted(counts.items(), key=lambda kv: _RANK.get(kv[0], 9)))
 
     out = [_paint(f"{len(rows)} sessions: {summary}", "bold", color)]
+    # usage: what each account has left, dim like the ports line. A usage
+    # problem is said on its own line and never costs the rows (eng E-D7)
+    snap, tags = fleet.get("usage"), {}
+    if "usage" in fleet:
+        try:
+            lines = ccwho_usage.usage_lines(snap, width)
+            tags = {r.get("sessionId", ""): ccwho_usage.row_tag(snap, r.get("sessionId", ""))
+                    for r in rows}
+        except Exception:
+            lines, tags = [[("usage  unknown", "dim")]], {}
+        out += [ccwho_usage.to_ansi(line) if color else "".join(t for t, _ in line)
+                for line in lines]
+    # in screen cells, and never wider than the doing column can give: a row
+    # with tags is exactly as wide as it was without them
+    tag_w = min(max((_cells(t) + 2 for t in tags.values() if t), default=0), w_doing - 8)
+    tag_w = tag_w if tag_w >= 3 else 0          # "  q": the smallest tag there is
+    w_doing -= tag_w
     # one dim line, never an alarm: NEEDS YOU owns this screen
     if held := ports_line(fleet, width):
         out.append(_paint(held, "dim", color))
@@ -2261,6 +2282,9 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
                 f"{_paint(shown_doing, 'dim', color)}"
                 f"{' ' * max(0, w_doing - len(shown_doing))}  "
                 f"{r['since']:>5}")
+        if tag_w:
+            tag = _cut(tags.get(r.get("sessionId", ""), ""), tag_w - 2)
+            line += _paint("  " + tag + " " * (tag_w - 2 - _cells(tag)), "dim", color)
         if r.get("ports"):
             line += _paint("  " + " ".join(f":{p}" for p in r["ports"]), "dim", color)
         if r["orphans"]:

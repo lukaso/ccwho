@@ -2548,3 +2548,168 @@ class TestTheKillButtonOnAScrollingList(UiTest):
     async def test_the_brief_opening_narrows_the_row(self):
         await self.check("Goal was moving the durable files into STATE; " * 6,
                          size=(160, 30), detail=True)
+
+
+# ------------------------------------------------------------------ usage
+NOW = 1790340000.0
+
+
+def usage_snap(two=True):
+    import ccwho_usage as usage
+    login = {"id": "login:a", "kind": "login", "email": "lukaso@gmail.com", "brand": "ant",
+             "label": "", "sessions": 1, "age": 5,
+             "five_hour": {"state": "ok", "pct": 42, "resets_at": NOW + 7200, "age": 5},
+             "seven_day": None}
+    token = {"id": "token:1a2b3c4d", "kind": "token", "email": "", "brand": "ant",
+             "label": "", "sessions": 1, "age": 5,
+             "five_hour": {"state": "ok", "pct": 67, "resets_at": NOW + 9000, "age": 5},
+             "seven_day": None}
+    rows = [login, token] if two else [login]
+    names = usage.short_names(rows, {})
+    sessions = {LIVE["sessionId"]: "login:a"}
+    if two:
+        sessions[BUSY["sessionId"]] = "token:1a2b3c4d"
+    return {"state": "ok", "accounts": usage.ordered(rows, names), "names": names,
+            "sessions": sessions, "now": NOW}
+
+
+class TestUsageLine(UiTest):
+    def app_with(self, snap):
+        fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage=snap)
+        return self.app(collector=FakeCollector(fleet=fleet))
+
+    def usage_text(self, app):
+        return app.query_one("#usage").render()
+
+    async def test_the_line_is_under_the_header(self):
+        app = self.app_with(usage_snap())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            widget = app.query_one("#usage")
+            self.assertTrue(widget.display)
+            self.assertIn("usage  ant lukaso 5h 42%", str(self.usage_text(app)))
+            ids = [w.id for w in app.screen.children]
+            self.assertLess(ids.index("header"), ids.index("usage"))
+            self.assertLess(ids.index("usage"), ids.index("ports"))
+
+    async def test_off_means_no_line(self):
+        app = self.app_with({"state": "off"})
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#usage").display)
+
+    async def test_no_usage_collected_means_no_line(self):                # control
+        app = self.app_with(None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#usage").display)
+
+    def bright(self, app):
+        """The characters no dim span covers: plain text has no span at all."""
+        text = self.usage_text(app)
+        dim = set()
+        for s in text.spans:
+            if "dim" in str(s.style):
+                dim.update(range(s.start, s.end))
+        return "".join(c for i, c in enumerate(text.plain) if i not in dim)
+
+    async def test_the_selected_rows_account_is_bright_and_follows_the_cursor(self):
+        app = self.app_with(usage_snap())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.selected = LIVE["sessionId"]
+            app.mark_selected()
+            await pilot.pause()
+            self.assertIn("lukaso", self.bright(app))
+            self.assertNotIn("1a2b", self.bright(app))
+            app.selected = BUSY["sessionId"]
+            app.mark_selected()
+            await pilot.pause()
+            self.assertIn("1a2b", self.bright(app))
+            self.assertNotIn("lukaso", self.bright(app))
+
+    async def test_rows_carry_the_account_tag_with_two_accounts(self):
+        app = self.app_with(usage_snap())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            words = {w.row["sessionId"]: w.words(w.width) for w in app.query(ui.Row)}
+            self.assertIn(" · lukaso", words[LIVE["sessionId"]].split("\n")[0])
+            self.assertIn(" · 1a2b", words[BUSY["sessionId"]].split("\n")[0])
+
+    async def test_one_account_no_tag(self):
+        plain = self.app_with(None)
+        async with plain.run_test() as pilot:
+            await pilot.pause()
+            before = sorted(w.words(w.width) for w in plain.query(ui.Row))
+        app = self.app_with(usage_snap(two=False))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(sorted(w.words(w.width) for w in app.query(ui.Row)), before)
+
+    async def test_a_broken_snapshot_says_unknown_and_keeps_the_rows(self):
+        app = self.app_with({"state": "ok", "accounts": [{"id": 3}]})
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIn("usage  unknown", str(self.usage_text(app)))
+            self.assertEqual(len(list(app.query(ui.Row))), 2)
+
+
+class TestTheCollectorReadsUsage(unittest.TestCase):
+    def collect(self, snapshot):
+        import ccwho as runner
+        real = (ui.engine.collect, runner.usage_snapshot)
+        ui.engine.collect = lambda cache=None, status=None: (
+            status.update(source_ok=True) or ([LIVE], {"collected": True}))
+        runner.usage_snapshot = snapshot
+        try:
+            c = ui.Collector()
+            c.reload = lambda: None
+            c.secure_input = lambda: ""
+            return c.fleet()
+        finally:
+            ui.engine.collect, runner.usage_snapshot = real
+
+    def test_the_fleet_carries_the_snapshot(self):
+        fleet = self.collect(lambda rows: {"state": "waiting", "rows": len(rows)})
+        self.assertEqual(fleet.usage, {"state": "waiting", "rows": 1})
+
+    def test_a_usage_failure_is_unknown_and_the_rows_survive(self):
+        def boom(rows):
+            raise ValueError("bad reading")
+        fleet = self.collect(boom)
+        self.assertEqual(fleet.usage, {"state": "unknown"})
+        self.assertEqual(len(fleet.rows), 1)
+
+
+class TestCursorRepaintsUsageOnlyWhenTheAccountChanges(UiTest):
+    async def test_same_account_no_update(self):
+        snap = usage_snap()
+        snap["sessions"][BUSY["sessionId"]] = "login:a"      # both rows: one account
+        fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage=snap)
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            box = app.query_one("#usage")
+            calls = []
+            real = box.update
+            box.update = lambda *a, **k: calls.append(1) or real(*a, **k)
+            app.selected = LIVE["sessionId"]
+            app.mark_selected()
+            app.selected = BUSY["sessionId"]
+            app.mark_selected()
+            self.assertEqual(calls, [])
+            app.fleet.usage["sessions"][BUSY["sessionId"]] = "token:1a2b3c4d"   # control
+            app.mark_selected()
+            self.assertEqual(calls, [1])
+
+
+class TestAMalformedSnapshotNeverCrashesTheList(UiTest):
+    async def test_sessions_none_on_a_cursor_move(self):
+        fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage={"state": "ok", "sessions": None})
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.selected = BUSY["sessionId"]
+            app.mark_selected()
+            await pilot.pause()
+            self.assertIn("usage  unknown", str(app.query_one("#usage").render()))

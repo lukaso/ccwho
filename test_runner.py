@@ -2842,18 +2842,26 @@ class TestStatusline(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def payload(self, **extra):
+        # resets relative to the clock: a fixed epoch expires and the window
+        # then reads "expired", which is right, and not what these tests are about
+        now = int(time.time())
         p = {"session_id": self.SID, "transcript_path": None,
-             "rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": 1790346600},
-                             "seven_day": {"used_percentage": 67, "resets_at": 1790625600}}}
+             "rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": now + 3600},
+                             "seven_day": {"used_percentage": 67, "resets_at": now + 3 * 86400}}}
         p.update(extra)
         return json.dumps(p)
 
     def usage_file(self):
         return os.path.join(self.tmp, "ccwho", "usage", self.SID + ".json")
 
-    def test_a_reading_is_written_and_nothing_printed(self):
+    def test_a_reading_is_written_and_its_entry_printed(self):
+        # D10 (design review 2026-09-25): the session's own entry in its status bar
         rc, out, err = self.run_with(self.payload())
-        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertEqual((rc, err), (0, ""))
+        plain = runner.usage.ANSI_RE.sub("", out)
+        self.assertTrue(plain.startswith("a 5h 5%"), plain)
+        self.assertIn("7d 67%", plain)
+        self.assertNotIn("\n\n", out)
         with open(self.usage_file()) as fh:
             rec = json.load(fh)
         self.assertEqual(rec["rate_limits"]["seven_day"]["used_percentage"], 67)
@@ -2887,12 +2895,18 @@ class TestStatusline(unittest.TestCase):
         self.assertTrue(rec["unsure"])
         self.assertEqual(rec["first_account"]["id"], "login:uuid-a")
 
-    def test_a_write_that_fails_is_still_silent(self):
+    def test_a_write_that_fails_still_prints_and_exits_zero(self):
         os.makedirs(os.path.join(self.tmp, "ccwho"))
         with open(os.path.join(self.tmp, "ccwho", "usage"), "w") as fh:
             fh.write("a file where the directory should be")
         rc, out, err = self.run_with(self.payload())
-        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("5h 5%", runner.usage.ANSI_RE.sub("", out))
+
+    def test_before_the_first_reply_nothing_is_printed(self):
+        p = json.loads(self.payload())
+        del p["rate_limits"]
+        self.assertEqual(self.run_with(json.dumps(p)), (0, "", ""))
 
     def test_accounts_lists_what_was_recorded(self):
         self.run_with(self.payload())
@@ -3393,5 +3407,227 @@ class TestDoctorGathersUsage(unittest.TestCase):
 
     def test_the_newest_reading_age(self):
         with open(os.path.join(self.tmp, "ccwho", "usage", "abc.json"), "w") as fh:
-            json.dump({"received_at": time.time() - 120, "session_id": "abc"}, fh)
+            json.dump({"received_at": time.time() - 120, "session_id": "abc",
+                       "rate_limits": {"five_hour": {"used_percentage": 1, "resets_at": None}},
+                       "first_account": {"kind": "login", "id": "login:a"}}, fh)
         self.assertAlmostEqual(runner.usage_facts()["usage_newest_age"], 120, delta=5)
+
+
+class TestUsageInTheTable(unittest.TestCase):
+    ROWS = [{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "project": "liveapp",
+             "title": "t", "tab_title": "liveapp-4e", "name": "n", "since": "1m",
+             "tty": "", "attention": "asks", "status": "waiting", "ask": "q",
+             "doing": "q", "orphans": 0, "topic": ""}]
+
+    def setUp(self):
+        self.real = (runner.engine.collect, runner.usage_snapshot)
+        runner.engine.collect = lambda cache=None, status=None: (list(self.ROWS), {})
+        self.snap = {"state": "waiting"}
+        runner.usage_snapshot = lambda rows, now=None, record=True: self.snap
+
+    def tearDown(self):
+        runner.engine.collect, runner.usage_snapshot = self.real
+
+    def test_the_table_has_the_usage_line(self):
+        out, _ = runner.tick({"watch": False, "ticks": 0}, [], False)
+        self.assertIn("usage  waiting", out)
+
+    def test_a_usage_failure_is_unknown_and_the_rows_survive(self):
+        def boom(rows, now=None, record=True):
+            raise OSError("disk")
+        runner.usage_snapshot = boom
+        out, rows = runner.tick({"watch": False, "ticks": 0}, [], False)
+        self.assertIn("usage  unknown", out)
+        self.assertIn("liveapp", out)
+
+    def test_filtered_ls_gets_the_fleet_and_the_usage(self):
+        out = io.StringIO()
+        real = runner.fresh_index
+        runner.fresh_index = lambda quiet=False: {}
+        try:
+            with contextlib.redirect_stdout(out):
+                runner.ls(["liveapp", "--no-color"])
+        finally:
+            runner.fresh_index = real
+        self.assertIn("usage  waiting", out.getvalue())
+
+
+class TestUsageSnapshotLogsWhatItShows(unittest.TestCase):
+    def test_the_shown_log_gets_one_line_per_window(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old = os.environ.get("CCWHO_DIR")
+        os.environ["CCWHO_DIR"] = tmp
+        self.addCleanup(lambda: os.environ.pop("CCWHO_DIR", None) if old is None
+                        else os.environ.__setitem__("CCWHO_DIR", old))
+        os.makedirs(os.path.join(tmp, "usage"))
+        now = time.time()
+        rec = {"v": 1, "session_id": "s1", "received_at": now, "measured_at": now,
+               "rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": now + 100}},
+               "account": {"kind": "login", "id": "login:a", "email": "a@x.com"},
+               "first_account": {"kind": "login", "id": "login:a", "email": "a@x.com"},
+               "first_seen": now, "login_at": None, "unsure": False}
+        with open(os.path.join(tmp, "usage", "s1.json"), "w") as fh:
+            json.dump(rec, fh)
+        real = runner.usage_facts
+        runner.usage_facts = lambda now=None: {"usage_roots": []}
+        try:
+            snap = runner.usage_snapshot([{"sessionId": "s1"}], now)
+        finally:
+            runner.usage_facts = real
+        self.assertEqual(snap["state"], "ok")
+        with open(os.path.join(tmp, "usage-shown.jsonl")) as fh:
+            lines = [json.loads(l) for l in fh]
+        self.assertEqual([(l["account"], l["window"], l["used"]) for l in lines],
+                         [("a", "5h", 5)])
+
+
+class TestReloadRebindsUsage(unittest.TestCase):
+    def test_the_runner_uses_the_reloaded_usage_module(self):
+        state = {"engine_error": ""}
+        runner.reload_engine(state)
+        self.assertEqual(state["engine_error"], "")
+        self.assertIs(runner.usage, sys.modules["ccwho_usage"])
+        self.assertIs(runner.engine.ccwho_usage, sys.modules["ccwho_usage"])
+
+
+class TestUsageWords(unittest.TestCase):
+    def test_help_has_the_legend(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["--help"])
+        self.assertIn("5h 42%↓/60%", out.getvalue())
+
+    def test_setup_says_when_sessions_report(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old = os.environ.get("CCWHO_DIR")
+        os.environ["CCWHO_DIR"] = os.path.join(tmp, "c")
+        self.addCleanup(lambda: os.environ.pop("CCWHO_DIR", None) if old is None
+                        else os.environ.__setitem__("CCWHO_DIR", old))
+        root = os.path.join(tmp, ".claude")
+        os.makedirs(root)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.usage_setup([root], [], yes=True, ccwho="/x/ccwho")
+        # measured 2026-09-25 on the owner's setup run: 11 of 11 sessions that
+        # were already running reported - running sessions reload settings.json
+        self.assertIn("sessions report usage after their next reply", out.getvalue())
+        self.assertNotIn("restart", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.usage_setup([root], [], yes=True, ccwho="/x/ccwho")   # already on
+        self.assertNotIn("next reply", out.getvalue())
+
+
+class TestReviewRoundOneRunner(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        old = os.environ.get("CCWHO_DIR")
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.addCleanup(lambda: os.environ.pop("CCWHO_DIR", None) if old is None
+                        else os.environ.__setitem__("CCWHO_DIR", old))
+        os.makedirs(os.path.join(self.tmp, "usage"))
+        self.now = time.time()
+
+    def put(self, sid, aid, email):
+        acct = {"kind": "login", "id": aid, "email": email}
+        rec = {"v": 1, "session_id": sid, "received_at": self.now, "measured_at": self.now,
+               "rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": self.now + 99}},
+               "account": acct, "first_account": acct, "first_seen": self.now,
+               "login_at": None, "unsure": False}
+        with open(os.path.join(self.tmp, "usage", sid + ".json"), "w") as fh:
+            json.dump(rec, fh)
+
+    def test_the_snapshot_uses_the_usage_module_in_sys_modules(self):
+        """The live list imports the runner once; after a reload the module in
+        sys.modules is the one to use (and after a failed reload, the old one
+        is put back there)."""
+        import types
+        fake = types.ModuleType("ccwho_usage")
+        for name in dir(runner.usage):
+            setattr(fake, name, getattr(runner.usage, name))
+        fake.snapshot = lambda *a, **k: {"state": "from-the-reloaded-module"}
+        real = sys.modules["ccwho_usage"]
+        sys.modules["ccwho_usage"] = fake
+        try:
+            snap = runner.usage_snapshot([], self.now)
+        finally:
+            sys.modules["ccwho_usage"] = real
+        self.assertEqual(snap["state"], "from-the-reloaded-module")
+
+    def test_one_read_of_the_readings_and_no_settings_when_an_account_is_live(self):
+        self.put("s1", "login:a", "a@x.com")
+        calls = {"load": 0, "facts": 0}
+        # the module usage_snapshot uses: the one in sys.modules. An earlier
+        # test's reload can leave runner.usage pointing at an older object
+        mod = sys.modules["ccwho_usage"]
+        real_load, real_facts = mod.load_readings, runner.usage_facts
+        def load(*a, **k):
+            calls["load"] += 1
+            return real_load(*a, **k)
+        def facts(*a, **k):
+            calls["facts"] += 1
+            return {"usage_roots": []}
+        mod.load_readings, runner.usage_facts = load, facts
+        try:
+            snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        finally:
+            mod.load_readings, runner.usage_facts = real_load, real_facts
+        self.assertEqual(snap["state"], "ok")
+        self.assertEqual(calls, {"load": 1, "facts": 0})
+
+    def test_filtered_ls_shows_only_the_accounts_of_the_rows_shown(self):
+        self.put("s1", "login:a", "ann@x.com")
+        self.put("s2", "login:b", "bob@x.com")
+        rows = [dict(TestUsageInTheTable.ROWS[0], sessionId="s1", project="alpha"),
+                dict(TestUsageInTheTable.ROWS[0], sessionId="s2", project="beta")]
+        real = (runner.engine.collect, runner.fresh_index, runner.usage_facts)
+        runner.engine.collect = lambda cache=None, status=None: (list(rows), {})
+        runner.fresh_index = lambda quiet=False: {}
+        runner.usage_facts = lambda *a, **k: {"usage_roots": []}
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                runner.ls(["alpha", "--no-color"])
+        finally:
+            runner.engine.collect, runner.fresh_index, runner.usage_facts = real
+        self.assertIn("ann", out.getvalue())
+        self.assertNotIn("bob", out.getvalue())
+
+    def test_the_status_bar_name_is_the_one_the_list_used(self):
+        self.put("s1", "login:a", "lukaso@gmail.com")
+        self.put("s2", "login:b", "lukaso@work.com")
+        real = runner.usage_facts
+        runner.usage_facts = lambda *a, **k: {"usage_roots": []}
+        try:
+            snap = runner.usage_snapshot([{"sessionId": "s1"}, {"sessionId": "s2"}], self.now)
+        finally:
+            runner.usage_facts = real
+        self.assertEqual(snap["names"]["login:a"], "lukaso@gmail")
+        rec = json.load(open(os.path.join(self.tmp, "usage", "s1.json")))
+        out = runner.usage.status_text(rec, self.now, names=runner.read_names())
+        self.assertTrue(runner.usage.ANSI_RE.sub("", out).startswith("lukaso@gmail "), out)
+
+
+class TestFilteredLsLeavesTheSharedFilesAlone(TestReviewRoundOneRunner):
+    def test_names_and_shown_log_are_untouched(self):
+        self.put("s1", "login:a", "lukaso@gmail.com")
+        self.put("s2", "login:b", "lukaso@work.com")
+        rows = [dict(TestUsageInTheTable.ROWS[0], sessionId="s1", project="alpha"),
+                dict(TestUsageInTheTable.ROWS[0], sessionId="s2", project="beta")]
+        real = (runner.engine.collect, runner.fresh_index, runner.usage_facts)
+        runner.engine.collect = lambda cache=None, status=None: (list(rows), {})
+        runner.fresh_index = lambda quiet=False: {}
+        runner.usage_facts = lambda *a, **k: {"usage_roots": []}
+        try:
+            runner.usage_snapshot(rows, self.now)              # the full list, first
+            names = open(runner.names_path()).read()
+            shown = open(os.path.join(self.tmp, "usage-shown.jsonl")).read()
+            with contextlib.redirect_stdout(io.StringIO()):
+                runner.ls(["alpha", "--no-color"])
+        finally:
+            runner.engine.collect, runner.fresh_index, runner.usage_facts = real
+        self.assertEqual(open(runner.names_path()).read(), names)
+        self.assertEqual(open(os.path.join(self.tmp, "usage-shown.jsonl")).read(), shown)

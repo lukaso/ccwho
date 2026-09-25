@@ -44,6 +44,7 @@ def reload_engine(state):
         # and rebind OUR handles: sys.modules is what the next import sees, but
         # this module's globals still point at the objects loaded at startup
         globals()["index"] = sys.modules[index.__name__]
+        globals()["usage"] = sys.modules[usage.__name__]
         state["engine_error"] = ""
     except Exception:
         state["engine_error"] = traceback.format_exc(limit=2).strip().splitlines()[-1]
@@ -53,6 +54,7 @@ def reload_engine(state):
 def tick(state, argv, color):
     eng = reload_engine(state) if state["watch"] else engine
     rows, fleet = eng.collect(cache=state.setdefault("cache", {}))
+    fleet = with_usage(rows, fleet)
     if "--blocked" in argv:
         rows = [r for r in rows if r["status"] == "waiting" or r["orphans"]]
     out = eng.render(rows, fleet, color=color,
@@ -704,14 +706,17 @@ def ls(argv):
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
     rows, fleet = engine.collect(cache={})
     if not query:
-        sys.stdout.write(engine.render(rows, fleet, color=color))
+        sys.stdout.write(engine.render(rows, with_usage(rows, fleet), color=color))
         return 0
     live, ended = matches(query, rows, everything="--all" in argv)
     if not live and not ended:
         print(f"ccwho: no session matches {query!r}", file=sys.stderr)
         return 1
     if live:
-        sys.stdout.write(engine.render(live, 0, color=color))
+        # the fleet too: without it the filtered table lost its ports, and now
+        # its usage and account tags
+        sys.stdout.write(engine.render(live, with_usage(live, fleet, record=False),
+                                       color=color))
     if ended:
         print(f"\n{DIM if color else ''}ended sessions{RESET if color else ''}")
         for r in ended[:10]:
@@ -1194,11 +1199,83 @@ def statusline(argv):
         rec = usage.record(payload, os.environ, setup_home(), time.time(), previous)
         if rec is None:
             return 0
-        os.makedirs(d, exist_ok=True)
-        write_atomic(path, json.dumps(rec))
+        try:
+            os.makedirs(d, exist_ok=True)
+            write_atomic(path, json.dumps(rec))
+        except Exception:         # noqa: BLE001 - a failed write still prints
+            pass
+        # D10: the session's own entry, in its own status bar
+        text = usage.status_text(rec, time.time(), read_labels(), names=read_names())
+        if text:
+            print(text)
     except Exception:             # noqa: BLE001 - see the docstring
         pass
     return 0
+
+
+_SHOWN_LAST = None       # what the shown-log last recorded, so it logs changes only
+
+
+def usage_snapshot(rows, now=None, record=True):
+    """What the list and the table show about usage, for these live rows. Also
+    logs what it shows (owner, 2026-09-25: the data that decides when an old
+    window loses its pace arrow)."""
+    global _SHOWN_LAST
+    now = time.time() if now is None else now
+    # the module in sys.modules, not this file's handle: the live list imports
+    # the runner once, and after its reload (or a failed one) sys.modules is
+    # what holds the module to use
+    u = sys.modules.get("ccwho_usage", usage)
+    readings = u.load_readings(usage_dir(), now)
+    snap = u.snapshot(readings, now, {r.get("sessionId") for r in rows},
+                      lambda: usage_facts(now, readings), read_labels())
+    # only a snapshot over the whole fleet is recorded: a filtered `ls` sees
+    # fewer accounts, so fewer clashes - its names and lines are not the list's
+    if record:
+        _SHOWN_LAST = u.append_shown(os.path.join(ccwho_dir(), "usage-shown.jsonl"),
+                                     u.shown_records(snap), _SHOWN_LAST, now)
+        save_names(snap.get("names") or {})
+    return snap
+
+
+def names_path():
+    return os.path.join(ccwho_dir(), "usage-names.json")
+
+
+def save_names(names):
+    """The names the list uses, for the status bar: one name per account in
+    both places, clashes and all. Written only when they change."""
+    if not names:
+        return
+    old = read_names()
+    merged = dict(old, **names)
+    if merged == old:
+        return
+    try:
+        os.makedirs(ccwho_dir(), exist_ok=True)
+        write_atomic(names_path(), json.dumps(merged))
+    except OSError:
+        pass
+
+
+def read_names():
+    try:
+        with open(names_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def with_usage(rows, fleet, record=True):
+    """The fleet, with the usage snapshot the table draws. A usage failure is
+    "unknown" and never costs the table its rows (eng E-D7)."""
+    fleet = dict(fleet) if isinstance(fleet, dict) else {}
+    try:
+        fleet["usage"] = usage_snapshot(rows, record=record)
+    except Exception:             # noqa: BLE001 - see the docstring
+        fleet["usage"] = {"state": "unknown"}
+    return fleet
 
 
 def read_labels():
@@ -1261,7 +1338,7 @@ def usage_roots():
     return setup.interactive_roots(entries, dirs)
 
 
-def usage_facts(now=None):
+def usage_facts(now=None, readings=None):
     """What doctor says about usage. Read-only and cheap: the saved index as it
     is, and the settings files. A dir is reported when it is interactive, holds
     ccwho's statusLine, or was opted out."""
@@ -1283,7 +1360,8 @@ def usage_facts(now=None):
         state = "invalid" if problem else setup.statusline_state(text)
         if d in yes or state == "ours" or d in opted:
             roots.append({"root": d, "state": state, "opted_out": d in opted})
-    readings = usage.load_readings(usage_dir(), now)
+    if readings is None:
+        readings = usage.load_readings(usage_dir(), now)
     newest = max((r["received_at"] for r in readings), default=None)
     return {"usage_roots": roots,
             "usage_newest_age": None if newest is None else max(0.0, now - newest)}
@@ -1465,6 +1543,7 @@ def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
         opted = set()
         remember()
 
+    wrote_any = False
     for root in skipped:
         print(f"note usage               skipped {root}: no interactive session there"
               " yet - run ccwho setup again after you use it")
@@ -1499,7 +1578,13 @@ def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
                     remember()
                     print("  off (your choice) - ccwho setup --usage turns it on")
                     continue
-            rc |= guarded_write(path, before, new)
+            written = guarded_write(path, before, new)
+            rc |= written
+            wrote_any = wrote_any or written == 0
+    if wrote_any:
+        # measured 2026-09-25: after setup wrote ~/.claude/settings.json, 11 of
+        # 11 sessions already running reported - they reload it, no restart
+        print("  sessions report usage after their next reply")
     return rc
 
 
@@ -1821,6 +1906,8 @@ def main(argv=None):
         print("       ccwho accounts [--json]                    subscription usage, per account")
         print("       ccwho accounts name <id> <label>           a display name for an account")
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
+        print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
+        print("       ↓ on pace, ↑ faster than time passes; ↻ when it resets")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY]         install what ccwho needs, once")
         print("       ccwho setup --no-usage | --usage           turn usage info off / back on")

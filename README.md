@@ -114,6 +114,33 @@ To end one: `claude stop <short id>` (the conversation is kept, and `--resume` w
 after), or `claude rm <short id>` to delete it. The session keeps the directory it
 was started in wherever you attach from; `--resume` uses the directory you are in.
 
+## Subscription usage
+
+```
+usage  ant work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu  │  ant 1a2b 5h 0% · 7d 67%↑/40% ↻Mon
+```
+
+One dim line under the header, one entry per account that a live session spends:
+the machine login by its email, a `CLAUDE_CODE_OAUTH_TOKEN` by the first hex of its
+fingerprint. `5h 42%↓/60%` is 42% of the 5-hour budget used with 60% of the 5 hours
+gone: `↓` (green) is on pace, `↑` (red) is faster than time passes. The used number
+turns yellow at 80% and bold at 95%. A window past its reset says `expired`; a window
+whose newest reading is older than 15 minutes says how old. With two or more accounts,
+each row ends with the account it spends (`?`: no reading yet), and the entry of the
+selected row's account is bright. The same line and tags are in `ccwho`, `ccwho ls`
+and `--watch`, and each session's own status bar shows its entry.
+
+Where it comes from: Claude Code hands a statusLine command the rate limits of the
+account the session spends. `ccwho setup` offers to add `ccwho statusline` in each
+config dir where you run claude yourself - it shows the change and asks - and
+`ccwho statusline` records one small file per session in `~/.ccwho/usage/`. ccwho
+never logs in and never reads a credential: a token account is a fingerprint of the
+token, computed inside the session and never stored. A session reports after its next
+reply - including sessions that were already running when setup added the line
+(measured: they reload the settings). `ccwho accounts` lists every account seen in the last 8 days;
+`ccwho accounts name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
+off again.
+
 ## Finding an old session
 
 ```sh

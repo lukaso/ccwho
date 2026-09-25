@@ -52,7 +52,14 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "action": "bold underline",   # the one part of a row you click on its own
               "age": "bold",           # inside a dim line, the age stands out
               "recap": "dim",
+              "account": "dim",        # which account the row spends (usage)
               "pad": ""}
+
+# The usage line's styles (ccwho_usage.STYLES), as ANSI colour names so the
+# iTerm2 theme applies (D7). The arrows are bold and never dim (owner, the
+# mockup's faint green): a dim line must not fade them.
+USAGE_STYLE = {"dim": "dim", "plain": "", "green": "bold green", "red": "bold red",
+               "yellow": "yellow", "byellow": "bold yellow"}
 
 # Three states, three colours, used on one glyph per row and on its heading.
 STATE_STYLE = {"needs": "bold #e5a50a",    # amber: it is waiting on you
@@ -93,8 +100,11 @@ class Fleet:
     """One snapshot of the world, and the questions the screen asks of it."""
 
     def __init__(self, rows=(), source_ok=True, at="", error="", procs=None,
-                 secure=""):
-        self.rows, self.source_ok, self.at, self.error = list(rows), source_ok, at, error
+                 secure="", usage=None):
+        self.source_ok, self.at, self.error = source_ok, at, error
+        # subscription usage, as ccwho_usage.snapshot built it; None = not read
+        self.usage = usage
+        self.rows = [self.tagged(r) for r in rows]
         # an app holding macOS Secure Input: no hotkey works until it lets go.
         # The list can still come forward (click iTerm2, run ccwho), so it is
         # where a dead hotkey gets explained
@@ -103,6 +113,15 @@ class Fleet:
         # what was left behind. None is "not collected": the list stays quiet
         # (a false alarm on every start is still an alarm) and `p` says unknown
         self.procs = procs if isinstance(procs, dict) else {"collected": False}
+
+    def tagged(self, row):
+        """The row, with the account it spends when 2+ accounts are seen. A copy:
+        the collected row is not ours to change. Usage never costs a row."""
+        try:
+            tag = engine.ccwho_usage.row_tag(self.usage, row.get("sessionId", ""))
+        except Exception:
+            tag = ""
+        return dict(row, usage_tag=tag) if tag else row
 
     def visible(self, query):
         return engine.ui_filter(self.rows, query)
@@ -149,7 +168,8 @@ class Row(Static):
 
     def spans_lines(self):
         """The two lines, each as (text, role) parts, at the width laid out."""
-        return engine.ui_row_cells(self.row, width=self.text_width())
+        return engine.ui_row_cells(self.row, width=self.text_width(),
+                                   tag=self.row.get("usage_tag", ""))
 
     def on_resize(self, event):
         # the scrollbar came or went: lay the text out at the width it now has
@@ -195,7 +215,7 @@ class CcwhoUi(App):
     CSS = """
     Screen { layout: vertical; }
     #header { height: 1; }
-    #ports, #procline { height: auto; padding: 0 1; }
+    #usage, #ports, #procline { height: auto; padding: 0 1; }
     #banner { height: auto; color: $warning; }
     #body { height: 1fr; }
     #list { width: 1fr; }
@@ -252,6 +272,9 @@ class CcwhoUi(App):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header", markup=False)
+        # subscription usage, one line per account a live session spends: dim,
+        # the selected row's account bright
+        yield Static("", id="usage", markup=False)
         # what agents hold: one dim line, never louder than what needs you
         yield Static("", id="ports", markup=False)
         yield Static("", id="banner", markup=False)
@@ -541,6 +564,45 @@ class CcwhoUi(App):
         banner.update(trouble)
         banner.display = bool(trouble)
         self.paint_procs_lines()
+        self.paint_usage()
+
+    def paint_usage(self):
+        """From the snapshot in hand: moving the cursor reads no file."""
+        box = self.part("#usage")
+        if box is None:
+            return
+        snap = self.fleet.usage
+        if snap is None:
+            # nothing to show: leave a hidden box alone - every mark_selected
+            # comes here, and a display write asks for a layout pass
+            if box.display:
+                box.display = False
+            return
+        selected = None
+        try:
+            row = self.selected_row()
+            selected = (snap.get("sessions", {}).get(row.get("sessionId"))
+                        if row and isinstance(snap, dict) else None)
+            lines = engine.ccwho_usage.usage_lines(snap, max(10, self.size.width - 2),
+                                                   selected=selected)
+        except Exception:               # a usage problem never costs the list
+            lines = [[("usage  unknown", "dim")]]
+        # the cursor moves far more often than anything here changes: the same
+        # snapshot, account and width is the same line, so the box is left alone
+        painted = (snap, selected, self.size.width)
+        last = getattr(self, "usage_painted", None)
+        if last and last[0] is painted[0] and last[1:] == painted[1:]:
+            return
+        self.usage_painted = painted
+        text = Text(no_wrap=True, overflow="crop")
+        for i, line in enumerate(lines):
+            if i:
+                text.append("\n")
+            for part, style in line:
+                text.append(part, style=USAGE_STYLE.get(style, ""))
+        box.update(text)
+        if box.display != bool(lines):
+            box.display = bool(lines)
 
     def paint_procs_lines(self):
         ports, bottom = self.part("#ports"), self.part("#procline")
@@ -687,6 +749,7 @@ class CcwhoUi(App):
         for widget in self.rows_on_screen():
             widget.set_class(widget.row.get("sessionId") == self.selected,
                              "selected")
+        self.paint_usage()          # the selected row's account is the bright one
 
     # ----------------------------------------------------------------- actions
 
@@ -1091,7 +1154,16 @@ class Collector:
         self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble, procs=procs,
-                     secure=self.secure_input())
+                     secure=self.secure_input(), usage=self.usage(rows))
+
+    def usage(self, rows):
+        """The usage snapshot, on this collecting thread; "unknown" when it
+        cannot be read. Never the reason the list goes down."""
+        try:
+            import ccwho as runner
+            return runner.usage_snapshot(rows)
+        except Exception:
+            return {"state": "unknown"}
 
     def secure_input(self):
         """The Secure Input line, or "". 18ms, on the collecting thread, and

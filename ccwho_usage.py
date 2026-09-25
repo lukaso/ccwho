@@ -32,6 +32,8 @@ import os
 import re
 import time
 
+import ccwho_text
+
 VERSION = 1
 WINDOWS = ("five_hour", "seven_day")
 SHORT = {"five_hour": "5h", "seven_day": "7d"}
@@ -187,7 +189,12 @@ def load_readings(directory, now):
             continue
         if now - rec["received_at"] > KEEP_SECONDS:
             continue
-        out.append(rec)
+        # Only ccwho writes these, but a file on disk is not a promise: a bad
+        # window is dropped here, so nothing downstream - the list - can trip on it.
+        limits = clean_limits(rec.get("rate_limits"))
+        if limits is None or not isinstance(rec.get("first_account"), dict):
+            continue
+        out.append(dict(rec, rate_limits=limits))
     return out
 
 
@@ -224,18 +231,20 @@ def _window(readings, name, now):
         if idle:
             last = max(idle, key=lambda r: r["measured_at"])
             return {"state": "ok", "pct": last["rate_limits"][name]["used_percentage"],
-                    "resets_at": None}
+                    "resets_at": None, "age": now - last["measured_at"]}
         seen = [(r, w) for r, w in seen if _number(w.get("resets_at"))
                 and newest - w["resets_at"] <= SAME_WINDOW]
     timed = [(r, w) for r, w in seen if _number(r.get("measured_at"))]
     if timed:
-        _, w = max(timed, key=lambda rw: rw[0]["measured_at"])
+        r, w = max(timed, key=lambda rw: rw[0]["measured_at"])
     else:
-        _, w = max(seen, key=lambda rw: rw[1]["used_percentage"])
+        r, w = max(seen, key=lambda rw: rw[1]["used_percentage"])
+    # each window keeps its own age: a fresh 5h must not vouch for an old 7d
+    age = now - (r["measured_at"] if _number(r.get("measured_at")) else r["received_at"])
     reset = w.get("resets_at")
     if _number(reset) and reset <= now:
-        return {"state": "expired", "resets_at": reset}
-    return {"state": "ok", "pct": w["used_percentage"], "resets_at": reset}
+        return {"state": "expired", "resets_at": reset, "age": age}
+    return {"state": "ok", "pct": w["used_percentage"], "resets_at": reset, "age": age}
 
 
 def accounts(readings, now, labels=None):
@@ -254,6 +263,7 @@ def accounts(readings, now, labels=None):
         default = acct.get("email") or (
             "token " + aid.split(":", 1)[1][:8] if acct.get("kind") == "token" else aid)
         rows.append({"id": aid, "kind": acct.get("kind"), "email": acct.get("email", ""),
+                     "brand": "ant",       # Claude; Codex ("oai") arrives with #13
                      "label": labels.get(aid) or default,
                      "sessions": len({r.get("session_id") for r in rs}),
                      "age": now - when,
@@ -307,3 +317,354 @@ def format_row(row, now):
     parts.append(f"{sessions} session{'s' if sessions != 1 else ''}")
     parts.append(f"{_age(row['age'])} ago")
     return "  ".join(parts)
+
+
+# ------------------------------------------------------------ what the list shows
+# One line per account a live session spends (owner, 2026-09-25: all of them, no
+# cap), in a fixed order, built as (text, style) spans. Cutting happens on the
+# text; colour is added last (to_ansi, or Textual in the list), so a cut can
+# never split an escape code and leak colour into the session rows below.
+
+WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+STYLES = ("dim", "plain", "green", "red", "yellow", "byellow")
+ANSI_CODES = {"dim": "\033[2m", "plain": "", "green": "\033[1;32m", "red": "\033[1;31m",
+              "yellow": "\033[33m", "byellow": "\033[1;33m"}
+ANSI_RE = ccwho_text.ANSI
+STALE_AFTER = 15 * 60             # a window older than this says how old
+LEAD, INDENT, SEP = "usage  ", "       ", "  │  "
+EMPTY = {"not_set_up": "not set up - ccwho setup adds it",
+         "waiting": "waiting - sessions report after their next reply",
+         "unknown": "unknown"}
+
+
+def elapsed_pct(name, resets_at, now):
+    """How much of the window is gone, 0-100; None without a reset time."""
+    span = WINDOW_SECONDS.get(name)
+    if not span or not _number(resets_at):
+        return None
+    return max(0, min(100, round(100 * (1 - (resets_at - now) / span))))
+
+
+def pace_arrow(used, elapsed):
+    """Faster than time passes: red up. At or below it: green down."""
+    if elapsed is None or not _number(used):
+        return None
+    # the numbers as shown: 60.4 prints as 60%, and 60%/60% is on pace
+    return ("↑", "red") if int(f"{used:.0f}") > elapsed else ("↓", "green")
+
+
+def used_style(pct, base):
+    return "byellow" if pct >= 95 else "yellow" if pct >= 80 else base
+
+
+def _base_name(row):
+    if row.get("kind") == "token":
+        return row["id"].split(":", 1)[1][:4]
+    email = row.get("email") or ""
+    return email.split("@", 1)[0] if email else row["id"]
+
+
+def _longer(row, step):
+    """The same account named longer, step by step, until names differ."""
+    if row.get("kind") == "token":
+        return row["id"].split(":", 1)[1][:4 + 2 * step]
+    email = row.get("email") or ""
+    if "@" not in email:
+        return row["id"]
+    local, domain = email.split("@", 1)
+    return f"{local}@{domain.split('.', 1)[0]}" if step == 1 else email
+
+
+def short_names(rows, labels):
+    """id -> the shortest name that still names one account."""
+    names = {r["id"]: _base_name(r) for r in rows}
+    for step in range(1, 9):
+        seen = {}
+        for aid, n in names.items():
+            seen.setdefault(n, []).append(aid)
+        clash = [aid for group in seen.values() if len(group) > 1 for aid in group]
+        if not clash:
+            break
+        by_id = {r["id"]: r for r in rows}
+        for aid in clash:
+            names[aid] = _longer(by_id[aid], step)
+    for aid, n in list(names.items()):
+        if len([a for a in names if names[a] == n]) > 1:
+            names[aid] = aid          # past every step: the id itself is unique
+    out = {}
+    label_count = {}
+    for aid in names:
+        lab = labels.get(aid)
+        if lab:
+            label_count[lab] = label_count.get(lab, 0) + 1
+    for aid, n in names.items():
+        lab = labels.get(aid)
+        out[aid] = (f"{lab} {n}" if label_count[lab] > 1 else lab) if lab else n
+    # a label can equal another account's own name: the labelled one gives way
+    for _ in range(2):
+        seen = {}
+        for aid, n in out.items():
+            seen.setdefault(n, []).append(aid)
+        clash = [aid for group in seen.values() if len(group) > 1 for aid in group]
+        if not clash:
+            break
+        for aid in clash:
+            if labels.get(aid) and out[aid] == labels[aid]:
+                out[aid] = f"{labels[aid]} {names[aid]}"
+            elif _ == 1:
+                out[aid] = aid
+    return out
+
+
+def ordered(rows, names):
+    """A fixed order, so an entry does not move when another account replies."""
+    kind = {"login": 0, "token": 1}
+    return sorted(rows, key=lambda r: (r.get("brand", ""), kind.get(r.get("kind"), 2),
+                                       names.get(r["id"], r["id"])))
+
+
+def session_accounts(readings):
+    """session id -> the account it spends; unsure and unknown sessions: none."""
+    out = {}
+    for r in readings:
+        acct = r.get("first_account") or {}
+        if not r.get("unsure") and acct.get("id") and isinstance(r.get("session_id"), str):
+            out[r["session_id"]] = acct["id"]
+    return out
+
+
+def snapshot(readings, now, live_ids, facts, labels=None):
+    """What the list needs about usage, built once per collect."""
+    labels = labels or {}
+    rows = accounts(readings, now, labels)
+    spent = session_accounts(readings)
+    live_ids = set(live_ids or ())
+    sessions = {sid: aid for sid, aid in spent.items() if sid in live_ids}
+    live = [r for r in rows if r["id"] in set(sessions.values())]
+    if live:
+        state = "ok"
+    else:
+        # facts may be a callable: reading settings is only needed without data
+        facts = facts() if callable(facts) else facts
+        roots = (facts or {}).get("usage_roots") or []
+        if any(r.get("state") == "ours" for r in roots):
+            state = "waiting"
+        elif roots and all(r.get("opted_out") for r in roots):
+            state = "off"
+        else:
+            state = "not_set_up"
+    names = short_names(live, labels)
+    return {"state": state, "accounts": ordered(live, names), "names": names,
+            "sessions": sessions, "now": now}
+
+
+def _reset_label(epoch, now):
+    t = time.localtime(epoch)
+    return time.strftime("%H:%M" if epoch - now < 86400 else "%a", t)
+
+
+def _window_spans(name, w, now, base, resets=True, age=True):
+    tag = SHORT[name]
+    if w["state"] == "expired":
+        out = [(f"{tag} expired", base)]
+        if resets:
+            out.append((f" ↻{_reset_label(w['resets_at'], now)}", base))
+        return out
+    pct = w["pct"]
+    out = [(f"{tag} ", base), (f"{pct:.0f}%", used_style(pct, base))]
+    el = elapsed_pct(name, w.get("resets_at"), now)
+    arrow = pace_arrow(pct, el)
+    if arrow:
+        out += [arrow, (f"/{el}%", base)]
+    if resets and _number(w.get("resets_at")):
+        out.append((f" ↻{_reset_label(w['resets_at'], now)}", base))
+    if age and _number(w.get("age")) and w["age"] > STALE_AFTER:
+        out.append((f" ({_age(w['age'])} ago)", base))
+    return out
+
+
+def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=True):
+    base = "plain" if selected else "dim"
+    out = [((f"{row.get('brand', 'ant')} " if brand else "") + name, base)]
+    first = True
+    for wname in WINDOWS:
+        w = row.get(wname)
+        if not w:
+            continue
+        out.append((" " if first else " · ", base))
+        out += _window_spans(wname, w, now, base, resets=resets, age=age)
+        first = False
+    return out
+
+
+def span_cells(spans):
+    return sum(ccwho_text.cells(t) for t, _ in spans)
+
+
+def cut_spans(spans, width):
+    """At most `width` cells, `…` marking a cut; styles never split."""
+    if span_cells(spans) <= width:
+        return list(spans)
+    out, room = [], max(0, width - 1)
+    for t, st in spans:
+        if room <= 0:
+            break
+        piece = t if ccwho_text.cells(t) <= room else ccwho_text.cut(t, room + 1)[:-1]
+        if piece:
+            out.append((piece, st))
+            room -= ccwho_text.cells(piece)
+        if piece != t:
+            break
+    return out + [("…", "dim")] if width > 0 else []
+
+
+def usage_lines(snap, width, selected=None):
+    """The usage line(s) under the header, as span lists; [] for none."""
+    if not isinstance(snap, dict):
+        return [[(LEAD + EMPTY["unknown"], "dim")]]
+    state = snap.get("state")
+    if state == "off":
+        return []
+    if state != "ok":
+        return [cut_spans([(LEAD + EMPTY.get(state, EMPTY["unknown"]), "dim")], width)]
+    now, names = snap.get("now", time.time()), snap.get("names", {})
+    rows = snap.get("accounts", [])
+    full = [entry_spans(r, names.get(r["id"], r["id"]), now, selected=r["id"] == selected)
+            for r in rows]
+    one = [(LEAD, "dim")]
+    for i, e in enumerate(full):
+        one += ([(SEP, "dim")] if i else []) + e
+    if span_cells(one) <= width:
+        return [one]
+    lines = []
+    for i, r in enumerate(rows):
+        lead = [(LEAD if i == 0 else INDENT, "dim")]
+        name, sel = names.get(r["id"], r["id"]), r["id"] == selected
+        tries = [dict(), dict(resets=False), dict(resets=False, age=False),
+                 dict(resets=False, age=False, brand=False)]
+        for opts in tries:
+            line = lead + entry_spans(r, name, now, selected=sel, **opts)
+            if span_cells(line) <= width:
+                break
+        lines.append(cut_spans(line, width))
+    return lines
+
+
+def plain(lines):
+    return ["".join(t for t, _ in line) for line in lines]
+
+
+def to_ansi(spans):
+    out = []
+    for t, st in spans:
+        code = ANSI_CODES.get(st, "")
+        out.append(f"{code}{t}\033[0m" if code else t)
+    return "".join(out)
+
+
+def row_tag(snap, session_id):
+    """The account a row spends, shortly; "" while only one account is seen."""
+    if not isinstance(snap, dict) or snap.get("state") != "ok":
+        return ""
+    rows = snap.get("accounts", [])
+    if len(rows) < 2:
+        return ""
+    aid = snap.get("sessions", {}).get(session_id)
+    by_id = {r["id"]: r for r in rows}
+    if aid not in by_id:
+        return "?"
+    name = snap.get("names", {}).get(aid, aid)
+    brands = {r.get("brand") for r in rows}
+    return f"{by_id[aid].get('brand', 'ant')} {name}" if len(brands) > 1 else name
+
+
+def status_text(rec, now, labels=None, names=None):
+    """What `ccwho statusline` prints in the session's own status bar."""
+    if not isinstance(rec, dict):
+        return ""
+    limits = clean_limits(rec.get("rate_limits"))
+    if not limits:
+        return ""
+    acct = rec.get("first_account") if isinstance(rec.get("first_account"), dict) else {}
+    when = rec["measured_at"] if _number(rec.get("measured_at")) else rec.get("received_at", now)
+    row = {"id": acct.get("id") or "?", "kind": acct.get("kind"), "email": acct.get("email", ""),
+           "brand": "ant"}
+    for name, w in limits.items():
+        reset = w.get("resets_at")
+        row[name] = ({"state": "expired", "resets_at": reset, "age": now - when}
+                     if _number(reset) and reset <= now else
+                     {"state": "ok", "pct": w["used_percentage"], "resets_at": reset,
+                      "age": now - when})
+    if rec.get("unsure") or not acct.get("id"):
+        name = "?"
+    elif names and isinstance(names.get(row["id"]), str):
+        name = names[row["id"]]       # the name the list used, clashes resolved
+    else:
+        name = short_names([row], labels or {})[row["id"]]
+    # Claude is what a status bar is assumed to show: a brand is named there
+    # only when it is not Anthropic (owner, design review of the built list)
+    return to_ansi(entry_spans(row, name, now, selected=True, brand=row["brand"] != "ant"))
+
+
+def shown_records(snap):
+    """What the usage line said, per account and window - for the log that
+    decides when an old window should lose its arrow (owner, 2026-09-25)."""
+    if not isinstance(snap, dict) or snap.get("state") != "ok":
+        return []
+    now, out = snap.get("now", time.time()), []
+    for r in snap.get("accounts", []):
+        for name in WINDOWS:
+            w = r.get(name)
+            if not w:
+                continue
+            el = elapsed_pct(name, w.get("resets_at"), now) if w["state"] == "ok" else None
+            arrow = pace_arrow(w.get("pct"), el) if w["state"] == "ok" else None
+            out.append({"account": snap.get("names", {}).get(r["id"], r["id"]),
+                        "window": SHORT[name], "state": w["state"], "used": w.get("pct"),
+                        "elapsed": el, "age": round(w.get("age") or 0),
+                        "arrow": arrow[0] if arrow else ""})
+    return out
+
+
+SHOWN_LINE_BYTES = 100            # a shown-log line is about this long
+
+
+def append_shown(path, records, last, now=None, keep=5000):
+    """Append what changed; keep the file bounded. Returns the new key. A write
+    that fails is dropped: this log must never cost the list anything.
+
+    The last key is kept beside the log, so the list, --watch and `ccwho ls`
+    (separate processes) do not each write the same lines. Appending never
+    reads the log; only a log past its size bound is read, once, to trim it."""
+    key = json.dumps([{k: v for k, v in r.items() if k != "age"} for r in records],
+                     sort_keys=True)
+    if not records:
+        return key
+    # the file, not this process's memory: the list and --watch each run for
+    # hours, and a change one of them logged is not news to the other
+    try:
+        with open(path + ".key", encoding="utf-8") as fh:
+            last = fh.read()
+    except OSError:
+        pass
+    if key == last:
+        return key
+    now = time.time() if now is None else now
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(dict(r, t=round(now))) + "\n")
+        tmp = f"{path}.key.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(key)
+        os.replace(tmp, path + ".key")         # a reader never sees half a key
+        if os.path.getsize(path) > 2 * keep * SHOWN_LINE_BYTES:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()[-keep:]
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.writelines(lines)
+            os.replace(tmp, path)
+    except OSError:
+        pass
+    return key

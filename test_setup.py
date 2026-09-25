@@ -776,7 +776,8 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
         for name, answer in (("iterm_scriptable", True),
                              ("handler_registered", True),
                              ("launchd_loaded", True),
-                             ("cc_status_hook", True)):
+                             ("cc_status_hook", True),
+                             ("secure_input_holder", None)):
             self.addCleanup(setattr, setup, name, getattr(setup, name))
             setattr(setup, name, lambda *a, **k: answer)
         self.addCleanup(setattr, setup.shutil, "which", setup.shutil.which)
@@ -802,6 +803,11 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
     def test_unreadable_session_files_reach_doctor(self):
         setup.engine.live_file_sessions = lambda *a, **k: ([], 4)
         self.assertEqual(setup.gather(ccwho_dir=self.tmp)["session_files_bad"], 4)
+
+    def test_who_holds_secure_input_reaches_doctor(self):
+        setup.secure_input_holder = lambda *a, **k: {"pid": 7835, "app": "Discord"}
+        self.assertEqual(setup.gather(ccwho_dir=self.tmp)["secure_input"],
+                         {"pid": 7835, "app": "Discord"})
 
     def test_a_machine_without_claude_still_reports_none(self):       # control
         real = setup.engine.find_tool
@@ -906,6 +912,101 @@ class TestTheHotkeyOnlyReachesYouWithPermission(unittest.TestCase):
     def test_iterm_not_running_is_not_a_fault_either(self):
         check = setup.hotkey_reach(self.facts(iterm_started_at=None))
         self.assertTrue(check["ok"])
+
+
+class TestAnAppHoldingSecureInputBlocksEveryHotkey(unittest.TestCase):
+    """macOS Secure Input (a password field, or iTerm2's Secure Keyboard Entry)
+    keeps keystrokes from every global hotkey. The app that turned it on must
+    turn it off again; one that crashed, or has a stuck password field, never
+    does. Found the hard way, many times: after a crash the hotkey was dead,
+    toggling Secure Keyboard Entry in iTerm2 did nothing, and the app that held
+    it was Discord. The fix is to name the app, because nothing else does.
+    """
+
+    def facts(self, **over):
+        f = {"accessibility": True, "iterm_granted_at": 1000.0,
+             "iterm_started_at": 2000.0, "secure_input": None}
+        f.update(over)
+        return f
+
+    def test_nobody_holding_it_is_fine(self):                         # control
+        self.assertTrue(setup.hotkey_reach(self.facts())["ok"])
+
+    def test_an_app_holding_it_is_named_with_the_way_out(self):
+        check = setup.hotkey_reach(self.facts(
+            secure_input={"pid": 7835, "app": "Discord"}))
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["do"], "lock")
+        self.assertIn("Discord", check["detail"],
+                      "the name is how you spot the app that keeps doing it")
+        self.assertIn("7835", check["detail"])
+        self.assertIn("Secure Input", check["detail"])
+
+    def test_the_fix_is_to_lock_the_screen_whoever_holds_it(self):
+        # locking the screen and logging back in frees it every time; a
+        # crashed app cannot be quit, and quitting does not always free it.
+        # "iTerm" because that is the bundle's name, measured
+        for app in ("Discord", "iTerm", "loginwindow"):
+            fix = setup.hotkey_reach(self.facts(
+                secure_input={"pid": 1, "app": app}))["fix"]
+            self.assertIn("Ctrl+Cmd+Q", fix, app)
+            self.assertNotIn("quit", fix.lower(), app)
+
+    def test_asking_for_the_permission_still_comes_first(self):
+        # setup can act on "ask"; hiding it behind a transient fault would
+        # stop setup from ever asking
+        check = setup.hotkey_reach(self.facts(
+            accessibility=False, secure_input={"pid": 7835, "app": "Discord"}))
+        self.assertEqual(check["do"], "ask")
+
+    def test_it_comes_before_a_restart(self):
+        # the cheap fix first: locking the screen, not ending every session
+        check = setup.hotkey_reach(self.facts(
+            iterm_granted_at=3000.0, secure_input={"pid": 7835, "app": "Discord"}))
+        self.assertEqual(check["do"], "lock")
+
+    def test_setup_reports_it_but_does_not_lock_anything(self):
+        f = facts(uv="/x/uv", hotkey_installed=True, accessibility=True,
+                  iterm_granted_at=1000.0, iterm_started_at=2000.0,
+                  secure_input={"pid": 7835, "app": "Discord"})
+        step = by_name(setup.setup_plan(f))["hotkey reach"]
+        self.assertFalse(step["todo"])
+        self.assertIn("Ctrl+Cmd+Q", step["fix"])
+
+    def test_doctor_shows_it(self):
+        check = by_name(setup.doctor_checks(facts(
+            accessibility=True, secure_input={"pid": 7835, "app": "Discord"})))
+        self.assertFalse(check["hotkey reach"]["ok"])
+
+
+class TestReadingWhoHoldsSecureInput(unittest.TestCase):
+    ON = ('  |   "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,'
+          '"kCGSSessionSecureInputPID"=7835,"kCGSSessionUserIDKey"=501})\n')
+    OFF = '  |   "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserIDKey"=501})\n'
+
+    def test_the_pid_is_read_from_ioreg(self):
+        self.assertEqual(setup.secure_input_pid(self.ON), 7835)
+
+    def test_no_key_means_nobody_holds_it(self):                      # control
+        self.assertIsNone(setup.secure_input_pid(self.OFF))
+
+    def test_pid_zero_means_nobody_holds_it(self):
+        self.assertIsNone(setup.secure_input_pid(
+            self.ON.replace("=7835", "=0")))
+
+    def test_the_app_is_its_bundle_name(self):
+        self.assertEqual(setup.app_name(
+            "/Applications/Discord.app/Contents/MacOS/Discord"), "Discord")
+        self.assertEqual(setup.app_name(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            "Google Chrome")
+
+    def test_a_bare_program_is_its_file_name(self):
+        self.assertEqual(setup.app_name("/usr/libexec/sshd-keygen"), "sshd-keygen")
+
+    def test_asking_the_machine_never_raises(self):
+        got = setup.secure_input_holder()
+        self.assertTrue(got is None or {"pid", "app"} <= set(got), got)
 
 
 class TestTheGatherersForThatSurviveAnyMachine(unittest.TestCase):

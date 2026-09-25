@@ -91,6 +91,10 @@ by default (`ccwho setup --hotkey option-w` to change it). A hotkey is only glob
 iTerm2 had Accessibility when it registered the key; setup asks for it, and says
 when iTerm2 must be restarted for it to take.
 
+If the hotkey stops working after a crash, an app has probably left macOS Secure
+Input on, and then no global hotkey works. `ccwho doctor` names the app. The fix
+is always the same: lock the screen (Ctrl+Cmd+Q) and log back in.
+
 ### Background sessions
 
 A session started with `claude --bg`, or sent to the background from agent view,

@@ -164,6 +164,8 @@ def gather(ccwho_dir=None, settings_path=None, now=None):
         "accessibility": accessibility_ok(),
         "iterm_granted_at": accessibility_granted_at(),
         "iterm_started_at": iterm_started_at(),
+        # a crashed app can leave Secure Input on, and then no hotkey fires
+        "secure_input": secure_input_holder(),
         "settings_path": settings_path or os.path.expanduser("~/.claude/settings.json"),
     }
 
@@ -398,11 +400,48 @@ def iterm_started_at(pid=None, timeout=10.0):
         return None
 
 
+_SECURE_INPUT = re.compile(r'"kCGSSessionSecureInputPID"=(\d+)')
+
+
+def secure_input_pid(ioreg_text):
+    """The pid that holds Secure Input, or None when nobody does."""
+    found = _SECURE_INPUT.search(ioreg_text or "")
+    pid = int(found.group(1)) if found else 0
+    return pid or None
+
+
+def app_name(comm):
+    """What a person calls the process: its bundle, else its file name."""
+    found = re.search(r"([^/]+)\.app/", comm or "")
+    return found.group(1) if found else os.path.basename(comm or "")
+
+
+def secure_input_holder(timeout=10.0):
+    """{"pid", "app"} of the process holding Secure Input, or None when nobody
+    does - or when we could not look, which must never read as a fault."""
+    try:
+        done = subprocess.run(["ioreg", "-l", "-w", "0", "-d", "1"],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pid = secure_input_pid(done.stdout)
+    if pid is None:
+        return None
+    try:
+        comm = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                              capture_output=True, text=True,
+                              timeout=timeout).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        comm = ""
+    return {"pid": pid, "app": app_name(comm) or "an unknown process"}
+
+
 def hotkey_reach(facts):
     """Can the hotkey reach you from another app?
 
-    Three answers, because they need three different things from you: ask for
-    the permission, restart iTerm2 so it can use one it has, or nothing.
+    Four answers, because they need four different things from you: ask for
+    the permission, lock the screen to free Secure Input, restart iTerm2 so it
+    can use a permission it has, or nothing.
     """
     allowed = facts.get("accessibility")
     if allowed is False:
@@ -411,6 +450,15 @@ def hotkey_reach(facts):
                       " can only work while iTerm2 is already in front",
                       "grant it when macOS asks, or System Settings >"
                       " Privacy & Security > Accessibility > iTerm")
+    held = facts.get("secure_input")
+    if held:
+        # The name is there to spot the app that keeps doing it. The fix is
+        # the same for all of them: a crashed app cannot be quit, and logging
+        # back in frees Secure Input every time.
+        return _reach(False, "lock",
+                      f"{held['app']} (pid {held['pid']}) holds Secure Input,"
+                      " so no hotkey reaches any app",
+                      "lock the screen (Ctrl+Cmd+Q) and log back in")
     granted, started = facts.get("iterm_granted_at"), facts.get("iterm_started_at")
     if allowed and granted and started and granted > started:
         return _reach(False, "restart",

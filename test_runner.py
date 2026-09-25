@@ -224,6 +224,19 @@ class TestSaveAndRestore(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
 
+    def test_save_prunes_usage_readings_older_than_eight_days(self):
+        d = os.path.join(self.tmp, "usage")
+        os.makedirs(d)
+        old, new = os.path.join(d, "old.json"), os.path.join(d, "new.json")
+        for p in (old, new):
+            with open(p, "w") as fh:
+                fh.write("{}")
+        stamp = time.time() - 9 * 86400
+        os.utime(old, (stamp, stamp))
+        self._save()
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))                                # control
+
     def test_save_records_the_session_it_could_not_capture(self):
         self._save()
         path = os.path.join(runner.restore_dir(),
@@ -2760,3 +2773,146 @@ class TestReapNeverPrintsASecret(unittest.TestCase):
             runner.main(["reap", "leak.js", "--older-than", "1h"])
         self.assertIn("leak.js", out.getvalue())                            # control
         self.assertNotIn("k8Hq2vX9pLm3nR7tW1yZ4bC6dF0gJ5sA", out.getvalue())
+
+
+class TestStatusline(unittest.TestCase):
+    """`ccwho statusline` runs inside every session, on every status update. It
+    records what it is handed, prints nothing, and never fails the session's
+    status bar - whatever arrives on stdin."""
+
+    TOKEN = "sk-ant-oat01-FAKE-runner-0000-never-out"
+    SID = "2f25ae12-9c12-4461-adf5-6000f566876d"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+        with open(os.path.join(self.home, ".claude.json"), "w") as fh:
+            json.dump({"oauthAccount": {"emailAddress": "a@example.com",
+                                        "accountUuid": "uuid-a"}}, fh)
+        self.saved = {k: os.environ.get(k) for k in
+                      ("CCWHO_DIR", runner.TEST_HOME_VAR, "CLAUDE_CODE_OAUTH_TOKEN",
+                       "CLAUDE_CONFIG_DIR")}
+        os.environ["CCWHO_DIR"] = os.path.join(self.tmp, "ccwho")
+        os.environ[runner.TEST_HOME_VAR] = self.home
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_with(self, stdin):
+        out, err = io.StringIO(), io.StringIO()
+        old = sys.stdin
+        sys.stdin = io.StringIO(stdin)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = runner.main(["statusline"])
+        finally:
+            sys.stdin = old
+        return rc, out.getvalue(), err.getvalue()
+
+    def payload(self, **extra):
+        p = {"session_id": self.SID, "transcript_path": None,
+             "rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": 1790346600},
+                             "seven_day": {"used_percentage": 67, "resets_at": 1790625600}}}
+        p.update(extra)
+        return json.dumps(p)
+
+    def usage_file(self):
+        return os.path.join(self.tmp, "ccwho", "usage", self.SID + ".json")
+
+    def test_a_reading_is_written_and_nothing_printed(self):
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, out, err), (0, "", ""))
+        with open(self.usage_file()) as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["rate_limits"]["seven_day"]["used_percentage"], 67)
+        self.assertEqual(rec["account"]["id"], "login:uuid-a")
+
+    def test_junk_on_stdin_is_exit_zero_silent_and_writes_nothing(self):
+        for junk in ("", "{nope", "[]", "null", json.dumps({"session_id": "../../x"})):
+            rc, out, err = self.run_with(junk)
+            self.assertEqual((rc, out, err), (0, "", ""), junk)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "ccwho", "usage")))
+
+    def test_the_token_is_in_no_file_and_no_output(self):
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = self.TOKEN
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(self.usage_file()))                  # control
+        for root, _, files in os.walk(self.tmp):
+            for name in files:
+                with open(os.path.join(root, name), errors="replace") as fh:
+                    self.assertNotIn(self.TOKEN, fh.read(), name)
+        self.assertNotIn(self.TOKEN, out + err)
+
+    def test_a_second_reading_keeps_the_first_account(self):
+        self.run_with(self.payload())
+        with open(os.path.join(self.home, ".claude.json"), "w") as fh:
+            json.dump({"oauthAccount": {"emailAddress": "b@example.com",
+                                        "accountUuid": "uuid-b"}}, fh)
+        self.run_with(self.payload())
+        with open(self.usage_file()) as fh:
+            rec = json.load(fh)
+        self.assertTrue(rec["unsure"])
+        self.assertEqual(rec["first_account"]["id"], "login:uuid-a")
+
+    def test_a_write_that_fails_is_still_silent(self):
+        os.makedirs(os.path.join(self.tmp, "ccwho"))
+        with open(os.path.join(self.tmp, "ccwho", "usage"), "w") as fh:
+            fh.write("a file where the directory should be")
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    def test_accounts_lists_what_was_recorded(self):
+        self.run_with(self.payload())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = runner.main(["accounts"])
+        self.assertEqual(rc, 0)
+        self.assertIn("a@example.com", out.getvalue())
+        self.assertIn("7d", out.getvalue())
+
+    def test_accounts_json(self):
+        self.run_with(self.payload())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["accounts", "--json"])
+        rows = json.loads(out.getvalue())
+        self.assertEqual(rows[0]["id"], "login:uuid-a")
+
+    def test_accounts_with_nothing_recorded_says_how_it_gets_data(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = runner.main(["accounts"])
+        self.assertEqual(rc, 0)
+        self.assertIn("statusline", out.getvalue())
+
+    def test_accounts_name_sets_a_label(self):
+        self.run_with(self.payload())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(runner.main(["accounts", "name", "login:uuid", "work"]), 0)
+            runner.main(["accounts"])
+        self.assertIn("work", out.getvalue())
+
+    def test_accounts_name_with_an_unknown_id_fails(self):
+        self.run_with(self.payload())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["accounts", "name", "nope", "work"]), 2)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "ccwho", "accounts.json")))
+
+    def test_housekeeping_prunes_old_readings(self):
+        self.run_with(self.payload())
+        old = self.usage_file()
+        stamp = time.time() - 9 * 86400
+        os.utime(old, (stamp, stamp))
+        runner.prune_usage()
+        self.assertFalse(os.path.exists(old))

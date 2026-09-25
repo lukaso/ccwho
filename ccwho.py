@@ -25,6 +25,7 @@ import traceback
 import ccwho_engine as engine
 import ccwho_index as index
 import ccwho_setup as setup
+import ccwho_usage as usage
 
 CLEAR_HOME = "\033[H\033[2J"
 DIM, RESET, RED = "\033[2m", "\033[0m", "\033[31m"
@@ -1130,6 +1131,91 @@ def ccwho_dir():
     return os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho")
 
 
+def usage_dir():
+    return os.path.join(ccwho_dir(), "usage")
+
+
+def labels_path():
+    return os.path.join(ccwho_dir(), "accounts.json")
+
+
+def prune_usage():
+    """Readings older than the 7-day window. Housekeeping: it never fails."""
+    d = usage_dir()
+    for name in usage.prune(d, time.time()):
+        try:
+            os.unlink(os.path.join(d, name))
+        except OSError:
+            pass
+
+
+def statusline(argv):
+    """Claude Code runs this in every session, on every status update, with the
+    session's JSON on stdin. It records the usage it is handed and prints
+    nothing. Whatever arrives, it exits 0: a statusLine that errors is noise in
+    every session the user has open."""
+    try:
+        payload = json.loads(sys.stdin.read() or "null")
+        sid = payload.get("session_id") if isinstance(payload, dict) else None
+        d = usage_dir()
+        path = os.path.join(d, f"{sid}.json")
+        previous = None
+        if isinstance(sid, str) and usage._SID.match(sid):
+            try:
+                with open(path) as fh:
+                    previous = json.load(fh)
+            except (OSError, ValueError):
+                previous = None
+        rec = usage.record(payload, os.environ, setup_home(), time.time(), previous)
+        if rec is None:
+            return 0
+        os.makedirs(d, exist_ok=True)
+        write_atomic(path, json.dumps(rec))
+    except Exception:             # noqa: BLE001 - see the docstring
+        pass
+    return 0
+
+
+def read_labels():
+    try:
+        with open(labels_path()) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def accounts(argv):
+    """Usage per account, from what the sessions' statusLines recorded."""
+    now = time.time()
+    rows = usage.accounts(usage.load_readings(usage_dir(), now), now, read_labels())
+    if argv and argv[0] == "name":
+        if len(argv) != 3:
+            print("usage: ccwho accounts name <id> <label>", file=sys.stderr)
+            return 2
+        aid = usage.resolve_id(argv[1], [r["id"] for r in rows])
+        if not aid:
+            print(f"ccwho accounts: no single account matches {argv[1]!r}"
+                  " - `ccwho accounts --json` lists the ids", file=sys.stderr)
+            return 2
+        labels = read_labels()
+        labels[aid] = argv[2]
+        os.makedirs(ccwho_dir(), exist_ok=True)
+        write_atomic(labels_path(), json.dumps(labels, indent=2))
+        print(f"{aid} -> {argv[2]}")
+        return 0
+    if "--json" in argv:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no usage recorded yet. Sessions record it through `ccwho statusline`,"
+              " after their first reply.")
+        return 0
+    for row in rows:
+        print(usage.format_row(row, now))
+    return 0
+
+
 def restore_dir():
     return os.path.join(ccwho_dir(), "restore")
 
@@ -1195,6 +1281,7 @@ def save(argv):
             os.unlink(os.path.join(d, stale))
     except OSError:
         pass                      # housekeeping never fails the save it follows
+    prune_usage()
     why = man.get("skippedWhy") or {}
     note = (", %d not saved (%s)" % (man["skipped"], "; ".join(
         "%d %s" % (n, w) for w, n in sorted(why.items()))) if man["skipped"] else "")
@@ -1416,6 +1503,10 @@ def main(argv=None):
         return ls(argv[1:])
     if argv and argv[0] == "ps":
         return ps(argv[1:])
+    if argv and argv[0] == "statusline":
+        return statusline(argv[1:])
+    if argv and argv[0] == "accounts":
+        return accounts(argv[1:])
     if argv and argv[0] == "doctor":
         return doctor(argv[1:])
     if argv and argv[0] == "setup":
@@ -1440,6 +1531,9 @@ def main(argv=None):
         print("                                                  (--all includes sessions a program started)")
         print("       ccwho show <anything>                      what that session was working on")
         print("       ccwho ps [--port N] [--all] [--json] [--full]  what agents started, and their ports")
+        print("       ccwho accounts [--json]                    subscription usage, per account")
+        print("       ccwho accounts name <id> <label>           a display name for an account")
+        print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY]         install what ccwho needs, once")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")

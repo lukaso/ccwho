@@ -34,7 +34,7 @@ import ccwho_procs as procs
 # The rule modules the engine imports, in the order they are re-read. One list,
 # used by the watch loop and the list alike: a module named in only one of two
 # lists is a fix that lands in one window and not the other.
-RELOAD_FIRST = ("ccwho_procs", "ccwho_brief", "ccwho_index")    # procs first:
+RELOAD_FIRST = ("ccwho_procs", "ccwho_brief", "ccwho_index", "ccwho_usage")    # procs first:
                                                                   # brief imports it
 
 # Status order: what needs you first, what is working next, what is parked last.

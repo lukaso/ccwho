@@ -433,7 +433,45 @@ def secure_input_holder(timeout=10.0):
                               timeout=timeout).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         comm = ""
-    return {"pid": pid, "app": app_name(comm) or "an unknown process"}
+    held = {"pid": pid, "app": app_name(comm) or "an unknown process"}
+    if held["app"] in ITERM_APPS:
+        held["iterm_secure_entry"] = iterm_secure_entry(timeout=timeout)
+    return held
+
+
+# the bundle is iTerm.app (measured); iTerm2 is what people call it
+ITERM_APPS = ("iTerm", "iTerm2")
+
+
+def secure_entry_on(defaults_answer):
+    """iTerm2's Secure Keyboard Entry from `defaults read`: True, False, or
+    None when it is not set - which is not the same as off."""
+    answer = (defaults_answer or "").strip()
+    return {"1": True, "0": False}.get(answer)
+
+
+def iterm_secure_entry(timeout=10.0):
+    try:
+        done = subprocess.run(["defaults", "read", ITERM_BUNDLE, "Secure Input"],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return secure_entry_on(done.stdout) if done.returncode == 0 else None
+
+
+def secure_input_problem(held):
+    """One line when an app holds Secure Input, "" when nobody does.
+
+    The name is there to spot the app that keeps doing it. The fix is the same
+    for all of them: a crashed app cannot be quit, and logging back in frees
+    Secure Input every time. iTerm2 with its own Secure Keyboard Entry on is
+    not a fault: it holds Secure Input only while it is in front, which is
+    exactly when ccwho looks.
+    """
+    if not held or held.get("iterm_secure_entry"):
+        return ""
+    return (f"{held['app']} (pid {held['pid']}) holds Secure Input, so no hotkey"
+            " reaches any app - lock the screen (Ctrl+Cmd+Q) and log back in")
 
 
 def hotkey_reach(facts):
@@ -451,10 +489,7 @@ def hotkey_reach(facts):
                       "grant it when macOS asks, or System Settings >"
                       " Privacy & Security > Accessibility > iTerm")
     held = facts.get("secure_input")
-    if held:
-        # The name is there to spot the app that keeps doing it. The fix is
-        # the same for all of them: a crashed app cannot be quit, and logging
-        # back in frees Secure Input every time.
+    if secure_input_problem(held):
         return _reach(False, "lock",
                       f"{held['app']} (pid {held['pid']}) holds Secure Input,"
                       " so no hotkey reaches any app",

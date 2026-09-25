@@ -92,8 +92,10 @@ iTerm2 had Accessibility when it registered the key; setup asks for it, and says
 when iTerm2 must be restarted for it to take.
 
 If the hotkey stops working after a crash, an app has probably left macOS Secure
-Input on, and then no global hotkey works. `ccwho doctor` names the app. The fix
-is always the same: lock the screen (Ctrl+Cmd+Q) and log back in.
+Input on, and then no global hotkey works. The live list (click iTerm2, or run
+`ccwho`) and `ccwho doctor` both name the app. The fix is always the same: lock
+the screen (Ctrl+Cmd+Q) and log back in. iTerm2's own Secure Keyboard Entry is
+not reported: iTerm2 holds Secure Input only while it is in front.
 
 ### Background sessions
 

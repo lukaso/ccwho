@@ -979,6 +979,73 @@ class TestAnAppHoldingSecureInputBlocksEveryHotkey(unittest.TestCase):
         self.assertFalse(check["hotkey reach"]["ok"])
 
 
+class TestItermsOwnSecureKeyboardEntryIsNotAFault(unittest.TestCase):
+    """With Secure Keyboard Entry on, iTerm2 holds Secure Input while it is in
+    front, and lets go when you leave it. ccwho runs IN iTerm2, so without this
+    every look would accuse iTerm2 of the fault it is not causing."""
+
+    def test_nobody_holding_it_says_nothing(self):                    # control
+        self.assertEqual(setup.secure_input_problem(None), "")
+
+    def test_another_app_is_named_with_the_fix(self):
+        line = setup.secure_input_problem({"pid": 7835, "app": "Discord"})
+        self.assertIn("Discord", line)
+        self.assertIn("Secure Input", line)
+        self.assertIn("Ctrl+Cmd+Q", line)
+
+    def test_iterm_with_its_switch_on_is_not_a_fault(self):
+        self.assertEqual(setup.secure_input_problem(
+            {"pid": 778, "app": "iTerm", "iterm_secure_entry": True}), "")
+
+    def test_iterm_with_its_switch_off_is_a_fault(self):              # control
+        # measured: a program in an iTerm2 tab that asks for Secure Input is
+        # reported as iTerm - and that one can get stuck
+        self.assertIn("iTerm", setup.secure_input_problem(
+            {"pid": 778, "app": "iTerm", "iterm_secure_entry": False}))
+
+    def test_doctor_agrees(self):
+        check = setup.hotkey_reach({
+            "accessibility": True, "iterm_granted_at": 1000.0,
+            "iterm_started_at": 2000.0,
+            "secure_input": {"pid": 778, "app": "iTerm", "iterm_secure_entry": True}})
+        self.assertTrue(check["ok"])
+
+    def holder_on_a_machine(self, comm, secure_entry):
+        answers = {"ioreg": '"kCGSSessionSecureInputPID"=778,', "ps": comm + "\n",
+                   "defaults": secure_entry}
+        asked = []
+
+        def run(cmd, **k):
+            asked.append(cmd[0])
+            return subprocess.CompletedProcess(cmd, 0, answers[cmd[0]], "")
+        real = setup.subprocess.run
+        setup.subprocess.run = run
+        try:
+            return setup.secure_input_holder(), asked
+        finally:
+            setup.subprocess.run = real
+
+    def test_an_iterm_holder_carries_its_switch(self):
+        held, _ = self.holder_on_a_machine(
+            "/Applications/iTerm.app/Contents/MacOS/iTerm2", "1\n")
+        self.assertEqual(held, {"pid": 778, "app": "iTerm",
+                                "iterm_secure_entry": True})
+
+    def test_another_holder_does_not_ask_iterm(self):                 # control
+        held, asked = self.holder_on_a_machine(
+            "/Applications/Discord.app/Contents/MacOS/Discord", "1\n")
+        self.assertEqual(held, {"pid": 778, "app": "Discord"})
+        self.assertNotIn("defaults", asked)
+
+    def test_reading_the_switch_never_raises(self):
+        self.assertIn(setup.iterm_secure_entry(), (True, False, None))
+
+    def test_the_switch_is_read_from_its_defaults_answer(self):
+        self.assertTrue(setup.secure_entry_on("1\n"))
+        self.assertFalse(setup.secure_entry_on("0\n"))
+        self.assertIsNone(setup.secure_entry_on(""), "not set is not known")
+
+
 class TestReadingWhoHoldsSecureInput(unittest.TestCase):
     ON = ('  |   "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,'
           '"kCGSSessionSecureInputPID"=7835,"kCGSSessionUserIDKey"=501})\n')

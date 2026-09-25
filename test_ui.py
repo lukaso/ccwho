@@ -163,6 +163,79 @@ class TestTheList(UiTest):
             self.assertIn("ccwho doctor", self.screen_text(app))
 
 
+class TestSecureInputShowsInTheList(UiTest):
+    """The list can come forward without the hotkey (click iTerm2, run
+    `ccwho`), so it is where a dead hotkey gets explained."""
+
+    LINE = ("hotkey: Discord (pid 7835) holds Secure Input, so no hotkey"
+            " reaches any app - lock the screen (Ctrl+Cmd+Q) and log back in")
+
+    async def test_it_is_shown_above_the_list(self):
+        fleet = ui.Fleet([LIVE], True, "12:00:00", secure=self.LINE)
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            banner = app.query_one("#banner")
+            self.assertTrue(banner.display)
+            self.assertIn("Ctrl+Cmd+Q", str(banner.render()))
+
+    async def test_nothing_held_means_no_banner(self):                # control
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([LIVE], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#banner").display)
+
+    async def test_it_does_not_hide_a_fleet_error(self):
+        fleet = ui.Fleet([], False, "12:00:00", "could not read the fleet: boom",
+                         secure=self.LINE)
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = str(app.query_one("#banner").render())
+            self.assertIn("boom", text)
+            self.assertIn("Ctrl+Cmd+Q", text)
+
+
+class TestTheCollectorLooksForSecureInput(unittest.TestCase):
+    def fleet_with(self, holder):
+        import ccwho_setup as setup
+        collector = ui.Collector()
+        collector.reload = lambda: None
+        real = ui.engine.collect, setup.secure_input_holder
+        ui.engine.collect = lambda cache=None, status=None: (
+            status.update(source_ok=True) or ([], {}))
+        setup.secure_input_holder = lambda *a, **k: holder
+        try:
+            return collector.fleet()
+        finally:
+            ui.engine.collect, setup.secure_input_holder = real
+
+    def test_a_holder_reaches_the_fleet(self):
+        fleet = self.fleet_with({"pid": 7835, "app": "Discord"})
+        self.assertIn("Discord", fleet.secure)
+        self.assertIn("Ctrl+Cmd+Q", fleet.secure)
+
+    def test_no_holder_is_quiet(self):                                # control
+        self.assertEqual(self.fleet_with(None).secure, "")
+
+    def test_a_failing_look_never_takes_the_fleet_down(self):
+        import ccwho_setup as setup
+        collector = ui.Collector()
+        collector.reload = lambda: None
+        real = ui.engine.collect, setup.secure_input_holder
+        ui.engine.collect = lambda cache=None, status=None: (
+            status.update(source_ok=True) or ([LIVE], {}))
+        def boom(*a, **k):
+            raise RuntimeError("ioreg moved")
+        setup.secure_input_holder = boom
+        try:
+            fleet = collector.fleet()
+        finally:
+            ui.engine.collect, setup.secure_input_holder = real
+        self.assertEqual(len(fleet.rows), 1)
+        self.assertEqual(fleet.secure, "")
+
+
 class TestKeys(UiTest):
     async def test_enter_goes_to_the_selected_session(self):
         adapter = FakeAdapter()

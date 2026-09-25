@@ -92,8 +92,13 @@ ARM_SECS = 10.0                # a kill asked for once is confirmed within this
 class Fleet:
     """One snapshot of the world, and the questions the screen asks of it."""
 
-    def __init__(self, rows=(), source_ok=True, at="", error="", procs=None):
+    def __init__(self, rows=(), source_ok=True, at="", error="", procs=None,
+                 secure=""):
         self.rows, self.source_ok, self.at, self.error = list(rows), source_ok, at, error
+        # an app holding macOS Secure Input: no hotkey works until it lets go.
+        # The list can still come forward (click iTerm2, run ccwho), so it is
+        # where a dead hotkey gets explained
+        self.secure = secure
         # collect()'s second answer: what agents started, the ports they hold,
         # what was left behind. None is "not collected": the list stays quiet
         # (a false alarm on every start is still an alarm) and `p` says unknown
@@ -531,8 +536,10 @@ class CcwhoUi(App):
         header.update(
             f"{len(self.fleet.rows)} sessions" + (f": {counts}" if counts else "")
             + when + searching + ("  " + self.status if self.status else ""))
-        banner.update(self.fleet.error or "")
-        banner.display = bool(self.fleet.error)
+        trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure)
+                            if line)
+        banner.update(trouble)
+        banner.display = bool(trouble)
         self.paint_procs_lines()
 
     def paint_procs_lines(self):
@@ -1073,7 +1080,8 @@ class Collector:
         try:
             rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
-            return Fleet([], False, "", f"could not read the fleet: {ex}")
+            return Fleet([], False, "", f"could not read the fleet: {ex}",
+                         secure=self.secure_input())
         # The scan's own answer to the cheap question, so the next cheap check
         # does not see a changed world and scan all over again.
         if status.get("watch") is not None:
@@ -1082,7 +1090,18 @@ class Collector:
                                         "cannot read the session list - run `ccwho doctor`")
         self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
-                     time.strftime("%H:%M:%S"), trouble, procs=procs)
+                     time.strftime("%H:%M:%S"), trouble, procs=procs,
+                     secure=self.secure_input())
+
+    def secure_input(self):
+        """The Secure Input line, or "". 18ms, on the collecting thread, and
+        never the reason the list goes down."""
+        try:
+            import ccwho_setup as setup
+            line = setup.secure_input_problem(setup.secure_input_holder())
+        except Exception:
+            return ""
+        return f"hotkey: {line}" if line else ""
 
     def saved_count(self):
         """How many sessions the newest manifest holds, or 0."""

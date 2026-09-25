@@ -151,6 +151,8 @@ class Row(Static):
     def __init__(self, row, width):
         self.row = row
         self.width = width
+        self.lit = None         # the action under the mouse: "detail", "kill" or None
+        self.mouse_at = None    # (x, y) in the text, while the mouse is on the row
         # NOT _render: Widget._render is Textual's own, and overriding it with a
         # different signature breaks every paint. Same trap as self.query.
         super().__init__(self._as_text(width), markup=False)
@@ -195,10 +197,31 @@ class Row(Static):
         self.painted = self.words(width)
         state = STATE_STYLE.get(engine.ui_state_style(self.row), "")
         text = Text(no_wrap=True, overflow="crop")
+        # read again for this text: a row rewritten under a still mouse has moved
+        # its parts, and the light follows what is under the mouse now
+        self.lit = self.action_at(*self.mouse_at) if self.mouse_at else None
+        lit = {"detail": "detail", "kill": "action"}.get(self.lit)
         for part, role in self.spans():
-            text.append(part, style=state if role == "mark"
-                        else ROLE_STYLE.get(role, ""))
+            style = state if role == "mark" else ROLE_STYLE.get(role, "")
+            # under the mouse, the part a click on it acts on lights up
+            text.append(part, style=f"{style} reverse".strip() if role == lit else style)
         return text
+
+    def action_at(self, x, y):
+        """What a click at (x, y) of the text does on its own, or None."""
+        return engine.ui_action_at(self.row, self.text_width(), y, x,
+                                   tag=self.row.get("usage_tag", ""))
+
+    def on_mouse_move(self, event):
+        at = event.get_content_offset(self)
+        self.mouse_at = (at.x, at.y) if at is not None else None
+        if (self.action_at(*self.mouse_at) if self.mouse_at else None) != self.lit:
+            self.refresh_text(self.width)
+
+    def on_leave(self, event):
+        self.mouse_at = None
+        if self.lit:
+            self.refresh_text(self.width)
 
     def refresh_text(self, width):
         self.update(self._as_text(width))
@@ -232,6 +255,9 @@ class CcwhoUi(App):
     .row.acting { background: $warning 30%; border-left: thick $warning; }
     .row.acting.pulse { background: $warning 70%; }
     .heading { color: $accent; text-style: bold; padding: 1 1 0 1; }
+    #closebar { dock: top; height: 1; align: right top; }
+    #close { width: 3; height: 1; color: $text-muted; }
+    #close:hover { background: $accent; color: $text; }
     """
 
     BINDINGS = [
@@ -288,7 +314,11 @@ class CcwhoUi(App):
         yield Static("", id="banner", markup=False)
         with Horizontal(id="body"):
             yield VerticalScroll(id="list")
-            yield VerticalScroll(Static("", id="brief", markup=False), id="detail")
+            # the close sits on its own line, docked: it stays at the top while
+            # a long detail scrolls under it
+            yield VerticalScroll(Horizontal(Static(" ✕ ", id="close", markup=False),
+                                            id="closebar"),
+                                 Static("", id="brief", markup=False), id="detail")
         # what was left behind, and Codex's: one collapsed line each
         yield Static("", id="procline", markup=False)
         yield Input(placeholder="search", id="search")
@@ -791,6 +821,12 @@ class CcwhoUi(App):
         if self.detail_open:
             self.paint_detail()
 
+    @on(events.Click, "#close")
+    def close_clicked(self, event):
+        event.stop()
+        if self.detail_open:
+            self.action_back()
+
     @on(events.Click)
     def clicked(self, event):
         """One click picks the session AND goes to it. Reaching for the mouse to
@@ -811,8 +847,7 @@ class CcwhoUi(App):
             self.open_detail("brief")
             return
         at = event.get_content_offset(widget)
-        action = engine.ui_action_at(widget.row, widget.text_width(), at.y, at.x) \
-            if at is not None else None
+        action = widget.action_at(at.x, at.y) if at is not None else None
         if action == "kill":
             self.action_kill_loop()
             return

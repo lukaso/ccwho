@@ -103,7 +103,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -117,8 +117,16 @@
        "age"
       ],
       [
-       "checking the kern…",
+       "checking the …",
        "recap"
+      ],
+      [
+       " ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -149,7 +157,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -163,8 +171,16 @@
        "age"
       ],
       [
-       "(no recap yet) Edit: engagement…",
+       "(no recap yet) Edit: engage…",
        "recap"
+      ],
+      [
+       " ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -195,7 +211,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -205,8 +221,16 @@
        "pad"
       ],
       [
-       "loop 123 waits on t1, which has…",
+       "loop 123 waits on t1, which…",
        "age"
+      ],
+      [
+       " ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ]
@@ -239,7 +263,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -255,6 +279,14 @@
       [
        "checking the kernel panic log",
        "recap"
+      ],
+      [
+       "      ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -285,7 +317,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -301,6 +333,14 @@
       [
        "(no recap yet) Edit: engagement.md",
        "recap"
+      ],
+      [
+       "               ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -331,7 +371,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -343,6 +383,14 @@
       [
        "loop 123 waits on t1, which has ended · ",
        "age"
+      ],
+      [
+       "         ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ]
@@ -375,7 +423,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -391,6 +439,14 @@
       [
        "checking the kernel panic log",
        "recap"
+      ],
+      [
+       "                                              ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -421,7 +477,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -437,6 +493,14 @@
       [
        "(no recap yet) Edit: engagement.md",
        "recap"
+      ],
+      [
+       "                                                       ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -467,7 +531,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -483,6 +547,14 @@
       [
        "reading the layout",
        "recap"
+      ],
+      [
+       "                               ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ]
@@ -515,7 +587,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -531,6 +603,14 @@
       [
        "checking the kernel panic log",
        "recap"
+      ],
+      [
+       "                                                                                                          ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -561,7 +641,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -577,6 +657,14 @@
       [
        "(no recap yet) Edit: engagement.md",
        "recap"
+      ],
+      [
+       "                                                                                                                   ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ],
@@ -607,7 +695,7 @@
        "pad"
       ],
       [
-       " › ",
+       " \\ ",
        "detail"
       ]
      ],
@@ -623,6 +711,14 @@
       [
        "reading the layout",
        "recap"
+      ],
+      [
+       "                                                                                           ",
+       "pad"
+      ],
+      [
+       " / ",
+       "detail"
       ]
      ]
     ]

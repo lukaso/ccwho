@@ -882,52 +882,119 @@ class TestStuckOnScreen(unittest.TestCase):
 
 class TestTheDetailIsOneClickAway(unittest.TestCase):
     """Reported: "there's no good way to get the detail screen with the mouse".
-    A click on a row goes to the session, so line one ends with a › that opens
-    its detail instead - at the right edge, where it is in the same place on
-    every row."""
+    A click on a row goes to the session, so each row ends with an arrow that
+    opens its detail instead: \\ over /, one big > the height of the row, at the
+    right edge where it is in the same place on every row. (Right click and
+    ctrl-click are iTerm2's own menu: they never reach the list.)"""
+
+    LOOP = {"pid": 86246, "tasks": ["bscl8fc6k"]}
 
     def _row(self, name="fix the login bug in auth", **kw):
         return dict({"sessionId": "e0e2a7c1-c7c4-499c-a72d-27d9c11b3211",
                      "project": "liveapp", "attention": "stopped", "since": "3h",
-                     "title": name, "tty": "ttys022", "recap": "", "doing": ""}, **kw)
+                     "title": name, "tty": "ttys022", "recap": "the recap " * 20,
+                     "recap_age": "3h", "doing": ""}, **kw)
 
-    def _cols(self, row, width):
-        first, _ = ccwho.ui_row_cells(row, width=width)
+    def rows(self):
+        stuck = self._row(attention="stuck", dead_loops=[self.LOOP])
+        return [self._row("short"), self._row("a very long name " * 8),
+                self._row("把持久化文件移到状态目录" * 4), self._row(recap=""), stuck]
+
+    def _col(self, cells, role="detail"):
         col = 0
-        for text, role in first:
-            if role == "detail":
+        for text, r in cells:
+            if r == role:
                 return col, text
             col += ccwho._cells(text)
         return None, None
 
-    def test_line_one_ends_with_it_at_the_right_edge(self):
-        for name in ("short", "a very long name " * 8, "把持久化文件移到状态目录" * 4):
+    def test_both_lines_end_with_half_the_arrow_at_the_right_edge(self):
+        for row in self.rows():
             for width in (40, 80, 100, 140):
-                with self.subTest(name=name[:10], width=width):
-                    first, _ = ccwho.ui_row_cells(self._row(name), width=width)
-                    self.assertEqual(first[-1][1], "detail")
-                    self.assertIn(ccwho.UI_DETAIL.strip(), first[-1][0])
-                    self.assertEqual(sum(ccwho._cells(t) for t, _ in first), width,
-                                     "the same place on every row: the edge")
+                with self.subTest(name=row["title"][:10], stuck=bool(row.get("dead_loops")),
+                                  width=width):
+                    first, second = ccwho.ui_row_cells(row, width=width)
+                    self.assertEqual(first[-1], (ccwho.UI_DETAIL[0], "detail"))
+                    self.assertEqual(second[-1], (ccwho.UI_DETAIL[1], "detail"))
+                    for line in (first, second):
+                        self.assertEqual(sum(ccwho._cells(t) for t, _ in line), width,
+                                         "the same place on every row: the edge")
 
-    def test_a_click_on_it_opens_the_detail(self):
-        for width in (40, 100):
+    def test_it_is_one_arrow(self):
+        top, bottom = ccwho.UI_DETAIL
+        self.assertEqual(top.strip(), "\\")
+        self.assertEqual(bottom.strip(), "/")
+        self.assertEqual(ccwho._cells(top), ccwho._cells(bottom))
+
+    def test_a_click_on_either_half_opens_the_detail(self):
+        for row in self.rows():
+            for width in (40, 100):
+                for line in (0, 1):
+                    with self.subTest(width=width, line=line):
+                        cells = ccwho.ui_row_cells(row, width=width)[line]
+                        col, text = self._col(cells)
+                        for c in range(col, col + ccwho._cells(text)):
+                            self.assertEqual(ccwho.ui_action_at(row, width, line, c),
+                                             "detail")
+                        self.assertNotEqual(ccwho.ui_action_at(row, width, line, col - 1),
+                                            "detail")
+
+    def test_the_kill_stays_whole_and_before_the_arrow(self):
+        stuck = self.rows()[-1]
+        for width in (40, 80, 140):
             with self.subTest(width=width):
-                col, text = self._cols(self._row(), width)
-                for c in range(col, col + ccwho._cells(text)):
-                    self.assertEqual(ccwho.ui_action_at(self._row(), width, 0, c),
-                                     "detail")
-                self.assertIsNone(ccwho.ui_action_at(self._row(), width, 0, col - 1))
+                _, second = ccwho.ui_row_cells(stuck, width=width)
+                roles = [r for _, r in second]
+                self.assertEqual([t for t, r in second if r == "action"], ["[kill loop]"])
+                self.assertLess(roles.index("action"), roles.index("detail"))
+                col, _ = self._col(second, "action")
+                self.assertEqual(ccwho.ui_action_at(stuck, width, 1, col), "kill")
 
-    def test_the_name_never_runs_into_it(self):
-        row = self._row("a very long name " * 8)
-        first, _ = ccwho.ui_row_cells(row, width=80)
-        self.assertEqual(first[-2][1], "pad", "a gap between the words and the ›")
+    # pad, the gap before the kill, the kill, one cell, the arrow's half
+    KILL_FITS = 8 + 2 + len("[kill loop]") + 1 + 3
 
-    def test_line_two_offers_nothing_new(self):                          # control
-        _, second = ccwho.ui_row_cells(self._row(), width=100)
-        self.assertNotIn("detail", [r for _, r in second])
-        self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 1, 99))
+    def test_the_kill_stays_whole_down_to_its_own_width(self):
+        # the loop's words give way, down to nothing - never the kill
+        stuck = dict(self.rows()[-1], dead_loops=[
+            {"pid": 86246, "tasks": ["bscl8fc6k", "b2", "b3"]}, self.LOOP])
+        for width in range(self.KILL_FITS, 41):
+            with self.subTest(width=width):
+                _, second = ccwho.ui_row_cells(stuck, width=width)
+                self.assertIn(("[kill loop]", "action"), second)
+                self.assertEqual(second[-1], (ccwho.UI_DETAIL[1], "detail"))
+                self.assertEqual(sum(ccwho._cells(t) for t, _ in second), width)
+
+    def test_below_that_there_is_no_room_for_it(self):                 # control
+        stuck = self.rows()[-1]
+        _, second = ccwho.ui_row_cells(stuck, width=self.KILL_FITS - 1)
+        self.assertNotIn(("[kill loop]", "action"), second)
+
+    def test_the_zones_are_where_a_tagged_row_is_drawn(self):
+        for row in self.rows():
+            for tag in ("", "1a2b", "lukaso@gmail"):
+                for width in (30, 40, 60, 100):
+                    for line in (0, 1):
+                        with self.subTest(tag=tag, width=width, line=line):
+                            cells = ccwho.ui_row_cells(row, width=width, tag=tag)[line]
+                            want, at = [], 0
+                            for text, role in cells:
+                                kind = {"action": "kill", "detail": "detail"}.get(role)
+                                want += [kind] * ccwho._cells(text)
+                            got = [ccwho.ui_action_at(row, width, line, c, tag=tag)
+                                   for c in range(len(want))]
+                            self.assertEqual(got, want)
+
+    def test_the_words_never_run_into_it(self):
+        for row in self.rows():
+            first, second = ccwho.ui_row_cells(row, width=80)
+            for line in (first, second):
+                self.assertEqual(line[-2][1], "pad", "a gap between the words and the arrow")
+                self.assertGreaterEqual(ccwho._cells(line[-2][0]), 1)
+
+    def test_the_rest_of_the_row_is_no_action(self):                    # control
+        row = self._row()
+        self.assertIsNone(ccwho.ui_action_at(row, 100, 0, 30))
+        self.assertIsNone(ccwho.ui_action_at(row, 100, 1, 30))
 
 
 class TestKillDeadLoops(unittest.TestCase):
@@ -2629,7 +2696,8 @@ class TestWhatIsColouredAndWhatIsNot(unittest.TestCase):
 
     def test_the_whole_second_line_is_subordinate(self):
         _, second = self.cells()
-        self.assertEqual(set(self.roles(second)) - {"pad"}, {"age", "recap"},
+        # the half of the detail arrow is a control, not words: it is not read
+        self.assertEqual(set(self.roles(second)) - {"pad", "detail"}, {"age", "recap"},
                          "the recap reads as context, and its age stands out in it")
 
     def test_a_session_that_needs_you_is_marked_differently_from_one_that_does_not(self):

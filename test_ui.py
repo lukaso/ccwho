@@ -1723,16 +1723,180 @@ class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
             self.assertEqual(self.marks, [self.A["sessionId"]])
 
 
+class TestTheDetailClosesWithTheMouse(UiTest):
+    """Reported: "There's also no clear way to close the detail with the mouse.
+    Maybe an X at the top right?" """
+
+    async def test_the_detail_has_a_close_at_its_top_right(self):
+        app = self.app()
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            close, detail = app.query_one("#close"), app.query_one("#detail")
+            self.assertTrue(close.display)
+            self.assertIn("✕", str(close.content))
+            self.assertEqual(close.region.y, detail.content_region.y, "at the top")
+            bar = app.query_one("#closebar")
+            self.assertEqual(close.region.right, bar.region.right, "at the right")
+            self.assertGreater(close.region.x, detail.content_region.x
+                               + detail.content_region.width // 2, "not the left")
+
+    async def test_clicking_it_closes_the_detail_and_goes_nowhere(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            close = app.query_one("#close")
+            await pilot.click(close, offset=(close.size.width - 2, 0))
+            await pilot.pause()
+            self.assertFalse(app.detail_open)
+            self.assertFalse(app.query_one("#detail").display)
+            self.assertEqual(adapter.asked, [])
+
+    async def test_it_closes_the_process_screen_too(self):
+        app = self.app()
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            close = app.query_one("#close")
+            await pilot.click(close, offset=(close.size.width - 2, 0))
+            await pilot.pause()
+            self.assertFalse(app.detail_open)
+
+    async def test_it_stays_at_the_top_of_a_long_detail(self):
+        app = self.app(collector=FakeCollector(brief=dict(
+            FakeCollector().brief_value, progress=[f"step {i}" for i in range(80)])))
+        async with app.run_test(size=(160, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            detail = app.query_one("#detail")
+            detail.scroll_end(animate=False)
+            await pilot.pause()
+            self.assertGreater(detail.scroll_y, 0, "the test needs a detail that scrolls")
+            self.assertEqual(app.query_one("#close").region.y, detail.content_region.y)
+
+    async def test_a_narrow_detail_has_it_too(self):
+        app = self.app()
+        async with app.run_test(size=(80, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            close = app.query_one("#close")
+            await pilot.click(close, offset=(close.size.width - 2, 0))
+            await pilot.pause()
+            self.assertFalse(app.detail_open)
+            self.assertTrue(app.query_one("#list").display, "the list is back")
+
+
+class TestClickableThingsLightUp(UiTest):
+    """"Are you able to do hover effects on clickable things?" The parts of a
+    row that do something of their own light up under the mouse; the rest of
+    the row does not, because a click there does what it always does."""
+
+    def roles_lit(self, widget):
+        text = widget.content
+        lit = set()
+        for span in text.spans:
+            if "reverse" in str(span.style):
+                lit.add(text.plain[span.start:span.end])
+        return lit
+
+    async def test_the_arrow_lights_up_both_halves(self):
+        app = self.app()
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.hover(w, offset=TestTheDetailWithTheMouse.detail_offset(None, w))
+            await pilot.pause()
+            self.assertEqual(self.roles_lit(w), set(ui.engine.UI_DETAIL))
+
+    async def test_the_kill_lights_up(self):
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00")))
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
+            await pilot.hover(w, offset=TestKillingAStuckLoop.kill_offset(None, w))
+            await pilot.pause()
+            self.assertEqual(self.roles_lit(w), {ui.engine.UI_KILL})
+
+    async def test_the_light_goes_when_the_mouse_does(self):
+        app = self.app()
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            rows = list(app.query(ui.Row))
+            await pilot.hover(rows[1], offset=TestTheDetailWithTheMouse.detail_offset(None, rows[1]))
+            await pilot.pause()
+            await pilot.hover(rows[0], offset=(10, 0))
+            await pilot.pause()
+            self.assertEqual(self.roles_lit(rows[1]), set(), "left the row")
+            self.assertEqual(self.roles_lit(rows[0]), set(), "the name is not a control")
+
+    async def test_a_row_that_changes_under_a_still_mouse_is_lit_where_it_is(self):
+        # the loop's words got shorter: the kill moved left, the mouse did not
+        long = dict(STUCK, dead_loops=[{"pid": 86246, "tasks": ["bscl8fc6k"]},
+                                       {"pid": 1, "tasks": ["x"]}])
+        collector = FakeCollector(fleet=ui.Fleet([LIVE, long], True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
+            at = TestKillingAStuckLoop.kill_offset(None, w)
+            await pilot.hover(w, offset=at)
+            await pilot.pause()
+            self.assertEqual(self.roles_lit(w), {ui.engine.UI_KILL})
+            collector.fleet_value = ui.Fleet([LIVE, STUCK], True, "12:00:05")
+            app.collect()
+            await pilot.pause(0.2)
+            w = [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
+            self.assertIsNotNone(w.mouse_at, "the same row, and the mouse is still on it")
+            under = w.action_at(*w.mouse_at)
+            self.assertNotEqual(under, "kill", "the test needs the kill to have moved")
+            self.assertEqual(w.lit, under)
+            self.assertEqual(self.roles_lit(w),
+                             {ui.engine.UI_KILL} if under == "kill" else set())
+
+    async def test_the_close_lights_up(self):
+        app = self.app()
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            close = app.query_one("#close")
+            before = close.styles.background
+            await pilot.hover(close, offset=(close.size.width - 2, 0))
+            await pilot.pause()
+            self.assertNotEqual(close.styles.background, before)
+
+
 class TestTheDetailWithTheMouse(UiTest):
     """Reported: "there's no good way to get the detail screen with the mouse".
-    A click goes to the session; the › at the end of line one, or a right
-    click anywhere on the row, opens its detail instead."""
+    A click goes to the session; the arrow at the right edge opens its detail
+    instead - either half of it. (Right click and ctrl-click do too, in a
+    terminal that passes them on: iTerm2 keeps both for its own menu.)"""
 
-    def detail_offset(self, widget):
-        first = widget.spans_lines()[0]
-        col = sum(ui.engine._cells(t) for t, r in first if r != "detail")
+    def detail_offset(self, widget, line=0):
+        cells = widget.spans_lines()[line]
+        col = sum(ui.engine._cells(t) for t, r in cells if r != "detail")
         # the row's left border and padding come before its text; one column in
-        return (col + 2 + 1, 0)
+        return (col + 2 + 1, line)
+
+    async def test_the_bottom_half_of_the_arrow_opens_it_too(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.click(w, offset=self.detail_offset(w, line=1))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [])
+            self.assertTrue(app.detail_open)
+            self.assertEqual(app.selected, w.row["sessionId"])
 
     async def test_the_arrow_opens_that_rows_detail_and_does_not_go(self):
         adapter = FakeAdapter()

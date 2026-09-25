@@ -2077,9 +2077,11 @@ UI_UNKNOWN_MARK = "·"
 UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action",
             "detail")
 UI_KILL = "[kill loop]"
-# A click on a row goes to the session; this, at the right edge of line one, opens
-# its detail instead. Three cells wide: one cell is too small to hit.
-UI_DETAIL = " › "
+# A click on a row goes to the session; this opens its detail instead: \ at the
+# right edge of line one over / on line two, one > the height of the row. ASCII:
+# a symbol of "ambiguous" width is two cells in some terminals, and pushes the
+# line past the edge.
+UI_DETAIL = (" \\ ", " / ")
 
 
 def ui_state_style(row):
@@ -2122,7 +2124,7 @@ def ui_row_cells(row, width=100, tag=""):
     account = [(f" · {tag}", "account")] if tag else []
     # and the detail's room, with one cell between it and the words
     room = max(8, width - _cells(glyph) - _cells(head) - _cells(tail)
-               - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL) - 1)
+               - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL[0]) - 1)
     shown = _cut(name, room)
     if _cells(shown) + _cells(held) <= room:
         tail += held
@@ -2152,24 +2154,33 @@ def ui_row_cells(row, width=100, tag=""):
                 f"which has ended{more} · ")
     # in screen cells, as _fit cuts the line: a CJK recap counted in characters
     # ran twice as wide, and the cut dropped the kill at the end of the line
-    room = width - _cells(pad) - sum(_cells(t) for t, _ in act)
+    room = (width - _cells(pad) - sum(_cells(t) for t, _ in act)
+            - _cells(UI_DETAIL[1]) - 1)
     if loops:
-        # what to do about it comes first; the recap only where it can be read
-        mark = _cut(mark, max(8, room))
+        # what to do about it comes first; the recap only where it can be read,
+        # and the words about the loop give way - to nothing - before the kill
+        mark = _cut(mark, max(0, room))
         body = body if room - _cells(mark) >= 20 else ""
     second = [(pad, "pad"), (mark, "age")] + (
         [(_cut(body, max(8, room - _cells(mark))), "recap")] if body else []) + act
-    first = _fit(first, width - _cells(UI_DETAIL) - 1)
-    gap = width - sum(_cells(t) for t, _ in first) - _cells(UI_DETAIL)
-    first += [(" " * gap, "pad"), (UI_DETAIL, "detail")]
-    return (_fit(first, width), _fit(second, width))
+    return _to_the_edge(first, UI_DETAIL[0], width), \
+        _to_the_edge(second, UI_DETAIL[1], width)
 
 
-def ui_action_at(row, width, line, col):
+def _to_the_edge(line, half, width):
+    """The line, then its half of the detail arrow at the right edge, with at
+    least one cell between them."""
+    line = _fit(line, width - _cells(half) - 1)
+    gap = width - sum(_cells(t) for t, _ in line) - _cells(half)
+    return _fit(line + [(" " * gap, "pad"), (half, "detail")], width)
+
+
+def ui_action_at(row, width, line, col, tag=""):
     """What a click at (line, col) of a row's text does on its own, or None - in
-    which case the click does what a click on the row always does."""
+    which case the click does what a click on the row always does. `tag` as the
+    row is drawn: the zones are read off the same cells the screen shows."""
     at = 0
-    for text, role in ui_row_cells(row, width)[line] if line in (0, 1) else ():
+    for text, role in ui_row_cells(row, width, tag=tag)[line] if line in (0, 1) else ():
         # a click lands in screen cells, where a CJK character takes two
         if role in ("action", "detail") and at <= col < at + _cells(text):
             return "kill" if role == "action" else "detail"

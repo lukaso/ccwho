@@ -1911,7 +1911,7 @@ class TestTheCollectorPassesWhatAgentsStarted(unittest.TestCase):
         finally:
             ui.engine.collect, ui.engine.reload_all = real_collect, real_reload
         self.assertEqual(fleet.procs, PROCS)
-        self.assertFalse(ui.Fleet([], True, "").procs["procs_ok"])       # control: unknown
+        self.assertIs(ui.Fleet([], True, "").procs.get("collected"), False)  # control: not yet
 
 
 class TestTheProcessScreenReview(UiTest):
@@ -2026,9 +2026,12 @@ class TestTheProcessScreenReview(UiTest):
                         self.assertLessEqual(len(line), width - 2)
 
     async def test_the_process_screen_fits_its_pane(self):
-        long = dict(PROCS, left_behind=[dict(PROCS["left_behind"][0],
-                                             command="node " + "x" * 200 + ".js")])
-        for width in (160, 80):
+        # enough processes to scroll: the scrollbar takes a cell of the pane
+        from rich.cells import cell_len
+        long = dict(PROCS, left_behind=[dict(PROCS["left_behind"][0], pid=100 + i,
+                                             command="node " + "x" * 200 + ".js")
+                                        for i in range(80)])
+        for width in (140, 160, 80):
             with self.subTest(width=width):
                 app = self.app(collector=with_procs(long))
                 async with app.run_test(size=(width, 40)) as pilot:
@@ -2037,7 +2040,7 @@ class TestTheProcessScreenReview(UiTest):
                     await pilot.pause()
                     box = app.query_one("#brief")
                     for line in str(box.content).splitlines():
-                        self.assertLessEqual(len(line), box.content_size.width)
+                        self.assertLessEqual(cell_len(line), box.content_size.width)
 
 
 STUCK = row("cccc3333-0000-4000-8000-000000000003", "stuck", status="busy", pid=73787,
@@ -2257,3 +2260,146 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
     def test_nothing_killed_says_so(self):                               # control
         _, said = self.kill([])
         self.assertNotIn("killed loop", said)
+
+
+class TestTheProcessScreenVerify(UiTest):
+    """Verification review of slice 2b's fixes."""
+
+    async def test_enter_on_the_process_screen_goes_nowhere(self):
+        # #2: it went to a session the screen did not show
+        adapter = FakeAdapter()
+        app = self.app(collector=with_procs(), adapter=adapter)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertEqual(adapter.asked, [])
+
+    async def test_enter_on_the_brief_still_goes(self):                  # control
+        adapter = FakeAdapter()
+        app = self.app(collector=with_procs(), adapter=adapter)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]])
+
+    async def test_a_new_mode_starts_at_the_top(self):
+        # #5: the brief opened scrolled down by what the process screen had scrolled
+        many = dict(PROCS, left_behind=[dict(PROCS["left_behind"][0], pid=100 + i)
+                                        for i in range(80)])
+        app = self.app(collector=with_procs(many))
+        async with app.run_test(size=(160, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            for _ in range(4):
+                await pilot.press("j")
+            await pilot.pause()
+            self.assertGreater(app.query_one("#detail").scroll_y, 0)            # control
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#detail").scroll_y, 0)
+
+    async def test_unknown_processes_are_said_in_the_brief(self):
+        app = self.app(collector=with_procs(dict(PROCS, procs_ok=False)))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIn("unknown", str(app.query_one("#brief").content))
+
+
+class TestTheProcessScreenRound3(UiTest):
+    """Third review of slice 2b's fixes."""
+
+    async def test_no_false_alarm_before_the_first_collect(self):
+        # #1: the panel said "processes unknown" on every start
+        class Slow(FakeCollector):
+            def fleet(self):
+                import time
+                time.sleep(2)
+                return super().fleet()
+        app = self.app(collector=Slow())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause(0.3)
+            self.assertFalse(app.query_one("#ports").display)
+
+    async def test_a_scan_that_failed_says_so_on_p(self):                # control
+        app = self.app(collector=with_procs(dict(PROCS, procs_ok=False)))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertIn("unknown", str(app.query_one("#ports").content))
+
+    async def test_enter_on_the_process_screen_leaves_a_running_jump_alone(self):
+        # #4: it cleared the "opening..." of a jump still under way
+        app = self.app(collector=with_procs(), adapter=FakeAdapter(hang=True))
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            acting = app.acting
+            self.assertTrue(acting)                                             # control
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(app.acting, acting)
+
+    async def test_wide_enter_goes_to_the_row_beside_the_screen(self):
+        # #5: at wide widths the list and its highlight are on screen
+        adapter = FakeAdapter()
+        app = self.app(collector=with_procs(), adapter=adapter)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]])
+
+    async def test_another_session_starts_at_the_top_of_its_brief(self):
+        # #7: moving to another session kept the last one's scroll
+        long = dict(FakeCollector().brief_value, progress=[f"Bash: step {i}" for i in range(80)])
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([LIVE, BUSY], True, "12:00:00"),
+                                               brief=long))
+        async with app.run_test(size=(160, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            app.query_one("#detail").scroll_to(y=10, animate=False)
+            await pilot.pause()
+            app.show(ui.Fleet([LIVE, BUSY], True, "12:00:05"))
+            await pilot.pause()
+            self.assertGreater(app.query_one("#detail").scroll_y, 0)            # control: same session
+            await pilot.press("j")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#detail").scroll_y, 0)
+
+    def test_cells_agree_with_rich(self):
+        # #6: the screen is drawn by Rich; a row counted any other way overflows
+        from rich.cells import cell_len
+        import ccwho_engine as engine
+        for s in ("✳️ x", "⚠️ warn", "👨‍👩‍👧 family", "👍🏽 ok", "1️⃣ one", "🇩🇪 de",
+                  "修复登录页面", "a\tb", "\U0001FAE9 new", "plain ascii"):
+            with self.subTest(s=s):
+                self.assertEqual(engine._cells(s), cell_len(s))
+
+
+class TestAClickStillGoesThere(UiTest):
+    async def test_a_click_on_a_row_goes_with_the_process_screen_open(self):
+        adapter = FakeAdapter()
+        app = self.app(collector=with_procs(), adapter=adapter)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            row = [w for w in app.rows_on_screen()
+                   if w.row["sessionId"] == BUSY["sessionId"]][0]
+            await pilot.click(row)
+            await pilot.pause(0.2)
+            self.assertEqual(adapter.asked, [BUSY["sessionId"]])

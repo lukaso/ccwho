@@ -748,6 +748,37 @@ def visible_len(text):
     return len(_ANSI.sub("", text or ""))
 
 
+try:        # the live list is drawn by Rich: count cells the way it does
+    from rich.cells import cell_len as _rich_cell_len
+except ImportError:                 # the command line has no Rich, and no need
+    _rich_cell_len = None
+
+
+def _cells(text):
+    """Screen cells, not characters: a CJK character or an emoji takes two, a
+    combining mark none. What a row must fit, where a name can be anything."""
+    text = _ANSI.sub("", text or "")
+    if _rich_cell_len is not None:
+        return _rich_cell_len(text)
+    import unicodedata
+    return sum(0 if unicodedata.combining(c) else
+               2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def _cut(text, cells):
+    """`text` in at most `cells` screen cells, `…` marking a cut."""
+    text = text or ""
+    if _cells(text) <= cells:
+        return text
+    out = ""
+    for c in text:
+        # the whole prefix, not char by char: a ZWJ family is one glyph
+        if _cells(out + c) > cells - 1:
+            break
+        out += c
+    return out + "…" if cells > 0 else ""
+
+
 def osc8(label, url, enabled=True):
     """Wrap a label as an OSC 8 hyperlink. iTerm2 renders it clickable."""
     if not enabled or not url:
@@ -2060,15 +2091,16 @@ def ui_row_cells(row, width=100):
         tail += f" · {short_tty(row['tty'])}"
     # what it started: dim, in the meta part, never the mark or the order - and
     # only in the room the name leaves: the name is what you are reading
-    ports = row.get("ports") or []
+    ports = [p for p in row.get("ports") or [] if isinstance(p, int)] \
+        if isinstance(row.get("ports"), list) else []
     held = (" · " + " ".join(f":{p}" for p in ports[:3])
             + (f" +{len(ports) - 3}" if len(ports) > 3 else "")) if ports else (
         f" · {_plural(row['procs'], 'proc')}" if row.get("procs") else "")
     glyph = UI_STATE_MARK.get(row.get("attention", ""), UI_UNKNOWN_MARK) + " "
     head = f"{sid}  {row.get('project', '?')[:12]}  "
-    room = max(8, width - visible_len(glyph) - visible_len(head) - visible_len(tail))
-    shown = truncate(name, room)
-    if visible_len(shown) + visible_len(held) <= room:
+    room = max(8, width - _cells(glyph) - _cells(head) - _cells(tail))
+    shown = _cut(name, room)
+    if _cells(shown) + _cells(held) <= room:
         tail += held
     first = [(glyph, "mark"), (f"{sid}  ", "id"),
              (f"{row.get('project', '?')[:12]}  ", "project"),
@@ -2116,15 +2148,16 @@ def ui_action_at(row, width, line, col):
 
 
 def _fit(cells, width):
-    """Drop what does not fit, so a part is never half drawn."""
+    """Drop what does not fit, so a part is never half drawn - counted in screen
+    cells, so a wide name cannot push the line past the edge."""
     out, room = [], width
     for text, role in cells:
         if room <= 0:
             break
-        if visible_len(text) > room:
-            text = truncate(text, room)
+        if _cells(text) > room:
+            text = _cut(text, room)
         out.append((text, role))
-        room -= visible_len(text)
+        room -= _cells(text)
     return out
 
 
@@ -2151,7 +2184,8 @@ def ui_filter(rows, query):
     for r in rows:
         hay = " ".join(str(r.get(f, "")) for f in _UI_SEARCHED).lower()
         hay += " " + short_tty(r.get("tty", "")).lower() + " " + str(r.get("pid", ""))
-        held = {str(p) for p in r.get("ports") or []}
+        held = {str(p) for p in r.get("ports") or [] if isinstance(p, int)} \
+            if isinstance(r.get("ports"), list) else set()
         # `3000` and `:3000` find the row holding that port
         if all(w in hay or w.lstrip(":") in held for w in words):
             out.append(r)
@@ -2233,17 +2267,23 @@ def ports_line(fleet, width=None):
     when none - and "unknown" is said, once, rather than shown as none."""
     fleet = fleet if isinstance(fleet, dict) else {}
     if fleet and not fleet.get("ports_ok", True):
-        return "ports unknown - lsof could not be asked"
-    held = fleet.get("agent_ports") or []
+        return truncate("ports unknown - lsof could not be asked", width or 99)
+    # processes unknown: what is held may be only part of it, and the line says so
+    lead = "processes unknown · " if fleet and not fleet.get("procs_ok", True) else ""
+    held = [a for a in fleet.get("agent_ports") or [] if isinstance(a, dict)]
     if not held:
-        return ""
+        return lead.rstrip(" ·") if width is None or len(lead) - 3 <= width else ""
     parts = [f":{a.get('port', '?')} {_one_line(a.get('who', '?'))}" for a in held]
     for n in range(min(len(parts), 6), 0, -1):
         more = f" · +{len(parts) - n}" if len(parts) > n else ""
-        line = "agents hold " + " · ".join(parts[:n]) + more
+        line = lead + "agents hold " + " · ".join(parts[:n]) + more
         if width is None or len(line) <= width:
             return line
-    return truncate(f"agents hold {_plural(len(parts), 'port')}", width)
+    for line in (lead + f"agents hold {_plural(len(parts), 'port')}", lead.rstrip(" ·")):
+        if line and len(line) <= width:
+            return line
+    # nothing fits that keeps "unknown": say nothing rather than a whole count
+    return "" if lead else truncate(f"agents hold {_plural(len(parts), 'port')}", width)
 
 
 def _one_line(text):
@@ -2260,7 +2300,7 @@ def bottom_lines(fleet, hint="ccwho ps", width=None):
     see = f"{sep}{hint} to see" if len(hint) <= 2 else f"{sep}{hint}"
     out = []
     if left:
-        n_ports = sum(len(p.get("ports") or []) for p in left)
+        n_ports = sum(len(_held(p)) for p in left)
         out.append(f"left behind: {_plural(len(left), 'process')}, "
                    f"{_plural(n_ports, 'port')}{see}")
     if codex:
@@ -2301,6 +2341,8 @@ def render_ps_screen(listing, fleet, width=100):
     """The process screen: a heading per session and per group, then one line a
     process - pid, ports, the command in its short form."""
     fleet = fleet if isinstance(fleet, dict) else {}
+    if fleet.get("collected") is False:
+        return "processes unknown - not collected yet"
     if not fleet.get("procs_ok", True):
         return "processes unknown - " + fleet.get("why", "ps or the environment read failed")
     if not listing:
@@ -2312,24 +2354,34 @@ def render_ps_screen(listing, fleet, width=100):
         if head != heading:
             out += ([""] if out else []) + [truncate(head, width)]
             heading = head
-        ports = (" ".join(f":{n}" for n in p.get("ports") or []) or "-") if known else "?"
-        line = f"  {p.get('pid', '?'):<7} {ports:<13} {p.get('command', '')}"
+        ports = (" ".join(f":{n}" for n in _held(p)) or "-") if known else "?"
+        pid = p.get("pid")
+        line = f"  {'?' if pid is None else pid!s:<7} {ports:<13} {p.get('command', '')}"
         if p["group"] == "unsure":
             line += f"  ({p.get('why', '?')})"
         out.append(truncate(line, width))
     return "\n".join(out)
 
 
+def _held(p):
+    """A process's ports, whatever shape they came in: only numbers count."""
+    ports = p.get("ports") if isinstance(p, dict) else None
+    return [n for n in ports if isinstance(n, int)] if isinstance(ports, list) else []
+
+
 def session_procs_lines(fleet, sid):
     """A session's own work, for its brief: helpers left out."""
     fleet = fleet if isinstance(fleet, dict) else {}
     known = fleet.get("ports_ok", True)
-    out = []
+    # unknown is said, or an empty list reads as "it started nothing"
+    out = [] if fleet.get("procs_ok", True) else [
+        "processes unknown - this list may be incomplete"]
     for p in (fleet.get("by_session") or {}).get(sid) or []:
         if p.get("helper"):
             continue
-        ports = (" ".join(f":{n}" for n in p.get("ports") or []) or "-") if known else "?"
-        out.append(f"{p.get('pid', '?'):<7} {ports:<13} {p.get('command', '')}")
+        ports = (" ".join(f":{n}" for n in _held(p)) or "-") if known else "?"
+        pid = p.get("pid")
+        out.append(f"{'?' if pid is None else pid!s:<7} {ports:<13} {p.get('command', '')}")
     return out
 
 

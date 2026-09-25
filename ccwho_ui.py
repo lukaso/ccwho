@@ -95,10 +95,9 @@ class Fleet:
     def __init__(self, rows=(), source_ok=True, at="", error="", procs=None):
         self.rows, self.source_ok, self.at, self.error = list(rows), source_ok, at, error
         # collect()'s second answer: what agents started, the ports they hold,
-        # what was left behind. None - not collected yet, or the scan failed -
-        # is "unknown", which must never read as "no processes"
-        self.procs = procs if isinstance(procs, dict) else {
-            "procs_ok": False, "why": "not collected yet, or the scan failed"}
+        # what was left behind. None is "not collected": the list stays quiet
+        # (a false alarm on every start is still an alarm) and `p` says unknown
+        self.procs = procs if isinstance(procs, dict) else {"collected": False}
 
     def visible(self, query):
         return engine.ui_filter(self.rows, query)
@@ -545,9 +544,10 @@ class CcwhoUi(App):
             return
         if self.detail_mode == "procs":
             procs = self.fleet.procs
-            # the pane's own width: wide, it is 38% of the screen, not all of it
+            # the pane's own width - wide, it is 38% of the screen - less its
+            # border, padding and the scrollbar a long list brings
             wide = self.size.width >= engine.UI_WIDE
-            width = (int(self.size.width * 0.38) if wide else self.size.width) - 4
+            width = (int(self.size.width * 0.38) - 5 if wide else self.size.width - 4)
             try:
                 text = engine.render_ps_screen(engine.ps_listing(self.fleet.rows, procs),
                                                procs, width=max(20, width))
@@ -701,7 +701,7 @@ class CcwhoUi(App):
                 widget.row, max(40, widget.width - 4), at.y, at.x) == "kill":
             self.action_kill_loop()
             return
-        self.action_go()
+        self._go()          # a click names its row, whatever the pane shows
 
     def action_kill_loop(self):
         """Kill the selected session's wait loops that cannot end - on the second
@@ -789,6 +789,11 @@ class CcwhoUi(App):
                      if w.row.get("sessionId") == self.selected), -1)
         widget = rows[max(0, min(len(rows) - 1, here + step))]
         widget.focus()
+        if self.detail_open and widget.row.get("sessionId", "") != self.selected:
+            # another session's brief starts at its top
+            detail = self.part("#detail")
+            if detail is not None:
+                detail.scroll_home(animate=False)
         self.selected = widget.row.get("sessionId", "")
         self.mark_selected()
         # or the selection walks off the bottom of a list too long to show
@@ -798,14 +803,20 @@ class CcwhoUi(App):
             self.paint_detail()
 
     def action_detail(self):
-        self.detail_open = True
-        self.detail_mode = "brief"
-        self.paint_detail()
+        self.open_detail("brief")
 
     def action_procs(self):
         """Every process agents started, in the detail pane - `ccwho ps`, here."""
+        self.open_detail("procs")
+
+    def open_detail(self, mode):
+        # another screen starts at its top, not where the last one was scrolled
+        if mode != self.detail_mode or not self.detail_open:
+            detail = self.part("#detail")
+            if detail is not None:
+                detail.scroll_home(animate=False)
         self.detail_open = True
-        self.detail_mode = "procs"
+        self.detail_mode = mode
         self.paint_detail()
 
     def action_back(self):
@@ -845,6 +856,16 @@ class CcwhoUi(App):
         self.call_after_refresh(box.focus)
 
     def action_go(self):
+        if self.detail_open and self.detail_mode == "procs" \
+                and self.size.width < engine.UI_WIDE:
+            # narrow, the process screen hides the list: Enter would go to a
+            # session you cannot see. Not said(): a jump under way stays marked
+            self.status = "Esc for the list, then Enter on a session"
+            self.paint_header(self.fleet.groups(self.filter_text))
+            return
+        self._go()
+
+    def _go(self):
         row = self.selected_row()
         if not row:
             return

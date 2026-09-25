@@ -4291,3 +4291,84 @@ class TestTheListSaysWhatAgentsHoldReview(unittest.TestCase):
         line = ccwho.ports_line(dict(self.FLEET, agent_ports=[
             {"port": 3000, "pid": 1, "who": "a-very-long-project-name-indeed"}]), width=20)
         self.assertNotIn("1 ports", line)
+
+
+class TestTheListSaysWhatAgentsHoldVerify(unittest.TestCase):
+    """Verification review of slice 2b's fixes."""
+
+    ROW = TestTheListSaysWhatAgentsHold.ROW
+    FLEET = TestTheListSaysWhatAgentsHold.FLEET
+
+    def test_unknown_processes_are_said_on_the_ports_line(self):
+        # #1: the line said "agents hold" while `p` said "processes unknown"
+        line = ccwho.ports_line({"procs_ok": False, "ports_ok": True,
+                                 "agent_ports": [{"port": 3000, "who": "x"}]}, 100)
+        self.assertIn("unknown", line)
+        self.assertNotIn("unknown", ccwho.ports_line(self.FLEET, 100))       # control
+
+    def test_unknown_processes_are_said_in_the_brief(self):
+        lines = ccwho.session_procs_lines(dict(self.FLEET, procs_ok=False),
+                                          self.ROW["sessionId"])
+        self.assertIn("unknown", " ".join(lines))
+        self.assertNotIn("unknown", " ".join(                                # control
+            ccwho.session_procs_lines(self.FLEET, self.ROW["sessionId"])))
+
+    def test_a_wide_name_never_overflows_the_row(self):
+        # #4: the room was counted in characters; a CJK character takes two cells
+        import unicodedata
+        cells = lambda s: sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+        row = dict(self.ROW, tab_title="✳ 修复登录页面的错误并且部署",
+                   ports=[3000, 5173, 8080, 9229])
+        for width in range(30, 201):
+            with self.subTest(width=width):
+                first, _ = ccwho.ui_row_cells(row, width=width)
+                self.assertLessEqual(cells("".join(t for t, _ in first)), width)
+
+    def test_odd_ports_and_pids_do_not_crash(self):
+        # #6
+        for ports in (5, {"a": 1}, "3000", [None, "x"]):
+            with self.subTest(ports=ports):
+                ccwho.ui_row_cells(dict(self.ROW, ports=ports), 120)
+                ccwho.ui_filter([dict(self.ROW, ports=ports)], ":3000")
+        lines = ccwho.session_procs_lines(
+            {"by_session": {"s": [{"pid": None, "ports": [1], "command": "x"}]}}, "s")
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("?"))
+        ccwho.ports_line({"agent_ports": ["not a dict", {"port": 1, "who": "a"}]}, 80)
+
+
+class TestTheListSaysWhatAgentsHoldRound3(unittest.TestCase):
+    """Third review of slice 2b's fixes."""
+
+    FLEET = TestTheListSaysWhatAgentsHold.FLEET
+
+    def test_not_collected_yet_says_nothing_on_the_list(self):
+        # #1: "processes unknown" on every start was a false alarm
+        self.assertEqual(ccwho.ports_line({"collected": False}, 100), "")
+        self.assertEqual(ccwho.bottom_lines({"collected": False}), [])
+        self.assertIn("not collected yet",
+                      ccwho.render_ps_screen([], {"collected": False}, width=100))
+        self.assertIn("unknown", ccwho.ports_line(dict(self.FLEET, procs_ok=False), 100))  # control
+
+    def test_unknown_survives_a_narrow_line(self):
+        # #2: the lead fell off and the line claimed a complete count
+        unknown = dict(self.FLEET, procs_ok=False, agent_ports=[
+            {"port": 3000, "pid": 1, "who": "liveapp-long-project"},
+            {"port": 5173, "pid": 2, "who": "marketing-site"}])
+        for width in range(10, 201):
+            with self.subTest(width=width):
+                line = ccwho.ports_line(unknown, width)
+                self.assertLessEqual(len(line), width)
+                self.assertTrue(line == "" or "unknown" in line, line)
+                self.assertNotIn("unknown", ccwho.ports_line(self.FLEET, width))   # control
+
+    def test_odd_ports_do_not_break_the_brief_or_the_screen(self):
+        # #3
+        for ports in (5, "3000", [None, "x", 3000]):
+            with self.subTest(ports=ports):
+                fleet = {"procs_ok": True, "by_session": {"s": [
+                    {"pid": 1, "ports": ports, "command": "x"}]}, "left_behind": [
+                    {"pid": 2, "ports": ports, "command": "y"}]}
+                self.assertEqual(len(ccwho.session_procs_lines(fleet, "s")), 1)
+                ccwho.render_ps_screen(ccwho.ps_listing([], fleet), fleet, width=80)
+                ccwho.bottom_lines(fleet)

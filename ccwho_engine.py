@@ -2074,8 +2074,12 @@ UI_UNKNOWN_MARK = "·"
 
 # What a part of a row IS, so the screen can decide how to draw it. The engine
 # never names a colour: a terminal's palette is not its business.
-UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action")
+UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action",
+            "detail")
 UI_KILL = "[kill loop]"
+# A click on a row goes to the session; this, at the right edge of line one, opens
+# its detail instead. Three cells wide: one cell is too small to hit.
+UI_DETAIL = " › "
 
 
 def ui_state_style(row):
@@ -2116,8 +2120,9 @@ def ui_row_cells(row, width=100, tag=""):
     # the account this row spends (usage, 2+ accounts only): last, and the name
     # gives way for it - never the mark, the id or the project
     account = [(f" · {tag}", "account")] if tag else []
+    # and the detail's room, with one cell between it and the words
     room = max(8, width - _cells(glyph) - _cells(head) - _cells(tail)
-               - sum(_cells(t) for t, _ in account))
+               - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL) - 1)
     shown = _cut(name, room)
     if _cells(shown) + _cells(held) <= room:
         tail += held
@@ -2154,6 +2159,9 @@ def ui_row_cells(row, width=100, tag=""):
         body = body if room - _cells(mark) >= 20 else ""
     second = [(pad, "pad"), (mark, "age")] + (
         [(_cut(body, max(8, room - _cells(mark))), "recap")] if body else []) + act
+    first = _fit(first, width - _cells(UI_DETAIL) - 1)
+    gap = width - sum(_cells(t) for t, _ in first) - _cells(UI_DETAIL)
+    first += [(" " * gap, "pad"), (UI_DETAIL, "detail")]
     return (_fit(first, width), _fit(second, width))
 
 
@@ -2163,8 +2171,8 @@ def ui_action_at(row, width, line, col):
     at = 0
     for text, role in ui_row_cells(row, width)[line] if line in (0, 1) else ():
         # a click lands in screen cells, where a CJK character takes two
-        if role == "action" and at <= col < at + _cells(text):
-            return "kill"
+        if role in ("action", "detail") and at <= col < at + _cells(text):
+            return "kill" if role == "action" else "detail"
         at += _cells(text)
     return None
 

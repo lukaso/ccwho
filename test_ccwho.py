@@ -880,6 +880,56 @@ class TestStuckOnScreen(unittest.TestCase):
         self.assertIsNone(ccwho.ui_action_at(self._row("asks", loops=[]), 100, 1, 90))
 
 
+class TestTheDetailIsOneClickAway(unittest.TestCase):
+    """Reported: "there's no good way to get the detail screen with the mouse".
+    A click on a row goes to the session, so line one ends with a › that opens
+    its detail instead - at the right edge, where it is in the same place on
+    every row."""
+
+    def _row(self, name="fix the login bug in auth", **kw):
+        return dict({"sessionId": "e0e2a7c1-c7c4-499c-a72d-27d9c11b3211",
+                     "project": "liveapp", "attention": "stopped", "since": "3h",
+                     "title": name, "tty": "ttys022", "recap": "", "doing": ""}, **kw)
+
+    def _cols(self, row, width):
+        first, _ = ccwho.ui_row_cells(row, width=width)
+        col = 0
+        for text, role in first:
+            if role == "detail":
+                return col, text
+            col += ccwho._cells(text)
+        return None, None
+
+    def test_line_one_ends_with_it_at_the_right_edge(self):
+        for name in ("short", "a very long name " * 8, "把持久化文件移到状态目录" * 4):
+            for width in (40, 80, 100, 140):
+                with self.subTest(name=name[:10], width=width):
+                    first, _ = ccwho.ui_row_cells(self._row(name), width=width)
+                    self.assertEqual(first[-1][1], "detail")
+                    self.assertIn(ccwho.UI_DETAIL.strip(), first[-1][0])
+                    self.assertEqual(sum(ccwho._cells(t) for t, _ in first), width,
+                                     "the same place on every row: the edge")
+
+    def test_a_click_on_it_opens_the_detail(self):
+        for width in (40, 100):
+            with self.subTest(width=width):
+                col, text = self._cols(self._row(), width)
+                for c in range(col, col + ccwho._cells(text)):
+                    self.assertEqual(ccwho.ui_action_at(self._row(), width, 0, c),
+                                     "detail")
+                self.assertIsNone(ccwho.ui_action_at(self._row(), width, 0, col - 1))
+
+    def test_the_name_never_runs_into_it(self):
+        row = self._row("a very long name " * 8)
+        first, _ = ccwho.ui_row_cells(row, width=80)
+        self.assertEqual(first[-2][1], "pad", "a gap between the words and the ›")
+
+    def test_line_two_offers_nothing_new(self):                          # control
+        _, second = ccwho.ui_row_cells(self._row(), width=100)
+        self.assertNotIn("detail", [r for _, r in second])
+        self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 1, 99))
+
+
 class TestKillDeadLoops(unittest.TestCase):
     """The kill looks again first. Between the scan and the key press a loop can
     end, and its pid can go to something else: only a pid that is STILL a dead
@@ -4473,7 +4523,9 @@ class TestRowsWithUsage(unittest.TestCase):
         row = self.rows[0]
         for w in (60, 100, 160):
             first, _ = ccwho.ui_row_cells(row, width=w, tag="1a2b")
-            self.assertEqual(first[-1], (" · 1a2b", "account"))
+            # last of the words; only the › that opens the detail comes after it
+            self.assertEqual(first[-3], (" · 1a2b", "account"))
+            self.assertEqual([r for _, r in first[-2:]], ["pad", "detail"])
             self.assertEqual(first[0][1], "mark")
             self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), w)
             plain, _ = ccwho.ui_row_cells(row, width=w)
@@ -4483,7 +4535,7 @@ class TestRowsWithUsage(unittest.TestCase):
         row = dict(self.rows[0], tab_title="a very long tab title " * 6)
         for w in (60, 100):
             first, _ = ccwho.ui_row_cells(row, width=w, tag="lukaso@gmail")
-            self.assertEqual(first[-1], (" · lukaso@gmail", "account"))
+            self.assertEqual(first[-3], (" · lukaso@gmail", "account"))
             name = [t for t, role in first if role == "name"][0]
             self.assertTrue(name.endswith("…"), name)
             self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), w)

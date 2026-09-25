@@ -50,6 +50,7 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "name": "",              # plain: this is the thing you are reading
               "meta": "dim",
               "action": "bold underline",   # the one part of a row you click on its own
+              "detail": "bold",        # the › that opens the detail, not the jump
               "age": "bold",           # inside a dim line, the age stands out
               "recap": "dim",
               "account": "dim",        # which account the row spends (usage)
@@ -267,6 +268,13 @@ class CcwhoUi(App):
         self.armed = None
         self.clock = time.monotonic
         self.pulsing = False
+        # While a window is being opened nothing on the list moves - you are
+        # watching one row blink - so a scan waits here, and so does the row you
+        # looked at leaving NEEDS YOU. Both land when the jump does.
+        self.held = None
+        self.reviewing = {}     # session id -> row, looked at by a jump that landed
+        self.jumps = 0          # which jump is the latest: only its answer ends it
+        self.seen = {}          # session id -> the turn (ts) you looked at
 
     # ------------------------------------------------------------------ layout
 
@@ -377,9 +385,22 @@ class CcwhoUi(App):
         if seq and seq < self.shown:
             return                      # a slower collection, finishing late
         self.shown = max(self.shown, seq)
-        self.fleet = fleet
+        if self.acting:
+            self.held = fleet           # shown when the jump is done: landed()
+            return
+        self.fleet = self.keep_seen(fleet)
         self.status = self.still_armed() or ""
         self.rebuild()
+
+    def keep_seen(self, fleet):
+        """A scan that read the marks before you looked, arriving after: the
+        turn you saw stays seen. Every fleet that reaches the screen comes
+        through here - the held one included."""
+        for row in fleet.rows:
+            if row.get("attention") == "review" and row.get("ts") \
+                    and self.seen.get(row.get("sessionId")) == row.get("ts"):
+                row["attention"] = "stopped"
+        return fleet
 
     # ---------------------------------------------------------------- painting
 
@@ -785,10 +806,18 @@ class CcwhoUi(App):
         widget.focus()
         if self.armed and self.armed[0] != self.selected:
             self.armed = None
+        # a right click - or ctrl-click, the Mac's own - asks about the row
+        if getattr(event, "button", 1) == 3 or getattr(event, "ctrl", False):
+            self.open_detail("brief")
+            return
         at = event.get_content_offset(widget)
-        if at is not None and engine.ui_action_at(
-                widget.row, widget.text_width(), at.y, at.x) == "kill":
+        action = engine.ui_action_at(widget.row, widget.text_width(), at.y, at.x) \
+            if at is not None else None
+        if action == "kill":
             self.action_kill_loop()
+            return
+        if action == "detail":
+            self.open_detail("brief")
             return
         self._go()          # a click names its row, whatever the pane shows
 
@@ -800,6 +829,11 @@ class CcwhoUi(App):
         row = self.selected_row()
         loops = (row or {}).get("dead_loops") or []
         if not loops or row.get("attention") == "busy":
+            return
+        if self.acting:
+            # a kill moves rows, and nothing moves while a window opens
+            self.status = "a window is being opened - kill it after that"
+            self.paint_header(self.fleet.groups(self.filter_text))
             return
         if self.still_armed() and self.armed[0] == row.get("sessionId", ""):
             self.armed = None
@@ -958,7 +992,7 @@ class CcwhoUi(App):
         row = self.selected_row()
         if not row:
             return
-        self.looked_at(row)
+        self.armed = None       # the question leaves the screen with the jump
         # Name it the way you picked it. "going to daf9..." is not something
         # you can check against the window that comes forward; the title is.
         name = (row.get("tab_title") or row.get("title") or row.get("name") or "")
@@ -973,7 +1007,8 @@ class CcwhoUi(App):
             self.status = "opening a window for it..."
             self.mark_acting(row.get("sessionId", ""))
             self.paint_header(self.fleet.groups(self.filter_text))
-            self.attaching(value)
+            self.jumps += 1         # only where a jump starts: a number with no
+            self.attaching(value, row, self.jumps)      # answer would never end
             return
         if row.get("windowed") is False:
             # We asked iTerm2 about this tty and it had never heard of it: the
@@ -986,13 +1021,14 @@ class CcwhoUi(App):
             return
         self.mark_acting(row.get("sessionId", ""))
         self.paint_header(self.fleet.groups(self.filter_text))
-        self.go_to(row)
+        self.jumps += 1
+        self.go_to(row, self.jumps)
         # The session you just opened is about to stop needing you. Look again
         # shortly, rather than scanning everything more often for the sake of
         # the one row that is about to change.
         self.set_timer(AFTER_A_JUMP, self.look_again)
 
-    def looked_at(self, row):
+    def looked_at(self, row, ts):
         """You are going to this session, so you have reviewed what it did.
 
         It leaves NEEDS YOU here and now rather than on the next scan, and the
@@ -1000,13 +1036,17 @@ class CcwhoUi(App):
         you for two seconds after you act on it. A session that is genuinely
         waiting on you cannot be dismissed this way: looking at a question does
         not answer it.
+
+        `ts` is the turn you were shown. A newer turn - one that came while the
+        window was opening - is one you have not seen.
         """
         if row.get("attention") != "review":
             return
-        sid, ts = row.get("sessionId", ""), row.get("ts", "")
-        if not (sid and ts):
+        sid = row.get("sessionId", "")
+        if not (sid and ts) or row.get("ts", "") != ts:
             return
         engine.mark_reviewed(sid, ts)
+        self.seen[sid] = ts
         row["attention"] = "stopped"
         self.painted_shape = None       # it moves group, so the list is rebuilt
         self.rebuild()
@@ -1022,16 +1062,45 @@ class CcwhoUi(App):
         self.collect()
 
     @work(thread=True)
-    def attaching(self, cmd):
+    def attaching(self, cmd, row, jump):
         said = self.adapter.attach(cmd, deadline=FOCUS_DEADLINE)
-        self.call_from_thread(self.said, said)
+        self.call_from_thread(self.landed, said, row, jump)
 
     @work(thread=True)
-    def go_to(self, row):
+    def go_to(self, row, jump):
         """Also off the UI thread: osascript is another program, and a hung
         iTerm2 must not take the list with it."""
         result = self.adapter.focus(row, deadline=FOCUS_DEADLINE)
-        self.call_from_thread(self.said, result, row)
+        self.call_from_thread(self.landed, result, row, jump)
+
+    def landed(self, text, row, jump):
+        """A jump's answer. Rows move here and nowhere else during a jump: the
+        scans that waited, and the row you looked at leaving NEEDS YOU.
+
+        Only the LATEST jump's answer ends it. An older one landing while a
+        newer row blinks keeps its review for later; a failed jump is not a
+        look - "iTerm2 did not answer" showed you nothing."""
+        worked = text.startswith(("focused", "attached"))
+        if worked and row.get("sessionId"):
+            self.reviewing[row["sessionId"]] = row
+        latest = jump == self.jumps
+        if latest or not worked:
+            # an older jump that worked is not the window in front: say nothing
+            self.said(text, row)
+        if latest:
+            self.mark_acting("")        # it is open: stop saying it is opening
+            held, self.held = self.held, None
+            if held is not None:
+                self.fleet = self.keep_seen(held)   # the scans that waited on it
+                self.rebuild()
+        elif self.acting:
+            return                      # a newer row still blinks: later
+        reviewing, self.reviewing = self.reviewing, {}
+        for sid, looked in reviewing.items():
+            self.looked_at(next((r for r in self.fleet.rows
+                                 if r.get("sessionId") == sid), looked),
+                           looked.get("ts", ""))
+        self.paint_header(self.fleet.groups(self.filter_text))
 
     def said(self, text, row=None):
         """What happened, in the words you chose the session by.
@@ -1046,7 +1115,6 @@ class CcwhoUi(App):
             text = (f"went to {engine.brief.short_id(row.get('sessionId', ''))}"
                     f"  {engine.truncate(name, 40)}")
         self.status = text
-        self.mark_acting("")        # it is open: stop saying it is opening
         self.paint_header(self.fleet.groups(self.filter_text))
 
     def action_reopen(self):

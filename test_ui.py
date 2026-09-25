@@ -1358,6 +1358,458 @@ class TestLookingAtOneDropsItOutOfTheList(UiTest):
             self.assertEqual(still, ["blocked"])
 
 
+class GatedAdapter(FakeAdapter):
+    """iTerm2 that answers when the test says so."""
+
+    def __init__(self):
+        super().__init__()
+        import threading
+        self.gate = threading.Event()
+
+    def focus(self, row, deadline=5.0):
+        self.asked.append(row.get("sessionId"))
+        self.gate_for(row.get("sessionId")).wait(10)
+        return "focused s022"
+
+    def gate_for(self, sid):
+        """One gate for every session, unless a test asks for one each."""
+        return getattr(self, "gates", {}).get(sid, self.gate)
+
+
+class TestTheRowMovesWhenTheBlinkEnds(UiTest):
+    """Reported: "When clicking on a line in needs you, it immediately moves to
+    the stopped line, even before the blinking finishes." The row blinks where
+    you clicked it, and moves once the window is open."""
+
+    def setUp(self):
+        self.marks = []
+        real = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: self.marks.append((sid, ts))
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", real)
+
+    def where(self, app):
+        return [w.row["attention"] for w in app.query(ui.Row)
+                if w.row["sessionId"] == reviewable()["sessionId"]]
+
+    async def test_it_stays_and_blinks_in_needs_you_while_it_opens(self):
+        adapter = GatedAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([reviewable(), BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.click(list(app.query(ui.Row))[0])
+                await pilot.pause(0.1)
+                self.assertEqual(adapter.asked, [reviewable()["sessionId"]])
+                self.assertEqual(self.where(app), ["review"])
+                self.assertEqual(self.marks, [],
+                                 "marked now, the next scan would move it early")
+                self.assertTrue([w for w in app.query(ui.Row) if w.has_class("acting")])
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.where(app), ["stopped"])
+            self.assertEqual(len(self.marks), 1)
+
+    async def test_a_scan_during_the_jump_does_not_move_it(self):
+        adapter = GatedAdapter()
+        collector = FakeCollector(fleet=ui.Fleet([reviewable(), BUSY], True, "12:00:00"))
+        app = self.app(adapter=adapter, collector=collector)
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                collector.fleet_value = ui.Fleet([reviewable(), BUSY], True, "12:00:05")
+                app.collect()
+                await pilot.pause(0.1)
+                self.assertEqual(self.where(app), ["review"])
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.where(app), ["stopped"])
+
+    async def test_no_row_moves_until_the_jump_is_complete(self):
+        # "no rows should move until the jump is complete, not just needs you"
+        adapter = GatedAdapter()
+        other = row("ffff6666-0000-4000-8000-000000000006", "stopped",
+                    title="Other", tab_title="Other")
+        collector = FakeCollector(fleet=ui.Fleet([reviewable(), other, BUSY],
+                                                 True, "12:00:00"))
+        app = self.app(adapter=adapter, collector=collector)
+        order = lambda: [w.row["sessionId"] for w in app.query(ui.Row)]
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                before = order()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                # the other stopped session starts asking: it would jump to the top
+                collector.fleet_value = ui.Fleet(
+                    [reviewable(), dict(other, attention="asks"), BUSY], True, "12:00:05")
+                app.collect()
+                await pilot.pause(0.1)
+                self.assertEqual(order(), before, "nothing moves under the blink")
+                self.assertIn("going to", app.status)
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(order()[0], other["sessionId"], "and then it does")
+            self.assertIn("12:00:05", self.screen_text(app))
+            self.assertIn("went to", app.status)
+
+
+class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
+    """Review of the change above: the end of the jump is where rows move, so
+    only THAT jump's answer may end it - not an older jump's, not a kill's."""
+
+    def setUp(self):
+        # fresh each test: looking at a row rewrites it in place
+        self.A = reviewable("aaaa0000-0000-4000-8000-00000000000a")
+        self.B = reviewable("bbbb0000-0000-4000-8000-00000000000b")
+        self.marks = []
+        real = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: self.marks.append(sid)
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", real)
+
+    def state(self, app):
+        return [(w.row["sessionId"], w.row["attention"], w.has_class("acting"))
+                for w in app.query(ui.Row)]
+
+    async def test_an_older_jump_landing_does_not_end_the_newer_one(self):
+        import threading
+        adapter = GatedAdapter()
+        adapter.gates = {self.A["sessionId"]: threading.Event(),
+                         self.B["sessionId"]: threading.Event()}
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([self.A, self.B, BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("j", "enter")
+                await pilot.pause(0.1)
+                during = self.state(app)
+                adapter.gates[self.A["sessionId"]].set()
+                await pilot.pause(0.1)
+                await pilot.pause()
+                self.assertEqual(self.state(app), during,
+                                 "B still blinks, and nothing moves under it")
+                self.assertEqual(app.acting, self.B["sessionId"])
+            finally:
+                for gate in adapter.gates.values():
+                    gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(sorted(self.marks),
+                             sorted([self.A["sessionId"], self.B["sessionId"]]),
+                             "both were looked at, each once")
+            self.assertEqual([a for sid, a, _ in self.state(app)
+                              if sid != BUSY["sessionId"]], ["stopped", "stopped"])
+
+    async def test_a_kill_waits_for_the_jump(self):
+        # a kill moves rows, and nothing moves while a window is being opened:
+        # it is refused, and says why, rather than half done
+        adapter = GatedAdapter()
+        collector = FakeCollector(fleet=ui.Fleet([self.A, STUCK], True, "12:00:00"))
+        app = self.app(adapter=adapter, collector=collector)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                before = self.state(app)
+                await pilot.press("j", "x", "x")
+                await pilot.pause(0.3)
+                self.assertIsNone(collector.killed)
+                self.assertIn("window is being opened", app.status)
+                self.assertEqual(app.acting, self.A["sessionId"])
+                self.assertEqual([s[:2] for s in self.state(app)],
+                                 [s[:2] for s in before])
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.marks, [self.A["sessionId"]])
+            await pilot.press("x")                  # and after it, the usual two:
+            await pilot.pause(0.1)
+            self.assertIsNone(collector.killed, "the refused x did not arm it")
+            self.assertTrue(app.status.startswith("x or click again"))
+            await pilot.press("x")
+            await pilot.pause(0.3)
+            self.assertEqual(collector.killed, [STUCK["sessionId"]])
+
+    async def test_a_jump_disarms_a_kill(self):
+        # armed, then Enter on the same row: the question left the screen with
+        # the jump, so one x afterwards only asks again
+        collector = FakeCollector(fleet=ui.Fleet([self.A, STUCK], True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "enter")
+            await pilot.pause(0.1)
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause(0.3)
+            self.assertIsNone(collector.killed)
+            self.assertTrue(app.status.startswith("x or click again"))
+
+    async def test_a_turn_that_came_during_the_jump_is_not_marked_seen(self):
+        adapter = GatedAdapter()
+        collector = FakeCollector(fleet=ui.Fleet([self.A, BUSY], True, "12:00:00"))
+        app = self.app(adapter=adapter, collector=collector)
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                collector.fleet_value = ui.Fleet(
+                    [dict(self.A, ts="2026-09-22T11:00:00.000Z"), BUSY], True, "12:00:05")
+                app.collect()
+                await pilot.pause(0.1)
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.marks, [], "you looked at the turn before it")
+            self.assertEqual(self.state(app)[0][:2], (self.A["sessionId"], "review"))
+
+    async def test_a_scan_that_was_under_way_does_not_bring_it_back(self):
+        # it read the marks before the jump landed, and arrives after
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([self.A, BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            await pilot.pause()
+            late = ui.Fleet([reviewable(self.A["sessionId"]), BUSY], True, "12:00:09")
+            late.seq = app.started + 1
+            app.show(late)
+            await pilot.pause()
+            self.assertEqual(self.state(app)[0][:2], (self.A["sessionId"], "stopped"))
+
+    async def late_scan_held_by_the_next_jump(self, ts):
+        import threading
+        adapter = GatedAdapter()
+        adapter.gates = {self.B["sessionId"]: threading.Event()}
+        adapter.gate.set()                                   # A lands at once
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([self.A, self.B, BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.pause()
+                # A has moved to STOPPED: B is picked by name, with a click
+                await pilot.click([w for w in app.query(ui.Row)
+                                   if w.row["sessionId"] == self.B["sessionId"]][0])
+                await pilot.pause(0.1)
+                self.assertEqual(app.acting, self.B["sessionId"], "B: still opening")
+                late = ui.Fleet([reviewable(self.A["sessionId"]) | {"ts": ts},
+                                 reviewable(self.B["sessionId"]), BUSY], True, "12:00:09")
+                late.seq = app.started + 1
+                app.show(late)                             # held
+                await pilot.pause()
+            finally:
+                adapter.gates[self.B["sessionId"]].set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            return dict((sid, a) for sid, a, _ in self.state(app))[self.A["sessionId"]]
+
+    async def test_a_late_scan_held_by_the_next_jump_does_not_bring_it_back(self):
+        self.assertEqual(await self.late_scan_held_by_the_next_jump(self.A["ts"]),
+                         "stopped")
+
+    async def test_a_new_turn_held_by_the_next_jump_does_come_back(self):  # control
+        self.assertEqual(await self.late_scan_held_by_the_next_jump(
+            "2026-09-22T12:00:00.000Z"), "review")
+
+    async def test_a_new_turn_in_a_late_scan_does_come_back(self):      # control
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([self.A, BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            await pilot.pause()
+            late = ui.Fleet([reviewable(self.A["sessionId"]) | {"ts": "2026-09-22T12:00:00.000Z"},
+                             BUSY], True, "12:00:09")
+            late.seq = app.started + 1
+            app.show(late)
+            await pilot.pause()
+            self.assertEqual(self.state(app)[0][:2], (self.A["sessionId"], "review"))
+
+    async def test_enter_on_a_row_with_no_window_does_not_freeze_the_list(self):
+        adapter = GatedAdapter()
+        nowhere = row("cafe0000-0000-4000-8000-00000000000c", "stopped",
+                      windowed=False, tab_title="nowhere", title="nowhere")
+        collector = FakeCollector(fleet=ui.Fleet([self.A, nowhere], True, "12:00:00"))
+        app = self.app(adapter=adapter, collector=collector)
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("j", "enter")         # nothing to go to: no jump
+                await pilot.pause(0.1)
+                collector.fleet_value = ui.Fleet([self.A, nowhere], True, "12:00:07")
+                app.collect()
+                await pilot.pause(0.1)
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(app.acting, "")
+            self.assertIsNone(app.held)
+            self.assertIn("12:00:07", self.screen_text(app))
+            self.assertEqual(self.marks, [self.A["sessionId"]])
+
+    async def test_an_older_jump_landing_last_is_applied_at_once(self):
+        import threading
+        adapter = GatedAdapter()
+        adapter.gates = {self.A["sessionId"]: threading.Event(),
+                         self.B["sessionId"]: threading.Event()}
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([self.A, self.B, BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("j", "enter")
+                await pilot.pause(0.1)
+                adapter.gates[self.B["sessionId"]].set()     # B first
+                await pilot.pause(0.1)
+                await pilot.pause()
+                self.assertEqual(app.acting, "")
+                adapter.gates[self.A["sessionId"]].set()     # then A, late
+                await pilot.pause(0.1)
+                await pilot.pause()
+            finally:
+                for gate in adapter.gates.values():
+                    gate.set()
+            self.assertEqual(sorted(self.marks),
+                             sorted([self.A["sessionId"], self.B["sessionId"]]))
+            self.assertEqual(app.reviewing, {})
+            self.assertIn("bbbb", app.status, "B is the window in front")
+
+    async def test_a_jump_that_failed_does_not_count_as_looking(self):
+        app = self.app(adapter=FakeAdapter(answer="iTerm2 did not answer in 5s"),
+                       collector=FakeCollector(fleet=ui.Fleet([self.A, BUSY], True,
+                                                              "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.marks, [])
+            self.assertEqual(self.state(app)[0][:2], (self.A["sessionId"], "review"))
+            self.assertEqual(app.acting, "", "but it is over: the blink stops")
+
+    async def test_a_jump_that_landed_does(self):                        # control
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([self.A, BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.marks, [self.A["sessionId"]])
+
+
+class TestTheDetailWithTheMouse(UiTest):
+    """Reported: "there's no good way to get the detail screen with the mouse".
+    A click goes to the session; the › at the end of line one, or a right
+    click anywhere on the row, opens its detail instead."""
+
+    def detail_offset(self, widget):
+        first = widget.spans_lines()[0]
+        col = sum(ui.engine._cells(t) for t, r in first if r != "detail")
+        # the row's left border and padding come before its text; one column in
+        return (col + 2 + 1, 0)
+
+    async def test_the_arrow_opens_that_rows_detail_and_does_not_go(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.click(w, offset=self.detail_offset(w))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [])
+            self.assertTrue(app.detail_open)
+            self.assertEqual(app.detail_mode, "brief")
+            self.assertEqual(app.selected, w.row["sessionId"])
+
+    async def test_a_right_click_opens_the_detail_and_does_not_go(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.click(w, button=3)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [])
+            self.assertTrue(app.detail_open)
+            self.assertEqual(app.selected, w.row["sessionId"])
+
+    async def test_a_ctrl_click_is_a_right_click(self):
+        # the Mac's own right click; the terminal reports it as button 1 + ctrl
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.click(w, control=True)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [])
+            self.assertTrue(app.detail_open)
+
+    async def test_a_right_click_on_the_kill_does_not_arm_it(self):
+        collector = FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
+            await pilot.click(w, offset=TestKillingAStuckLoop.kill_offset(None, w),
+                              button=3)
+            await pilot.pause()
+            self.assertIsNone(app.armed)
+            self.assertTrue(app.detail_open)
+
+    async def test_it_works_from_the_process_screen_too(self):
+        app = self.app()
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.click(w, offset=self.detail_offset(w))
+            await pilot.pause()
+            self.assertEqual(app.detail_mode, "brief")
+
+    async def test_a_plain_click_still_goes(self):                      # control
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(160, 30)) as pilot:
+            await pilot.pause()
+            w = list(app.query(ui.Row))[1]
+            await pilot.click(w, offset=(10, 0))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [w.row["sessionId"]])
+            self.assertFalse(app.detail_open)
+
+
 class TestTheTwoTiersLookDifferent(UiTest):
     async def test_a_finished_session_is_drawn_more_quietly(self):
         app = self.app(collector=FakeCollector(

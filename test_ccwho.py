@@ -5753,3 +5753,27 @@ class TestTheBriefInParts(unittest.TestCase):
         shown = ccwho.render_brief(self.brief(progress=["a" * 98 + "\r\nrest of it"]), {},
                                    color=False)
         self.assertTrue(any(l.startswith("    · " + "a" * 90) for l in shown.splitlines()), shown)
+
+    def test_every_value_says_which_field_it_is(self):
+        b = self.brief()
+        fields = [(f, v) for line in ccwho.brief_parts(b, {"project": "liveapp"}, fields=True)
+                  for _, _, v, f in line if v or f]
+        self.assertEqual([f for f, _ in fields],
+                         ["id", "project", "title", "recap", "goal", "you_said", "closing",
+                          "tty", "pid", "name", "cwd", "session_id", "resume"])
+        self.assertEqual(tuple(f for f, _ in fields), ccwho.BRIEF_FIELDS,
+                         "the order a screen follows is the order they come in")
+        self.assertTrue(all(v for _, v in fields), "a field is a value; a label has none")
+        # a value that is not there has no field either: no project, no "project"
+        bare = [f for line in ccwho.brief_parts(b, {}, fields=True) for _, _, _, f in line if f]
+        self.assertNotIn("project", bare)
+        self.assertIn("id", bare)                                           # control
+
+    def test_a_list_running_since_before_keeps_the_shape_it_reads(self):
+        # the engine is hot-reloaded into a list that stays open for days; a
+        # list from before fields reads three per part, and must not crash
+        for line in ccwho.brief_parts(self.brief(), {"project": "liveapp"}):
+            for part, style, value in line:
+                self.assertIsInstance(part, str)
+        with_fields = ccwho.brief_parts(self.brief(), {"project": "liveapp"}, fields=True)
+        self.assertEqual({len(p) for line in with_fields for p in line}, {4})    # control

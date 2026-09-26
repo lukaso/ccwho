@@ -35,6 +35,7 @@ from textual.app import App, ComposeResult                         # noqa: E402
 from textual.screen import ModalScreen                             # noqa: E402
 from textual.binding import Binding                                # noqa: E402
 from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
+from textual.geometry import Region                                # noqa: E402
 from textual.widgets import Footer, Input, OptionList, Static      # noqa: E402
 from textual.widgets.option_list import Option                     # noqa: E402
 from rich.style import Style                                       # noqa: E402
@@ -134,6 +135,15 @@ class Fleet:
         return engine.ui_groups(self.visible(query))
 
 
+def brief_parts(b, row):
+    """The brief's parts with their fields - from an engine reloaded from before
+    fields too, which gives three per part and knows no fields."""
+    try:
+        return engine.brief_parts(b, row, fields=True)
+    except TypeError:
+        return [[(t, s, v, None) for t, s, v in line] for line in engine.brief_parts(b, row)]
+
+
 class Brief(Static):
     """The detail's text. A value you can click lights up under the mouse, as a
     row's arrow does: Textual 8 marks it as a link but no longer draws the hover,
@@ -144,15 +154,69 @@ class Brief(Static):
     # the row's arrow does
     auto_links = False
 
+    # The keys, once → takes them in here (Finder's column view: → into the
+    # column, ← back out). Bound on the widget with focus, so the footer says
+    # what they do here, and Enter is a copy, not the list's jump.
+    can_focus = True
+    BINDINGS = [
+        Binding("down,j", "step(1)", "down", show=False),
+        Binding("up,k", "step(-1)", "up", show=False),
+        Binding("enter", "copy", "copy"),
+        Binding("left,escape", "leave", "back"),
+    ]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.base = Text()
-        self.lit = None         # the click under the mouse, or None
+        self.lit = None         # the part under the mouse or the keys, or None
+        self.values = {}        # part -> what a click on it copies
+        self.fields = {}        # part -> which value it is ("closing", "tty")
 
     def show(self, text):
+        # with the keys in here, a refresh keeps them where they were: on the
+        # same field, whatever it says now (a recap and a new closing arrive in
+        # one refresh); else on the same value, the nearest if it shows twice;
+        # else at the same place
+        at = self.lit
+        was, field = self.values.get(at), self.fields.get(at)
         self.base = text
-        self.lit = None         # a part's number means nothing in new text
+        self.values, self.fields = {}, {}
+        for span in text.spans:
+            meta = getattr(span.style, "meta", None) or {}
+            if "part" in meta:
+                self.values[meta["part"]] = meta.get("value")
+                self.fields[meta["part"]] = meta.get("field")
+        self.lit = None
+        if self.has_focus and not self.values:
+            self.app.leave_detail()     # nothing to be on here: the keys go back
+        elif self.has_focus:
+            near = (lambda ps: min(ps, key=lambda p: abs(p - (at or 0))))
+            same_field = [p for p, f in self.fields.items() if f == field]
+            same = [p for p, v in self.values.items() if v == was]
+            # the field known and gone: the next one - not the same text in
+            # another field, up the pane or past the ones between
+            self.lit = (near(same_field) if same_field else self.after(field, at) if field
+                        else near(same) if same else max(0, min(len(self.values) - 1, at or 0)))
+            self.call_after_refresh(self.follow)
         self.paint()
+
+    def after(self, field, at):
+        """The field under the keys is gone: the next one still here, in the
+        brief's order - never up to one that arrived above - else the last."""
+        order = engine.BRIEF_FIELDS     # a field known: an engine that knows them
+        if field in order:
+            k = order.index(field)
+            rank = {p: order.index(f) for p, f in self.fields.items() if f in order}
+            later = [p for p, r in rank.items() if r > k]
+            if later:
+                return min(later, key=lambda p: rank[p])
+            if rank:
+                return max(rank, key=lambda p: rank[p])
+        return max(0, min(len(self.values) - 1, at or 0))
+
+    def focus_on_click(self):
+        # a click copies; it does not take the keys in here - that is a second →
+        return False
 
     def paint(self):
         text = self.base.copy()
@@ -163,14 +227,57 @@ class Brief(Static):
                     text.stylize("reverse", span.start, span.end)
         self.update(text)
 
+    def on_focus(self, event):
+        if self.lit is None and self.values:
+            self.lit = 0
+            self.paint()
+            self.call_after_refresh(self.follow)
+
+    def on_blur(self, event):
+        if self.lit is not None:
+            self.lit = None
+            self.paint()
+
+    def action_step(self, step):
+        if not self.values:
+            return
+        at = self.lit if self.lit is not None else -1
+        self.lit = max(0, min(len(self.values) - 1, at + step))
+        self.paint()
+        self.call_after_refresh(self.follow)
+
+    def follow(self):
+        """Scroll the detail so the value the keys are on can be seen."""
+        detail = self.parent
+        for y in range(self.size.height):
+            if any(seg.style and seg.style.reverse and seg.text.strip()
+                   for seg in self.render_line(y)):
+                detail.scroll_to_region(Region(0, self.virtual_region.y + y, 1, 1),
+                                        animate=False)
+                return
+
+    def action_copy(self):
+        value = self.values.get(self.lit)
+        if value:
+            self.app.action_copy_value(value)
+
+    def action_leave(self):
+        self.app.leave_detail()
+
     def on_mouse_move(self, event):
+        if self.has_focus:
+            return              # the keys are in here: the one light is theirs
         lit = (event.style.meta or {}).get("part")
-        if lit != self.lit:
+        if lit is not None and lit != self.lit:
             self.lit = lit
+            self.paint()
+        elif lit is None and self.lit is not None and not self.has_focus:
+            self.lit = None
             self.paint()
 
     def on_leave(self, event):
-        if self.lit is not None:
+        # with the keys in here, the value they are on stays lit
+        if self.lit is not None and not self.has_focus:
             self.lit = None
             self.paint()
 
@@ -821,10 +928,10 @@ class CcwhoUi(App):
             # labels and which are the answer. Asking for plain text and drawing
             # it all the same way made the pane a wall of white.
             text, n = Text(no_wrap=False), 0
-            for i, parts in enumerate(engine.brief_parts(self.collector.brief(row), row)):
+            for i, parts in enumerate(brief_parts(self.collector.brief(row), row)):
                 if i:
                     text.append("\n")
-                for part, style, value in parts:
+                for part, style, value, field in parts:
                     # every part through from_ansi, the plain ones too: codes a
                     # session printed are decoded here, never drawn as text
                     piece = Text.from_ansi(engine.brief_ansi(part, style))
@@ -833,7 +940,8 @@ class CcwhoUi(App):
                         # a refresh may have rebuilt; the part's number is what
                         # lights up, so one value in two places lights once
                         piece.stylize(Style(meta={"@click": f"app.copy_value({value!r})",
-                                                  "part": n}))
+                                                  "part": n, "value": value,
+                                                  "field": field}))
                         n += 1
                     text.append_text(piece)
             try:
@@ -896,13 +1004,20 @@ class CcwhoUi(App):
         if box is not None and box.display and self.focused is box:
             return        # you are typing: every keystroke rebuilds the list, and
                           # taking focus back would eat the rest of the word
+        # the keys in the brief stay there: only ← gives them back. A session
+        # arriving rebuilt the list, took them back, and the next Enter jumped
+        # where it should have copied
+        brief = self.part("#brief")
+        keep = brief is not None and self.focused is brief
         for widget in rows:
             if widget.row.get("sessionId") == session_id:
-                widget.focus()
+                if not keep:
+                    widget.focus()
                 self.selected = session_id
                 self.mark_selected()
                 return
-        rows[0].focus()
+        if not keep:
+            rows[0].focus()
         self.selected = rows[0].row.get("sessionId", "")
         self.mark_selected()
         self.mark_acting()
@@ -1095,7 +1210,18 @@ class CcwhoUi(App):
             self.paint_detail()
 
     def action_detail(self):
+        # a second → takes the keys into the brief it opened (Finder's columns)
+        box = self.part("#brief")
+        if (self.detail_open and self.detail_mode == "brief" and box is not None
+                and box.values):
+            box.focus()
+            return
         self.open_detail("brief")
+
+    def leave_detail(self):
+        """← from inside the brief: the keys go back to the list, the brief stays."""
+        self.set_focus(None)            # so restore_selection gives them to the row
+        self.call_after_refresh(self.restore_selection)
 
     def action_procs(self):
         """Every process agents started, in the detail pane - `ccwho ps`, here."""

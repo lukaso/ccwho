@@ -3938,3 +3938,425 @@ class TestTheDetailLooksLikeTheList(UiTest):
                     self.assertIn("@click", value.meta or {})
                     self.assertEqual((value.color, value.bgcolor), (plain.color, plain.bgcolor))
                     self.assertFalse(value.underline)
+
+
+class TestTheKeysGoIntoTheDetail(UiTest):
+    """Finder's column view: → opens the detail and ↑/↓ still browse sessions
+    under it; → again takes the keys into the detail, where ↑/↓ move between
+    its values and Enter copies one; ← gives the keys back to the list."""
+
+    def lit(self, app):
+        """The text of each segment the detail draws reversed, in order."""
+        box = app.query_one("#brief")
+        return [seg.text for y in range(box.size.height) for seg in box.render_line(y)
+                if seg.style and seg.style.reverse and seg.text.strip()]
+
+    async def enter(self, pilot):
+        await pilot.pause()
+        await pilot.press("right")
+        await pilot.pause()
+        await pilot.press("right")
+        await pilot.pause()
+
+    async def test_right_again_puts_the_keys_on_the_first_value(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            self.assertIs(app.focused, app.query_one("#brief"))
+            self.assertEqual(self.lit(app), ["aaaa"])
+
+    async def test_up_and_down_move_between_values_and_stop_at_the_ends(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["liveapp"])
+            await pilot.press("up", "up", "up")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["aaaa"], "the first value is where up stops")
+            for _ in range(30):
+                await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), [f"claude --resume {LIVE['sessionId']}"])
+            self.assertEqual(app.selected, LIVE["sessionId"], "the session did not change")
+
+    async def test_enter_copies_the_value_and_does_not_jump(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await pilot.press("down", "down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.copied, ["Issue 362"])
+            self.assertIn("copied Issue 362", self.screen_text(app))
+            self.assertEqual(adapter.asked, [], "Enter in the detail is a copy, not a jump")
+
+    async def test_the_footer_says_what_the_keys_do_in_the_detail(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            enter = app.active_bindings.get("enter")
+            self.assertEqual(enter.binding.description, "copy")
+
+    async def test_left_gives_the_keys_back_and_left_again_closes(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertIsNot(app.focused, app.query_one("#brief"))
+            self.assertTrue(app.query_one("#detail").display, "the detail stays open")
+            self.assertEqual(self.lit(app), [])
+            await pilot.press("down")                   # the list has the keys again
+            await pilot.pause()
+            self.assertEqual(app.selected, BUSY["sessionId"])
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertFalse(app.query_one("#detail").display)
+
+    async def test_one_right_leaves_the_keys_on_the_list(self):          # control
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), [])
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.copied, [])
+            self.assertEqual(adapter.asked, [LIVE["sessionId"]], "Enter still jumps")
+
+    async def test_a_refresh_keeps_the_keys_on_the_same_value(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, recap="", goal="", you_said="",
+                                     closing="")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            for _ in range(5):                          # id, project, title, tty, pid -> name
+                await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["liveapp-b2"])
+            app.collector.brief_value = dict(app.collector.brief_value, recap="a recap now",
+                                             goal="a goal", you_said="said", closing="said back")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["liveapp-b2"])
+            self.assertIs(app.focused, app.query_one("#brief"))
+
+    async def test_the_pane_scrolls_to_the_value_the_keys_are_on(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value,
+                                     progress=[f"step {i}" for i in range(40)])
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 20)) as pilot:
+            await self.enter(pilot)
+            for _ in range(30):
+                await pilot.press("down")
+            await pilot.pause()
+            detail, box = app.query_one("#detail"), app.query_one("#brief")
+            y = next(y for y in range(box.size.height)
+                     if any(seg.style and seg.style.reverse and seg.text.strip()
+                            for seg in box.render_line(y)))
+            top = box.virtual_region.y + y
+            self.assertGreater(detail.scroll_y, 0)
+            self.assertTrue(detail.scroll_y <= top < detail.scroll_y + detail.size.height,
+                            (detail.scroll_y, top, detail.size.height))
+
+    async def test_when_the_keys_leave_by_another_way_nothing_stays_lit(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            self.assertEqual(self.lit(app), ["aaaa"])                          # control
+            app.query_one("#brief").blur()
+            await pilot.pause()
+            self.assertIsNot(app.focused, app.query_one("#brief"))
+            self.assertEqual(self.lit(app), [])
+
+
+class TestTheKeysStayInTheDetail(UiTest):
+    """Review of the keys slice, round 1: nothing but ← takes the keys out of
+    the detail, and a refresh leaves them where they were."""
+
+    lit = TestTheKeysGoIntoTheDetail.lit
+    enter = TestTheKeysGoIntoTheDetail.enter
+
+    def lit_row(self, app):
+        box = app.query_one("#brief")
+        return next((y for y in range(box.size.height)
+                     if any(seg.style and seg.style.reverse and seg.text.strip()
+                            for seg in box.render_line(y))), None)
+
+    async def test_a_session_arriving_leaves_the_keys_in_the_detail(self):
+        new = row("dddd4444-0000-4000-8000-000000000004", "busy", title="New one")
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await pilot.press("down")
+            await pilot.pause()
+            app.show(ui.Fleet([LIVE, BUSY, new], True, "12:00:01"))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#brief"))
+            self.assertEqual(self.lit(app), ["liveapp"])
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.copied, ["liveapp"])
+            self.assertEqual(adapter.asked, [], "a copy, never a jump")
+
+    async def test_with_the_keys_on_the_list_a_rebuild_still_focuses_the_row(self):  # control
+        new = row("dddd4444-0000-4000-8000-000000000004", "busy", title="New one")
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            app.show(ui.Fleet([LIVE, BUSY, new], True, "12:00:01"))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIsInstance(app.focused, ui.Row)
+
+    async def test_a_value_that_changes_under_the_keys_keeps_its_place(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            while self.lit(app) != ["Shall I land it?"]:
+                await pilot.press("down")
+                await pilot.pause()
+            app.collector.brief_value = dict(app.collector.brief_value,
+                                             closing="Landed. Anything else?")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["Landed. Anything else?"])
+
+    async def test_after_a_refresh_the_value_the_keys_are_on_is_on_screen(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value,
+                                     progress=[f"step {i}" for i in range(40)])
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 20)) as pilot:
+            await self.enter(pilot)
+            for _ in range(30):
+                await pilot.press("down")
+            await pilot.pause()
+            app.collector.brief_value = dict(app.collector.brief_value,
+                                             progress=[f"step {i}" for i in range(80)])
+            app.paint_detail()
+            await pilot.pause()
+            await pilot.pause()
+            detail, box = app.query_one("#detail"), app.query_one("#brief")
+            top = box.virtual_region.y + self.lit_row(app)
+            self.assertTrue(detail.scroll_y <= top < detail.scroll_y + detail.size.height,
+                            (detail.scroll_y, top, detail.size.height))
+
+    async def test_one_value_in_two_places_keeps_the_place_the_keys_are_on(self):
+        collector = FakeCollector()
+        brief = collector.brief_value
+        collector.brief_value = dict(brief, aka=dict(brief["aka"], name="Issue 362"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            for _ in range(20):
+                await pilot.press("down")
+                await pilot.pause()
+                if self.lit(app) == ["Issue 362"] and self.lit_row(app) > 2:
+                    break
+            y = self.lit_row(app)
+            self.assertGreater(y, 2, "the second Issue 362, on the aka line")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit_row(app), y)
+
+    async def test_the_processes_screen_gives_the_keys_back_to_the_list(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            moved = []
+            real = app.move
+            app.move = lambda step: (moved.append(step), real(step))
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertIsNot(app.focused, app.query_one("#brief"))
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(moved, [1], "the processes screen scrolls again")
+
+    async def test_a_click_copies_and_leaves_the_keys_on_the_list(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            box = app.query_one("#brief")
+            y = next(y for y in range(box.size.height) if "Issue 362" in box.render_line(y).text)
+            await pilot.click("#brief", offset=(box.render_line(y).text.index("Issue 362") + 2, y))
+            await pilot.pause()
+            self.assertEqual(adapter.copied, ["Issue 362"])
+            self.assertIsNot(app.focused, box)
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.selected, BUSY["sessionId"], "↓ still moves between sessions")
+
+
+class TestTheKeysKeepTheirField(UiTest):
+    """Review of the keys slice, round 2: a refresh keeps the keys on the same
+    FIELD, and with the keys in the detail the mouse does not move them."""
+
+    lit = TestTheKeysGoIntoTheDetail.lit
+    enter = TestTheKeysGoIntoTheDetail.enter
+
+    async def on_the_closing(self, pilot, app):
+        while self.lit(app) != ["Shall I land it?"]:
+            await pilot.press("down")
+            await pilot.pause()
+
+    async def test_a_recap_arriving_with_a_new_closing_keeps_the_keys_on_the_closing(self):
+        adapter = FakeAdapter()
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, recap="")
+        app = self.app(collector=collector, adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await self.on_the_closing(pilot, app)
+            app.collector.brief_value = dict(app.collector.brief_value, recap="landed the fix",
+                                             closing="Landed. Anything else?")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["Landed. Anything else?"])
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.copied, ["Landed. Anything else?"])
+
+    async def test_a_recap_going_with_a_new_closing_keeps_the_keys_on_the_closing(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await self.on_the_closing(pilot, app)
+            app.collector.brief_value = dict(app.collector.brief_value, recap="",
+                                             closing="new closing")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["new closing"])
+
+    async def test_the_mouse_does_not_move_the_keys(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            box = app.query_one("#brief")
+            y = next(y for y in range(box.size.height) if "Issue 362" in box.render_line(y).text)
+            await pilot.hover("#brief", offset=(box.render_line(y).text.index("Issue 362") + 2, y))
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["aaaa"], "the one light is the keys'")
+            await pilot.hover("#header")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.copied, ["aaaa"])
+
+    async def test_when_the_field_goes_the_keys_go_to_the_next_field(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await self.on_the_closing(pilot, app)
+            app.collector.brief_value = dict(app.collector.brief_value, recap="", closing="")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["s022"], "the tty comes after the closing")
+
+    async def test_the_keys_never_go_up_to_a_field_that_arrived(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, title="")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            while self.lit(app) != ["the gate flake, understood"]:
+                await pilot.press("down")
+                await pilot.pause()
+            app.collector.brief_value = dict(app.collector.brief_value, recap="", title="T")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["fix the gate flake"], "the goal, not up to T")
+
+    async def test_only_the_recap_going_lands_on_the_goal(self):              # control
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            while self.lit(app) != ["the gate flake, understood"]:
+                await pilot.press("down")
+                await pilot.pause()
+            app.collector.brief_value = dict(app.collector.brief_value, recap="")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["fix the gate flake"])
+
+    async def test_the_last_field_going_lands_on_the_one_before(self):
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            for _ in range(30):
+                await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), [f"claude --resume {LIVE['sessionId']}"])
+            real = ui.engine.brief_parts
+            def no_resume(b, r=None, fields=False):
+                parts = [[p for p in line if p[3] != "resume"]
+                         for line in real(b, r, fields=True)]
+                return parts if fields else [[p[:3] for p in line] for line in parts]
+            ui.engine.brief_parts = no_resume
+            try:
+                app.paint_detail()
+                await pilot.pause()
+            finally:
+                ui.engine.brief_parts = real
+            self.assertEqual(self.lit(app), [LIVE["sessionId"]], "the session id, before it")
+
+    async def test_a_newer_list_on_an_older_engine_still_copies(self):
+        real = ui.engine.brief_parts
+        fields = ui.engine.BRIEF_FIELDS
+
+        def old_shape(b, row=None):             # the engine before fields
+            return real(b, row)
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        ui.engine.brief_parts = old_shape
+        del ui.engine.BRIEF_FIELDS
+        try:
+            async with app.run_test(size=(300, 50)) as pilot:
+                await self.enter(pilot)
+                await pilot.press("down")
+                await pilot.pause()
+                app.paint_detail()
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(adapter.copied, ["liveapp"])
+        finally:
+            ui.engine.brief_parts = real
+            ui.engine.BRIEF_FIELDS = fields
+
+    async def test_a_field_that_goes_is_followed_by_the_next_even_if_its_value_is_elsewhere(self):
+        collector = FakeCollector()
+        brief = collector.brief_value
+        collector.brief_value = dict(brief, title="liveapp-b2")      # the title says the name
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            box = app.query_one("#brief")
+            for _ in range(30):                                       # to the name, on the aka line
+                await pilot.press("down")
+                await pilot.pause()
+                if self.lit(app) == ["liveapp-b2"] and box.fields.get(box.lit) == "name":
+                    break
+            app.collector.brief_value = dict(app.collector.brief_value,
+                                             aka=dict(brief["aka"], name=""))
+            app.paint_detail()
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["/Users/x/liveapp"], "the cwd, not up to the title")

@@ -67,7 +67,8 @@ ccwho                         # on a terminal
 |---|---|
 | ↑ ↓ / `j` `k` | move |
 | Enter | go to the session's window - or give it one (see below) |
-| → | the brief: what it was working on, and the processes it started |
+| → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
+| → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list |
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
 | `p` | every process agents started, grouped: each session, left behind, Codex, not sure |
@@ -94,8 +95,11 @@ the detail - the id, project, title, recap, what it opened with, what you said,
 what it said, the tty, pid, name, cwd, session id and the `claude --resume` line -
 lights up under the mouse, as what you can click on the list does: a left click
 copies it, whole even where the pane shows it cut, and the status line says what
-it copied. What you paste is what the pane shows, without the terminal codes a
-session printed. Labels and progress steps copy nothing.
+it copied, and leaves the keys where they were. The keys do the same: → a second
+time, ↑ ↓ to the value, Enter; while the keys are in the brief, the one light is
+theirs and the mouse moves nothing. What you paste is what the pane shows,
+without the terminal codes a session printed. Labels and progress steps copy
+nothing.
 
 It notices a session start needing you within a second, by stat-ing transcript
 files - no program is started for that - and does a full scan every 20 seconds.

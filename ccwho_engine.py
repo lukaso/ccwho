@@ -2325,7 +2325,12 @@ _ESCAPES = re.compile(r"\x1b\][^\x07\x1b\x18\x1a\n]*(?:\x07|\x1b\\|[\x18\x1a]|(?
                       r"|\x1b[ -/]*[0-~]")
 
 
-def brief_parts(b, row=None):
+# The fields a brief's values are, in the order brief_parts gives them.
+BRIEF_FIELDS = ("id", "project", "title", "recap", "goal", "you_said", "closing",
+                "tty", "pid", "name", "cwd", "session_id", "resume")
+
+
+def brief_parts(b, row=None, fields=False):
     """The brief as a human reads it: what it is about first, then how it got here.
 
     Order is the argument. The recap answers "is this the one?", so it leads; the
@@ -2334,7 +2339,11 @@ def brief_parts(b, row=None):
 
     Line by line, in parts of (text, style, value): the style a _paint key or
     None, the value what a click on the part copies - whole, where the text is
-    cut - or None for a label, which is not something you would paste.
+    cut - or None for a label, which is not something you would paste. With
+    `fields`, a fourth: which field the value is ("closing", "tty") - a screen
+    that follows a value across a refresh follows its field, as the value
+    changes. Only on request: the engine is reloaded into a list that has been
+    open for days, and a list from before fields reads three.
     """
     row = row or {}
     att = row.get("attention", "")
@@ -2343,30 +2352,31 @@ def brief_parts(b, row=None):
     project = row.get("project", "?")
     project = "?" if project is None else project
     style = None if att else "bold"
-    head = [(aka["short_id"], style, aka["short_id"] or None), ("  ", style, None),
-            (project, style, project if project not in ("", "?") else None)]
+    head = [(aka["short_id"], style, aka["short_id"] or None, "id"), ("  ", style, None),
+            (project, style, project if project not in ("", "?") else None, "project")]
     if att:
         head += [("  ", None, None), (_LABEL.get(att, att), att, None)]
     out.append(head)
     if b["title"]:
-        out.append([("  ", "bold", None), (b["title"], "bold", b["title"])])
+        out.append([("  ", "bold", None), (b["title"], "bold", b["title"], "title")])
     if b["recap"]:
         age = b["recap_age"] or "?"
         turns = b["turns_since_recap"]
         plural = "" if turns == 1 else "s"
         stale = f"recap {age} old" + (f" · {turns} turn{plural} since" if turns else "")
         out.append([("  ", None, None), (stale, "dim", None)])
-        out.append([("  ", None, None), (b["recap"], None, b["recap"])])
+        out.append([("  ", None, None), (b["recap"], None, b["recap"], "recap")])
     elif not (b["you_said"] or b["goal"] or b["progress"] or b["closing"]):
         out.append([("  ", None, None), ("nothing typed in this session yet", "dim", None)])
     else:
         out.append([("  ", None, None), ("(no recap yet)", "dim", None)])
     if b["goal"]:
         out.append([("  ", None, None), ("opened", "dim", None), ("    ", None, None),
-                    (truncate(_as_shown(plain_text(b["goal"])), 100), None, b["goal"])])
+                    (truncate(_as_shown(plain_text(b["goal"])), 100), None, b["goal"], "goal")])
     if b["you_said"]:
         out.append([("  ", None, None), ("you said", "dim", None), ("  ", None, None),
-                    (truncate(_as_shown(plain_text(b["you_said"])), 100), None, b["you_said"])])
+                    (truncate(_as_shown(plain_text(b["you_said"])), 100), None, b["you_said"],
+                     "you_said")])
     if b["progress"]:
         out.append([("  ", None, None), ("progress", "dim", None)])
         for step in b["progress"]:
@@ -2374,26 +2384,29 @@ def brief_parts(b, row=None):
             out.append([("    · ", None, None), (truncate(_as_shown(plain_text(step)), 96), None, None)])
     if b["closing"]:
         out.append([("  ", None, None), ("it said", "dim", None)])
-        out.append([("    ", None, None), (truncate(_as_shown(plain_text(b["closing"])), 96), None, b["closing"])])
+        out.append([("    ", None, None), (truncate(_as_shown(plain_text(b["closing"])), 96), None, b["closing"],
+                                              "closing")])
     tty = aka["tty"] or row.get("tty", "")
-    bits = ([[("tty ", "dim", None), (short_tty(tty), "dim", tty)]] if tty else []) + (
-        [[("pid ", "dim", None), (str(aka["pid"]), "dim", str(aka["pid"]))]]
+    bits = ([[("tty ", "dim", None), (short_tty(tty), "dim", tty, "tty")]] if tty else []) + (
+        [[("pid ", "dim", None), (str(aka["pid"]), "dim", str(aka["pid"]), "pid")]]
         if aka["pid"] else []) + [
-        [(x, "dim", x)] for x in (aka["name"], aka["cwd"], aka["session_id"]) if x]
+        [(aka[k], "dim", aka[k], k)] for k in ("name", "cwd", "session_id") if aka[k]]
     line = [("  ", None, None)]
     for i, bit in enumerate(bits):
         line += ([(" · ", "dim", None)] if i else []) + bit
     out.append(line if bits else line + [("", "dim", None)])
     resume = f"claude --resume {aka['session_id']}"
     out.append([("  ", None, None), ("resume", "dim", None), ("    ", None, None),
-                (resume, None, resume)])
+                (resume, None, resume, "resume")])
     # the text without a session's own terminal codes, which the pane draws
     # (cut above LAST, after the codes and the \r went: a cut through a code left
     # "31" behind, and one through "\r\n" left a \r that blanked the line); and
     # what you paste is what the pane shows, whole - no space at either end
-    return [[(plain_text(t).replace("\r\n", "\n"), s,
-              (_as_shown(plain_text(v)).strip() or None) if v else None)
-             for t, s, v in line] for line in out]
+    def part(t, s, v=None, field=None):
+        v = (_as_shown(plain_text(v)).strip() or None) if v else None
+        shown = plain_text(t).replace("\r\n", "\n")
+        return (shown, s, v, field if v else None) if fields else (shown, s, v)
+    return [[part(*p) for p in line] for line in out]
 
 
 def _as_shown(text):

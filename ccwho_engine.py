@@ -1351,6 +1351,84 @@ def newest_manifest(names):
     return found[-1] if found else None
 
 
+def boot_time(text):
+    """When the Mac last started, from `sysctl -n kern.boottime`, or None."""
+    m = re.search(r"\bsec\s*=\s*(\d+)", text or "")
+    return int(m.group(1)) if m else None
+
+
+def save_points(saves, live_ids=(), booted=None):
+    """Every save `o` can reopen, newest first.
+
+    `saves` is (file name, manifest) pairs; a manifest that could not be read is
+    None, and is listed with count None rather than dropped - a save that has
+    gone missing from the list is one nobody knows to look for.
+
+    The autosave keeps writing after a restart, so the newest save can hold
+    only what was started since (the loops, first). The last save from BEFORE
+    the restart is the fleet the restart took away: it is marked.
+    """
+    live = set(live_ids or ())
+    points = []
+    for name, man in saves or ():
+        if not (name and _MANIFEST_NAME.match(name)):
+            continue
+        at = man.get("savedAt") if isinstance(man, dict) else None
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            try:
+                at = int(time.mktime(time.strptime(name, "%Y-%m-%dT%H%M.json")))
+            except ValueError:
+                at = None
+        # a string, or it is not a session: one damaged entry must not stop the menu
+        sids = ({e.get("sessionId") for e in manifest_entries(man)
+                 if isinstance(e.get("sessionId"), str) and e.get("sessionId")}
+                if isinstance(man, dict) else None)
+        running = len(sids & live) if sids is not None else 0
+        points.append({"name": name, "at": at,
+                       "count": len(sids) if sids is not None else None,
+                       "running": running,
+                       "to_open": len(sids) - running if sids is not None else 0,
+                       "before_reboot": False})
+    points.sort(key=lambda p: p["name"], reverse=True)
+    if booted:
+        for p in points:
+            # a save it cannot read cannot bring the fleet back: not that one
+            if p["at"] is not None and p["at"] < booted and p["count"] is not None:
+                p["before_reboot"] = True
+                break
+    return points
+
+
+def _when(at, now):
+    """today 12:22, yesterday 18:04, or Thu 24 Sep 09:10 - local time."""
+    t, day = time.localtime(at), time.localtime(now)
+    if t[:3] == day[:3]:
+        return "today " + time.strftime("%H:%M", t)
+    if t[:3] == time.localtime(now - 86400)[:3]:
+        return "yesterday " + time.strftime("%H:%M", t)
+    return time.strftime("%a %d %b %H:%M", t)
+
+
+def save_point_line(point, now=None, booted=None):
+    """One line of the `o` menu: when, how many, and what reopening it would do."""
+    now = time.time() if now is None else now
+    when = _when(point["at"], now) if point.get("at") is not None else point.get("name", "?")
+    n = point.get("count")
+    if n is None:
+        return f"{when}   unreadable"
+    what = f"{n} session{'' if n == 1 else 's'}"
+    running, to_open = point.get("running", 0), point.get("to_open", n)
+    if n and not to_open:
+        what += " · all running"
+    elif running:
+        what += f" · {running} running, {to_open} to reopen"
+    mark = ""
+    if point.get("before_reboot"):
+        mark = "   ← last save before the restart" + (
+            f" ({_when(booted, now)})" if booted else "")
+    return f"{when}   {what}{mark}"
+
+
 def manifest_transcript_finder(manifest):
     """transcript_for for check_manifest: a saved session from another config dir
     has its transcript under that dir, not under the known roots."""

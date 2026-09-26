@@ -2501,6 +2501,134 @@ class TestTheUiCanReopenTheLastSave(unittest.TestCase):
             runner.restore = real
         self.assertIn("could not", said.lower())
 
+    def test_a_save_that_is_all_running_says_so_not_reopened(self):
+        def fake(argv):
+            print("already open: app - focus it with `ccwho open x`")
+            print("all 3 session(s) in that manifest are already running or starting.")
+            return 0
+        real = runner.restore
+        runner.restore = fake
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertIn("already running", said)
+        self.assertNotIn("reopened", said)
+
+    def test_a_file_that_is_not_a_save_is_never_opened(self):
+        self.write("2026-09-22T1000.json", [{"sessionId": "a"}])
+        self.write("notes.json", [{"sessionId": "b"}])
+        import builtins
+        opened = []
+        # a module global `open` shadows the builtin for ccwho.py only
+        runner.open = lambda path, *a, **k: (opened.append(os.path.basename(path))
+                                             or builtins.open(path, *a, **k))
+        try:
+            points = self.points()
+        finally:
+            del runner.open
+        self.assertNotIn("notes.json", opened)
+        self.assertIn("2026-09-22T1000.json", opened)                   # control
+        self.assertEqual(len(points), 1)
+
+    def test_a_chosen_save_is_not_called_the_last_save(self):
+        real = runner.restore
+        runner.restore = lambda argv: 0
+        try:
+            said = runner.reopen_saved("/x/2026-09-22T1000.json")
+            plain = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertNotIn("last save", said)
+        self.assertIn("last save", plain)                                # control
+
+    def test_starting_is_not_called_running(self):
+        def fake(argv):
+            print("all 3 session(s) in that manifest are already running or starting.")
+            return 0
+        real = runner.restore
+        runner.restore = fake
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertIn("already running or starting", said)
+
+    def test_a_chosen_save_is_the_one_restored(self):
+        seen = []
+        real = runner.restore
+        runner.restore = lambda argv: seen.append(argv) or 0
+        try:
+            runner.reopen_saved("/x/2026-09-22T1000.json")
+        finally:
+            runner.restore = real
+        self.assertEqual(seen, [["--open", "--from", "/x/2026-09-22T1000.json"]])
+
+    def points(self, live_ids=(), booted=None):
+        real = runner.booted_at
+        runner.booted_at = lambda: booted
+        try:
+            return runner.save_points(live_ids)
+        finally:
+            runner.booted_at = real
+
+    def test_the_menu_lists_every_save_newest_first_with_its_path(self):
+        self.write("2026-09-22T1000.json", [{"sessionId": "a"}])
+        self.write("2026-09-22T1200.json", [{"sessionId": "b"}, {"sessionId": "c"}])
+        points = self.points(live_ids={"c"})
+        self.assertEqual([(p["name"], p["count"], p["running"]) for p in points],
+                         [("2026-09-22T1200.json", 2, 1), ("2026-09-22T1000.json", 1, 0)])
+        self.assertEqual(points[0]["path"],
+                         os.path.join(self.dir, "restore", "2026-09-22T1200.json"))
+
+    def test_the_menu_marks_the_save_before_the_restart(self):
+        self.write("2026-09-22T1000.json", [{"sessionId": "a"}])
+        self.write("2026-09-22T1200.json", [{"sessionId": "b"}])
+        boot = int(time.mktime((2026, 9, 22, 11, 0, 0, 0, 0, -1)))
+        points = self.points(booted=boot)
+        self.assertEqual([p["name"] for p in points if p["before_reboot"]],
+                         ["2026-09-22T1000.json"])
+        self.assertTrue(all(p["booted"] == boot for p in points))
+
+    def test_a_broken_save_is_in_the_menu_as_unreadable(self):
+        with open(os.path.join(self.dir, "restore", "2026-09-22T1300.json"), "w") as fh:
+            fh.write("{not json")
+        self.assertEqual([p["count"] for p in self.points()], [None])
+
+    def test_no_restore_dir_is_an_empty_menu(self):
+        shutil.rmtree(os.path.join(self.dir, "restore"))
+        self.assertEqual(self.points(), [])
+
+    def test_a_restore_dir_it_cannot_read_raises_not_nothing_saved(self):
+        real = runner.os.listdir
+        def denied(d):
+            raise PermissionError(13, "Permission denied", d)
+        runner.os.listdir = denied
+        try:
+            with self.assertRaises(PermissionError):
+                self.points()
+        finally:
+            runner.os.listdir = real
+
+    def test_boot_time_comes_from_sysctl(self):
+        real = runner.subprocess.run
+        runner.subprocess.run = lambda *a, **k: runner.subprocess.CompletedProcess(
+            a[0], 0, "{ sec = 1790423298, usec = 5 } Sat Sep 26 12:48:18 2026\n", "")
+        try:
+            self.assertEqual(runner.booted_at(), 1790423298)
+        finally:
+            runner.subprocess.run = real
+
+    def test_no_sysctl_is_no_boot_time_not_a_crash(self):
+        def boom(*a, **k):
+            raise OSError("no sysctl")
+        real = runner.subprocess.run
+        runner.subprocess.run = boom
+        try:
+            self.assertIsNone(runner.booted_at())
+        finally:
+            runner.subprocess.run = real
+
 
 class TestOpenGivesABackgroundSessionAWindow(unittest.TestCase):
     """`ccwho open` on a running background session: put it in a terminal, do

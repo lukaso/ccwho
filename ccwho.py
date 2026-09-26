@@ -1711,8 +1711,45 @@ def newest_manifest():
     return man if isinstance(man, dict) else {}
 
 
-def reopen_saved():
-    """What `o` in the list does: the same restore the command line runs.
+def booted_at():
+    """When the Mac last started, or None. Never raises: it only adds a mark."""
+    try:
+        r = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return engine.boot_time(r.stdout) if r.returncode == 0 else None
+
+
+def save_points(live_ids=()):
+    """Every save, newest first, for the `o` menu - each with its path, what it
+    holds, how much of it runs now, and the mark on the last one before the
+    restart. A save it cannot read is listed as unreadable; no restore dir is
+    no saves. A dir it cannot read raises: [] would say "nothing saved"."""
+    d = restore_dir()
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return []
+    saves = []
+    # the name first: anything else in there - a FIFO, a big file - is never read
+    for n in (n for n in names if engine._MANIFEST_NAME.match(n)):
+        try:
+            with open(os.path.join(d, n)) as fh:
+                man = json.load(fh)
+        except (OSError, ValueError):
+            man = None
+        saves.append((n, man if isinstance(man, dict) else None))
+    booted = booted_at()
+    points = engine.save_points(saves, live_ids=live_ids, booted=booted)
+    for p in points:
+        p["path"], p["booted"] = os.path.join(d, p["name"]), booted
+    return points
+
+
+def reopen_saved(path=None):
+    """What `o` in the list does: the same restore the command line runs, on
+    the save chosen in its menu (the newest when none is named).
 
     Not a second implementation - every guard that stops a bulk reopen forking
     live conversations lives in restore(), and one of those written twice is
@@ -1720,14 +1757,19 @@ def reopen_saved():
     """
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-        rc = restore(["--open"])
+        rc = restore(["--open"] + (["--from", path] if path else []))
     if rc:
         tail = [l for l in out.getvalue().splitlines() if l.strip()]
         return "could not reopen: " + (tail[-1] if tail else "see `ccwho restore --open`")
     text = out.getvalue()
+    m = re.search(r"^(all \d+ session\(s\)) in that manifest (are already running[^.\n]*)",
+                  text, re.M)
+    if m:
+        return f"{m.group(1)} in that save {m.group(2)}"
     m = re.search(r"^opened (\d+) window", text, re.M)
     left = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: not reopening"))
-    said = f"reopened {m.group(1)} session(s)" if m else "reopened the last save"
+    said = (f"reopened {m.group(1)} session(s)" if m
+            else "reopened that save" if path else "reopened the last save")
     return said + (f", {left} left out - they could not resume" if left else "")
 
 

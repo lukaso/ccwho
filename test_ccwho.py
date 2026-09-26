@@ -1749,6 +1749,129 @@ class NewestManifest(unittest.TestCase):
         self.assertIsNone(ccwho.newest_manifest(["readme.md"]))
 
 
+def _local(y, mo, d, h, mi):
+    """An epoch for a wall-clock time here, so the tests pass in any timezone."""
+    import time
+    return int(time.mktime((y, mo, d, h, mi, 0, 0, 0, -1)))
+
+
+def _man(at, *sids):
+    return {"version": 1, "savedAt": at, "count": len(sids), "skipped": 0,
+            "sessions": [{"sessionId": s, "cwd": "/p", "project": "p"} for s in sids]}
+
+
+class BootTime(unittest.TestCase):
+    """When the Mac last started: `sysctl -n kern.boottime`."""
+
+    def test_reads_the_seconds(self):
+        self.assertEqual(ccwho.boot_time(
+            "{ sec = 1790423298, usec = 678588 } Sat Sep 26 12:48:18 2026\n"), 1790423298)
+
+    def test_junk_is_none_not_a_crash(self):
+        for junk in ("", None, "nope", "{ usec = 5 }"):
+            self.assertIsNone(ccwho.boot_time(junk), repr(junk))
+
+
+class SavePoints(unittest.TestCase):
+    """What `o` offers: every save, newest first, with what it holds and what
+    reopening it would do - and which one was the last before the restart."""
+
+    A, B, C = "a" * 8, "b" * 8, "c" * 8
+
+    def saves(self):
+        return [("2026-09-26T1020.json", _man(_local(2026, 9, 26, 10, 20), self.A, self.B, self.C)),
+                ("2026-09-26T1222.json", _man(_local(2026, 9, 26, 12, 22), self.A, self.B, self.C)),
+                ("2026-09-26T1310.json", _man(_local(2026, 9, 26, 13, 10), self.A))]
+
+    def test_newest_first(self):
+        names = [p["name"] for p in ccwho.save_points(self.saves())]
+        self.assertEqual(names, ["2026-09-26T1310.json", "2026-09-26T1222.json",
+                                 "2026-09-26T1020.json"])
+
+    def test_counts_what_it_holds_and_what_is_running_now(self):
+        p = ccwho.save_points(self.saves(), live_ids={self.A, "zzzz"})[1]
+        self.assertEqual((p["count"], p["running"], p["to_open"]), (3, 1, 2))
+
+    def test_one_session_saved_twice_counts_once(self):
+        p = ccwho.save_points([("2026-09-26T1020.json",
+                                _man(_local(2026, 9, 26, 10, 20), self.A, self.A))])[0]
+        self.assertEqual(p["count"], 1, "restore opens one process per transcript")
+
+    def test_the_last_save_before_the_restart_is_marked(self):
+        points = ccwho.save_points(self.saves(), booted=_local(2026, 9, 26, 12, 48))
+        self.assertEqual([p["name"] for p in points if p["before_reboot"]],
+                         ["2026-09-26T1222.json"])
+
+    def test_the_mark_skips_an_unreadable_save(self):
+        saves = self.saves() + [("2026-09-26T1230.json", None)]
+        points = ccwho.save_points(saves, booted=_local(2026, 9, 26, 12, 48))
+        self.assertEqual([p["name"] for p in points if p["before_reboot"]],
+                         ["2026-09-26T1222.json"])
+
+    def test_no_boot_time_marks_nothing(self):                            # control
+        self.assertFalse(any(p["before_reboot"] for p in ccwho.save_points(self.saves())))
+
+    def test_a_restart_before_every_save_marks_nothing(self):             # control
+        points = ccwho.save_points(self.saves(), booted=_local(2026, 9, 1, 0, 0))
+        self.assertFalse(any(p["before_reboot"] for p in points))
+
+    def test_no_savedAt_falls_back_to_the_name(self):
+        man = _man(None, self.A)
+        del man["savedAt"]
+        p = ccwho.save_points([("2026-09-26T1020.json", man)])[0]
+        self.assertEqual(p["at"], _local(2026, 9, 26, 10, 20))
+
+    def test_an_unreadable_save_is_listed_not_dropped(self):
+        points = ccwho.save_points([("2026-09-26T1020.json", None)])
+        self.assertEqual(len(points), 1)
+        self.assertIsNone(points[0]["count"])
+
+    def test_a_damaged_session_id_does_not_stop_the_menu(self):
+        bad = _man(_local(2026, 9, 26, 10, 20), self.A)
+        bad["sessions"].append({"sessionId": [1], "cwd": "/p"})
+        points = ccwho.save_points(self.saves()[1:2] + [("2026-09-26T1020.json", bad)])
+        self.assertEqual([p["count"] for p in points], [3, 1])
+
+    def test_anything_not_a_manifest_name_is_left_out(self):
+        self.assertEqual(ccwho.save_points([("notes.md", _man(1, self.A))]), [])
+
+
+class SavePointLine(unittest.TestCase):
+    NOW = _local(2026, 9, 26, 13, 15)
+    BOOT = _local(2026, 9, 26, 12, 48)
+
+    def line(self, **kw):
+        p = {"name": "2026-09-26T1222.json", "at": _local(2026, 9, 26, 12, 22),
+             "count": 12, "running": 0, "to_open": 12, "before_reboot": False}
+        p.update(kw)
+        return ccwho.save_point_line(p, now=self.NOW, booted=self.BOOT)
+
+    def test_says_when_and_how_many(self):
+        text = self.line()
+        self.assertIn("today 12:22", text)
+        self.assertIn("12 sessions", text)
+
+    def test_yesterday_and_older_say_so(self):
+        self.assertIn("yesterday 18:04", self.line(at=_local(2026, 9, 25, 18, 4)))
+        self.assertIn("Thu 24 Sep 09:10", self.line(at=_local(2026, 9, 24, 9, 10)))
+
+    def test_says_what_reopening_it_would_do(self):
+        self.assertIn("1 running, 11 to reopen", self.line(running=1, to_open=11))
+        self.assertIn("all running", self.line(running=12, to_open=0))
+
+    def test_marks_the_last_save_before_the_restart_with_its_time(self):
+        text = self.line(before_reboot=True)
+        self.assertIn("last save before the restart", text)
+        self.assertIn("12:48", text)
+        self.assertNotIn("restart", self.line())                        # control
+
+    def test_one_session_is_singular(self):
+        self.assertIn("1 session ", self.line(count=1, to_open=1) + " ")
+
+    def test_an_unreadable_save_says_so(self):
+        self.assertIn("unreadable", self.line(count=None))
+
+
 class RenderRestore(unittest.TestCase):
     def man(self, **kw):
         base = dict(version=1, savedAt=1788196525, count=2, skipped=1, sessions=[

@@ -33,6 +33,15 @@ BUSY = row("bbbb2222-0000-4000-8000-000000000002", "busy", title="Release queue"
            tab_title="✳ Release queue (claude)", tty="ttys007", since="2m")
 
 
+_NOW = __import__("time").time()
+POINTS = [
+    {"name": "2026-09-26T1310.json", "path": "/r/2026-09-26T1310.json", "at": _NOW - 300,
+     "count": 1, "running": 1, "to_open": 0, "before_reboot": False, "booted": _NOW - 1800},
+    {"name": "2026-09-26T1222.json", "path": "/r/2026-09-26T1222.json", "at": _NOW - 3000,
+     "count": 12, "running": 1, "to_open": 11, "before_reboot": True, "booted": _NOW - 1800},
+]
+
+
 class FakeCollector:
     def __init__(self, fleet=None, brief=None):
         self.fleet_value = fleet or ui.Fleet([LIVE, BUSY], True, "12:00:00")
@@ -64,8 +73,11 @@ class FakeCollector:
     def saved_count(self):
         return self.saved
 
-    def restore(self):
+    def restore(self, path=None):
         return "reopened 14 session(s)"
+
+    def save_points(self, live_ids=()):
+        return [dict(p) for p in POINTS]
 
     reloads = 0
 
@@ -2132,61 +2144,227 @@ class TestYouCanTellWhenYouAreSearching(UiTest):
                              str(app.query_one("#header").content).lower())
 
 
-class TestTheEmptyListCanBringThemBack(UiTest):
-    """The empty list has always said "o = restore the last save" and there was
-    no o binding: the screen advertised a key that did nothing. It does it now,
-    and only from an empty list - pressing o with fifteen sessions running must
-    never start fifteen more."""
+class TestOOffersTheSaves(UiTest):
+    """o opens a menu of every save, newest first and highlighted. It used to
+    work only on an empty list - so after a restart, with the loops started
+    first, o did nothing at all. restore() skips every session that is still
+    running, so o is always there."""
+
+    def setUp(self):
+        self.restored = []
+        self.asked = []
+        self.real = (FakeCollector.restore, FakeCollector.save_points)
+        FakeCollector.restore = lambda s, path=None: (self.restored.append(path)
+                                                      or "reopened 11 session(s)")
+        FakeCollector.save_points = lambda s, live_ids=(): (
+            self.asked.append(set(live_ids)) or [dict(p) for p in self.points])
+        self.addCleanup(self.put_back)
+        self.points = POINTS
+
+    def put_back(self):
+        FakeCollector.restore, FakeCollector.save_points = self.real
 
     def empty(self):
         return FakeCollector(fleet=ui.Fleet([], True, "12:00:00"))
 
-    def setUp(self):
-        self.restored = []
-        self.real = FakeCollector.restore
-        FakeCollector.restore = lambda s: self.restored.append(1) or "reopened 14"
-        self.addCleanup(setattr, FakeCollector, "restore", self.real)
+    async def opened(self, pilot):
+        await pilot.pause()
+        await pilot.press("o")
+        for _ in range(4):
+            await pilot.pause()
 
-    async def test_o_reopens_the_last_save(self):
+    def menu_text(self, app):
+        box = app.screen.query_one("#saves")
+        return "\n".join(str(box.get_option_at_index(i).prompt)
+                         for i in range(box.option_count))
+
+    async def test_o_opens_the_menu_while_sessions_are_running(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            self.assertIsInstance(app.screen, ui.SavesMenu)
+
+    async def test_o_opens_the_menu_on_an_empty_list(self):
         app = self.app(collector=self.empty())
         async with app.run_test() as pilot:
-            await pilot.pause()
-            await pilot.press("o")
-            await pilot.pause()
-            await pilot.pause()
-            self.assertEqual(self.restored, [1])
+            await self.opened(pilot)
+            self.assertIsInstance(app.screen, ui.SavesMenu)
 
-    async def test_it_says_what_happened(self):
-        app = self.app(collector=self.empty())
+    async def test_the_menu_asks_about_the_sessions_running_now(self):
+        app = self.app()
         async with app.run_test() as pilot:
-            await pilot.pause()
-            await pilot.press("o")
-            await pilot.pause()
-            await pilot.pause()
-            self.assertIn("reopened", str(app.query_one("#header").content))
+            await self.opened(pilot)
+            self.assertEqual(self.asked, [{LIVE["sessionId"], BUSY["sessionId"]}])
 
-    async def test_o_does_nothing_while_sessions_are_running(self):   # control
+    async def test_each_line_says_when_how_many_and_the_restart(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            text = self.menu_text(app)
+            self.assertIn("12 sessions", text)
+            self.assertIn("1 running, 11 to reopen", text)
+            self.assertIn("last save before the restart", text)
+            self.assertEqual(len(text.splitlines()), 2)
+
+    async def test_the_newest_is_highlighted(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            self.assertEqual(app.screen.query_one("#saves").highlighted, 0)
+
+    async def test_enter_reopens_the_newest(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.press("enter")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertEqual(self.restored, [POINTS[0]["path"]])
+            self.assertNotIsInstance(app.screen, ui.SavesMenu)
+
+    async def test_down_then_enter_reopens_the_older_one(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.press("down", "enter")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertEqual(self.restored, [POINTS[1]["path"]])
+
+    async def test_a_click_on_a_line_reopens_that_one(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            box = app.screen.query_one("#saves")
+            # the SECOND line, not the highlighted one: a click names its line
+            await pilot.click(box, offset=(3, 1))      # no border: y=1 is line 2
+            for _ in range(4):
+                await pilot.pause()
+            self.assertEqual(self.restored, [POINTS[1]["path"]])
+
+    async def test_j_and_k_move_the_menu_not_the_list_behind_it(self):
         app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("o")
+            before = app.selected
+            await self.opened(pilot)
+            await pilot.press("j")
             await pilot.pause()
+            self.assertEqual(app.screen.query_one("#saves").highlighted, 1)
+            self.assertEqual(app.selected, before)
+            await pilot.press("k")
             await pilot.pause()
-            self.assertEqual(self.restored, [],
-                             "fifteen running sessions must not become thirty")
+            self.assertEqual(app.screen.query_one("#saves").highlighted, 0)
 
-    async def test_the_offer_is_only_made_when_there_is_a_save(self):
-        real = FakeCollector.saved_count
-        FakeCollector.saved_count = lambda s: 0
-        try:
-            app = self.app(collector=self.empty())
-            async with app.run_test() as pilot:
+    async def test_the_list_keys_do_nothing_behind_the_menu(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.press("p", "o", "slash")
+            for _ in range(4):
                 await pilot.pause()
-                self.assertNotIn(" o ", self.screen_text(app))
-        finally:
-            FakeCollector.saved_count = real
+            self.assertFalse(app.detail_open, "p opened the process pane behind it")
+            self.assertEqual(len(app.screen_stack), 2, "o stacked a second menu")
+            self.assertFalse(app.query_one("#search").display)
 
-    async def test_the_offer_names_how_many(self):
+    async def test_two_quick_presses_open_one_menu(self):
+        slow = FakeCollector.save_points
+
+        def slowly(s, live_ids=()):
+            import time
+            time.sleep(0.4)
+            return slow(s, live_ids)
+        FakeCollector.save_points = slowly
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o", "o")
+            for _ in range(10):
+                await pilot.pause(0.1)
+            self.assertEqual(len(app.screen_stack), 2)
+            self.assertEqual(len(self.asked), 1)
+
+    async def test_the_close_mark_closes_it_with_a_click(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.click("#savesclose")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.SavesMenu)
+            self.assertEqual(self.restored, [])
+
+    async def test_a_click_outside_the_box_closes_it(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.click(offset=(0, 0))
+            for _ in range(4):
+                await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.SavesMenu)
+            self.assertEqual(self.restored, [])
+
+    async def test_a_click_inside_the_box_keeps_it(self):                 # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.click("#saveshead")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertIsInstance(app.screen, ui.SavesMenu)
+
+    async def test_a_failed_read_says_so_and_o_still_works(self):
+        calls = []
+
+        def broken(s, live_ids=()):
+            calls.append(1)
+            raise OSError("disk says no")
+        FakeCollector.save_points = broken
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            header = str(app.query_one("#header").content)
+            self.assertIn("could not read the saves", header)
+            self.assertNotIn("nothing saved", header)
+            self.assertFalse(app.loading)
+            await self.opened(pilot)
+            self.assertEqual(len(calls), 2, "o must not go dead after a failed read")
+
+    async def test_escape_closes_it_and_reopens_nothing(self):           # control
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.press("escape")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertEqual(self.restored, [])
+            self.assertNotIsInstance(app.screen, ui.SavesMenu)
+
+    async def test_it_says_what_happened(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            await pilot.press("enter")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertIn("reopened", str(app.query_one("#header").content))
+
+    async def test_nothing_saved_says_so_and_opens_no_menu(self):
+        self.points = []
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            self.assertNotIsInstance(app.screen, ui.SavesMenu)
+            self.assertIn("ccwho save", str(app.query_one("#header").content))
+
+    async def test_o_is_named_in_the_footer(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            shown = [b.key for b in app.BINDINGS if b.show]
+            self.assertIn("o", shown)
+
+    async def test_the_empty_list_offer_names_how_many(self):
         real = FakeCollector.saved_count
         FakeCollector.saved_count = lambda s: 14
         try:
@@ -2194,6 +2372,18 @@ class TestTheEmptyListCanBringThemBack(UiTest):
             async with app.run_test() as pilot:
                 await pilot.pause()
                 self.assertIn("14", self.screen_text(app))
+                self.assertIn("o = choose a save to reopen", self.screen_text(app))
+        finally:
+            FakeCollector.saved_count = real
+
+    async def test_no_save_no_offer(self):                                 # control
+        real = FakeCollector.saved_count
+        FakeCollector.saved_count = lambda s: 0
+        try:
+            app = self.app(collector=self.empty())
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                self.assertNotIn(" o ", self.screen_text(app))
         finally:
             FakeCollector.saved_count = real
 

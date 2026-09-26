@@ -32,9 +32,11 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from textual import events, on, work                                       # noqa: E402
 from textual.app import App, ComposeResult                         # noqa: E402
+from textual.screen import ModalScreen                             # noqa: E402
 from textual.binding import Binding                                # noqa: E402
-from textual.containers import Horizontal, VerticalScroll          # noqa: E402
-from textual.widgets import Footer, Input, Static                  # noqa: E402
+from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
+from textual.widgets import Footer, Input, OptionList, Static      # noqa: E402
+from textual.widgets.option_list import Option                     # noqa: E402
 from rich.text import Text                                         # noqa: E402
 
 import ccwho_engine as engine                                      # noqa: E402
@@ -227,6 +229,82 @@ class Row(Static):
         self.update(self._as_text(width))
 
 
+class SavesMenu(ModalScreen):
+    """Which save to reopen: every one, newest first and highlighted.
+
+    Enter or a click on a line reopens that save; Esc closes. The answer is the
+    save's path, or None. The newest save is not always the one you want: the
+    autosave keeps writing after a restart, so it can hold only what you
+    started since - the loops, first - and the line marked "last save before
+    the restart" is the fleet the restart took away.
+    """
+
+    DEFAULT_CSS = """
+    SavesMenu { align: center middle; }
+    #savesbox { width: 90%; max-width: 100; height: auto; max-height: 80%;
+                border: round $accent; background: $surface; padding: 0 1; }
+    #savestop { height: auto; }
+    #saveshead { color: $text-muted; width: 1fr; }
+    #savesclose { width: 3; color: $text-muted; }
+    #savesclose:hover { background: $accent; color: $text; }
+    #saves { height: auto; max-height: 20; border: none; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "close"),
+        Binding("j", "down", "down", show=False),
+        Binding("k", "up", "up", show=False),
+    ]
+
+    def __init__(self, points):
+        super().__init__()
+        self.points = points
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="savesbox"):
+            with Horizontal(id="savestop"):
+                yield Static("reopen a save - enter or click a line, esc to close."
+                             " Sessions still running are left alone.",
+                             id="saveshead", markup=False)
+                # the owner's iTerm2 passes only a plain left click: Esc is
+                # not the only way out
+                yield Static(" ✕ ", id="savesclose", markup=False)
+            yield OptionList(*[Option(Text(engine.save_point_line(
+                                   p, booted=p.get("booted")), no_wrap=True,
+                                   overflow="ellipsis"), id=p["path"])
+                               for p in self.points], id="saves")
+
+    def on_mount(self):
+        # OptionList starts on its first line, the newest save. Behind this
+        # screen the list's own keys are off (Textual's modal), so j moves here
+        self.query_one("#saves").focus()
+
+    @on(OptionList.OptionSelected, "#saves")
+    def chosen(self, event):
+        self.dismiss(event.option.id)
+
+    def action_close(self):
+        self.dismiss(None)
+
+    @on(events.Click)
+    def clicked(self, event):
+        """The ✕, or anywhere outside the box, closes it."""
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget.id == "savesclose":
+            self.dismiss(None)
+            return
+        while widget is not None and widget.id != "savesbox":
+            widget = widget.parent
+        if widget is None:
+            self.dismiss(None)
+
+    def action_down(self):
+        self.query_one("#saves").action_cursor_down()
+
+    def action_up(self):
+        self.query_one("#saves").action_cursor_up()
+
+
 class CcwhoUi(App):
     """The screen. Everything it knows comes from a Fleet snapshot."""
 
@@ -268,7 +346,7 @@ class CcwhoUi(App):
         Binding("p", "procs", "processes"),
         Binding("j,down", "next", "down", show=False),
         Binding("k,up", "prev", "up", show=False),
-        Binding("o", "reopen", "reopen", show=False),
+        Binding("o", "reopen", "reopen"),
         Binding("x", "kill_loop", "kill loop", show=False),
         Binding("r", "restart", "restart", show=False),
         Binding("q", "quit", "quit"),
@@ -301,6 +379,7 @@ class CcwhoUi(App):
         self.reviewing = {}     # session id -> row, looked at by a jump that landed
         self.jumps = 0          # which jump is the latest: only its answer ends it
         self.seen = {}          # session id -> the turn (ts) you looked at
+        self.loading = False    # the saves are being read for the o menu
 
     # ------------------------------------------------------------------ layout
 
@@ -587,7 +666,7 @@ class CcwhoUi(App):
         saved = self.collector.saved_count()
         if saved:
             return (f"  No Claude Code sessions running."
-                    f"   o = reopen the {saved} from the last save")
+                    f"   o = choose a save to reopen (the newest holds {saved})")
         return "  No Claude Code sessions running, and nothing saved to reopen."
 
     def paint_header(self, groups):
@@ -1153,21 +1232,54 @@ class CcwhoUi(App):
         self.paint_header(self.fleet.groups(self.filter_text))
 
     def action_reopen(self):
-        """Bring back the last saved fleet - but only when nothing is running.
+        """Offer every save, whatever is running.
 
-        The empty list has always offered this and no key did it. Offering it
-        with sessions alive would be a way to start a second copy of every one
-        of them, so the offer and the key both belong to an empty list.
+        It used to work only on an empty list, for fear of a second copy of
+        every running session. restore() already leaves each running session
+        alone, one by one - and "only when empty" meant that after a restart,
+        with the loops started first, o did nothing.
         """
-        if self.fleet.rows:
-            return
-        self.status = "reopening the last save..."
+        if self.loading:
+            return          # one menu: a second o while the first is read is the same ask
+        self.loading = True
+        self.status = "reading the saves..."
         self.paint_header(self.fleet.groups(self.filter_text))
-        self.reopening()
+        self.loading_saves({r.get("sessionId") for r in self.fleet.rows
+                            if r.get("sessionId")})
+
+    @work(thread=True, exclusive=True, group="saves")
+    def loading_saves(self, live_ids):
+        """Off the UI thread: it reads every save and asks sysctl for the boot.
+        A failure is said, never raised: a worker that raises takes the whole
+        list down, and one that never answers leaves o dead."""
+        try:
+            points = self.collector.save_points(live_ids)
+        except Exception as ex:
+            points = f"could not read the saves: {ex}"
+        self.call_from_thread(self.offer_saves, points)
+
+    def offer_saves(self, points):
+        self.loading = False
+        if isinstance(points, str):
+            self.said(points)
+            return
+        if not points:
+            self.said("nothing saved yet - `ccwho save` keeps the list for a restart")
+            return
+        self.status = ""
+        self.paint_header(self.fleet.groups(self.filter_text))
+        self.push_screen(SavesMenu(points), callback=self.chose_save)
+
+    def chose_save(self, path):
+        if not path:
+            return
+        self.status = "reopening that save..."
+        self.paint_header(self.fleet.groups(self.filter_text))
+        self.reopening(path)
 
     @work(thread=True)
-    def reopening(self):
-        said = self.collector.restore()
+    def reopening(self, path):
+        said = self.collector.restore(path)
         self.call_from_thread(self.said, said)
 
     def action_restart(self):
@@ -1286,11 +1398,17 @@ class Collector:
         except Exception:
             return 0
 
-    def restore(self):
-        """Reopen the saved fleet, by running ccwho's own restore."""
+    def save_points(self, live_ids=()):
+        """Every save for the `o` menu, newest first. It raises when it cannot
+        read them: [] would say "nothing saved", which is not what happened."""
+        import ccwho as runner
+        return runner.save_points(live_ids)
+
+    def restore(self, path=None):
+        """Reopen a save, by running ccwho's own restore."""
         try:
             import ccwho as runner
-            return runner.reopen_saved()
+            return runner.reopen_saved(path)
         except Exception as ex:
             return f"could not reopen: {ex}"
 

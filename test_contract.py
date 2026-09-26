@@ -30,6 +30,8 @@ ROW_KEYS = {
     "procs", "ports",     # added 2026-09-24: the session's work processes, their ports
     "dead_loops",         # added 2026-09-24: its wait loops that can never end
     "entrypoint",         # added 2026-09-26: who started it - cli, or a program (sdk-*)
+    "parked",             # added 2026-09-26: ids of terminals that parked this job
+                          # (ctrl+b) - they show it, and have no row of their own
 }
 
 # Every key a manifest session entry has ever carried. Append only.

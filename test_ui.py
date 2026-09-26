@@ -2203,6 +2203,13 @@ class TestOOffersTheSaves(UiTest):
             await self.opened(pilot)
             self.assertEqual(self.asked, [{LIVE["sessionId"], BUSY["sessionId"]}])
 
+    async def test_a_terminal_that_parked_a_job_is_running_too(self):
+        job = row("4e3efc1d-3639-4af3-91e9-6d6373c1cf94", parked=["fc509261-e383-4ed4-aacc-44087dc5a599"])
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([job], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            self.assertEqual(self.asked, [{job["sessionId"], job["parked"][0]}])
+
     async def test_each_line_says_when_how_many_and_the_restart(self):
         app = self.app()
         async with app.run_test() as pilot:

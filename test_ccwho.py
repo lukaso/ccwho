@@ -2870,6 +2870,92 @@ class TestCollectReportsAnUnparseableSource(MachinelessCollect):
         self.assertIs(status["source_ok"], True)      # control
 
 
+class TestCollectShowsNoDaemonRows(MachinelessCollect):
+    """The spare and the parked terminal come from session files only; the
+    list, the TUI and `ccwho save` all read collect's rows, so none may hold them."""
+
+    JOB = "4e3efc1d-3639-4af3-91e9-6d6373c1cf94"
+    SPARE = "49dc1790-be8a-4c68-98de-153189ebc981"
+    PARKED = "fc509261-e383-4ed4-aacc-44087dc5a599"
+
+    def collect(self, files):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: json.dumps([
+            {"pid": 3, "id": "4e3efc1d", "sessionId": self.JOB, "cwd": "/x",
+             "kind": "background", "status": "idle"}])
+        ccwho.live_file_sessions = lambda *a, **k: (files, 0)
+        try:
+            return ccwho.collect(cache={}, status={})[0]
+        finally:
+            ccwho.agents_json = real
+
+    PARKED_ROW = {"pid": 2, "sessionId": PARKED, "cwd": "/x", "kind": "interactive",
+                  "status": "busy", "parkedJobId": "4e3efc1d"}
+
+    def test_a_parked_terminal_that_runs_is_never_resumed(self):
+        # hidden is not closed: `claude --resume` on it would be a second
+        # process on a live transcript. Its window shows the job: open that
+        rows = self.collect([self.PARKED_ROW])
+        action, value = ccwho.resolve_open(self.PARKED, rows,
+                                           [{"sessionId": self.PARKED, "cwd": "/x"}])
+        self.assertEqual((action, value), ("attach", "claude attach 4e3efc1d"))
+
+    def test_a_parked_terminal_that_ended_is_resumed(self):          # control
+        rows = self.collect([])
+        action, _ = ccwho.resolve_open(self.PARKED, rows,
+                                       [{"sessionId": self.PARKED, "cwd": "/x"}])
+        self.assertEqual(action, "resume")
+
+    def test_the_job_row_answers_to_the_parked_id(self):
+        rows = self.collect([self.PARKED_ROW])
+        self.assertEqual(rows[0]["parked"], [self.PARKED])
+        self.assertEqual([r["sessionId"] for r in ccwho.match_rows(rows, "fc509261")],
+                         [self.JOB])
+
+    def test_what_the_parked_terminal_started_names_the_job(self):
+        rows = self.collect([self.PARKED_ROW])
+        rows[0].update(project="ccwho", title="TUI copy-paste")
+        fleet = {"by_session": {self.PARKED: [{"pid": 9, "helper": False, "ports": [3000]}]}}
+        listed = ccwho.ps_listing(rows, fleet)
+        self.assertEqual(listed[0]["who"], "ccwho · TUI copy-paste")
+        att = {"sessions": fleet["by_session"], "left_behind": [], "codex": []}
+        self.assertEqual(ccwho._fleet(att, rows, True)["agent_ports"][0]["who"], "ccwho")
+
+    def test_the_parked_terminal_counts_as_running(self):
+        rows = self.collect([self.PARKED_ROW])
+        self.assertEqual(ccwho.live_ids(rows), {self.JOB, self.PARKED})
+        self.assertEqual(ccwho.live_ids(self.collect([])), {self.JOB})  # control
+
+    def test_a_terminal_behind_a_chain_of_parked_jobs_is_never_resumed(self):
+        mid = "11111111-2222-4333-8444-555555555555"
+        # PARKED parked job aaaaaaaa (mid), and mid was parked again as 4e3efc1d
+        rows = self.collect([
+            dict(self.PARKED_ROW, parkedJobId="aaaaaaaa"),
+            {"pid": 4, "sessionId": mid, "cwd": "/x", "kind": "background",
+             "status": "idle", "id": "aaaaaaaa", "parkedJobId": "4e3efc1d"}])
+        self.assertEqual([(r["sessionId"], r["parked"]) for r in rows],
+                         [(self.JOB, sorted([self.PARKED, mid]))])
+        action, _ = ccwho.resolve_open(self.PARKED, rows,
+                                       [{"sessionId": self.PARKED, "cwd": "/x"}])
+        self.assertNotEqual(action, "resume")
+
+    def test_only_the_job_is_a_row(self):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: json.dumps([
+            {"pid": 3, "id": "4e3efc1d", "sessionId": self.JOB, "cwd": "/x",
+             "kind": "background", "status": "idle"}])
+        ccwho.live_file_sessions = lambda *a, **k: ([
+            {"pid": 1, "sessionId": self.SPARE, "cwd": "/x", "kind": "background",
+             "status": "idle", "id": "49dc1790", "spare": True},
+            {"pid": 2, "sessionId": self.PARKED, "cwd": "/x", "kind": "interactive",
+             "status": "busy", "parkedJobId": "4e3efc1d"}], 0)
+        try:
+            rows, _ = ccwho.collect(cache={}, status={})
+        finally:
+            ccwho.agents_json = real
+        self.assertEqual([r["sessionId"] for r in rows], [self.JOB])
+
+
 class TestRowsCarryTheRecap(unittest.TestCase):
     """The list's second line is the recap, so the row has to have one. It comes
     from the windows the engine already read for that session - no extra work."""

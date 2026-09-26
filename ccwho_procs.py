@@ -154,8 +154,69 @@ def live_session_files(entries, starts):
         row["kind"] = _KIND.get(e.get("kind"), e.get("kind") or "interactive")
         if e.get("jobId"):
             row["id"] = e["jobId"]
+        # the daemon's bookkeeping, kept so shown_sessions can leave it out
+        if e.get("spare") is True:
+            row["spare"] = True
+        if isinstance(e.get("parkedJobId"), str) and e["parkedJobId"]:
+            row["parkedJobId"] = e["parkedJobId"]
         out.append(row)
     return out
+
+
+def parked_terminals(sessions):
+    """hidden terminal's sessionId -> the sessionId of the row that answers for it.
+
+    A terminal that parked its conversation as a job (ctrl+b) shows that job
+    now; its own file stops at the status it had when it parked. It counts only
+    while the job is a live session, whatever its status: after that, nothing
+    else shows its window. The row that answers for it is the job - or, when
+    that job was parked again, the first session along the chain that is
+    shown: the job at its end, or a member of a loop of parked jobs, which
+    keeps its own row. A spare has a job id too, and is not that job. The
+    feed's fields are not checked one by one, so an id that is not text is
+    nobody's job rather than a crash.
+    """
+    jobs = {s["id"]: s.get("sessionId") for s in sessions or []
+            if isinstance(s.get("id"), str) and s["id"] and not s.get("spare")}
+    shows = {s.get("sessionId"): jobs[s["parkedJobId"]] for s in sessions or []
+             if not s.get("spare") and isinstance(s.get("parkedJobId"), str)
+             and s["parkedJobId"] in jobs and s["parkedJobId"] != s.get("id")}
+    # A job can be parked again (A -> J1 -> J2): follow to the one that is shown.
+    # A loop has no end to show the window, so everyone on it keeps a row. Each
+    # walk is bounded by the map's size - these files come from other processes.
+    def on_a_loop(start):
+        sid = start
+        for _ in range(len(shows)):
+            sid = shows.get(sid)
+            if sid == start:
+                return True
+            if sid not in shows:
+                return False
+        return False
+    hidden = {t for t in shows if not on_a_loop(t)}
+    out = {}
+    for t in hidden:
+        # the first one along the way that is shown: the job at the end, or a
+        # member of a loop that keeps its row
+        sid = shows[t]
+        for _ in range(len(shows)):
+            if sid not in hidden:
+                break
+            sid = shows[sid]
+        out[t] = sid
+    return out
+
+
+def shown_sessions(sessions):
+    """The sessions that are rows: `claude agents --json` leaves out two kinds of
+    session file, and so does this - a spare (`claude bg-spare`, a process the
+    daemon starts ahead of the next background job, with no conversation), and
+    a terminal that parked a job that is still a live session, unless it is on
+    a loop of parked jobs (parked_terminals). Hidden is not closed: the row
+    parked_terminals names answers for the terminal (its `parked`)."""
+    hidden = parked_terminals(sessions)
+    return [s for s in sessions or []
+            if not s.get("spare") and s.get("sessionId") not in hidden]
 
 
 def merge_sessions(agent_rows, file_rows):

@@ -256,7 +256,7 @@ def _cmdline_orphans(ps_output, session_ids):
 
 def _fleet(att, rows, ports_ok, procs_ok=True, sessions_ok=True):
     """What the whole machine says, for the header and the bottom lines."""
-    project = {r.get("sessionId"): r.get("project", "?") for r in rows}
+    project = {sid: r.get("project", "?") for r in rows for sid in answers_for(r)}
     held = []
     for sid, mine in att["sessions"].items():
         held += [(port, p["pid"], project.get(sid, "?")) for p in mine
@@ -274,6 +274,17 @@ def _fleet(att, rows, ports_ok, procs_ok=True, sessions_ok=True):
             "procs_ok": procs_ok,
             "agent_ports": [{"port": port, "pid": pid, "who": who}
                             for port, pid, who in sorted(set(held))]}
+
+
+def answers_for(row):
+    """The session ids a row stands for: its own, and those of the terminals
+    that parked it (ctrl+b) - they have no row, and what they started is its."""
+    return [row.get("sessionId")] + list(row.get("parked") or [])
+
+
+def live_ids(rows):
+    """Every session id the rows say is running, the parked terminals included."""
+    return {sid for r in rows or [] for sid in answers_for(r) if sid}
 
 
 def _ps_rows(ps_output):
@@ -864,7 +875,9 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
     if not source_ok:
         return ("unknown", "cannot read the live session list")
     for r in live_rows or []:
-        if r.get("sessionId") == session_id:
+        # a terminal that parked a job shows it: the row that answers for it
+        # (parked_terminals) lists it in `parked`
+        if r.get("sessionId") == session_id or session_id in (r.get("parked") or []):
             tty = short_tty(r.get("tty", ""))
             if tty:
                 return ("jump", tty)
@@ -876,7 +889,8 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
             # not one to reopen. `claude attach` puts a running session in a
             # terminal; `claude --resume` would start a second process on a
             # live transcript.
-            return ("attach", attach_command(session_id, r.get("configDir")))
+            return ("attach", attach_command(r.get("sessionId") or session_id,
+                                             r.get("configDir")))
     for e_ in entries or []:
         if e_.get("sessionId") == session_id:
             cmd = restore_command(e_)
@@ -920,6 +934,8 @@ def match_rows(rows, query):
             hits.append(r)
         elif sid and sid.startswith(q):
             hits.append(r)
+        elif any(p.lower().startswith(q) for p in r.get("parked") or []):
+            hits.append(r)          # the terminal that parked it shows it
         elif q in (r.get("name") or "").lower():
             hits.append(r)
         elif q in (r.get("tab_title") or "").lower():
@@ -1996,6 +2012,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "work": work,
         "tty": tty,
         "tab_title": tab_title,
+        "parked": [],           # collect fills it: terminals that parked this job
         "recap": r["text"],
         "recap_ts": r["ts"],
         "recap_age": brief.age_between(r["ts"], now_iso(now)) if r["ts"] else "",
@@ -2187,7 +2204,10 @@ def collect(cache=None, status=None):
     reviewed = load_reviewed()
     rows = []
     parents, commands = parent_map(ps_out), command_map(ps_out)
-    for s in sessions:
+    # the spare and the parked terminal still count above - as live claude
+    # processes, and as owners of what they started - but are not rows
+    parked = procs.parked_terminals(sessions)
+    for s in procs.shown_sessions(sessions):
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
         # not ttys[pid]: a session served by the daemon reports a background
@@ -2204,6 +2224,7 @@ def collect(cache=None, status=None):
                               windowed=windowed(tty, titles),
                               dead_loops=dead))
         rows[-1]["procs"] = summary["procs"]
+        rows[-1]["parked"] = sorted(t for t, job in parked.items() if job == sid)
         # unknown is null, not [] - a script must not read "holds nothing"
         rows[-1]["ports"] = summary["ports"] if ports is not None else None
     rows.sort(key=sort_key)
@@ -2805,9 +2826,9 @@ def ps_listing(rows, fleet, show_all=False):
     `ccwho ps` prints and the process screen shows. Helpers (MCP servers and the
     like) only with show_all, except left behind: litter is litter."""
     fleet = fleet if isinstance(fleet, dict) else {}
-    titles = {r.get("sessionId"): (r.get("tab_title") or r.get("title") or r.get("name")
-                                   or "?") for r in rows or []}
-    project = {r.get("sessionId"): r.get("project", "?") for r in rows or []}
+    titles = {sid: (r.get("tab_title") or r.get("title") or r.get("name") or "?")
+              for r in rows or [] for sid in answers_for(r)}
+    project = {sid: r.get("project", "?") for r in rows or [] for sid in answers_for(r)}
     listed = []
     for sid, mine in (fleet.get("by_session") or {}).items():
         who = _one_line(f"{project.get(sid, '?')} · {titles.get(sid, '?')}")

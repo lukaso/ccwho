@@ -52,6 +52,31 @@ def tearDownModule():
         setattr(runner.engine, name, real)
 
 
+class TestASearchFindsTheJobForItsParkedTerminal(unittest.TestCase):
+    """The parked terminal (ctrl+b) has no row, but its transcript is the long
+    conversation a search finds. Running, it is the job's row - not "ended"."""
+
+    JOB = "4e3efc1d-3639-4af3-91e9-6d6373c1cf94"
+    PARKED = "fc509261-e383-4ed4-aacc-44087dc5a599"
+
+    def setUp(self):
+        real = runner.fresh_index
+        self.addCleanup(setattr, runner, "fresh_index", real)
+        runner.fresh_index = lambda quiet=False: {self.PARKED: {
+            "sessionId": self.PARKED, "title": "copy paste in the tui",
+            "project": "ccwho", "entrypoint": "cli"}}
+
+    def test_it_is_the_running_job(self):
+        job = {"sessionId": self.JOB, "project": "ccwho", "title": "x",
+               "parked": [self.PARKED], "attention": "stopped"}
+        live, ended = runner.matches("paste", [job])
+        self.assertEqual(([r["sessionId"] for r in live], ended), ([self.JOB], []))
+
+    def test_with_its_job_gone_it_ended(self):                       # control
+        live, ended = runner.matches("paste", [])
+        self.assertEqual((live, [e["sessionId"] for e in ended]), ([], [self.PARKED]))
+
+
 class TestWatchRequested(unittest.TestCase):
     def test_long_flag(self):
         self.assertTrue(runner.watch_requested(["--watch"]))
@@ -3861,6 +3886,22 @@ class TestReviewRoundOneRunner(unittest.TestCase):
         finally:
             sys.modules["ccwho_usage"] = real
         self.assertEqual(snap["state"], "from-the-reloaded-module")
+
+    def test_a_terminal_that_parked_a_job_is_a_live_session(self):
+        # ctrl+b: the terminal has no row, and its account is still in use
+        import types
+        fake = types.ModuleType("ccwho_usage")
+        for name in dir(runner.usage):
+            setattr(fake, name, getattr(runner.usage, name))
+        fake.snapshot = lambda readings, now, live, *a, **k: {"state": sorted(live)}
+        real = sys.modules["ccwho_usage"]
+        sys.modules["ccwho_usage"] = fake
+        try:
+            snap = runner.usage_snapshot([{"sessionId": "j", "parked": ["p"]}], self.now,
+                                         record=False)
+        finally:
+            sys.modules["ccwho_usage"] = real
+        self.assertEqual(snap["state"], ["j", "p"])
 
     def test_one_read_of_the_readings_and_no_settings_when_an_account_is_live(self):
         self.put("s1", "login:a", "a@x.com")

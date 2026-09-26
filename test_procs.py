@@ -254,6 +254,100 @@ class TestLiveSessionFiles(unittest.TestCase):
         self.assertEqual(len(got), 1)
 
 
+class TestTheDaemonsOwnRowsAreNotSessions(unittest.TestCase):
+    """Two session files that `claude agents --json` leaves out, measured
+    2026-09-26 after a ctrl+b in ccwho-03:
+
+      81657 claude bg-spare           spare: true, no transcript, no job state
+      85775 claude --resume fc50...   parkedJobId: 4e3efc1d - its window now
+                                      shows that job; its file stopped at busy
+
+    Each one was a row: the spare as a nameless STOPPED session, the parked
+    terminal as BUSY forever, both on the job's window."""
+
+    STARTS = {101: "Tue Sep 22 13:45:15 2026", 102: "Tue Sep 22 13:45:15 2026",
+              103: "Tue Sep 22 13:45:15 2026"}
+    JOB = {"pid": 103, "sessionId": SID[:-1] + "3", "id": "4e3efc1d", "kind": "background"}
+
+    def test_the_file_says_it_is_a_spare(self):
+        row = procs.live_session_files([entry(101, SID, kind="bg", spare=True)],
+                                       self.STARTS)[0]
+        self.assertIs(row.get("spare"), True)
+
+    def test_the_file_says_which_job_it_parked(self):
+        row = procs.live_session_files([entry(101, SID, parkedJobId="4e3efc1d")],
+                                       self.STARTS)[0]
+        self.assertEqual(row.get("parkedJobId"), "4e3efc1d")
+
+    def test_a_spare_is_not_shown(self):
+        spare = {"pid": 101, "sessionId": SID, "kind": "background", "spare": True}
+        self.assertEqual(procs.shown_sessions([spare, self.JOB]), [self.JOB])
+
+    def test_a_session_that_is_not_a_spare_is_shown(self):           # control
+        plain = {"pid": 101, "sessionId": SID, "kind": "background", "spare": False}
+        self.assertEqual(procs.shown_sessions([plain, self.JOB]), [plain, self.JOB])
+
+    def test_a_terminal_that_parked_a_running_job_is_not_shown(self):
+        parked = {"pid": 102, "sessionId": SID, "status": "busy",
+                  "parkedJobId": "4e3efc1d"}
+        self.assertEqual(procs.shown_sessions([parked, self.JOB]), [self.JOB])
+
+    def test_a_terminal_whose_parked_job_is_gone_is_shown(self):     # control
+        # nothing else shows that window now, so the terminal's own row does
+        parked = {"pid": 102, "sessionId": SID, "parkedJobId": "4e3efc1d"}
+        self.assertEqual(procs.shown_sessions([parked]), [parked])
+
+    def test_an_id_that_is_not_text_does_not_crash_the_list(self):
+        # the agents feed is not checked field by field: a list or a dict as an
+        # id must not take every row down with it
+        for bad in (["x"], {"a": 1}):
+            with self.subTest(id=bad):
+                odd = {"pid": 103, "sessionId": SID, "id": bad}
+                self.assertEqual(procs.shown_sessions([odd]), [odd])
+                parked = {"pid": 102, "sessionId": SID[:-1] + "2", "parkedJobId": "4e3efc1d"}
+                self.assertEqual(procs.shown_sessions([parked, odd]), [parked, odd])
+
+    def test_a_spare_is_not_the_job_that_was_parked(self):
+        # the spare has a jobId too; it does not show the terminal's window
+        parked = {"pid": 102, "sessionId": SID, "parkedJobId": "4e3efc1d"}
+        spare = dict(self.JOB, spare=True)
+        self.assertEqual(procs.shown_sessions([parked, spare]), [parked])
+
+    def test_which_job_each_hidden_terminal_shows(self):
+        parked = {"pid": 102, "sessionId": SID, "parkedJobId": "4e3efc1d"}
+        self.assertEqual(procs.parked_terminals([parked, self.JOB]),
+                         {SID: self.JOB["sessionId"]})
+        self.assertEqual(procs.parked_terminals([parked]), {}, "its job is gone")
+
+    def test_a_chain_of_parked_jobs_ends_at_the_job_that_is_shown(self):
+        # A parked J1, and J1 was parked again as J2: only J2 is a row, so it
+        # answers for both - else A runs with no row, and an open resumes it
+        a = {"pid": 101, "sessionId": "A", "parkedJobId": "j1"}
+        j1 = {"pid": 102, "sessionId": "J1", "id": "j1", "parkedJobId": "j2"}
+        j2 = {"pid": 103, "sessionId": "J2", "id": "j2"}
+        self.assertEqual(procs.parked_terminals([a, j1, j2]), {"A": "J2", "J1": "J2"})
+        self.assertEqual(procs.shown_sessions([a, j1, j2]), [j2])
+
+    def test_one_parked_job_maps_to_it(self):                        # control
+        a = {"pid": 101, "sessionId": "A", "parkedJobId": "j1"}
+        j1 = {"pid": 102, "sessionId": "J1", "id": "j1"}
+        self.assertEqual(procs.parked_terminals([a, j1]), {"A": "J1"})
+
+    def test_a_loop_of_parked_jobs_hides_nobody_and_ends(self):
+        # files from other processes can say anything; a loop has no job at its
+        # end to show the window, so each one keeps its own row
+        x = {"pid": 101, "sessionId": "X", "id": "x", "parkedJobId": "y"}
+        y = {"pid": 102, "sessionId": "Y", "id": "y", "parkedJobId": "x"}
+        a = {"pid": 103, "sessionId": "A", "parkedJobId": "x"}
+        self.assertEqual(procs.parked_terminals([x, y, a]), {"A": "X"})
+        self.assertEqual(procs.shown_sessions([x, y, a]), [x, y])
+
+    def test_a_job_does_not_hide_itself(self):
+        # a file naming its own job id as parked must not make it vanish
+        odd = dict(self.JOB, parkedJobId="4e3efc1d")
+        self.assertEqual(procs.shown_sessions([odd]), [odd])
+
+
 class TestOnlyClaudeProcessesVouchForASession(unittest.TestCase):
     """A pid and its start time are public (`ps`). A file that names a live
     shell's pid and start is not a session: only a claude process is."""

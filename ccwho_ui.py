@@ -1309,8 +1309,7 @@ class CcwhoUi(App):
         self.loading = True
         self.status = "reading the saves..."
         self.paint_header(self.fleet.groups(self.filter_text))
-        self.loading_saves({r.get("sessionId") for r in self.fleet.rows
-                            if r.get("sessionId")})
+        self.loading_saves(engine.live_ids(self.fleet.rows))
 
     @work(thread=True, exclusive=True, group="saves")
     def loading_saves(self, live_ids):

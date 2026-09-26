@@ -681,9 +681,10 @@ def matches(query, rows, everything=False):
     session found through the index that is running is still running - reporting
     it as ended because of where the match came from is a lie about the world.
     """
-    by_id = {r.get("sessionId"): r for r in rows}
+    # a parked terminal (ctrl+b) has no row: the job it shows answers for it
+    by_id = {sid: r for r in rows for sid in engine.answers_for(r)}
     hits = list(engine.match_rows(rows, query))
-    seen = {r.get("sessionId") for r in hits}
+    seen = {sid for r in hits for sid in engine.answers_for(r)}
     now = engine.now_iso()
     ended = []
     for entry in index.search(fresh_index(), query, live_ids=set(by_id),
@@ -693,7 +694,8 @@ def matches(query, rows, everything=False):
             continue
         seen.add(sid)
         if sid in by_id:
-            hits.append(by_id[sid])          # running, found by what it is about
+            if by_id[sid] not in hits:
+                hits.append(by_id[sid])      # running, found by what it is about
         else:
             ended.append(_ended_row(entry, now))
     hits.sort(key=engine.sort_key)
@@ -1230,7 +1232,7 @@ def usage_snapshot(rows, now=None, record=True):
     # what holds the module to use
     u = sys.modules.get("ccwho_usage", usage)
     readings = u.load_readings(usage_dir(), now)
-    snap = u.snapshot(readings, now, {r.get("sessionId") for r in rows},
+    snap = u.snapshot(readings, now, engine.live_ids(rows),
                       lambda: usage_facts(now, readings), read_labels())
     # only a snapshot over the whole fleet is recorded: a filtered `ls` sees
     # fewer accounts, so fewer clashes - its names and lines are not the list's

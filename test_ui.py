@@ -3887,3 +3887,47 @@ class TestTheDetailRound2(UiTest):
             self.assertIn("second", shown)
             self.assertIn("100%", shown)
             self.assertNotIn("10%1", shown, "a bare \\r still overwrites, as a terminal does")
+
+
+class TestTheDetailLooksLikeTheList(UiTest):
+    """What you can copy is shown the way the row's arrow is: it lights up under
+    the mouse, and at rest it looks like the text around it."""
+
+    async def test_nothing_in_the_detail_is_underlined(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            box = app.query_one("#brief")
+            under = [seg.text for y in range(box.size.height) for seg in box.render_line(y)
+                     if seg.style and seg.style.underline and seg.text.strip()]
+            self.assertEqual(under, [])
+            shown = "\n".join(box.render_line(y).text for y in range(box.size.height))
+            self.assertIn("/Users/x/liveapp", shown)                        # control
+
+
+    async def test_a_value_is_the_colour_of_the_text_around_it_in_every_theme(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            box = app.query_one("#brief")
+
+            def style_of(text):
+                for y in range(box.size.height):
+                    for seg in box.render_line(y):
+                        if text in seg.text:
+                            return seg.style
+                self.fail(f"{text!r} is not on the screen")
+            for theme in sorted(app.available_themes):
+                with self.subTest(theme=theme):
+                    app.theme = theme
+                    await pilot.pause()
+                    plain, value = style_of("Bash: run the gate"), style_of("Shall I land it?")
+                    # the reference must be plain text, or a link colour on both passes
+                    self.assertNotIn("@click", plain.meta or {})
+                    self.assertIn("@click", value.meta or {})
+                    self.assertEqual((value.color, value.bgcolor), (plain.color, plain.bgcolor))
+                    self.assertFalse(value.underline)

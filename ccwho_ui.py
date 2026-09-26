@@ -139,6 +139,11 @@ class Brief(Static):
     row's arrow does: Textual 8 marks it as a link but no longer draws the hover,
     and iTerm2 keeps every click but the left one - what a click does must show."""
 
+    # not drawn as links: no underline, and not the theme's link colour - what a
+    # click copies looks like the text around it until the mouse is on it, as
+    # the row's arrow does
+    auto_links = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.base = Text()

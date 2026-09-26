@@ -5528,7 +5528,7 @@ class TestTheBriefInParts(unittest.TestCase):
         b = self.brief()
         got = self.copies(b, {"project": "liveapp", "tty": "/dev/ttys017"})
         for want in ("4f2b", "liveapp", "Laptop crash", "S4 is paused. Continue?",
-                     "investigate the crash", self.LONG.strip(), "read logs",
+                     "investigate the crash", self.LONG.strip(),
                      "Do you want me to continue?", "/dev/ttys017", "4242", "liveapp-40",
                      "/Users/u/projects/liveapp", "4f2b91ac-1111-4222-8333-abcdefabcdef",
                      "claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef"):
@@ -5624,10 +5624,10 @@ class TestTheBriefInParts(unittest.TestCase):
         self.assertIn("100% done", got)
 
     def test_a_cut_value_is_cut_last(self):
-        for field in ("goal", "you_said", "closing", "progress"):
+        for field in ("goal", "you_said", "closing"):
             with self.subTest(field=field):
                 def shown_and_copied(raw):
-                    b = self.brief(**{field: [raw] if field == "progress" else raw})
+                    b = self.brief(**{field: raw})
                     lines = ccwho.brief_parts(b, {})
                     for line in lines:
                         for t, _, v in line:
@@ -5650,3 +5650,20 @@ class TestTheBriefInParts(unittest.TestCase):
     def test_an_osc_that_never_ends_ends_with_its_line(self):
         self.assertEqual(ccwho.plain_text("a\x1b]0;t\nnext line"), "a\nnext line")
         self.assertEqual(ccwho.plain_text("a\x1b]0;title"), "a")                   # control
+
+    def test_a_progress_step_is_shown_not_offered(self):
+        b = self.brief(progress=["read logs", "ran the gate"])
+        shown = ccwho.render_brief(b, {}, color=False)
+        self.assertIn("read logs", shown)
+        self.assertIn("ran the gate", shown)
+        got = self.copies(b)
+        self.assertNotIn("read logs", got)
+        self.assertNotIn("ran the gate", got)
+        self.assertIn("investigate the crash", got)                         # control
+
+    def test_a_progress_step_is_cut_last_too(self):
+        shown = ccwho.render_brief(self.brief(progress=["x" * 150 + "\rshort"]), {}, color=False)
+        self.assertIn("    · short", shown.splitlines())
+        shown = ccwho.render_brief(self.brief(progress=["a" * 98 + "\r\nrest of it"]), {},
+                                   color=False)
+        self.assertTrue(any(l.startswith("    · " + "a" * 90) for l in shown.splitlines()), shown)

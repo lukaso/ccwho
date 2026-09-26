@@ -2349,7 +2349,8 @@ def brief_parts(b, row=None):
     if b["progress"]:
         out.append([("  ", None, None), ("progress", "dim", None)])
         for step in b["progress"]:
-            out.append([("    · ", None, None), (truncate(_as_shown(plain_text(step)), 96), None, step)])
+            # shown, not offered: a step is how it got here, not something to paste
+            out.append([("    · ", None, None), (truncate(_as_shown(plain_text(step)), 96), None, None)])
     if b["closing"]:
         out.append([("  ", None, None), ("it said", "dim", None)])
         out.append([("    ", None, None), (truncate(_as_shown(plain_text(b["closing"])), 96), None, b["closing"])])

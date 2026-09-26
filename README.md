@@ -68,7 +68,7 @@ ccwho                         # on a terminal
 | ↑ ↓ / `j` `k` | move |
 | Enter | go to the session's window - or give it one (see below) |
 | → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
-| → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list |
+| → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
 | `p` | every process agents started, grouped: each session, left behind, Codex, not sure |

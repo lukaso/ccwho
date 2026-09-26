@@ -421,6 +421,10 @@ class TestSelectionIsNotJustFocus(UiTest):
             await pilot.pause()
             app.show(app.fleet)                # a refresh while the list is hidden
             await pilot.pause()
+            # the full-window detail has the keys (Enter copies there): back to
+            # the list, and Enter goes to the session you chose
+            await pilot.press("left")
+            await pilot.pause()
             await pilot.press("enter")
             await pilot.pause(0.2)
             self.assertEqual(adapter.asked, [chosen])
@@ -4360,3 +4364,143 @@ class TestTheKeysKeepTheirField(UiTest):
             app.paint_detail()
             await pilot.pause()
             self.assertEqual(self.lit(app), ["/Users/x/liveapp"], "the cwd, not up to the title")
+
+
+class TestTheDetailThatCoversTheWindow(UiTest):
+    """Below UI_WIDE the detail covers the list. Browsing a list you cannot see
+    is no use there: → opens the detail with the keys in it, one ← closes it."""
+
+    lit = TestTheKeysGoIntoTheDetail.lit
+
+    async def test_right_opens_it_with_the_keys_on_the_first_value(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#brief"))
+            self.assertEqual(self.lit(app), ["aaaa"])
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["liveapp"])
+            self.assertEqual(app.selected, LIVE["sessionId"], "no hidden list moved")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.copied, ["liveapp"])
+            self.assertEqual(adapter.asked, [])
+
+    async def test_one_left_closes_it(self):
+        for key in ("left", "escape"):
+            with self.subTest(key=key):
+                app = self.app()
+                async with app.run_test(size=(100, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("right")
+                    await pilot.pause()
+                    await pilot.press(key)
+                    await pilot.pause()
+                    await pilot.pause()
+                    self.assertFalse(app.query_one("#detail").display)
+                    self.assertTrue(app.query_one("#list").display)
+                    self.assertIsInstance(app.focused, ui.Row)
+                    self.assertEqual(app.selected, LIVE["sessionId"])
+
+    async def test_a_window_that_narrows_gives_the_detail_the_keys(self):
+        app = self.app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, ui.Row)                      # control
+            await pilot.resize_terminal(100, 40)
+            await pilot.pause(0.3)
+            self.assertIs(app.focused, app.query_one("#brief"))
+            self.assertEqual(self.lit(app), ["aaaa"])
+
+    async def test_side_by_side_keeps_the_finder_keys(self):                  # control
+        app = self.app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, ui.Row)
+            self.assertEqual(self.lit(app), [])
+
+    async def test_a_refresh_never_takes_the_keys_out_of_the_search_box(self):
+        app = self.app()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            box = app.query_one("#search")
+            self.assertIs(app.focused, box)                                 # control
+            app.detail_open, app.detail_mode = True, "brief"
+            app.paint_detail()                  # the refresh, with the detail up
+            await pilot.pause()
+            self.assertIs(app.focused, box, "you are typing")
+
+    async def test_the_processes_screen_over_a_narrow_window_stays_whole(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.pause()
+            detail = app.query_one("#detail")
+            self.assertTrue(app.detail_open)
+            self.assertEqual(app.detail_mode, "procs")
+            self.assertEqual(detail.display, app.detail_open)
+            chosen = app.selected
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.selected, chosen, "↓ scrolls the processes, no hidden list")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [], "no jump to a session you cannot see")
+            self.assertIn("Esc for the list", self.screen_text(app))
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app.detail_open)
+            self.assertFalse(detail.display)
+            self.assertTrue(app.query_one("#list").display)
+
+    async def test_a_left_that_races_a_rebuild_closes_the_detail_whole(self):
+        new = row("dddd4444-0000-4000-8000-000000000004", "busy", title="New one")
+        app = self.app()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#brief"))                # control
+            app.show(ui.Fleet([LIVE, BUSY, new], True, "12:00:01"))
+            app.query_one("#brief").action_leave()  # ← before the rebuild has painted
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertFalse(app.detail_open)
+            self.assertFalse(app.query_one("#detail").display)
+            self.assertTrue(app.query_one("#list").display)
+
+    async def test_after_a_search_the_narrow_detail_keeps_the_keys(self):
+        app = self.app()
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            await pilot.press("i", "enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertTrue(app.query_one("#detail").display, "the detail stays up")
+            self.assertIsNot(type(app.focused), ui.Row, "not on a list you cannot see")
+            chosen = app.selected
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.selected, chosen)

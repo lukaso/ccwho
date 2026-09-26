@@ -188,7 +188,9 @@ class Brief(Static):
                 self.fields[meta["part"]] = meta.get("field")
         self.lit = None
         if self.has_focus and not self.values:
-            self.app.leave_detail()     # nothing to be on here: the keys go back
+            # nothing to be on here: the keys go back - and only the keys. This
+            # runs inside a paint; closing the pane here left it half closed
+            self.app.leave_detail(close=False)
         elif self.has_focus:
             near = (lambda ps: min(ps, key=lambda p: abs(p - (at or 0))))
             same_field = [p for p, f in self.fields.items() if f == field]
@@ -905,6 +907,8 @@ class CcwhoUi(App):
             self.paint_detail()
 
     def paint_detail(self):
+        if not self.detail_open:
+            return      # a paint scheduled before a ← closed it must not re-open it
         row = self.selected_row()
         detail, brief_box = self.part("#detail"), self.part("#brief")
         if detail is None or brief_box is None or self.part("#list") is None:
@@ -955,6 +959,12 @@ class CcwhoUi(App):
         detail.display = True
         detail.set_class(self.size.width < engine.UI_WIDE, "full")
         self.part("#list").display = self.size.width >= engine.UI_WIDE
+        # covering the window, the detail has the keys: a list you cannot see
+        # is nothing to browse. Only from a row: never out of the search box
+        if (self.size.width < engine.UI_WIDE and self.detail_mode == "brief"
+                and brief_box.values and (self.focused is None
+                                          or isinstance(self.focused, Row))):
+            brief_box.focus()
 
     # --------------------------------------------------------------- selection
 
@@ -1218,9 +1228,14 @@ class CcwhoUi(App):
             return
         self.open_detail("brief")
 
-    def leave_detail(self):
-        """← from inside the brief: the keys go back to the list, the brief stays."""
+    def leave_detail(self, close=True):
+        """← from inside the brief: the keys go back to the list, the brief stays -
+        unless it covers the window: then there is no list to go back to beside
+        it, and one ← closes it."""
         self.set_focus(None)            # so restore_selection gives them to the row
+        if close and self.size.width < engine.UI_WIDE:
+            self.action_back()
+            return
         self.call_after_refresh(self.restore_selection)
 
     def action_procs(self):
@@ -1487,6 +1502,9 @@ class CcwhoUi(App):
         rows = self.rows_on_screen()
         if rows:
             rows[0].focus()
+            # a detail covering the window takes the keys back from the row -
+            # once the row has them: focus moves after this message
+            self.call_after_refresh(self.repaint_detail)
 
 
 class Collector:

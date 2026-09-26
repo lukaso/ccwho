@@ -1623,7 +1623,8 @@ def save(argv):
               file=sys.stderr)
         print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
         return 1
-    man = engine.manifest_from_rows(rows, why_not=save_problem)
+    man = engine.manifest_from_rows(rows, why_not=save_problem,
+                                    panes=engine.panes_snapshot())
     if man["count"] == 0:
         # Writing this would only push a manifest that HAS something out of the
         # keep-20 window. Nothing to restore is not something to record.
@@ -1766,9 +1767,10 @@ def reopen_saved(path=None):
                   text, re.M)
     if m:
         return f"{m.group(1)} in that save {m.group(2)}"
-    m = re.search(r"^opened (\d+) window", text, re.M)
+    counts = [int(m.group(1)) for m in
+              re.finditer(r"^(?:opened|filled) (\d+) (?:window|pane)", text, re.M)]
     left = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: not reopening"))
-    said = (f"reopened {m.group(1)} session(s)" if m
+    said = (f"reopened {sum(counts)} session(s)" if counts
             else "reopened that save" if path else "reopened the last save")
     return said + (f", {left} left out - they could not resume" if left else "")
 
@@ -1806,6 +1808,11 @@ def restore(argv):
             man, cwd_exists=os.path.isdir,
             transcript_for=engine.manifest_transcript_finder(man))
         n = len(engine.manifest_entries(man))
+        saved = {e_.get("pane") for e_ in engine.manifest_entries(man) if e_.get("pane")}
+        if saved:
+            # asked only of a manifest that names panes: nothing else to count
+            live = {p["pane"] for p in engine.panes_snapshot().values()}
+            print(f"iTerm2 has {len(saved & live)} of {len(saved)} saved panes open now.")
         if ok:
             print(f"restorable: {n} session(s) in {path}")
             print("every cwd exists, every transcript is on disk, every resume line builds.")
@@ -1866,7 +1873,12 @@ def restore(argv):
         for e_ in unusable:
             print(f"ccwho restore: {e_.get('project') or e_.get('sessionId') or '?'}"
                   " cannot be reopened from this manifest", file=sys.stderr)
-        script = engine.iterm_open_script(openable)
+        fill = {}
+        if openable and any(e_.get("pane") or e_.get("tabTitle") for e_ in openable):
+            # the panes iTerm2 restored: resume each session where it was
+            fill = engine.match_panes(openable, engine.panes_snapshot(),
+                                      engine.idle_snapshot(), saved=entries)
+        script = engine.iterm_open_script(openable, fill=fill)
         if not script and (running or starting) and not (unusable or gone):
             print(f"all {len(running) + len(starting)} session(s) in that manifest"
                   " are already running or starting.")
@@ -1875,7 +1887,10 @@ def restore(argv):
             print("ccwho restore: nothing in that manifest can be reopened", file=sys.stderr)
             return 1
         n = script.count("create window with default profile")
-        print(f"opening {n} iTerm2 window(s)...")
+        if fill:
+            print(f"resuming {len(fill)} session(s) in the panes iTerm2 restored...")
+        if n:
+            print(f"opening {n} iTerm2 window(s)...")
         try:
             r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
         except (OSError, subprocess.SubprocessError) as ex:
@@ -1884,7 +1899,29 @@ def restore(argv):
         if r.returncode != 0:
             print(f"ccwho restore: iTerm2 refused: {r.stderr.strip()}", file=sys.stderr)
             return r.returncode
-        print(f"opened {n} window(s). each is at its project, resuming its own session.")
+        wrote = set((r.stdout or "").split())
+        filled = [e_ for e_ in openable if fill.get(e_.get("sessionId", "")) in wrote]
+        missed = [e_ for e_ in openable
+                  if fill.get(e_.get("sessionId", "")) not in wrote | {None}]
+        if missed:
+            # the script says it never wrote these: their panes closed in between
+            for e_ in missed:
+                print(f"{e_.get('project') or e_.get('sessionId')}: its pane closed before"
+                      " ccwho could write to it - opening a new window")
+            again = engine.iterm_open_script(missed)
+            try:
+                r2 = subprocess.run(["osascript", "-e", again], capture_output=True, text=True)
+            except (OSError, subprocess.SubprocessError) as ex:
+                print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
+                return 1
+            if r2.returncode != 0:
+                print(f"ccwho restore: iTerm2 refused: {r2.stderr.strip()}", file=sys.stderr)
+                return r2.returncode
+            n += again.count("create window with default profile")
+        if filled:
+            print(f"filled {len(filled)} pane(s) iTerm2 restored.")
+        if n:
+            print(f"opened {n} window(s). each is at its project, resuming its own session.")
         return 0
 
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
@@ -1944,7 +1981,7 @@ def main(argv=None):
         print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
         print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2)")
         print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
-        print("       ccwho restore [--open] [--from PATH]       list it back / reopen the windows")
+        print("       ccwho restore [--open] [--from PATH]       list it back / reopen them, in their old panes")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
         print("       ccwho ls [words] [--all]                   the table, or every session matching")

@@ -349,7 +349,7 @@ red machine.
 ```sh
 ccwho save                 # capture the live fleet
 ccwho restore              # ...what was open, about what, how to reopen it
-ccwho restore --open       # ...actually reopen them, one iTerm2 window each
+ccwho restore --open       # ...actually reopen them, in their old panes where iTerm2 restored them
 ccwho restore --check      # would it restore? run this BEFORE you reboot
 ccwho restore --list       # every saved manifest and what it holds
 ccwho restore --from PATH  # an older manifest
@@ -369,6 +369,18 @@ ccwho open <session-id>    # focus that session, or reopen it if its window is g
 fleet: `latest` read `/compact`, `go ahead` and `let's fix 1-3` for three of the
 seventeen, while `opened` read `restart from disk` for another. Rows are in
 dashboard order, so what was waiting on you is at the top and still carries its ask.
+
+**Back where it was.** A save records the iTerm2 pane each session is in, and that
+tab's title. When iTerm2 restores its windows after a restart, it gives each pane
+the id it had before - `PTYSession.m` adopts the saved "Session GUID" on window
+restoration - so `restore --open` (and `o` in the list) writes each session's resume
+line into its own pane, in the same window, tab and split. A pane that came back
+with a new id is found by its title instead, but only when exactly one saved session
+and exactly one pane have it; the status mark Claude Code puts in front (`✳`, `◐`)
+does not count. It writes only into a pane where nothing runs but a shell at its
+prompt, and clears a half-typed line there first. Every other session - and one
+whose pane closed before the write - opens in a new window, as before. `restore --check`
+says how many of the saved panes are open now.
 
 **It saves itself.** Two ways, because the reboot this exists for is usually the one
 you did not plan. `ccwho --watch` writes a manifest every 5 minutes

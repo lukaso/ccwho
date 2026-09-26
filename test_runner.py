@@ -19,7 +19,8 @@ import ccwho as runner
 # Reading this machine's processes, ports and session files is machine state; see
 # test_ccwho. Every test here runs with guards that fail loudly instead.
 REAL = {name: getattr(runner.engine, name) for name in ("live_file_sessions",
-                                                       "ps_table", "listen_ports")}
+                                                       "ps_table", "listen_ports",
+                                                       "panes_snapshot", "idle_snapshot")}
 REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 
 
@@ -30,6 +31,10 @@ def _guard(name):
 
 
 GUARDS = {name: _guard(name) for name in REAL}
+# iTerm2's panes: every save and restore asks, and "iTerm2 could not be asked"
+# is an answer they handle - so the stand-in is that answer, not a failure
+GUARDS["panes_snapshot"] = lambda *a, **k: {}
+GUARDS["idle_snapshot"] = lambda *a, **k: set()
 _unpinned_live_file_sessions = GUARDS["live_file_sessions"]
 
 
@@ -179,7 +184,7 @@ class TestRestoreDir(unittest.TestCase):
 class TestSaveAndRestore(unittest.TestCase):
     ROWS = [{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/liveapp",
              "project": "liveapp", "topic": "the reaper", "ask": "Land it?", "attention": "asks",
-             "tty": "s032", "since": "2h", "status": "waiting", "first": "", "pid": 1},
+             "tty": "ttys032", "since": "2h", "status": "waiting", "first": "", "pid": 1},
             {"sessionId": "", "cwd": "/Users/x/p/nope", "project": "nope", "topic": "t",
              "ask": "", "attention": "stopped", "tty": "", "since": "1h", "status": "waiting",
              "first": "", "pid": 2}]
@@ -223,6 +228,17 @@ class TestSaveAndRestore(unittest.TestCase):
         rc, out = self._restore()
         self.assertEqual(rc, 0)
         self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+
+    def test_save_records_the_pane_each_session_is_in(self):
+        real = runner.engine.panes_snapshot
+        runner.engine.panes_snapshot = lambda: {"ttys032": {"pane": "G-1", "name": "t"}}
+        try:
+            self._save()
+        finally:
+            runner.engine.panes_snapshot = real
+        path = os.path.join(runner.restore_dir(), os.listdir(runner.restore_dir())[0])
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["sessions"][0]["pane"], "G-1")
 
     def test_save_prunes_usage_readings_older_than_eight_days(self):
         d = os.path.join(self.tmp, "usage")
@@ -1216,6 +1232,125 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
         rc, out = self._restore_open()
         self.assertEqual(self.runs, [])
         self.assertIn("already open", out)
+
+
+class TestRestoreOpenFillsRestoredPanes(unittest.TestCase):
+    """The person's workaround was to let iTerm2 bring its windows back, then
+    move every reopened session into its old pane by hand. A pane iTerm2
+    restores keeps its unique id, so the restore can write into it."""
+
+    LIVE_SID = TestRestoreOpenSkipsWhatIsAlreadyRunning.LIVE_SID
+    DEAD_SID = TestRestoreOpenSkipsWhatIsAlreadyRunning.DEAD_SID
+    setUp = TestRestoreOpenSkipsWhatIsAlreadyRunning.setUp
+    write_manifest = TestRestoreOpenSkipsWhatIsAlreadyRunning.write_manifest
+    _restore_open = TestRestoreOpenSkipsWhatIsAlreadyRunning._restore_open
+    _script = TestRestoreOpenSkipsWhatIsAlreadyRunning._script
+
+    def setUp(self):
+        TestRestoreOpenSkipsWhatIsAlreadyRunning.setUp(self)
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b",
+             "pane": "G-B", "tabTitle": "b"}])
+        self.panes = {"ttys050": {"pane": "G-B", "name": "-zsh"}}
+        self.idle = {"ttys050"}
+        self.wrote = "G-B\n"
+        real = (runner.engine.panes_snapshot, runner.engine.idle_snapshot)
+        runner.engine.panes_snapshot = lambda: self.panes
+        runner.engine.idle_snapshot = lambda: self.idle
+        self.addCleanup(setattr, runner.engine, "panes_snapshot", real[0])
+        self.addCleanup(setattr, runner.engine, "idle_snapshot", real[1])
+
+        test = self
+
+        class Done:
+            returncode, stderr = 0, ""
+
+            @property
+            def stdout(self):
+                return test.wrote
+
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a) or Done()
+
+    tearDown = TestRestoreOpenSkipsWhatIsAlreadyRunning.tearDown
+
+    def test_a_session_whose_pane_came_back_resumes_in_it(self):
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0, out)
+        script = self._script()
+        self.assertIn('if u is "G-B"', script)
+        self.assertEqual(script.count("create window with default profile"), 1,
+                         "only the session with no pane gets a window")
+        self.assertIn("claude --resume " + self.LIVE_SID, script)
+        self.assertIn("filled 1 pane", out)
+        self.assertIn("opened 1 window", out)
+
+    def test_a_busy_pane_gets_a_window_instead(self):                   # control
+        self.idle = set()
+        self.wrote = ""
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0, out)
+        script = self._script()
+        self.assertNotIn(" u is ", script)
+        self.assertEqual(script.count("create window with default profile"), 2)
+
+    def test_a_pane_that_closed_before_the_write_gets_a_window(self):
+        self.wrote = ""
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.runs), 2, "a second script opens what the first could not")
+        second = " ".join(str(a) for a in self.runs[1][0])
+        self.assertIn("create window with default profile", second)
+        self.assertIn("claude --resume " + self.DEAD_SID, second)
+        self.assertNotIn(self.LIVE_SID, second, "already opened by the first script")
+        self.assertIn("pane closed", out)
+        self.assertNotIn("filled 1 pane", out)
+        self.assertIn("opened 2 window", out)
+        self.assertNotIn("not reopening", out)
+
+    def test_every_pane_written_needs_no_second_script(self):          # control
+        rc, out = self._restore_open()
+        self.assertEqual(len(self.runs), 1)
+
+    def test_a_title_another_saved_session_had_is_not_used(self):
+        # LIVE is running, so only DEAD opens - but both were saved as "X"
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a",
+             "pane": "PA", "tabTitle": "X"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b",
+             "pane": "OLD", "tabTitle": "X"}])
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7}]
+        self.panes = {"ttys050": {"pane": "P-NEW", "name": "X"}}
+        self._restore_open()
+        self.assertNotIn("unique id", self._script())
+
+    def test_a_manifest_with_no_panes_does_not_ask_iterm(self):
+        self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
+        asked = []
+        runner.engine.panes_snapshot = lambda: asked.append(1) or {}
+        self._restore_open()
+        self.assertEqual(asked, [])
+
+
+class TestRestoreCheckCountsPanes(unittest.TestCase):
+    setUp = TestRestoreCheck.setUp
+    tearDown = TestRestoreCheck.tearDown
+    write = TestRestoreCheck.write
+    run_check = TestRestoreCheck.run_check
+
+    def test_check_says_how_many_saved_panes_are_open(self):
+        self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": self.tmp,
+                     "project": "a", "pane": "G-A"},
+                    {"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef", "cwd": self.tmp,
+                     "project": "b", "pane": "G-GONE"}])
+        real = runner.engine.panes_snapshot
+        runner.engine.panes_snapshot = lambda: {"ttys050": {"pane": "G-A", "name": ""}}
+        try:
+            _rc, out = self.run_check(["--check"])
+        finally:
+            runner.engine.panes_snapshot = real
+        self.assertIn("1 of 2 saved panes", out)
+        self.assertNotIn("resumes", out, "--open writes only into the idle ones")
 
 
 class TestLaunchClaim(unittest.TestCase):
@@ -2491,6 +2626,28 @@ class TestTheUiCanReopenTheLastSave(unittest.TestCase):
         self.assertIn("13", said)
         self.assertIn("3", said.replace("13", ""), "the ones left out are named as a number")
         self.assertNotIn("reopened 3 ", said)
+
+    def test_a_filled_pane_counts_as_a_reopened_session(self):
+        def fake(argv):
+            print("filled 2 pane(s) iTerm2 restored.")
+            print("opened 3 window(s). each is at its project, resuming its own session.")
+            return 0
+        real = runner.restore
+        runner.restore = fake
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertIn("reopened 5 session(s)", said)
+
+    def test_only_filled_panes_still_count(self):
+        real = runner.restore
+        runner.restore = lambda argv: print("filled 2 pane(s) iTerm2 restored.") or 0
+        try:
+            said = runner.reopen_saved()
+        finally:
+            runner.restore = real
+        self.assertIn("reopened 2 session(s)", said)
 
     def test_it_says_when_the_restore_refused(self):
         real = runner.restore

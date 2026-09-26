@@ -991,6 +991,93 @@ def titles_snapshot(timeout=5.0):
     return parse_titles(done.stdout) if done.returncode == 0 else {}
 
 
+def iterm_panes_script():
+    """AppleScript listing every pane as tty<TAB>unique id<TAB>name, one a line.
+
+    The unique id is what a restore needs: iTerm2 gives a restored pane the id
+    it had before the restart (PTYSession.m adopts the saved "Session GUID" on
+    system window restoration and on the startup arrangement), so a save can
+    name the pane a session was in and a restore can put it back there.
+    """
+    return (
+        'tell application "iTerm2"\n'
+        '  set d to (ASCII character 9)\n'
+        '  set out to ""\n'
+        '  repeat with w in windows\n'
+        '    set ttyGroups to tty of sessions of every tab of w\n'
+        '    set idGroups to unique id of sessions of every tab of w\n'
+        '    set nameGroups to name of sessions of every tab of w\n'
+        '    repeat with i from 1 to count of ttyGroups\n'
+        '      set ts to item i of ttyGroups\n'
+        '      set us to item i of idGroups\n'
+        '      set ns to item i of nameGroups\n'
+        '      repeat with j from 1 to count of ts\n'
+        '        set out to out & (item j of ts) & d & (item j of us) & d & (item j of ns) & linefeed\n'
+        '      end repeat\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        '  return out\n'
+        'end tell\n'
+    )
+
+
+def parse_panes(dump):
+    """tty -> {"pane": unique id, "name": name}. A line with no id is skipped:
+    a pane that cannot be found again is no use to a restore."""
+    out = {}
+    for line in (dump or "").splitlines():
+        f = line.split("\t")
+        if len(f) < 3 or not f[0].strip() or not f[1].strip():
+            continue
+        out[short_tty_full(f[0].strip())] = {"pane": f[1].strip(), "name": f[2].strip()}
+    return out
+
+
+def panes_snapshot(timeout=5.0):
+    """Ask iTerm2 for its panes. Empty when it cannot be asked: a save then
+    records no panes, and a restore opens windows, as it always did."""
+    try:
+        done = subprocess.run(["osascript", "-e", iterm_panes_script()],
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return parse_panes(done.stdout) if done.returncode == 0 else {}
+
+
+_SHELLS = {"sh", "bash", "zsh", "fish", "ksh", "tcsh", "csh", "dash", "nu", "xonsh"}
+
+
+def idle_ttys(ps_output):
+    """The terminals where nothing runs but a shell at its prompt.
+
+    From `ps -eo pid,tty,command`. Measured on an iTerm2 pane: `/usr/bin/login
+    -fpl ...` and `-zsh`, nothing else. A shell with arguments is running a
+    script, and anything else is a program the person is using - a restore
+    writes its command only where it cannot land in either.
+    """
+    busy, seen = set(), set()
+    for line in (ps_output or "").splitlines():
+        f = line.split(None, 2)
+        if len(f) < 3 or not f[0].isdigit() or f[1] in ("??", "?", "-"):
+            continue
+        tty, argv = f[1], f[2].split()
+        seen.add(tty)
+        head = os.path.basename(argv[0]).lstrip("-")
+        if head == "login" or (head in _SHELLS and len(argv) == 1):
+            continue
+        busy.add(tty)
+    return seen - busy
+
+
+def idle_snapshot():
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,tty,command"], capture_output=True,
+                             text=True, errors="replace", timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return idle_ttys(out)
+
+
 # Tab names change when you rename a tab or a session's title updates - minutes,
 # not seconds. The osascript round trip is ~0.5s of a 1.2s run, and --watch has
 # burned a core before by repeating per-tick work that did not need repeating.
@@ -1292,7 +1379,7 @@ def in_temp_dir(path, temp_roots):
     return False
 
 
-def manifest_from_rows(rows, now=None, why_not=None):
+def manifest_from_rows(rows, now=None, why_not=None, panes=None):
     """Capture the live fleet. Pure: the caller supplies the rows and the clock.
 
     Order is the caller's (collect() sorts needs-you first), so the restore list
@@ -1301,6 +1388,10 @@ def manifest_from_rows(rows, now=None, why_not=None):
     why_not(row) -> "" or the reason this session could never be resumed. Such a
     row is counted in `skipped`, under its reason in `skippedWhy`, and not saved:
     a restore would only open a window onto the error.
+
+    panes: tty -> {"pane", "name"} from panes_snapshot(). Each entry records the
+    pane it was shown in and that tab's title, so a restore can fill the pane
+    iTerm2 brings back instead of opening a window beside it.
     """
     now = int(time.time() if now is None else now)
     kept, why_count = [], {}
@@ -1313,6 +1404,9 @@ def manifest_from_rows(rows, now=None, why_not=None):
             why_count[why] = why_count.get(why, 0) + 1
             continue
         kept.append({k: r.get(k, "") for k in _MANIFEST_KEYS})
+        tty = short_tty_full(r.get("tty", ""))
+        kept[-1]["pane"] = ((panes or {}).get(tty) or {}).get("pane", "") if tty else ""
+        kept[-1]["tabTitle"] = r.get("tab_title", "") or ""
     return {"version": MANIFEST_VERSION, "savedAt": now, "count": len(kept),
             "skipped": sum(why_count.values()), "skippedWhy": why_count,
             "sessions": kept}
@@ -1562,24 +1656,111 @@ def iterm_run_script(cmd):
             '    write text %s\n  end tell\nend tell\n' % applescript_str(cmd))
 
 
-def iterm_open_script(entries):
-    """AppleScript that reopens one iTerm2 window per restorable session.
+_TITLE_MARK = re.compile(r"^[^\w\s]+(\s+|\Z)")
+
+
+def title_key(title):
+    """A tab title without the status mark Claude Code puts in front of it.
+    Measured: "✳ topic" at rest, "◐ topic" and "◑ topic" while it works - the
+    mark when a save ran need not be the mark iTerm2 restored."""
+    return _TITLE_MARK.sub("", (title or "").strip()).strip()
+
+
+def match_panes(entries, panes, idle, saved=None):
+    """sessionId -> the unique id of the live pane to resume it in.
+
+    panes: tty -> {"pane", "name"}, iTerm2 now. idle: the ttys at a bare shell.
+    Only an idle pane is ever chosen - a command typed into a program, or into
+    a prompt someone is using, is worse than a new window.
+
+    First by the pane id the save recorded, which iTerm2 keeps when it restores
+    its windows. Then, for a pane restored some other way (a new id), by the tab
+    title (title_key: the status mark in front does not count) - but only when
+    exactly one saved session and exactly one pane, busy or not, have it, and
+    that pane is idle. `saved` is the whole manifest (default: entries): a
+    session that is not being opened still makes its title ambiguous.
+
+    A pane id found on two ttys matches nothing: iTerm2 does not promise ids are
+    unique, and one saved session written into two panes is two processes on
+    one transcript.
+    """
+    ids = [p.get("pane") for p in (panes or {}).values() if p.get("pane")]
+    names = {p["pane"]: title_key(p.get("name", "")) for p in (panes or {}).values()
+             if p.get("pane") and ids.count(p["pane"]) == 1}
+    live = {p["pane"] for tty, p in (panes or {}).items()
+            if tty in (idle or ()) and p.get("pane") in names}
+    saved_titles = [title_key(o.get("tabTitle")) for o in (saved if saved is not None
+                                                          else entries) or []]
+    got, used = {}, set()
+    for e_ in entries or []:
+        uid = e_.get("pane") or ""
+        if uid in live and uid not in used:
+            got[e_.get("sessionId", "")] = uid
+            used.add(uid)
+    for e_ in entries or []:
+        if e_.get("sessionId", "") in got:
+            continue
+        title = title_key(e_.get("tabTitle"))
+        if not title or saved_titles.count(title) != 1:
+            continue
+        same = [u for u, name in names.items() if name == title]
+        if len(same) == 1 and same[0] in live and same[0] not in used:
+            got[e_.get("sessionId", "")] = same[0]
+            used.add(same[0])
+    return got
+
+
+def iterm_open_script(entries, fill=None):
+    """AppleScript that reopens each restorable session: in the pane `fill`
+    names for it (sessionId -> pane unique id), else in a new window.
+
+    The script returns the ids of the panes it wrote into, one a line, so the
+    caller can tell a pane that closed in the meantime from one that was filled.
+    A pane is idle by `ps`, which cannot see a line typed and not sent: ^E ^U
+    clears it first (^E because ^U clears only left of the cursor in bash, fish
+    and zsh's vi-insert), so the resume line is never appended to "rm -rf ". A
+    shell in vi command mode reads the line as commands; that is not handled.
+
+    Each pane is tried on its own and written at most once: a pane closing in
+    the middle must not stop the script before it returns what it wrote.
 
     An entry whose resume line cannot be built is DROPPED rather than emitted
     broken: a window that opens onto a failed command is worse than no window.
     """
-    lines = []
+    fill = fill or {}
+    lines, fills = [], []
     for e_ in entries or []:
         cmd = restore_command(e_)
         if not cmd:
+            continue
+        uid = fill.get(e_.get("sessionId", ""))
+        if uid:
+            fills.append((uid, cmd))
             continue
         lines.append("  create window with default profile")
         lines.append("  tell current session of current window")
         lines.append("    write text %s" % applescript_str(cmd))
         lines.append("  end tell")
-    if not lines:
+    if not lines and not fills:
         return ""
-    return 'tell application "iTerm2"\n  activate\n%s\nend tell\n' % "\n".join(lines)
+    head = ['  set done to ""']
+    if fills:
+        head += ["  repeat with w in windows", "    repeat with t in tabs of w",
+                 "      repeat with s in sessions of t",
+                 "        try",
+                 "          set u to unique id of s",
+                 "          if done does not contain u then"]
+        for i, (uid, cmd) in enumerate(fills):
+            head.append("            %s u is %s then" % ("if" if i == 0 else "else if",
+                                                        applescript_str(uid)))
+            head.append("              tell s to write text"
+                        " ((ASCII character 5) & (ASCII character 21)) newline no")
+            head.append("              tell s to write text %s" % applescript_str(cmd))
+            head.append("              set done to done & u & linefeed")
+        head += ["            end if", "          end if", "        end try",
+                 "      end repeat", "    end repeat", "  end repeat"]
+    body = "\n".join(head + lines + ["  return done"])
+    return 'tell application "iTerm2"\n  activate\n%s\nend tell\n' % body
 
 
 # -------------------------------------------------------------------- assemble

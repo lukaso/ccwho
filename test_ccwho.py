@@ -1989,6 +1989,254 @@ class ItermOpenScript(unittest.TestCase):
         self.assertEqual(ccwho.iterm_open_script([]), "")
 
 
+# A restore used to open one new window per session, and the person then moved
+# each one by hand into the panes iTerm2 had restored. iTerm2 keeps a pane's
+# `unique id` when it restores its windows (PTYSession.m adopts the saved
+# "Session GUID" on window restoration and on the startup arrangement), so a
+# save can name the pane and a restore can fill it.
+class ItermPanes(unittest.TestCase):
+    def test_the_script_asks_every_pane_for_its_tty_id_and_name(self):
+        s = ccwho.iterm_panes_script()
+        for word in ("tty", "unique id", "name", "every tab"):
+            self.assertIn(word, s)
+
+    def test_a_line_is_tty_id_and_name(self):
+        got = ccwho.parse_panes("/dev/ttys045\tGUID-1\t✳ the reaper\n")
+        self.assertEqual(got, {"ttys045": {"pane": "GUID-1", "name": "✳ the reaper"}})
+
+    def test_a_pane_with_no_name_is_still_a_pane(self):
+        got = ccwho.parse_panes("/dev/ttys045\tGUID-1\t\n")
+        self.assertEqual(got["ttys045"]["pane"], "GUID-1")
+
+    def test_junk_and_a_line_with_no_id_are_skipped(self):
+        got = ccwho.parse_panes("garbage\n/dev/ttys001\t\tname\n/dev/ttys002\tG2\tn\n")
+        self.assertEqual(list(got), ["ttys002"])
+
+
+class IdleTtys(unittest.TestCase):
+    LOGIN = ("/usr/bin/login -fpl someone /Applications/iTerm.app/Contents/MacOS/"
+             "ShellLauncher --launch_shell")
+
+    def ps(self, *rows):
+        return "  PID TTY      COMMAND\n" + "".join(
+            "%d %s %s\n" % (100 + i, tty, cmd) for i, (tty, cmd) in enumerate(rows))
+
+    def test_a_login_and_its_shell_is_idle(self):
+        out = self.ps(("ttys045", self.LOGIN), ("ttys045", "-zsh"))
+        self.assertEqual(ccwho.idle_ttys(out), {"ttys045"})
+
+    def test_a_pane_running_anything_else_is_not(self):
+        out = self.ps(("ttys045", self.LOGIN), ("ttys045", "-zsh"),
+                      ("ttys045", "claude --resume x"),
+                      ("ttys001", self.LOGIN), ("ttys001", "-zsh"),
+                      ("ttys001", "caffeinate -s"),
+                      ("ttys002", self.LOGIN), ("ttys002", "-bash"))      # control
+        self.assertEqual(ccwho.idle_ttys(out), {"ttys002"})
+
+    def test_a_shell_running_a_script_is_not_idle(self):
+        out = self.ps(("ttys003", "/bin/zsh ./deploy.sh"), ("ttys004", "fish"))
+        self.assertEqual(ccwho.idle_ttys(out), {"ttys004"})
+
+    def test_no_terminal_is_no_pane(self):
+        self.assertEqual(ccwho.idle_ttys(self.ps(("??", "-zsh"))), set())
+
+
+class ManifestRecordsThePane(unittest.TestCase):
+    def row(self, **kw):
+        base = dict(sessionId="4f2b91ac-1111-4222-8333-abcdefabcdef",
+                    cwd="/Users/x/projects/liveapp", project="liveapp",
+                    tty="ttys032", tab_title="✳ the reaper")
+        base.update(kw)
+        return base
+
+    def test_the_pane_showing_a_session_is_saved_with_it(self):
+        panes = {"ttys032": {"pane": "GUID-1", "name": "✳ the reaper"}}
+        s = ccwho.manifest_from_rows([self.row()], now=1, panes=panes)["sessions"][0]
+        self.assertEqual(s["pane"], "GUID-1")
+        self.assertEqual(s["tabTitle"], "✳ the reaper")
+
+    def test_no_pane_known_saves_an_empty_one(self):                     # control
+        s = ccwho.manifest_from_rows([self.row(tty="ttys099")], now=1,
+                                     panes={"ttys032": {"pane": "G", "name": ""}})
+        self.assertEqual(s["sessions"][0]["pane"], "")
+
+    def test_a_session_with_no_tty_takes_no_pane(self):
+        s = ccwho.manifest_from_rows([self.row(tty="")], now=1,
+                                     panes={"": {"pane": "G", "name": ""}})
+        self.assertEqual(s["sessions"][0]["pane"], "")
+
+
+class MatchPanes(unittest.TestCase):
+    A = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    B = "a1b2c3d4-1111-4222-8333-abcdefabcdef"
+
+    def e(self, sid, pane="", title=""):
+        return {"sessionId": sid, "cwd": "/x", "pane": pane, "tabTitle": title}
+
+    def test_a_restored_idle_pane_is_matched_by_its_id(self):
+        panes = {"ttys050": {"pane": "G-A", "name": "whatever it says now"}}
+        got = ccwho.match_panes([self.e(self.A, "G-A")], panes, {"ttys050"})
+        self.assertEqual(got, {self.A: "G-A"})
+
+    def test_a_busy_pane_is_never_written_into(self):
+        panes = {"ttys050": {"pane": "G-A", "name": "t"}}
+        got = ccwho.match_panes([self.e(self.A, "G-A", "t")], panes, set())
+        self.assertEqual(got, {})
+
+    def test_a_new_id_falls_back_to_the_one_pane_with_that_title(self):
+        panes = {"ttys050": {"pane": "NEW", "name": "✳ reaper"},
+                 "ttys051": {"pane": "OTHER", "name": "zsh"}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "✳ reaper")], panes,
+                                {"ttys050", "ttys051"})
+        self.assertEqual(got, {self.A: "NEW"})
+
+    def test_the_status_mark_claude_puts_before_its_title_is_ignored(self):
+        # measured: "✳ topic" at rest, "◐ topic" / "◑ topic" while it works - the
+        # mark at the moment of the save need not be the one iTerm2 restored
+        panes = {"ttys050": {"pane": "NEW", "name": "✳ Laptop crash (claude)"}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "◐ Laptop crash (claude)")], panes,
+                                {"ttys050"})
+        self.assertEqual(got, {self.A: "NEW"})
+
+    def test_a_different_title_after_the_mark_is_no_match(self):        # control
+        panes = {"ttys050": {"pane": "NEW", "name": "✳ Laptop crash (claude)"}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "◐ Laptop fan (claude)")], panes,
+                                {"ttys050"})
+        self.assertEqual(got, {})
+
+    def test_a_bare_mark_is_no_title(self):
+        panes = {"ttys050": {"pane": "NEW", "name": "✳ "}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "◐")], panes, {"ttys050"})
+        self.assertEqual(got, {})
+
+    def test_a_busy_pane_with_that_title_makes_it_ambiguous(self):
+        panes = {"ttys050": {"pane": "P1", "name": "X"}, "ttys051": {"pane": "P2", "name": "X"}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "X")], panes, {"ttys051"})
+        self.assertEqual(got, {})
+
+    def test_a_session_matched_by_id_still_counts_for_its_title(self):
+        panes = {"ttys050": {"pane": "P1", "name": "X"}, "ttys051": {"pane": "P2", "name": "X"}}
+        got = ccwho.match_panes([self.e(self.A, "P1", "X"), self.e(self.B, "OLD", "X")],
+                                panes, {"ttys050", "ttys051"})
+        self.assertEqual(got, {self.A: "P1"})
+
+    def test_a_saved_session_not_being_opened_counts_for_its_title(self):
+        # B is running already, so only A is opened - but "X" was B's title too
+        panes = {"ttys050": {"pane": "P2", "name": "X"}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "X")], panes, {"ttys050"},
+                                saved=[self.e(self.A, "OLD", "X"), self.e(self.B, "PB", "X")])
+        self.assertEqual(got, {})
+
+    def test_one_pane_id_on_two_ttys_is_never_matched_by_id(self):
+        # two panes given one saved id would both resume the session: a fork
+        panes = {"ttys050": {"pane": "G-A", "name": "a"}, "ttys051": {"pane": "G-A", "name": "b"}}
+        got = ccwho.match_panes([self.e(self.A, "G-A", "a")], panes, {"ttys050", "ttys051"})
+        self.assertEqual(got, {})
+
+    def test_one_pane_id_on_two_ttys_is_never_matched_by_title(self):
+        panes = {"ttys050": {"pane": "NEW", "name": "X"}, "ttys051": {"pane": "NEW", "name": "Y"}}
+        got = ccwho.match_panes([self.e(self.A, "OLD", "X")], panes, {"ttys050", "ttys051"})
+        self.assertEqual(got, {})
+
+    def test_two_panes_with_that_title_is_no_match(self):
+        panes = {"ttys050": {"pane": "N1", "name": "claude"},
+                 "ttys051": {"pane": "N2", "name": "claude"}}
+        got = ccwho.match_panes([self.e(self.A, "", "claude")], panes, {"ttys050", "ttys051"})
+        self.assertEqual(got, {})
+
+    def test_two_sessions_with_one_title_is_no_match(self):
+        panes = {"ttys050": {"pane": "N1", "name": "claude"}}
+        got = ccwho.match_panes([self.e(self.A, "", "claude"), self.e(self.B, "", "claude")],
+                                panes, {"ttys050"})
+        self.assertEqual(got, {})
+
+    def test_a_pane_matched_by_id_is_not_given_away_by_title(self):
+        panes = {"ttys050": {"pane": "G-A", "name": "same"}}
+        got = ccwho.match_panes([self.e(self.A, "G-A", "x"), self.e(self.B, "", "same")],
+                                panes, {"ttys050"})
+        self.assertEqual(got, {self.A: "G-A"})
+
+    def test_an_empty_title_matches_nothing(self):
+        panes = {"ttys050": {"pane": "N1", "name": ""}}
+        self.assertEqual(ccwho.match_panes([self.e(self.A)], panes, {"ttys050"}), {})
+
+    def test_an_old_manifest_matches_nothing_and_opens_windows(self):
+        panes = {"ttys050": {"pane": "N1", "name": "t"}}
+        old = {"sessionId": self.A, "cwd": "/x"}
+        self.assertEqual(ccwho.match_panes([old], panes, {"ttys050"}), {})
+
+
+class ItermOpenScriptFillsPanes(unittest.TestCase):
+    A = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    B = "a1b2c3d4-1111-4222-8333-abcdefabcdef"
+    entries = [{"sessionId": A, "cwd": "/Users/x/p/liveapp"},
+               {"sessionId": B, "cwd": "/Users/x/p/football"}]
+
+    def test_a_filled_session_opens_no_window_and_the_other_does(self):
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        self.assertEqual(s.count("create window with default profile"), 1)
+        self.assertIn('if u is "G-A"', s)
+        self.assertIn("claude --resume " + self.A, s)
+        self.assertIn("claude --resume " + self.B, s)
+
+    def test_the_script_says_which_panes_it_wrote_into(self):
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        self.assertIn("return done", s)
+
+    def test_a_pane_id_cannot_break_out_of_its_literal(self):
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: 'x" then do shell script "id'})
+        checked = [l for l in s.splitlines() if " u is " in l]
+        self.assertEqual(len(checked), 1)
+        for line in checked:
+            self.assertEqual(line.count('"') - line.count('\\"'), 2)
+
+    def test_a_half_typed_line_is_cleared_before_the_resume_line(self):
+        # `ps` cannot see "rm -rf " typed at a prompt; the resume line must not
+        # be appended to it
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A", self.B: "G-B"})
+        for sid in (self.A, self.B):
+            at = s.index("claude --resume " + sid)
+            branch = s[s.rindex("unique id", 0, at):at]
+            # ^E first: ^U clears only left of the cursor in bash, fish and vi-insert
+            self.assertIn("write text ((ASCII character 5) & (ASCII character 21)) newline no",
+                          branch)
+
+    def test_a_pane_id_is_written_at_most_once(self):
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        self.assertIn("if done does not contain u then", s)
+        self.assertLess(s.index("if done does not contain u then"), s.index('if u is "G-A"'))
+
+    def test_one_pane_failing_does_not_lose_what_was_written(self):
+        # a pane that closes mid-loop must not abort the script: the ids already
+        # written are only reported if the script reaches `return done`
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        start, end = s.index("      repeat with s in sessions of t"), s.index("    end repeat")
+        loop = s[start:end]
+        self.assertLess(loop.index("try"), loop.index("set u to unique id of s"))
+        self.assertGreater(loop.rindex("end try"), loop.rindex("set done to done"))
+
+    def test_each_pane_id_is_read_once(self):
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A", self.B: "G-B"})
+        self.assertEqual(s.count("unique id of s"), 1)
+
+    def test_the_filled_ids_are_returned_after_the_windows_open(self):
+        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        self.assertGreater(s.index("return done"), s.rindex("create window"))
+
+    @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
+    def test_the_script_compiles(self):
+        for fill in ({self.A: "G-A", self.B: "G-B"}, {self.A: "G-A"}, {}):
+            s = ccwho.iterm_open_script(self.entries, fill=fill)
+            r = subprocess.run(["osacompile", "-o", os.devnull, "-e", s],
+                               capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_only_filled_sessions_still_make_a_script(self):
+        s = ccwho.iterm_open_script(self.entries[:1], fill={self.A: "G-A"})
+        self.assertNotIn("create window", s)
+        self.assertIn("claude --resume " + self.A, s)
+
+
 class RestoreLabelling(unittest.TestCase):
     """A restore list whose rows read '/compact' and 'go ahead' identifies nothing.
     Measured on the real fleet: 3 of 17 rows were useless with `topic` alone, and 1

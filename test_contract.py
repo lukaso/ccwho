@@ -38,6 +38,9 @@ MANIFEST_SESSION_KEYS = {
     "status", "tty", "pid", "since",
     "configDir",          # added 2026-09-24: resume runs in that dir; older
                           # manifests lack it and resume in the default dir
+    "pane", "tabTitle",   # added 2026-09-26: the iTerm2 pane and its title, so
+                          # a restore resumes in the pane iTerm2 brought back;
+                          # older manifests lack them and open new windows
 }
 
 MANIFEST_TOP_KEYS = {"version", "savedAt", "count", "skipped", "skippedWhy", "sessions"}

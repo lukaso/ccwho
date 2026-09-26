@@ -291,6 +291,14 @@ def _closing_line(text):
     return re.sub(r"[*_`#>]", "", lines[-1]).strip()
 
 
+# A question in quotation marks is one the session reports - put to a reviewer,
+# or one a user might ask - not one it puts to you. Measured over 5388 ended
+# turns: dropping quoted text turned 7 asks into none, and all 7 were quotes.
+# A quote runs to the next mark, never the last. A " after a digit is inches
+# (13"), not the start of a quote.
+_QUOTED = re.compile(r'(?<!\d)"[^"]*"|“[^”]*”')
+
+
 def asks_user(text):
     """Does this message hand the decision back to the human?
 
@@ -298,8 +306,8 @@ def asks_user(text):
     so status alone loses them. Only the closing line is considered: a question
     earlier in a long report is usually one the message goes on to answer.
     """
-    closing = _closing_line(text).lower()
-    if not closing:
+    closing = _QUOTED.sub("", _closing_line(text).lower())
+    if not closing.strip():
         return False
     return "?" in closing or any(p in closing for p in _ASK_PHRASES)
 

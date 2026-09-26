@@ -459,6 +459,32 @@ class TestAsksUser(unittest.TestCase):
     def test_only_the_closing_line_counts(self):
         self.assertFalse(ccwho.asks_user("Should I do X?\n\nDone, all landed."))
 
+    def test_a_quoted_question_is_not_an_ask(self):
+        # real closing lines: the question is one put to a reviewer, not to you
+        self.assertFalse(ccwho.asks_user(
+            'Both reviewers are still running: one mutation audit asking only "can each '
+            'of these assertions actually fail?". I will fix whatever they find.'))
+        self.assertFalse(ccwho.asks_user(
+            "I'll keep watching r/gimp - user-crowd questions (“does it work for X?”) "
+            "are the likely first comments."))
+
+    def test_an_ask_phrase_in_quotes_is_not_an_ask(self):
+        self.assertFalse(ccwho.asks_user('The reviewer\'s brief says "tell me what breaks". It runs now.'))
+
+    def test_a_question_outside_the_quotes_still_asks(self):     # control
+        self.assertTrue(ccwho.asks_user('The round asked "is it pending?" - rename it to "ready"?'))
+        self.assertTrue(ccwho.asks_user('I asked it "what breaks?" - say the word and I land it.'))
+
+    def test_an_ask_between_two_quotes_still_asks(self):         # control
+        # a quote runs to the NEXT mark, not the last: the ask between is kept
+        self.assertTrue(ccwho.asks_user('Kept "a" - want me to rename it to "b"'))
+
+    def test_inch_marks_are_not_quotes(self):
+        self.assertTrue(ccwho.asks_user('The 13" build passes - want me to ship it? The 15" one too.'))
+
+    def test_an_unclosed_quote_hides_nothing(self):              # control
+        self.assertTrue(ccwho.asks_user('The label reads "ready. Want me to fix it?'))
+
     def test_empty_text(self):
         self.assertFalse(ccwho.asks_user(""))
 

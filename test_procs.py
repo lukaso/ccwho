@@ -1269,7 +1269,7 @@ class TestKillPlan(unittest.TestCase):
                               sessions, own=99)
         return {"table": table, "att": att, "sessions": sessions, "own": 99,
                 "ports": {20: [3000], 21: [5173], 40: [8000], 50: [2375]},
-                "pipes": {**{q: set() for q in table}, **(pipes or {})}, "marks": m}
+                "pipes": {**{q: set() for q in table}, **(pipes or {})}, "marks": m, "connections": []}
 
     def plan(self, mode, target, **kw):
         return procs.kill_plan(mode, target, self.world(**kw))
@@ -1312,17 +1312,23 @@ class TestKillPlan(unittest.TestCase):
     def test_a_port_kills_its_agent_started_holder(self):
         self.assertEqual(self.kills(self.plan("port", 3000)), [20])
 
-    def test_an_unmarked_holder_is_named_not_killed(self):
-        p = self.plan("port", 8000)
-        self.assertEqual(self.kills(p), [])
-        self.assertIn("ccwho kill 40 if you mean it", self.spared(p)[40])
+    def note(self, plan, pid):
+        return next(k.get("note", "") for k in plan["kill"] if k["pid"] == pid)
 
-    def test_a_not_sure_holder_is_not_killed(self):
+    def test_an_unmarked_holder_is_taken_with_a_note(self):
+        p = self.plan("port", 8000, marks={40: None})       # read, no mark
+        self.assertEqual(self.kills(p), [40])
+        self.assertIn("no agent started it", self.note(p, 40))
+        p = self.plan("port", 8000)                         # not read: said so
+        self.assertEqual(self.kills(p), [40])
+        self.assertIn("could not read who started it", self.note(p, 40))
+
+    def test_a_not_sure_holder_is_taken_with_a_note(self):
         w = self.world()
         w["ports"][60] = [9999]                                         # gpg-agent
         p = procs.kill_plan("port", 9999, w)
-        self.assertEqual(self.kills(p), [])
-        self.assertIn("not sure: it is a shared user daemon", self.spared(p)[60])
+        self.assertEqual(self.kills(p), [60])
+        self.assertIn("not sure: it is a shared user daemon", self.note(p, 60))
 
     def test_a_port_nobody_holds_plans_nothing(self):                   # control
         p = self.plan("port", 4444)
@@ -1355,16 +1361,15 @@ class TestKillPlan(unittest.TestCase):
         self.assertEqual(self.kills(procs.kill_plan("clean", None, w)), [20, 21])
 
     # ---- the pipe rule (plan, decided after #9's reviews)
-    def test_a_process_feeding_a_live_one_is_spared(self):
+    def test_a_process_feeding_a_live_one_says_so(self):
         # an ssh mux's ProxyCommand is an orphan whose stdin/stdout lead to the
         # `ssh: ... [mux]` master: killing it drops every connection on it
         extra = {70: (1, self.T, "ssh: /Users/u/.ssh/cm-x [mux]"),
                  71: (1, self.T, "aws ssm start-session --target i-1")}
         p = procs.kill_plan("clean", None, self.world(
             extra=extra, marks={71: ("claude", DEAD_SID)}, pipes={71: {70}}))
-        self.assertNotIn(71, self.kills(p))
-        self.assertIn("70", self.spared(p)[71])
-        self.assertEqual([20, 21], [x for x in self.kills(p) if x in (20, 21)])   # control
+        self.assertIn("piped to 70", self.note(p, 71))                 # said; a person decides
+        self.assertEqual(self.note(p, 20), "")                                     # control
 
     def test_a_pipe_to_another_target_is_no_reason_to_spare(self):     # control
         # `a | b`, both left behind: killing both is the whole pipeline
@@ -1379,21 +1384,20 @@ class TestKillPlan(unittest.TestCase):
     def test_a_pipe_to_a_process_newer_than_the_scan_spares(self):
         # review: a peer lsof reports at kill time is alive, scan or no scan
         p = procs.kill_plan("clean", None, self.world(pipes={20: {555}}))
-        self.assertNotIn(20, self.kills(p))
-        self.assertIn("555", self.spared(p)[20])
+        self.assertIn("piped to 555 (a process newer than the scan - it may be an agent)", self.note(p, 20))
 
-    def test_what_feeds_a_spared_process_is_spared_too(self):
-        # 20 feeds 21, 21 feeds the live mux: 21 stays, so 20 must stay too
+    def test_a_pipe_inside_the_kill_is_no_note(self):
+        # 20 feeds 21, 21 feeds the live mux: only 21's pipe leads out
         extra = {70: (1, self.T, "ssh: /Users/u/.ssh/cm-x [mux]")}
         p = procs.kill_plan("clean", None, self.world(extra=extra,
                                                       pipes={20: {21}, 21: {70}}))
-        self.assertEqual(self.kills(p), [])
-        self.assertTrue({20, 21} <= set(self.spared(p)))
+        self.assertIn("piped to 70", self.note(p, 21))
+        self.assertNotIn("piped", self.note(p, 20))
 
     def test_the_pipe_rule_holds_for_a_port_too(self):
         extra = {70: (1, self.T, "ssh: /Users/u/.ssh/cm-x [mux]")}
         p = procs.kill_plan("port", 3000, self.world(extra=extra, pipes={20: {70}}))
-        self.assertEqual(self.kills(p), [])
+        self.assertIn("piped to 70", self.note(p, 20))
 
     # ---- review: what must never be killed, in any mode
     def ccwho_under_a_shell(self, extra=None, marks=None):
@@ -1443,7 +1447,7 @@ class TestKillPlan(unittest.TestCase):
         listed = {x["pid"] for g in ("left_behind", "unsure", "codex") for x in w["att"][g]}
         self.assertTrue(listed <= set(self.kills(p)) | set(self.spared(p)))
 
-    def test_a_live_sessions_helper_holding_a_port_is_spared(self):
+    def test_a_live_sessions_helper_holding_a_port_says_so(self):
         extra = {12: (10, self.T, "npm exec chrome-devtools-mcp@latest")}
         w = self.world(extra=extra, marks={12: ("claude", self.LIVE)})
         w["ports"][12] = [9222]
@@ -1451,24 +1455,18 @@ class TestKillPlan(unittest.TestCase):
             {11: ("claude", self.LIVE), 12: ("claude", self.LIVE)}), w["ports"],
             w["sessions"], own=99)
         p = procs.kill_plan("port", 9222, w)
-        self.assertEqual(self.kills(p), [])
-        self.assertIn("ccwho kill 12 if you mean it", self.spared(p)[12])
+        self.assertIn("helper", self.note(p, 12))
 
     def test_a_codex_holder_is_named_with_its_note(self):
         # v1: named, not killed - ccwho cannot tell whether its session still runs
         w = self.world()
         w["ports"][30] = [4000]
         p = procs.kill_plan("port", 4000, w)
-        self.assertEqual(self.kills(p), [])
-        self.assertIn("Codex", self.spared(p)[30])
+        self.assertIn("Codex", self.note(p, 30))
 
-    def test_the_port_messages_say_what_the_plan_says(self):
-        self.assertEqual(self.spared(self.plan("port", 8000))[40],
-                         ":8000 is held by 40 python3, which no agent started"
-                         " - ccwho kill 40 if you mean it")
-        self.assertEqual(self.spared(self.plan("port", 2375))[50],
-                         ":2375 is held by Docker (a container) - ccwho cannot tell"
-                         " which agent started it")
+    def test_the_port_notes_say_what_the_plan_knows(self):
+        self.assertEqual(self.note(self.plan("port", 8000, marks={40: None}), 40), "no agent started it")
+        self.assertEqual(self.note(self.plan("port", 2375), 50), "not sure: it is an app")
 
     def test_a_port_given_as_text_is_the_same_port(self):
         self.assertEqual(self.kills(self.plan("port", "3000")), [20])
@@ -1492,10 +1490,9 @@ class TestKillPlan(unittest.TestCase):
         self.assertEqual(procs.kill_plan("session", self.LIVE, w)["kill"], [])
         for pid in (60, 70, 71, 80, 81, 82, 90, 91):      # named, each says what it is
             k = procs.kill_plan("pid", {"pid": pid, "start": self.T}, w)["kill"]
-            self.assertTrue(not k or "not sure" in k[0].get("note", ""), pid)
+            self.assertRegex(k[0].get("note", "") if k else "spared", r"daemon|ssh|tmux|spared", pid)
         p = procs.kill_plan("port", 11434, w)
-        self.assertEqual(self.kills(p), [])
-        self.assertIn("shared user daemon", self.spared(p)[90])
+        self.assertIn("shared user daemon", self.note(p, 90))
 
     def test_without_ccwho_in_the_scan_a_computed_kill_takes_nothing(self):
         for own in (None, 12345):
@@ -1528,13 +1525,12 @@ class TestKillPlan(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertNotIn(10, self.kills(procs.kill_plan(mode, target, w)))
 
-    def test_pipes_not_read_spares_every_computed_target(self):
+    def test_pipes_not_read_is_said_for_every_target(self):
         w = self.world()
         w["pipes"] = None
         p = procs.kill_plan("clean", None, w)
-        self.assertEqual(p["kill"], [])
-        self.assertIn("pipes", self.spared(p)[20])
-        self.assertEqual(self.kills(self.plan("clean", None)), [20, 21])        # control: read, none
+        self.assertIn("pipes were not read", self.note(p, 20))
+        self.assertNotIn("pipes", self.note(self.plan("clean", None), 20))      # control: read, none
 
     def test_a_named_pid_says_what_killing_it_means(self):
         extra = {70: (1, self.T, "ssh: /u/.ssh/cm-h [mux]")}
@@ -1550,9 +1546,7 @@ class TestKillPlan(unittest.TestCase):
     def test_the_messages_are_the_plans(self):
         self.assertEqual(self.spared(self.plan("pid", {"pid": 20, "start": "Wed Sep 23 09:00:00 2026"}))[20],
                          "20 is now a different process - not killed; run ccwho ps again")
-        w = self.world(extra={51: (1, self.T, "/Applications/Docker.app/Contents/MacOS/com.docker.backend")})
-        w["ports"][51] = [2376]
-        self.assertIn("held by Docker", self.spared(procs.kill_plan("port", 2376, w))[51])
+        self.assertEqual(self.plan("port", 4444)["why"], "nothing holds :4444")
 
     def test_bad_input_is_answered_never_raised(self):
         for mode, target in (("pid", {"pid": 20, "start": 12345}), ("pid", 20),
@@ -1594,7 +1588,7 @@ class TestKillPlan(unittest.TestCase):
     def test_a_package_that_is_not_claude_is_not_one(self):             # control
         self.assertFalse(procs._is_a_claude("npm exec @anthropic-ai/claude-code-foo"))
 
-    def test_port_mode_spares_what_attribute_is_not_sure_of(self):
+    def test_port_mode_says_what_attribute_is_not_sure_of(self):
         # 11's claude (10) still runs: attribute calls it not sure; so must port
         w = self.world(extra={10: (1, self.T, "/Users/x/.local/bin/claude"),
                               11: (10, self.T, "node server.js")},
@@ -1604,9 +1598,8 @@ class TestKillPlan(unittest.TestCase):
         w["att"] = procs.attribute(w["table"], {11: ("claude", DEAD_SID, 10), 20: ("claude", DEAD_SID)},
                                    w["ports"], [], own=99)
         p = procs.kill_plan("port", 3001, w)
-        self.assertEqual(self.kills(p), [])
         # 11 runs under 10, a claude no source lists: the nearest agent above it
-        self.assertIn("not sure: it runs under a claude that ccwho does not list", self.spared(p)[11])
+        self.assertIn("not sure: it runs under a claude that ccwho does not list", self.note(p, 11))
         p = procs.kill_plan("pid", {"pid": 11, "start": self.T}, w)
         self.assertIn("not sure: it runs under a claude", p["kill"][0]["note"])
         self.assertEqual(self.kills(procs.kill_plan("port", 3000, w)), [20])      # control
@@ -1635,7 +1628,7 @@ class TestKillPlan(unittest.TestCase):
                  .get("note", "") for pid in (71, 61, 11)}
         self.assertIn("ssh connection", notes[71])
         self.assertIn("runs under a shared user daemon", notes[61])
-        self.assertEqual(notes[11], "")                                          # control
+        self.assertNotRegex(notes[11], "ssh|daemon")                             # control
 
     def test_an_empty_plan_always_says_why(self):
         w = self.world()
@@ -1738,7 +1731,7 @@ class TestKillPlan(unittest.TestCase):
                 att = procs.attribute(table, marks, {}, sessions, own=99)
                 self.assertEqual(sorted(p["pid"] for p in att["sessions"][B]), [210, 220, 221])
                 w = {"table": table, "att": att, "sessions": sessions, "own": 99,
-                     "ports": {}, "pipes": {q: set() for q in table}, "marks": marks}
+                     "ports": {}, "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
                 self.assertEqual(self.kills(procs.kill_plan("clean", None, w)), [300])   # control
 
     def test_another_live_sessions_work_is_not_this_ones(self):
@@ -1776,7 +1769,7 @@ class TestKillPlan(unittest.TestCase):
                 p = self.plan("pid", {"pid": raw, "start": self.T})
                 self.assertEqual((p["kill"], p.get("why")), ([], "no pid given"))
         p = procs.kill_plan("clean", None, self.world(pipes={20: [400, "a"]}))
-        self.assertNotIn(20, self.kills(p))
+        self.assertIn("not in its shape", p["why"])          # a text peer: out of shape
         w = self.world()
         # a session with no id, and a group filed under None: `session None` is no session
         w["sessions"] = w["sessions"] + [{"pid": 12}]
@@ -1800,8 +1793,10 @@ class TestKillPlan(unittest.TestCase):
                 att = procs.attribute(table, marks, ports, sessions, own=99)
                 self.assertIn(21, [p["pid"] for p in att["unsure"]])
                 w = {"table": table, "att": att, "sessions": sessions, "own": 99,
-                     "ports": ports, "pipes": {q: set() for q in table}, "marks": marks}
-                self.assertEqual(self.kills(procs.kill_plan("port", 3000, w)), [])
+                     "ports": ports, "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
+                p = procs.kill_plan("port", 3000, w)
+                self.assertIn("runs under a", self.note(p, 21))
+                self.assertEqual(self.kills(p), [21])        # never the agent above it
 
     def test_a_session_in_a_gui_terminal_can_have_its_work_killed(self):
         # every terminal app runs from .app/Contents/: what is ABOVE the claude
@@ -1816,9 +1811,10 @@ class TestKillPlan(unittest.TestCase):
         sessions = [{"sessionId": self.LIVE, "pid": 10}]
         ports = {12: [3000]}
         w = {"table": table, "att": procs.attribute(table, marks, ports, sessions, own=99),
-             "sessions": sessions, "own": 99, "ports": ports, "pipes": {q: set() for q in table}, "marks": marks}
-        # the terminal app above the claude is no doubt: a named pid has no note
-        self.assertNotIn("note", procs.kill_plan("pid", {"pid": 12, "start": self.T}, w)["kill"][0])
+             "sessions": sessions, "own": 99, "ports": ports, "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
+        # the terminal app above the claude is no doubt
+        self.assertNotIn("app", procs.kill_plan("pid", {"pid": 12, "start": self.T}, w)["kill"][0]
+                         .get("note", ""))
         # control: tmux the session itself started still is
         k = procs.kill_plan("pid", {"pid": 14, "start": self.T}, w)["kill"][0]
         self.assertIn("runs in an app or tmux", k.get("note", ""))
@@ -1854,7 +1850,7 @@ class TestKillPlan(unittest.TestCase):
         att = procs.attribute(table, marks, {}, sessions, own=99)
         self.assertIn(21, [p["pid"] for p in att["sessions"][self.LIVE]])
         self.assertIn(22, [p["pid"] for p in att["unsure"]])
-        w = {"table": table, "att": att, "sessions": sessions, "own": 99, "ports": {}, "pipes": {q: set() for q in table}, "marks": marks}
+        w = {"table": table, "att": att, "sessions": sessions, "own": 99, "ports": {}, "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
         self.assertNotIn(21, self.kills(procs.kill_plan("clean", None, w)))
 
     # ---- seventh review: one rule - a process belongs to the nearest agent above it
@@ -1873,13 +1869,15 @@ class TestKillPlan(unittest.TestCase):
         ports = {503: [5173]}
         att = procs.attribute(table, marks, ports, [], own=99)
         return {"table": table, "att": att, "sessions": [], "own": 99, "ports": ports,
-                "pipes": {q: set() for q in table}, "marks": marks}
+                "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
 
     def test_a_running_codex_agents_work_is_never_left_behind(self):
         w = self.codex_world()
         self.assertEqual(w["att"]["left_behind"], [])
         self.assertEqual(self.kills(procs.kill_plan("clean", None, w)), [])
-        self.assertEqual(self.kills(procs.kill_plan("port", 5173, w)), [])
+        p = procs.kill_plan("port", 5173, w)            # named: taken, and said whose it is
+        self.assertEqual(self.kills(p), [503])
+        self.assertIn("Codex", self.note(p, 503))
         gone = self.codex_world(codex_alive=False)                                # control
         self.assertEqual(self.kills(procs.kill_plan("clean", None, gone)), [502, 503])
 
@@ -1909,17 +1907,17 @@ class TestKillPlan(unittest.TestCase):
         sessions = [{"sessionId": self.LIVE, "pid": 10}]
         ports = {12: [3000]}
         att = procs.attribute(table, marks, ports, sessions, own=99)
-        w = {"table": table, "att": att, "sessions": sessions, "own": 99, "ports": ports, "pipes": {q: set() for q in table}, "marks": marks}
+        w = {"table": table, "att": att, "sessions": sessions, "own": 99, "ports": ports, "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
         k = procs.kill_plan("pid", {"pid": 12, "start": self.T}, w)["kill"][0]
         self.assertEqual((k["session"], k["marked"]), (self.LIVE, DEAD_SID))
 
     def test_a_pipe_to_an_agent_spares_too(self):
         # v1, review 8: `claude -p x | tee` - kill the tee and the claude dies
-        w = self.world(pipes={20: {10}})
+        w = self.world(pipes={20: {10}, 10: {20}})         # as lsof reads it: both sides
         self.assertNotIn(20, self.kills(procs.kill_plan("clean", None, w)))
         extra = {70: (1, self.T, "ssh: /u/.ssh/cm-h [mux]")}                      # control
         w = self.world(extra=extra, pipes={20: {70}})
-        self.assertNotIn(20, self.kills(procs.kill_plan("clean", None, w)))
+        self.assertIn(20, self.kills(procs.kill_plan("clean", None, w)))       # a person decides
 
     def test_an_agent_is_known_by_the_program_that_runs(self):
         for cmd in ("/bin/zsh -c cd /Users/u/src/codex && npm run dev",
@@ -1952,7 +1950,7 @@ class TestKillPlan(unittest.TestCase):
                 self.assertFalse(procs._is_an_agent(cmd))
 
     def test_a_pipe_to_an_unlisted_agent_spares_too(self):
-        w = self.world(extra={46: (1, self.T, "claude -p summarize")}, pipes={20: {46}})
+        w = self.world(extra={46: (1, self.T, "claude -p summarize")}, pipes={20: {46}, 46: {20}})
         self.assertNotIn(20, self.kills(procs.kill_plan("clean", None, w)))
 
     def test_the_plan_carries_the_mark_the_signaller_rechecks(self):
@@ -1987,13 +1985,16 @@ class TestKillPlanV1(unittest.TestCase):
         return {"table": table, "att": procs.attribute(table, m, p, s, own=99),
                 "sessions": s, "own": 99, "ports": p,
                 "pipes": {**{q: set() for q in table}, **pipes} if pipes is not None else
-                         {q: set() for q in table}, "marks": m}
+                         {q: set() for q in table}, "marks": m, "connections": []}
 
     def kills(self, plan):
         return sorted(p["pid"] for p in plan["kill"])
 
     def spared(self, plan):
         return {p["pid"]: p["why"] for p in plan["spare"]}
+
+    def note(self, plan, pid):
+        return next(k.get("note", "") for k in plan["kill"] if k["pid"] == pid)
 
     def test_session_mode_is_not_built(self):
         p = procs.kill_plan("session", LIVE_SID, self.world())
@@ -2005,38 +2006,39 @@ class TestKillPlanV1(unittest.TestCase):
         p = procs.kill_plan("clean", None, self.world())
         self.assertEqual(self.kills(p), [20, 21])
 
-    def test_a_pipe_to_any_live_process_spares_an_orphan(self):
+    def test_a_pipe_to_an_agent_spares_an_orphan(self):
         # an agent reading or feeding it included: `claude -p | tee`
         extra = {30: (1, self.T, "claude -p x")}
-        for peer in (30, 10, 11):
+        for peer in (30, 10):
             with self.subTest(peer=peer):
-                p = procs.kill_plan("clean", None, self.world(extra=extra, pipes={20: {peer}}))
+                p = procs.kill_plan("clean", None, self.world(extra=extra, pipes={20: {peer}, peer: {20}}))
                 self.assertNotIn(20, self.kills(p))
+        p = procs.kill_plan("clean", None, self.world(extra=extra, pipes={20: {11}}))
+        self.assertIn("piped to 11", self.note(p, 20))           # no agent: said, a person decides
         self.assertIn(20, self.kills(procs.kill_plan("clean", None, self.world(pipes={20: set()}))))
 
-    def test_a_port_takes_only_such_an_orphan(self):
+    def test_a_port_takes_its_holder_and_says_whose(self):
         self.assertEqual(self.kills(procs.kill_plan("port", 3000, self.world())), [20, 21])
         p = procs.kill_plan("port", 5173, self.world())                   # a live session's work
-        self.assertEqual(p["kill"], [])
-        self.assertIn(":5173 is held by 11 node, work of a live session - ccwho kill 11"
-                      " if you mean it", self.spared(p)[11])
+        self.assertEqual(self.kills(p), [11])
+        self.assertEqual(self.note(p, 11), "it is the work of a live session")
 
-    def test_a_port_held_by_codex_is_named_not_killed(self):
+    def test_a_port_held_by_codex_says_so(self):
         w = self.world(extra={30: (1, self.T, "workerd serve")}, marks={30: ("codex", "01a0-x")},
                        ports={30: [4000]})
         p = procs.kill_plan("port", 4000, w)
-        self.assertEqual(p["kill"], [])
-        self.assertIn("ccwho kill 30 if you mean it", self.spared(p)[30])
+        self.assertEqual(self.kills(p), [30])
+        self.assertIn("Codex", self.note(p, 30))
 
     def test_a_named_pid_still_acts(self):
         p = procs.kill_plan("pid", {"pid": 11, "start": self.T}, self.world())
         self.assertEqual(self.kills(p), [11])
 
-    def test_a_named_pid_that_feeds_an_agent_says_so(self):
+    def test_a_named_pid_that_feeds_an_agent_is_spared(self):
         extra = {30: (1, self.T, "claude -p x")}
-        k = procs.kill_plan("pid", {"pid": 20, "start": self.T},
-                            self.world(extra=extra, pipes={20: {30}}))["kill"][0]
-        self.assertIn("30", k.get("note", ""))
+        p = procs.kill_plan("pid", {"pid": 20, "start": self.T}, self.world(extra=extra, pipes={20: {30}, 30: {20}}))
+        self.assertEqual(p["kill"], [])                  # killing it would end the agent
+        self.assertIn("20 is piped to 30, an agent", self.spared(p)[20])
 
     # ---- the agent detector, for the live list and the orphans alike
     NOT_AGENTS = ("npm --prefix /Users/u/src/codex run dev", "pnpm --filter codex dev",
@@ -2060,13 +2062,13 @@ class TestKillPlanV1(unittest.TestCase):
         p = procs.kill_plan("port", 7000, self.world(ports={20: [3000], 21: [7000]}))
         self.assertEqual(self.kills(p), [20, 21])
 
-    def test_a_port_held_by_a_non_orphan_is_named(self):
-        # its parent still runs (not an ended session's orphan): named, not taken
+    def test_a_port_held_by_a_non_orphan_takes_it_alone(self):
+        # its parent still runs: not an orphan's tree - the holder and what it runs
         w = self.world(extra={24: (11, self.T, "node child.js")}, marks={24: ("claude", DEAD_SID)},
                        ports={24: [7001]})
         p = procs.kill_plan("port", 7001, w)
-        self.assertEqual(p["kill"], [])
-        self.assertIn(24, self.spared(p))
+        self.assertEqual(self.kills(p), [24])
+        self.assertIn("a live session", self.note(p, 24))
 
     def test_a_runner_reads_past_its_flags_and_names_its_package(self):
         self.assertEqual(procs._agent_kind("npm --cache /tmp/c exec @anthropic-ai/claude-code"), "claude")
@@ -2105,7 +2107,7 @@ class TestKillPlanV1Review9(unittest.TestCase):
                                               "own": 99, "ports": ports or {},
                                               "pipes": {**{q: set() for q in table}, **pipes}
                                               if pipes is not None else {q: set() for q in table},
-                                              "marks": marks})
+                                              "marks": marks, "connections": []})
 
     def kills(self, p):
         return sorted(k["pid"] for k in p["kill"])
@@ -2150,7 +2152,7 @@ class TestKillPlanV1Review9(unittest.TestCase):
         p = self.plan("clean", None, table, {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID)})
         self.assertEqual(self.kills(p), [20, 21])
 
-    def test_a_tree_with_a_persons_shell_in_it_is_not_litter(self):
+    def test_a_tree_with_a_persons_shell_in_it_says_so(self):
         for host in ("dtach -n /tmp/work -z bash", "mosh-server new -s", "ttyd -p 7681 bash",
                      "/usr/local/bin/code tunnel", "/usr/sbin/sshd -D -p 2222"):
             for shell in ("-bash", "bash", "/bin/zsh -i"):
@@ -2159,9 +2161,11 @@ class TestKillPlanV1Review9(unittest.TestCase):
                              22: (21, self.T, "vim notes.md")}
                     marks = {k: ("claude", DEAD_SID) for k in (20, 21, 22)}
                     p = self.plan("clean", None, table, marks)
-                    self.assertEqual(p["kill"], [])
-        self.assertEqual(self.kills(self.plan("clean", None, self.NPM, self.npm_marks())),   # control
-                         [20, 21, 22])
+                    notes = {k["pid"]: k.get("note", "") for k in p["kill"]}
+                    self.assertIn("session host", notes[20])
+                    self.assertIn("a shell someone may be working in", notes[21])
+        p = self.plan("clean", None, self.NPM, self.npm_marks())                        # control
+        self.assertFalse(any(k.get("note") for k in p["kill"]))
 
     def test_more_shared_daemons_are_named(self):
         for cmd in ("adb -L tcp:5037 fork-server server --reply-fd 4",
@@ -2188,20 +2192,19 @@ class TestKillPlanV1Review9(unittest.TestCase):
     def test_a_runtimes_later_arguments_are_not_its_script(self):
         self.assertIsNone(procs._agent_kind("node /x/vite.js /Users/u/proj/bin/claude"))
 
-    def test_an_unmarked_daemon_in_the_tree_spares_it(self):
+    def test_an_unmarked_daemon_in_the_tree_says_so(self):
         # its environment could not be read, so no mark: its shape still counts
         table = {**self.NPM, 25: (21, self.T, "gpg-agent --daemon")}
         p = self.plan("clean", None, table, self.npm_marks())
-        self.assertEqual(p["kill"], [])
-        self.assertIn("shared user daemon", " ".join(s["why"] for s in p["spare"]))
+        self.assertIn("shared user daemon", next(k["note"] for k in p["kill"] if k["pid"] == 25))
 
-    def test_a_member_attribute_doubts_spares_the_tree(self):
+    def test_a_member_attribute_doubts_says_so(self):
         # same dead mark, but its claude (10) still runs: attribute is not sure
         table = {**self.NPM, 10: (1, self.T, "/Users/u/.local/bin/claude"),
                  26: (21, self.T, "node worker.js")}
         marks = {**self.npm_marks(), 26: ("claude", DEAD_SID, 10)}
         p = self.plan("clean", None, table, marks)
-        self.assertNotIn(26, self.kills(p))
+        self.assertIn("not sure", next(k["note"] for k in p["kill"] if k["pid"] == 26))
 
     def test_bad_world_data_is_answered_never_raised(self):
         base = {20: (1, self.T, "node s.js")}
@@ -2212,14 +2215,14 @@ class TestKillPlanV1Review9(unittest.TestCase):
             with self.subTest(label=label):
                 w = {"table": {**base, 99: (1, self.T, "python3 ccwho.py")},
                      "att": {"left_behind": [{"pid": 20, "session": DEAD_SID}]},
-                     "sessions": [], "own": 99, "ports": {}, "pipes": {20: set()}, "marks": {20: ("claude", DEAD_SID)}}
+                     "sessions": [], "own": 99, "ports": {}, "pipes": {20: set()}, "marks": {20: ("claude", DEAD_SID)}, "connections": []}
                 w.update(world)
                 if "table" in world:
                     w["table"] = {**world["table"], 99: (1, self.T, "python3 ccwho.py")}
                 for mode, target in (("clean", None), ("port", 3000), ("pid", {"pid": 20, "start": self.T})):
                     procs.kill_plan(mode, target, w)
         p = procs.kill_plan("port", "٣٠٠٠", {"table": {99: (1, self.T, "x")}, "att": {}, "own": 99,
-                                              "sessions": [], "ports": {}, "pipes": {20: set()}, "marks": {20: ("claude", DEAD_SID)}})
+                                              "sessions": [], "ports": {}, "pipes": {20: set()}, "marks": {20: ("claude", DEAD_SID)}, "connections": []})
         self.assertEqual((p["kill"], p.get("why")), ([], "not a port number"))
 
 
@@ -2235,7 +2238,8 @@ class TestKillPlanV1Review10(unittest.TestCase):
         full_pipes = {q: set() for q in table} if pipes is None else pipes
         return procs.kill_plan(mode, target, {"table": table, "att": att, "sessions": [], "own": 99,
                                               "ports": ports or {}, "pipes": full_pipes,
-                                              "marks": marks if read is None else read})
+                                              "marks": marks if read is None else read,
+                                              "connections": []})
 
     def kills(self, p):
         return sorted(k["pid"] for k in p["kill"])
@@ -2247,14 +2251,14 @@ class TestKillPlanV1Review10(unittest.TestCase):
            21: (20, "Tue Sep 22 13:45:15 2026", "node /u/app/server.js"),
            22: (20, "Tue Sep 22 13:45:15 2026", "node /u/mine/app.js")}
 
-    def test_what_a_person_started_under_an_orphan_spares_the_tree(self):
+    def test_what_a_person_started_under_an_orphan_says_so(self):
         # 22's environment was READ and carries no mark: someone else started it
         marks = {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 22: None}
-        p = self.plan("clean", None, self.PM2, marks, ports={22: [8080]})
-        self.assertEqual(p["kill"], [])
-        p = self.plan("port", 8080, self.PM2, marks, ports={22: [8080]})
-        self.assertEqual(p["kill"], [])
-        self.assertIn("no agent started", self.spared(p)[22])
+        for mode, target in (("clean", None), ("port", 8080)):
+            with self.subTest(mode=mode):
+                p = self.plan(mode, target, self.PM2, marks, ports={22: [8080]})
+                self.assertEqual(self.kills(p), [20, 21, 22])
+                self.assertIn("no agent started it", next(k["note"] for k in p["kill"] if k["pid"] == 22))
 
     def test_a_member_whose_environment_could_not_be_read_is_part_of_the_tree(self):   # control
         # platform binaries (/bin/sleep) hide their environment: not read, not "no mark"
@@ -2262,18 +2266,19 @@ class TestKillPlanV1Review10(unittest.TestCase):
         p = self.plan("clean", None, table, {20: ("claude", DEAD_SID)})
         self.assertEqual(self.kills(p), [20, 21])
 
-    def test_marks_not_given_means_nothing_is_taken(self):
+    def test_marks_not_given_leave_attributes_list(self):
         table = {20: (1, self.T, "node s.js")}
-        p = self.plan("clean", None, table, {20: ("claude", DEAD_SID)}, read=False)
-        self.assertEqual(p["kill"], [])
+        p = self.plan("clean", None, table, {20: ("claude", DEAD_SID)}, read=None)
+        self.assertEqual(self.kills(p), [20])            # a person: attribute's list still holds
 
-    def test_a_member_missing_from_the_pipes_spares_its_tree(self):
+    def test_a_member_missing_from_the_pipes_says_so(self):
         table = {20: (1, self.T, "/bin/zsh -c npm run dev"), 21: (20, self.T, "npm run dev"),
                  22: (21, self.T, "tee log")}
         marks = {k: ("claude", DEAD_SID) for k in table}
         p = self.plan("clean", None, table, marks, pipes={20: set(), 99: set()})
-        self.assertEqual(p["kill"], [])
-        self.assertIn("pipes were not read", " ".join(self.spared(p).values()))
+        notes = {k["pid"]: k.get("note", "") for k in p["kill"]}
+        self.assertIn("pipes were not read", notes[21])
+        self.assertNotIn("pipes", notes[20])                                     # control
 
     TOOL = "/bin/zsh -c -l source /Users/u/.claude/shell-snapshots/snap.sh && eval '{}'"
 
@@ -2317,15 +2322,1741 @@ class TestKillPlanV1Review10(unittest.TestCase):
                 w = {"table": {**table, 99: (1, self.T, "python3 ccwho.py")},
                      "att": {"left_behind": [{"pid": 20, "session": DEAD_SID}]}, "sessions": [],
                      "own": 99, "ports": {}, "pipes": {20: set(), 99: set()},
-                     "marks": {20: ("claude", DEAD_SID)}}
+                     "marks": {20: ("claude", DEAD_SID)}, "connections": []}
                 w.update(extra)
                 for mode, target in (("clean", None), ("port", 3000), ("pid", {"pid": 20, "start": self.T})):
                     procs.kill_plan(mode, target, w)
 
     def test_members_of_a_spared_tree_carry_its_reason(self):
-        table = {20: (1, self.T, "dtach -n /tmp/w -z bash"), 21: (20, self.T, "bash"),
-                 22: (21, self.T, "npm run dev")}
+        table = {20: (1, self.T, "/bin/zsh -c x"), 21: (20, self.T, "bash"),
+                 22: (21, "", "npm run dev")}                       # no start: not provable
         p = self.plan("clean", None, table, {k: ("claude", DEAD_SID) for k in table})
         for pid in (21, 22):
             self.assertIn("20's tree, which is spared", self.spared(p)[pid])
             self.assertNotIn("ccwho kill", self.spared(p)[pid])
+
+
+class TestKillPlanPort(unittest.TestCase):
+    """The port slice (review 11's findings), under the owner's model: a tree
+    whose port somebody is using, or a session host a person may be using, is
+    taken with a note that says so. The person decides."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    TREE = {20: (1, "Tue Sep 22 13:45:15 2026", "/bin/zsh -c -l source /u/.claude/shell-snapshots/s.sh && eval 'npm run dev'"),
+            21: (20, "Tue Sep 22 13:45:15 2026", "npm run dev"),
+            22: (21, "Tue Sep 22 13:45:15 2026", "node /u/app/node_modules/.bin/vite")}
+
+    def plan(self, mode, target, table=None, marks=None, ports=None, conns=(), pipes=None,
+             sessions=()):
+        table = {**(table or self.TREE), 99: (1, self.T, "python3 ccwho.py")}
+        marks = marks if marks is not None else {k: ("claude", DEAD_SID) for k in (table or self.TREE)
+                                                 if k != 99}
+        ports = ports if ports is not None else {22: [5173]}
+        att = procs.attribute(table, {k: v for k, v in marks.items() if v}, ports, list(sessions), own=99)
+        return procs.kill_plan(mode, target, {
+            "table": table, "att": att, "sessions": list(sessions), "own": 99, "ports": ports,
+            "pipes": pipes if pipes is not None else {q: set() for q in table}, "marks": marks,
+            "connections": None if conns is None else list(conns)})
+
+    def kills(self, p):
+        return sorted(k["pid"] for k in p["kill"])
+
+    @staticmethod
+    def c(pid, lport, rport, local=True, laddr="127.0.0.1"):
+        """One ESTABLISHED socket: (pid, local addr, local port, remote addr, remote port)."""
+        return (pid, laddr, lport, laddr if local else "192.168.1.20", rport)
+
+    def whys(self, p):
+        return " ".join(s["why"] for s in p["spare"])
+
+    def notes(self, p):
+        return " ".join(k.get("note", "") for k in p["kill"])
+
+    # ---- somebody is using the port: said, never a refusal
+    def test_a_port_another_process_is_using_says_who(self):
+        # a live session's `npx playwright test` against the dev server
+        table = {**self.TREE, 10: (1, self.T, "claude"), 11: (10, self.T, "node playwright test")}
+        conns = [self.c(22, 5173, 61234), self.c(11, 61234, 5173)]
+        for mode, target in (("port", 5173), ("clean", None)):
+            with self.subTest(mode=mode):
+                p = self.plan(mode, target, table=table, conns=conns,
+                              marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID),
+                                     22: ("claude", DEAD_SID), 11: ("claude", LIVE_SID)},
+                              sessions=[{"sessionId": LIVE_SID, "pid": 10}])
+                self.assertEqual(self.kills(p), [20, 21, 22])
+                self.assertIn("node (11) is connected to :5173", self.notes(p))
+    def test_a_port_nobody_uses_is_taken(self):                               # control
+        self.assertEqual(self.kills(self.plan("port", 5173)), [20, 21, 22])
+
+    def test_a_client_inside_the_tree_is_part_of_it(self):                    # control
+        conns = [self.c(22, 5173, 61234), self.c(21, 61234, 5173)]
+        self.assertEqual(self.kills(self.plan("port", 5173, conns=conns)), [20, 21, 22])
+
+    def test_a_client_from_another_machine_says_so(self):
+        p = self.plan("port", 5173, conns=[self.c(22, 5173, 50112, local=False)])
+        self.assertIn("talks to another machine", self.notes(p))
+    def test_a_client_ccwho_cannot_see_says_so(self):
+        p = self.plan("port", 5173, conns=[self.c(22, 5173, 61234)])
+        self.assertIn("a client ccwho cannot see is using :5173", self.notes(p))
+    def test_connections_not_read_are_said(self):
+        p = self.plan("port", 5173, conns=None)
+        self.assertIn("connections were not read", self.notes(p))
+        self.assertNotIn("connections", self.notes(self.plan("port", 5173)))     # control
+    def test_established_connections_are_read_from_lsof(self):
+        text = ("p22\nn127.0.0.1:5173->127.0.0.1:61234\n"
+                "p11\nn127.0.0.1:61234->127.0.0.1:5173\n"
+                "p30\nn[::1]:8080->[::1]:50000\n"
+                "p31\nn192.168.1.5:8888->192.168.1.20:50112\n")
+        self.assertEqual(sorted(procs.parse_lsof_established(text)),
+                         [(11, "127.0.0.1", 61234, "127.0.0.1", 5173),
+                          (22, "127.0.0.1", 5173, "127.0.0.1", 61234),
+                          (30, "::1", 8080, "::1", 50000),
+                          (31, "192.168.1.5", 8888, "192.168.1.20", 50112)])
+
+    def test_a_line_that_does_not_parse_means_not_read(self):
+        # without -P a port is a name: `localhost:http-alt` - not read, not "none"
+        self.assertIsNone(procs.parse_lsof_established("p22\nnlocalhost:http-alt->localhost:61234\n"))
+        self.assertEqual(procs.parse_lsof_established(""), [])                  # control
+
+    # ---- review 12
+    def test_only_the_exact_other_end_is_the_client(self):
+        # a proxy's own upstream socket and an outside client share a port
+        # number; and a socket whose two ports are equal matches itself
+        table = {**self.TREE, 300: (1, self.T, "/opt/x/bin/curl-loop")}
+        marks = {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 22: ("claude", DEAD_SID), 300: None}
+        conns = [(22, "192.168.1.5", 50000, "10.0.0.9", 8080), self.c(22, 8080, 50000),
+                 self.c(300, 50000, 8080)]
+        p = self.plan("clean", None, table=table, ports={22: [8080]}, conns=conns, marks=marks)
+        self.assertIn("(300) is connected to :8080", self.notes(p))
+        conns = [self.c(22, 5173, 5173), (300, "::1", 5173, "::1", 5173)]
+        p = self.plan("clean", None, table=table, ports={22: [5173]}, conns=conns, marks=marks)
+        self.assertIn("a client ccwho cannot see is using :5173", self.notes(p))
+        self.assertNotIn("300", self.notes(p))
+    def test_a_socket_that_only_shares_port_numbers_is_no_client(self):
+        # the true client is not visible; the tree's own upstream socket shares
+        # the port numbers. Matching ports alone "found" it inside the tree
+        conns = [self.c(22, 8080, 50000), (22, "192.168.1.5", 50000, "10.0.0.9", 8080)]
+        p = self.plan("clean", None, ports={22: [8080]}, conns=conns)
+        self.assertIn("a client ccwho cannot see is using :8080", self.notes(p))
+    def test_every_holder_of_the_client_socket_counts(self):
+        # an inherited socket: held by 21 (inside) and 300 (outside)
+        table = {**self.TREE, 300: (1, self.T, "/opt/x/bin/relay")}
+        conns = [self.c(22, 5173, 61000), self.c(21, 61000, 5173), self.c(300, 61000, 5173)]
+        p = self.plan("clean", None, table=table, conns=conns,
+                      marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 22: ("claude", DEAD_SID),
+                             300: None})
+        self.assertIn("(300) is connected to :5173", self.notes(p))
+        self.assertNotIn("(21)", self.notes(p))                                   # control: inside
+    def test_bad_connection_data_means_not_read(self):
+        for bad in ([("22", "127.0.0.1", 5173, "127.0.0.1", 61234)],
+                    [(22, "127.0.0.1", "5173", "127.0.0.1", 61234)],
+                    [(22, 5173, 61234, True)], [([22], "127.0.0.1", 3000, "127.0.0.1", 1)]):
+            with self.subTest(bad=bad):
+                p = self.plan("port", 5173, conns=bad)             # out of shape: the whole plan
+                self.assertEqual(p["kill"], [])
+                self.assertIn("not in its shape", p["why"])
+    BROWSER = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper --type=utility"
+
+    def test_your_app_on_another_port_of_the_tree_is_said(self):
+        # you named :5173; your tab is on the tree's storybook :6006
+        table = {**self.TREE, 23: (21, self.T, "node storybook"), 300: (1, self.T, self.BROWSER)}
+        conns = [self.c(23, 6006, 61000), self.c(300, 61000, 6006)]
+        marks = {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 22: ("claude", DEAD_SID),
+                 23: ("claude", DEAD_SID), 300: None}
+        p = self.plan("port", 5173, table=table, conns=conns, marks=marks, ports={22: [5173], 23: [6006]})
+        self.assertIn("Google Chrome (300) is connected to :6006", self.notes(p))
+    # ---- review 14
+    def test_ports_not_read_are_said_and_no_port_is_found(self):
+        # lsof failed: the ports come as None - the client check had nothing to check
+        for bad in (None,):                                   # other forms: out of shape (TestWorldShape)
+            with self.subTest(ports=bad):
+                table = {**self.TREE, 99: (1, self.T, "python3 ccwho.py")}
+                marks = {k: ("claude", DEAD_SID) for k in self.TREE}
+                w = {"table": table, "att": procs.attribute(table, marks, {}, [], own=99),
+                     "sessions": [], "own": 99, "ports": bad, "pipes": {q: set() for q in table},
+                     "marks": marks, "connections": []}
+                p = procs.kill_plan("clean", None, w)
+                self.assertEqual(self.kills(p), [20, 21, 22])
+                self.assertIn("listening ports were not read", self.notes(p))
+                p = procs.kill_plan("port", 5173, w)
+                self.assertEqual(p["kill"], [])
+                self.assertIn("ports were not read", p.get("why", ""))
+        self.assertNotIn("ports", self.notes(self.plan("clean", None, ports={})))  # control: read, none
+    def test_an_app_is_known_by_its_program_word(self):
+        self.assertFalse(procs._is_app("node /x/tool.js --open /Applications/Foo.app/Contents/x"))
+        self.assertTrue(procs._is_app("/Applications/Foo.app/Contents/MacOS/Foo --flag"))  # control
+
+    def test_the_person_is_told_the_apps_name(self):
+        table = {**self.TREE, 300: (1, self.T, self.BROWSER)}
+        conns = [self.c(22, 5173, 61000), self.c(300, 61000, 5173)]
+        marks = {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 22: ("claude", DEAD_SID), 300: None}
+        p = self.plan("port", 5173, table=table, conns=conns, marks=marks)
+        self.assertIn("Google Chrome (300) is connected to :5173", self.notes(p))
+    # ---- review 15
+    APPS = ("/Applications/GIMP 2.app/Contents/MacOS/gimp", "/Applications/GIMP (Nightly).app/Contents/MacOS/gimp",
+            "/Applications/pgAdmin 4.app/Contents/MacOS/pgAdmin4", "/Applications/Chief of Staff.app/Contents/MacOS/cos",
+            "/Applications/DB Browser for SQLite.app/Contents/MacOS/DB Browser for SQLite",
+            "/Applications/Adobe Photoshop 2024/Adobe Photoshop 2024.app/Contents/MacOS/Adobe Photoshop 2024",
+            "/Applications/Utilities/1Password 7.app/Contents/MacOS/1Password 7",
+            "/Users/me/my apps/Foo.app/Contents/MacOS/Foo")
+
+    def test_every_app_bundle_path_is_an_app(self):
+        for cmd in self.APPS:
+            for tail in ("", " --flag value"):
+                with self.subTest(cmd=cmd + tail):
+                    self.assertTrue(procs._is_app(cmd + tail))
+        for cmd in ("/usr/bin/open -W /Applications/Foo.app/Contents/MacOS/Foo",        # control
+                    "/usr/bin/python3 /Applications/Foo.app/Contents/Resources/x.py",
+                    f"{self.FW} -m http.server"):
+            with self.subTest(not_app=cmd):
+                self.assertFalse(procs._is_app(cmd))
+        p = self.plan("clean", None, table={20: (1, self.T, "/bin/zsh -c open-gimp"),
+                                            21: (20, self.T, self.APPS[0])},
+                      ports={}, marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID)})
+        self.assertIn("it is an app", self.notes(p))
+
+    def test_a_tree_talking_to_another_machine_says_so(self):
+        # a tunnel (lt, ngrok, cloudflared, ssh -R) serves remote people through
+        # an OUTGOING socket - no client on the listening port shows it
+        table = {**self.TREE, 23: (21, self.T, "node /x/.bin/lt --port 5173")}
+        marks = {k: ("claude", DEAD_SID) for k in (20, 21, 22, 23)}
+        conns = [(23, "192.168.1.5", 50100, "104.16.1.1", 443)]
+        for mode, target in (("clean", None), ("port", 5173)):
+            with self.subTest(mode=mode):
+                p = self.plan(mode, target, table=table, marks=marks, conns=conns)
+                self.assertIn("talks to another machine", self.notes(p))
+        conns = [self.c(21, 61000, 5173), self.c(22, 5173, 61000)]                  # control: loopback only
+        self.assertNotIn("another machine", self.notes(self.plan("clean", None, table=table, marks=marks,
+                                                                  conns=conns)))
+    def test_attribute_lists_of_the_wrong_type_never_raise(self):
+        good = {"table": {20: (1, self.T, "node s.js"), 99: (1, self.T, "python3 ccwho.py")},
+                "sessions": [], "own": 99, "ports": {}, "pipes": {20: set(), 99: set()},
+                "marks": {20: ("claude", DEAD_SID)}, "connections": []}
+        for att in ({"left_behind": 10 ** 30}, {"sessions": {1: 2}}, {"codex": "x"}):
+            with self.subTest(att=att):
+                for mode, target in (("clean", None), ("port", 3000), ("pid", {"pid": 20, "start": self.T})):
+                    procs.kill_plan(mode, target, {**good, "att": att})
+
+    def test_a_browser_under_an_agent_is_named_too(self):
+        # Playwright's Chromium under a live claude is a test run, not you
+        table = {**self.TREE, 10: (1, self.T, "claude"), 300: (10, self.T, self.BROWSER)}
+        conns = [self.c(22, 5173, 61000), self.c(300, 61000, 5173)]
+        for mark in (("claude", LIVE_SID), None):           # marked, or env read and unmarked
+            with self.subTest(mark=mark):
+                p = self.plan("port", 5173, table=table, conns=conns,
+                              marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID),
+                                     22: ("claude", DEAD_SID), 300: mark},
+                              sessions=[{"sessionId": LIVE_SID, "pid": 10}])
+                self.assertIn("(300) is connected to :5173", self.notes(p))
+    FW = "/opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+
+    def test_a_host_run_by_an_interpreter_is_a_host(self):
+        for host in (f"{self.FW} /opt/homebrew/bin/jupyter-lab --port 8888", "python3 -m jupyterlab",
+                     "/usr/bin/python3 /Users/u/.local/bin/jupyter-notebook",
+                     "node /usr/lib/code-server/out/node/entry", "sshd: u@ttys003", "sshd-session: u"):
+            with self.subTest(host=host):
+                self.assertTrue(procs._session_host(host))
+                table = {20: (1, self.T, host), 21: (20, self.T, f"{self.FW} -m ipykernel_launcher")}
+                p = self.plan("clean", None, table=table, ports={20: [8888]},
+                              marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID)})
+                self.assertIn("session host", self.notes(p))
+        p = self.plan("port", 8000, table={20: (1, self.T, f"{self.FW} -m http.server 8000")},   # control
+                      ports={20: [8000]}, marks={20: ("claude", DEAD_SID)})
+        self.assertNotIn("session host", self.notes(p))
+    def test_the_framework_python_is_known_by_its_program_word(self):
+        apple = ("/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/"
+                 "Versions/3.9/Resources/Python.app/Contents/MacOS/Python -m http.server 8000")
+        self.assertFalse(procs._is_app(apple))
+        self.assertTrue(procs._is_app("/Applications/Foo.app/Contents/MacOS/Foo --py "      # control
+                                      "/Library/Frameworks/Python.framework/Versions/3.12/"
+                                      "Resources/Python.app/Contents/MacOS/Python"))
+
+    # ---- a session host a person may be using, whatever runs under it
+    def test_a_session_host_says_so(self):
+        for host, child in (("dtach -n /tmp/s python3", "python3"), ("abduco -n s python3 -i", "python3 -i"),
+                            ("ttyd -W -p 7681 node", "node"), ("gotty -w node", "node"),
+                            ("/Users/u/.local/bin/jupyter-lab --port 8888", "python3 -m ipykernel_launcher"),
+                            ("/usr/local/bin/code-server --bind-addr 0:8080", "node extensionHost"),
+                            ("/usr/sbin/sshd -D -p 2222", "sshd: u@notty"),
+                            ("mosh-server new -s", "node repl.js"), ("/usr/local/bin/code tunnel", "node x")):
+            with self.subTest(host=host):
+                table = {20: (1, self.T, host), 21: (20, self.T, child)}
+                p = self.plan("clean", None, table=table, ports={21: [7000]},
+                              marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID)})
+                self.assertIn("session host", p["kill"][0].get("note", ""))
+        table = {20: (1, self.T, "nohup node server.js"), 21: (20, self.T, "node worker.js")}  # control
+        p = self.plan("clean", None, table=table, ports={20: [3000]},
+                      marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID)})
+        self.assertNotIn("session host", self.notes(p))
+    # ---- python3 -m http.server is no app
+    def test_a_framework_python_is_no_app(self):
+        py = ("/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/Versions/3.13/"
+              "Resources/Python.app/Contents/MacOS/Python -m http.server 8000")
+        p = self.plan("port", 8000, table={20: (1, self.T, py)}, ports={20: [8000]},
+                      marks={20: ("claude", DEAD_SID)})
+        self.assertEqual(self.kills(p), [20])
+        for app in ("/Applications/Docker.app/Contents/MacOS/com.docker.backend",           # control
+                    "/Applications/Slack.app/Contents/MacOS/Slack"):
+            with self.subTest(app=app):
+                p = self.plan("clean", None, table={20: (1, self.T, app)}, ports={},
+                              marks={20: ("claude", DEAD_SID)})
+                self.assertEqual(p["kill"], [])         # attribute is not sure: named, not cleaned
+                self.assertIn("it is an app", self.whys(p))
+
+    # ---- the confirm list shows every member of a spared tree
+    # ---- malformed worlds
+    def test_more_malformed_worlds_never_raise(self):
+        good = {"table": {20: (1, self.T, "node s.js"), 99: (1, self.T, "python3 ccwho.py")},
+                "att": {"left_behind": [{"pid": 20, "session": DEAD_SID}]}, "sessions": [],
+                "own": 99, "ports": {20: [3000]}, "pipes": {20: set(), 99: set()},
+                "marks": {20: ("claude", DEAD_SID)}, "connections": []}
+        for label, change in {"sessions int": {"sessions": 5},
+                              "session pid list": {"sessions": [{"pid": [1]}]},
+                              "session id list": {"sessions": [{"sessionId": [1], "pid": 3}]},
+                              "own list": {"own": [99]}, "pipe peer list": {"pipes": {20: [[1]]}},
+                              "ports nested": {"ports": {20: [[3000]]}}}.items():
+            with self.subTest(label=label):
+                for mode, target in (("clean", None), ("port", 3000)):
+                    procs.kill_plan(mode, target, {**good, **change})
+
+    def test_malformed_worlds_never_raise(self):
+        good = {"table": {20: (1, self.T, "node s.js"), 99: (1, self.T, "python3 ccwho.py")},
+                "att": {"left_behind": [{"pid": 20, "session": DEAD_SID}]}, "sessions": [],
+                "own": 99, "ports": {}, "pipes": {20: set(), 99: set()},
+                "marks": {20: ("claude", DEAD_SID)}, "connections": []}
+        bad = {"pipes list": {"pipes": [20]}, "pipes set": {"pipes": {20}},
+               "pipe value int": {"pipes": {20: 5}}, "table list": {"table": [20]},
+               "ports list": {"ports": [3000]}, "att sessions list": {"att": {"sessions": [1]}},
+               "connections junk": {"connections": [None, (1,), "x"]}}
+        for label, change in bad.items():
+            with self.subTest(label=label):
+                for mode, target in (("clean", None), ("port", 3000), ("pid", {"pid": 20, "start": self.T})):
+                    procs.kill_plan(mode, target, {**good, **change})
+        for mode in ("clean", "port", "pid"):
+            with self.subTest(world=None, mode=mode):
+                self.assertEqual(procs.kill_plan(mode, 3000, None)["kill"], [])
+
+    def test_a_session_pid_given_as_text_still_protects(self):
+        w = {"table": {20: (1, self.T, "node s.js"), 99: (1, self.T, "python3 ccwho.py")},
+             "att": {"left_behind": [{"pid": 20, "session": DEAD_SID}]},
+             "sessions": [{"sessionId": LIVE_SID, "pid": "20"}], "own": 99, "ports": {},
+             "pipes": {20: set(), 99: set()}, "marks": {20: ("claude", DEAD_SID)}, "connections": []}
+        self.assertEqual(procs.kill_plan("clean", None, w)["kill"], [])
+
+    # ---- more shells
+    def test_more_shells_are_shells(self):
+        for shell in ("-elvish", "yash", "osh", "ash", "rbash", "zsh --emulate sh",
+                      "fish -C 'set x'", "fish --init-command 'set x'"):
+            with self.subTest(shell=shell):
+                self.assertTrue(procs._person_shell(shell))
+        self.assertFalse(procs._person_shell("fish -c 'echo hi'"))                  # control
+
+
+class TestKillPlanTrustsThePerson(unittest.TestCase):
+    """The owner's model (2026-09-25): a person at a terminal decides. A plan
+    lists every process a kill takes, with notes on what ccwho doubts; the
+    notes never refuse. Hard guards refuse for everyone: a live session, an
+    agent or what runs one, ccwho and its shell, a pid not proved the same. An
+    agent (`mine` in the world: its own session id) takes only what its own
+    session started."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    TREE = {20: (1, T, "/bin/zsh -c -l source /u/.claude/shell-snapshots/s.sh && eval 'npm run dev'"),
+            21: (20, T, "npm run dev"),
+            22: (21, T, "node /u/app/node_modules/.bin/vite")}
+    BROWSER = TestKillPlanPort.BROWSER
+
+    def plan(self, mode, target, table=None, marks=None, ports=None, conns=(), pipes=None,
+             sessions=(), mine=None):
+        table = {99: (1, self.T, "python3 ccwho.py"), **(table if table is not None else self.TREE)}
+        if marks is None:
+            marks = {k: ("claude", DEAD_SID) for k in table if k != 99}
+        ports = ports if ports is not None else {22: [5173]}
+        att = procs.attribute(table, {k: v for k, v in marks.items() if v}, ports,
+                              list(sessions), own=99)
+        world = {"table": table, "att": att, "sessions": list(sessions), "own": 99,
+                 "ports": ports, "marks": marks,
+                 "pipes": pipes if pipes is not None else {q: set() for q in table},
+                 "connections": None if conns is None else list(conns)}
+        if mine is not None:
+            world["mine"] = mine
+        return procs.kill_plan(mode, target, world)
+
+    def kills(self, p):
+        return sorted(k["pid"] for k in p["kill"])
+
+    def note(self, p, pid):
+        return next(k.get("note", "") for k in p["kill"] if k["pid"] == pid)
+
+    def whys(self, p):
+        return " ".join([s["why"] for s in p["spare"]] + [p.get("why", "")])
+
+    c = staticmethod(TestKillPlanPort.c)
+
+    # ---- a person: what ccwho doubts is said, never refused
+    def test_a_client_on_the_port_is_a_note(self):
+        table = {**self.TREE, 300: (1, self.T, self.BROWSER)}
+        conns = [self.c(22, 5173, 61000), self.c(300, 61000, 5173)]
+        marks = {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 22: ("claude", DEAD_SID), 300: None}
+        for mode, target in (("port", 5173), ("clean", None)):
+            with self.subTest(mode=mode):
+                p = self.plan(mode, target, table=table, conns=conns, marks=marks)
+                self.assertEqual(self.kills(p), [20, 21, 22])
+                self.assertIn("Google Chrome (300) is connected to :5173", self.note(p, 22))
+                self.assertNotIn("needs_person", p)
+        p = self.plan("port", 5173)                                              # control
+        self.assertEqual(self.note(p, 22), "")
+
+    def test_what_ccwho_doubts_about_a_member_is_its_note(self):
+        cases = {"talks to another machine": dict(conns=[(22, "192.168.1.5", 50100, "104.16.1.1", 443)]),
+                 "connections were not read": dict(conns=None),
+                 "pipes were not read": dict(pipes={20: set(), 21: set(), 99: set()}),
+                 "a client ccwho cannot see": dict(conns=[self.c(22, 5173, 61234)])}
+        for text, kw in cases.items():
+            with self.subTest(note=text):
+                p = self.plan("port", 5173, **kw)
+                self.assertEqual(self.kills(p), [20, 21, 22])
+                self.assertIn(text, " ".join(k.get("note", "") for k in p["kill"]))
+
+    def test_a_process_that_feeds_a_live_one_is_a_note(self):
+        table = {**self.TREE, 70: (1, self.T, "ssh: /Users/u/.ssh/cm-x [mux]")}
+        pipes = {**{q: set() for q in table}, 99: set(), 22: {70}}
+        p = self.plan("clean", None, table=table, pipes=pipes,
+                      marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID),
+                             22: ("claude", DEAD_SID), 70: None})
+        self.assertEqual(self.kills(p), [20, 21, 22])
+        self.assertIn("piped to 70", self.note(p, 22))
+
+    def test_the_shape_of_a_member_is_a_note(self):
+        for child, text in (("/Applications/Slack.app/Contents/MacOS/Slack", "an app"),
+                            ("gpg-agent --daemon", "shared user daemon"),
+                            ("-zsh", "a shell someone may be working in"),
+                            ("dtach -n /tmp/s python3", "session host")):
+            with self.subTest(child=child):
+                table = {20: (1, self.T, "/bin/zsh -c x"), 21: (20, self.T, child)}
+                p = self.plan("clean", None, table=table, ports={})
+                self.assertEqual(self.kills(p), [20, 21])
+                self.assertIn(text, self.note(p, 21))
+
+    def test_a_port_takes_any_holder_with_what_ccwho_knows_of_it(self):
+        table = {10: (1, self.T, "claude"), 11: (10, self.T, "node live.js"),
+                 40: (1, self.T, "python3 my_own.py"), 60: (1, self.T, "gpg-agent --daemon"),
+                 30: (1, self.T, "workerd serve")}
+        marks = {11: ("claude", LIVE_SID), 40: None, 60: ("claude", DEAD_SID), 30: ("codex", "01a0-x")}
+        ports = {11: [3000], 40: [8000], 60: [9999], 30: [7000]}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}]
+        for port, pid, text in ((3000, 11, "a live session"), (8000, 40, "no agent started it"),
+                                (9999, 60, "shared user daemon"), (7000, 30, "Codex")):
+            with self.subTest(port=port):
+                p = self.plan("port", port, table=table, marks=marks, ports=ports, sessions=sessions)
+                self.assertEqual(self.kills(p), [pid])
+                self.assertIn(text, self.note(p, pid))
+
+    def test_a_named_pid_takes_its_tree(self):
+        # SIGTERM to a `zsh -c` tool shell is not passed on: its dev server lives on
+        p = self.plan("pid", {"pid": 20, "start": self.T})
+        self.assertEqual(self.kills(p), [20, 21, 22])
+        self.assertEqual(self.kills(self.plan("pid", {"pid": 22, "start": self.T})), [22])   # control
+
+    def test_no_plan_carries_needs_person(self):
+        table = {**self.TREE, 300: (1, self.T, self.BROWSER)}
+        conns = [self.c(22, 5173, 61000), self.c(300, 61000, 5173)]
+        p = self.plan("port", 5173, table=table, conns=conns,
+                      marks={20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID),
+                             22: ("claude", DEAD_SID), 300: None})
+        self.assertNotIn("needs_person", p)
+        self.assertFalse(any("needs_person" in k for k in p["kill"]))
+
+    # ---- hard guards: for everyone
+    def test_a_live_session_is_never_taken(self):
+        table = {10: (1, self.T, "/opt/x/my-dev-build"), 11: (10, self.T, "node s.js")}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}]
+        for mode, target in (("pid", {"pid": 10, "start": self.T}), ("port", 3000)):
+            with self.subTest(mode=mode):
+                p = self.plan(mode, target, table=table, ports={10: [3000]}, sessions=sessions,
+                              marks={11: ("claude", LIVE_SID)})
+                self.assertEqual(p["kill"], [])
+                self.assertIn("live Claude session", self.whys(p))
+
+    def test_an_agent_or_what_runs_one_is_never_taken(self):
+        table = {20: (1, self.T, "/bin/zsh -c x"), 21: (20, self.T, "node /u/.bin/claude -p hi"),
+                 22: (1, self.T, "npx @openai/codex")}
+        for mode, target in (("pid", {"pid": 20, "start": self.T}), ("pid", {"pid": 22, "start": self.T}),
+                             ("port", 3000), ("clean", None)):
+            with self.subTest(mode=mode, target=target):
+                p = self.plan(mode, target, table=table, ports={20: [3000]})
+                self.assertEqual(p["kill"], [])
+        p = self.plan("pid", {"pid": 20, "start": self.T}, table=table)
+        self.assertIn("a claude runs under 20", self.whys(p))
+
+    def test_ccwho_and_its_shell_are_never_taken(self):
+        table = {**self.TREE, 98: (1, self.T, "/bin/zsh -c 'ccwho kill :5173'")}
+        table[99] = (98, self.T, "python3 ccwho.py")                 # ccwho, run by that shell
+        for pid, why in ((98, "98 runs ccwho"), (99, "99 is part of this ccwho run")):
+            with self.subTest(pid=pid):
+                p = self.plan("pid", {"pid": pid, "start": self.T}, table=table)
+                self.assertEqual(p["kill"], [])
+                self.assertIn(why, self.whys(p))
+        self.assertEqual(self.kills(self.plan("pid", {"pid": 20, "start": self.T}, table=table)),
+                         [20, 21, 22])                                           # control
+
+    def test_a_member_without_a_start_time_spares_its_tree(self):
+        table = {20: (1, self.T, "/bin/zsh -c x"), 21: (20, "", "node s.js")}
+        p = self.plan("clean", None, table=table, ports={})
+        self.assertEqual(p["kill"], [])
+        self.assertIn("cannot prove 21", self.whys(p))
+        table[21] = (20, self.T, "node s.js")                                        # control
+        self.assertEqual(self.kills(self.plan("clean", None, table=table, ports={})), [20, 21])
+
+    def test_a_reused_pid_is_never_taken(self):
+        p = self.plan("pid", {"pid": 20, "start": "Wed Sep 23 09:00:00 2026"})
+        self.assertEqual(p["kill"], [])
+        self.assertIn("now a different process", self.whys(p))
+
+    # ---- an agent: only what its own session started
+    LIVE_TREE = {10: (1, T, "claude"), 20: (10, T, "/bin/zsh -c 'npm run dev'"),
+                 21: (20, T, "npm run dev"), 22: (21, T, "node vite"),
+                 23: (10, T, "npm exec chrome-devtools-mcp@latest"),
+                 98: (10, T, "/bin/zsh -c 'ccwho clean --mine'"),
+                 99: (98, T, "python3 ccwho.py clean --mine"),
+                 40: (1, T, "node other.js")}
+
+    def agent(self, mode, target, **kw):
+        marks = {k: ("claude", LIVE_SID) for k in (20, 21, 22, 23, 98)}
+        marks[40] = ("claude", DEAD_SID)
+        table = {**self.LIVE_TREE}
+        kw.setdefault("marks", marks)
+        kw.setdefault("ports", {22: [5173], 40: [3000]})
+        kw.setdefault("mine", LIVE_SID)
+        p = self.plan(mode, target, table=table, sessions=[{"sessionId": LIVE_SID, "pid": 10}], **kw)
+        return p
+
+    def test_an_agent_takes_its_own_sessions_port(self):
+        self.assertEqual(self.kills(self.agent("port", 5173)), [22])
+
+    def test_an_agent_never_takes_another_sessions_work(self):
+        for mode, target in (("port", 3000), ("pid", {"pid": 40, "start": self.T})):
+            with self.subTest(mode=mode):
+                p = self.agent(mode, target)
+                self.assertEqual(p["kill"], [])
+                self.assertIn("your session did not start", self.whys(p))
+
+    def test_an_agents_clean_is_mine_only(self):
+        p = self.agent("clean", None)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("--mine", self.whys(p))
+        p = self.agent("mine", LIVE_SID)
+        self.assertEqual(self.kills(p), [20, 21, 22])           # not its helper, not ccwho's shell
+        self.assertIn("helper", self.whys(p))
+
+    def test_mine_takes_nothing_without_an_agent_or_its_environments(self):
+        p = self.agent("mine", LIVE_SID, mine=None)                                # a person
+        self.assertEqual(p["kill"], [])
+        self.assertIn("--mine is for an agent", self.whys(p))
+        p = self.agent("port", 5173, mine="not-a-session")
+        self.assertEqual(p["kill"], [])
+        self.assertIn("not one", self.whys(p))
+        p = self.agent("mine", LIVE_SID, marks={k: None for k in self.LIVE_TREE})
+        self.assertEqual(p["kill"], [])
+        self.assertEqual(self.agent("mine", DEAD_SID)["kill"], [])                  # not its own id
+
+    def test_mine_takes_what_runs_beside_a_nested_agent(self):
+        # the agent's tool shell runs codex and a dev server: the shell stays
+        # (killing it ends codex), the dev server goes
+        table = {10: (1, self.T, "claude"), 20: (10, self.T, "/bin/zsh -c 'codex exec x & npm run dev'"),
+                 21: (20, self.T, "codex exec x"), 23: (20, self.T, "node server.js"),
+                 98: (10, self.T, "/bin/zsh -c 'ccwho clean --mine'"),
+                 99: (98, self.T, "python3 ccwho.py clean --mine")}
+        marks = {20: ("claude", LIVE_SID), 21: ("claude", LIVE_SID), 23: ("claude", LIVE_SID),
+                 98: ("claude", LIVE_SID)}
+        p = self.plan("mine", LIVE_SID, table=table, marks=marks, ports={23: [3000]},
+                      sessions=[{"sessionId": LIVE_SID, "pid": 10}], mine=LIVE_SID)
+        self.assertEqual(self.kills(p), [23])
+
+    def test_an_agent_needs_the_environments_read(self):
+        w_marks = None
+        p = self.agent("port", 5173, marks=None)
+        # marks=None in the fixture means "all marked dead"; pass a non-dict to mean unread
+        table = {**self.LIVE_TREE, 99: (1, self.T, "python3 ccwho.py")}
+        p = procs.kill_plan("port", 5173, {"table": table, "att": {}, "sessions": [{"sessionId": LIVE_SID, "pid": 10}],
+                                           "own": 99, "ports": {22: [5173]}, "marks": w_marks,
+                                           "pipes": {q: set() for q in table}, "connections": [],
+                                           "mine": LIVE_SID})
+        self.assertEqual(p["kill"], [])
+        self.assertIn("environments were not read", self.whys(p))
+
+    def test_an_app_bundle_name_with_a_dash_is_an_app(self):
+        # review 16: a lone `-` in a name is no flag
+        self.assertTrue(procs._is_app("/Applications/Visual Studio Code - Insiders.app/Contents/MacOS/Electron"))
+        self.assertFalse(procs._is_app("/usr/bin/open -a /Applications/Foo.app/Contents/MacOS/Foo"))  # control
+
+
+class TestKillPlanReview17(unittest.TestCase):
+    """Review 17 of kill_plan (the trust model): malformed session pids, a
+    member whose environment was not read, two holders in one tree, a client
+    on a forked child, pipe peers as text or unknown, an agent with no person
+    to read its notes, and what reaches the terminal."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    OTHER = "0ce0ce00-0000-4000-8000-000000000009"
+    plan = TestKillPlanTrustsThePerson.plan
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    c = staticmethod(TestKillPlanPort.c)
+    TREE = TestKillPlanTrustsThePerson.TREE
+
+    def notes(self, p):
+        return " ".join(k.get("note", "") for k in p["kill"])
+
+    def test_a_member_whose_environment_was_not_read_keeps_attributes_mark(self):
+        table = {10: (1, self.T, "claude"), 20: (10, self.T, "/bin/zsh -c x"),
+                 21: (20, self.T, "node s.js")}
+        att_marks = {20: ("claude", LIVE_SID), 21: ("claude", self.OTHER)}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}]
+        full = {**table, 99: (1, self.T, "python3 ccwho.py")}
+        for mark21, want in ((None, []), (LIVE_SID, [20, 21])):     # not read; control: ours
+            with self.subTest(mark21=mark21):
+                am = dict(att_marks) if mark21 is None else {**att_marks, 21: ("claude", mark21)}
+                att = procs.attribute(full, am, {}, sessions, own=99)
+                p = procs.kill_plan("pid", {"pid": 20, "start": self.T},
+                                    {"table": full, "att": att, "sessions": sessions, "own": 99,
+                                     "ports": {}, "marks": {20: ("claude", LIVE_SID),
+                                                            **({21: ("claude", mark21)} if mark21 else {})},
+                                     "pipes": {q: set() for q in full}, "connections": [],
+                                     "mine": LIVE_SID})
+                self.assertEqual(self.kills(p), want)
+                if not want:        # review 18: a note refuses an agent - here "not read"
+                    self.assertIn("its environment was not read", self.whys(p))
+
+    def test_two_holders_in_one_tree_are_one_tree(self):
+        table = {10: (1, self.T, "claude"), 20: (10, self.T, "node server.js"),
+                 21: (20, self.T, "node worker.js")}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}]
+        for mine, marks in ((None, {20: ("claude", LIVE_SID), 21: ("claude", LIVE_SID)}),
+                            (LIVE_SID, {20: ("claude", LIVE_SID), 21: ("claude", LIVE_SID)})):
+            with self.subTest(mine=mine):
+                p = self.plan("port", 3000, table=table, marks=marks, ports={20: [3000], 21: [3000]},
+                              sessions=sessions, mine=mine)
+                pids = [k["pid"] for k in p["kill"]]
+                self.assertEqual(sorted(pids), [20, 21])
+                self.assertEqual({k["root"] for k in p["kill"]}, {20})
+                self.assertFalse(set(pids) & {s["pid"] for s in p["spare"]})
+        table = {20: (1, self.T, "node a.js"), 21: (1, self.T, "node b.js")}      # control
+        p = self.plan("port", 3000, table=table, ports={20: [3000], 21: [3000]})
+        self.assertEqual({k["root"] for k in p["kill"]}, {20, 21})
+
+    def test_a_client_on_a_forked_child_is_named(self):
+        table = {20: (1, self.T, "node server.js"), 21: (20, self.T, "node worker.js"),
+                 300: (1, self.T, "curl localhost:8000")}
+        marks = {20: ("claude", DEAD_SID), 21: ("claude", DEAD_SID), 300: None}
+        conns = [self.c(21, 8000, 61000), self.c(300, 61000, 8000)]
+        p = self.plan("port", 8000, table=table, marks=marks, ports={20: [8000]}, conns=conns)
+        self.assertIn("curl (300) is connected to :8000", self.notes(p))
+        conns = [self.c(21, 8000, 61000), self.c(20, 61000, 8000)]               # control: inside
+        p = self.plan("port", 8000, table=table, marks=marks, ports={20: [8000]}, conns=conns)
+        self.assertNotIn("connected", self.notes(p))
+
+    def test_a_peer_newer_than_the_scan_may_be_an_agent(self):
+        table = {20: (1, self.T, "tee log")}
+        pipes = {20: {555}, 99: set()}
+        p = self.plan("pid", {"pid": 20, "start": self.T}, table=table, ports={}, pipes=pipes)
+        self.assertIn("newer than the scan - it may be an agent", self.notes(p))    # a person decides
+        p = self.plan("pid", {"pid": 20, "start": self.T}, table=table, ports={}, pipes=pipes,
+                      marks={20: ("claude", LIVE_SID)}, mine=LIVE_SID)
+        self.assertEqual(p["kill"], [])                                            # no person: refused
+
+    def test_an_agent_leaves_what_serves_the_whole_login(self):
+        # no person reads an agent's notes: a shared daemon, an ssh master, an app stay
+        table = {10: (1, self.T, "claude"), 60: (10, self.T, "gpg-agent --daemon"),
+                 61: (10, self.T, "ssh: /u/.ssh/cm-h [mux]"),
+                 62: (10, self.T, "/Applications/Docker.app/Contents/MacOS/Docker"),
+                 63: (10, self.T, "node server.js")}
+        marks = {k: ("claude", LIVE_SID) for k in (60, 61, 62, 63)}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}]
+        p = self.plan("mine", LIVE_SID, table=table, marks=marks, ports={}, sessions=sessions,
+                      mine=LIVE_SID)
+        self.assertEqual(self.kills(p), [63])
+        for pid in (60, 61, 62):
+            p = self.plan("pid", {"pid": pid, "start": self.T}, table=table, marks=marks, ports={},
+                          sessions=sessions)
+            self.assertEqual(self.kills(p), [pid])                                 # control: a person
+
+    def test_what_attribute_says_is_printable_too(self):
+        table = {20: (1, self.T, "node s.js")}
+        full = {**table, 99: (1, self.T, "python3 ccwho.py")}
+        bad = "x\x1b]0;pwned\x07y"
+        att = {"unsure": [{"pid": 20, "why": bad, "session": DEAD_SID}]}
+        w = {"table": full, "att": att, "sessions": [], "own": 99, "ports": {},
+             "marks": {20: ("claude", DEAD_SID)}, "pipes": {20: set(), 99: set()}, "connections": []}
+        for mode, target in (("pid", {"pid": 20, "start": self.T}), ("clean", None)):
+            with self.subTest(mode=mode):
+                p = procs.kill_plan(mode, target, w)
+                text = self.notes(p) + self.whys(p)
+                self.assertNotRegex(text, r"[\x00-\x1f\x7f-\x9f]")
+                self.assertIn("not sure: x", text)                                 # control: said
+
+    def test_every_spare_has_the_same_keys(self):
+        p = self.plan("pid", {"pid": 777, "start": self.T})
+        q = self.plan("pid", {"pid": 20, "start": "Wed Sep 23 09:00:00 2026"})       # control
+        self.assertEqual(set(p["spare"][0]), set(q["spare"][0]))
+
+
+class TestKillPlanReview18(unittest.TestCase):
+    """Review 18: an agent has no person to read its notes, so any note on a
+    tree refuses it (one structural rule, not a list of shapes); what is piped
+    to this ccwho run is part of it; marks are what the environment said."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    OTHER = TestKillPlanReview17.OTHER
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    c = staticmethod(TestKillPlanPort.c)
+    BASE = {10: (1, T, "claude"), 98: (10, T, "/bin/zsh -c 'ccwho kill --mine | head'"),
+            99: (98, T, "python3 ccwho.py")}
+
+    def world(self, extra, marks, mine=LIVE_SID, ports=None, pipes="all", conns=(), named=None,
+              sessions=None, att=True):
+        table = {**self.BASE, **extra}
+        marks = {98: ("claude", LIVE_SID), **marks}
+        sessions = sessions if sessions is not None else [{"sessionId": LIVE_SID, "pid": 10}]
+        ports = ports if ports is not None else {}
+        w = {"table": table, "sessions": sessions, "own": 99, "ports": ports, "marks": marks,
+             "att": procs.attribute(table, {k: v for k, v in marks.items() if v},
+                                    ports if isinstance(ports, dict) else {},
+                                    sessions, own=99, named=named) if att else {},
+             "pipes": {q: set() for q in table} if pipes == "all" else pipes,
+             "connections": None if conns is None else list(conns)}
+        if mine:
+            w["mine"] = mine
+        return w
+
+    def notes(self, p):
+        return " ".join(k.get("note", "") for k in p["kill"])
+
+    def test_what_reads_this_ccwhos_output_is_part_of_it(self):
+        extra = {97: (98, self.T, "head -50")}
+        pipes = {**{q: set() for q in {**self.BASE, **extra}}, 97: {99}, 99: {97}}
+        for mode, target, mine in (("mine", LIVE_SID, LIVE_SID), ("pid", {"pid": 97, "start": self.T}, LIVE_SID),
+                                   ("pid", {"pid": 97, "start": self.T}, None)):
+            with self.subTest(mode=mode, mine=mine):
+                p = procs.kill_plan(mode, target, self.world(extra, {97: ("claude", LIVE_SID)},
+                                                             mine=mine, pipes=pipes))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("this ccwho run", self.whys(p))
+        p = procs.kill_plan("mine", LIVE_SID, self.world(extra, {97: ("claude", LIVE_SID)}))  # control
+        self.assertEqual(self.kills(p), [97])
+
+    def test_an_agent_takes_nothing_a_person_would_be_told_about(self):
+        cases = {"tmux": ({50: (1, self.T, "tmux new-session -d -s dev"), 51: (50, self.T, "-zsh"),
+                           52: (51, self.T, "vim notes.md")}, {}),
+                 "shell": ({50: (1, self.T, "-zsh")}, {}),
+                 "host": ({50: (1, self.T, "dtach -n /tmp/s python3")}, {}),
+                 "under a daemon": ({49: (1, self.T, "ollama serve"),
+                                     50: (49, self.T, "/opt/ollama runner --port 51234")}, {50: [51234]}),
+                 "app": ({50: (10, self.T, "/Applications/Docker.app/Contents/MacOS/Docker")}, {})}
+        for label, (extra, ports) in cases.items():
+            with self.subTest(case=label):
+                marks = {k: ("claude", LIVE_SID) for k in extra}
+                p = procs.kill_plan("mine", LIVE_SID, self.world(extra, marks, ports=ports))
+                self.assertNotIn(50, self.kills(p))
+                self.assertIn("no person is here to decide", self.whys(p))
+                w = self.world(extra, marks, ports=ports, mine=None)                     # control: a person
+                self.assertIn(50, self.kills(procs.kill_plan("pid", {"pid": 50, "start": self.T}, w)))
+        extra = {50: (98, self.T, "node server.js")}                                    # control
+        p = procs.kill_plan("mine", LIVE_SID, self.world({50: (10, self.T, "node server.js")},
+                                                         {50: ("claude", LIVE_SID)}))
+        self.assertEqual(self.kills(p), [50])
+
+    def test_an_agent_refuses_what_was_not_read(self):
+        extra = {70: (10, self.T, "tee out.log")}
+        marks = {70: ("claude", LIVE_SID)}
+        target = {"pid": 70, "start": self.T}
+        full = {**self.BASE, **extra}
+        for label, kw in {"pipes None": dict(pipes=None),
+                          "member missing": dict(pipes={q: set() for q in full if q != 70}),
+                          "text key": dict(pipes={"70": ["10"], **{q: set() for q in full if q not in (70, 10)}}),
+                          "conns None": dict(conns=None)}.items():
+            with self.subTest(case=label):
+                p = procs.kill_plan("pid", target, self.world(extra, marks, **kw))
+                self.assertEqual(p["kill"], [])
+                p = procs.kill_plan("pid", target, self.world(extra, marks, mine=None, **kw))
+                # control: a person - except the text key, which IS pid 70 piped to claude 10
+                self.assertEqual(self.kills(p), [] if label == "text key" else [70])
+        w = self.world(extra, marks)                                  # ports not read: None
+        w["ports"] = None
+        self.assertEqual(procs.kill_plan("pid", target, w)["kill"], [])
+        w = self.world(extra, marks, mine=None)
+        w["ports"] = None
+        self.assertEqual(self.kills(procs.kill_plan("pid", target, w)), [70])     # control: a person
+        p = procs.kill_plan("pid", target, self.world({**extra, 71: (70, self.T, "node vite")}, marks))
+        self.assertEqual(p["kill"], [])                               # a member whose environment was not read
+        self.assertEqual(self.kills(procs.kill_plan("pid", target, self.world(extra, marks))), [70])  # control
+
+    def test_a_command_line_naming_a_session_is_no_mark(self):
+        tail = f"tail -f /u/.claude/projects/p/{LIVE_SID}.jsonl"
+        extra = {80: (1, self.T, tail)}
+        for mode, target in (("mine", LIVE_SID), ("pid", {"pid": 80, "start": self.T})):
+            with self.subTest(mode=mode):
+                p = procs.kill_plan(mode, target, self.world(extra, {}, named={LIVE_SID: [80]}))
+                self.assertEqual(p["kill"], [])
+        p = procs.kill_plan("mine", LIVE_SID, self.world(extra, {80: ("claude", LIVE_SID)}))  # control
+        self.assertEqual(self.kills(p), [80])
+        p = procs.kill_plan("pid", {"pid": 80, "start": self.T},
+                            self.world(extra, {}, named={LIVE_SID: [80]}, mine=None))
+        self.assertIsNone(p["kill"][0]["marked"])                       # a guess is never the mark
+
+    def test_a_person_is_told_what_a_command_line_names(self):
+        extra = {20: (1, self.T, "/bin/zsh -c 'npm test'"),
+                 21: (20, self.T, f"tail -f /u/.claude/projects/p/{self.OTHER}.jsonl"),
+                 30: (1, self.T, "claude")}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}, {"sessionId": self.OTHER, "pid": 30}]
+        target = {"pid": 20, "start": self.T}
+        w = self.world(extra, {20: ("claude", DEAD_SID)}, mine=None, named={self.OTHER: [21]},
+                       sessions=sessions)
+        p = procs.kill_plan("pid", target, w)
+        self.assertEqual(self.kills(p), [20, 21])
+        self.assertIn("not read", next(k["note"] for k in p["kill"] if k["pid"] == 21))
+        w = self.world(extra, {20: ("claude", DEAD_SID), 21: ("claude", self.OTHER)}, mine=None,
+                       sessions=sessions)                                                # control
+        self.assertIn("carries another session's mark", self.whys(procs.kill_plan("pid", target, w)))
+
+    def test_a_read_mark_is_the_mark_without_attribute(self):
+        extra = {40: (1, self.T, "node s.js")}
+        p = procs.kill_plan("pid", {"pid": 40, "start": self.T},
+                            self.world(extra, {40: ("claude", DEAD_SID)}, mine=None, att=False))
+        self.assertEqual(p["kill"][0]["marked"], DEAD_SID)
+        self.assertNotIn("could not read", p["kill"][0].get("note", ""))
+        w = self.world(extra, {}, mine=None, att=False)                                   # control
+        w["marks"].pop(40, None)
+        p = procs.kill_plan("pid", {"pid": 40, "start": self.T}, w)
+        self.assertIsNone(p["kill"][0]["marked"])
+        self.assertIn("could not read", p["kill"][0]["note"])
+
+    def test_a_server_at_the_other_end_is_hedged(self):
+        extra = {20: (1, self.T, "node server.js"), 400: (1, self.T, "postgres")}
+        conns = [(20, "192.168.1.5", 55000, "192.168.1.5", 5432), (400, "192.168.1.5", 5432, "192.168.1.5", 55000)]
+        p = procs.kill_plan("port", 55000, self.world(extra, {20: ("claude", DEAD_SID), 400: None}, mine=None,
+                                                      ports={20: [55000], 400: [5432]}, conns=conns))
+        # review 19: both ends listen - a libp2p client, or an outgoing connection:
+        # ccwho cannot tell, so it says so, hedged
+        self.assertIn("postgres (400) may be connected to :55000", self.notes(p))
+        conns = [self.c(20, 55000, 61000), self.c(400, 61000, 55000)]                   # control: a client
+        p = procs.kill_plan("port", 55000, self.world(extra, {20: ("claude", DEAD_SID), 400: None}, mine=None,
+                                                      ports={20: [55000]}, conns=conns))
+        self.assertIn("(400) is connected to :55000", self.notes(p))
+
+    def test_a_pipe_says_piped_and_a_bool_is_no_pid(self):
+        extra = {20: (1, self.T, "tee log"), 30: (1, self.T, "node reader.js"), 1: (0, self.T, "/sbin/launchd")}
+        full = {**self.BASE, **extra}
+        target = {"pid": 20, "start": self.T}
+        p = procs.kill_plan("pid", target, self.world(extra, {20: ("claude", DEAD_SID)}, mine=None,
+                                                      pipes={**{q: set() for q in full}, 20: {True}}))
+        self.assertNotIn("True", self.notes(p))
+        p = procs.kill_plan("pid", target, self.world(extra, {20: ("claude", DEAD_SID)}, mine=None,
+                                                      pipes={**{q: set() for q in full}, 20: {30}}))
+        self.assertIn("is piped to 30 (node)", self.notes(p))                           # control
+
+    def test_attribute_text_is_printable_and_notes_are_all_said(self):
+        extra = {51: (1, self.T, "-zsh")}
+        full = {**self.BASE, **extra}
+        att = {"unsure": [{"pid": 51, "why": "it is a shell someone may be working in and fine",
+                           "session": "\x1b[2J", "marked": "\x1b[2J", "harness": "\x1b[2J"}]}
+        w = {"table": full, "att": att, "sessions": [{"sessionId": LIVE_SID, "pid": 10}], "own": 99,
+             "ports": {}, "marks": {51: None}, "pipes": {q: set() for q in full}, "connections": []}
+        k = procs.kill_plan("pid", {"pid": 51, "start": self.T}, w)["kill"][0]
+        self.assertIn("; it is a shell someone may be working in", k["note"])
+        for key in ("session", "harness"):
+            self.assertNotRegex(str(k[key]), r"[\x00-\x1f\x7f-\x9f]")
+        att["unsure"][0]["why"] = "it is an app"                                          # control
+        w["table"] = {**full, 51: (1, self.T, "/Applications/Slack.app/Contents/MacOS/Slack")}
+        k = procs.kill_plan("pid", {"pid": 51, "start": self.T}, w)["kill"][0]
+        self.assertEqual(k["note"].count("it is an app"), 1)
+
+    def test_a_tree_piped_to_one_an_agent_leaves_is_left_too(self):
+        # 60 reads tmux 50's pipe: 50 has a note (an agent leaves it), so 50
+        # keeps running - and then 60 is piped to a live process: a note too
+        extra = {50: (1, self.T, "tmux new-session -d"), 60: (1, self.T, "tee log")}
+        full = {**self.BASE, **extra}
+        pipes = {**{q: set() for q in full}, 60: {50}, 50: {60}}
+        marks = {50: ("claude", LIVE_SID), 60: ("claude", LIVE_SID)}
+        p = procs.kill_plan("mine", LIVE_SID, self.world(extra, marks, pipes=pipes))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("piped to 50", self.whys(p))
+        pipes = {q: set() for q in full}                                            # control
+        self.assertEqual(self.kills(procs.kill_plan("mine", LIVE_SID, self.world(extra, marks, pipes=pipes))), [60])
+
+
+class TestKillPlanReview19(unittest.TestCase):
+    """Review 19: pipes are a graph - both directions, through what stays
+    alive; one strict reading of the world: whole numbers only, and a
+    malformed entry is not read."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    c = staticmethod(TestKillPlanPort.c)
+    BASE = TestKillPlanReview18.BASE
+
+    def world(self, extra, marks=None, pipes=None, mine=None, own=99, ports=None, conns=(), att=True):
+        table = {**self.BASE, **extra}
+        marks = {98: ("claude", LIVE_SID), **(marks or {})}
+        sessions = [{"sessionId": LIVE_SID, "pid": 10}]
+        ports = ports or {}
+        good = {k: v for k, v in marks.items() if isinstance(v, tuple) and len(v) > 1}
+        w = {"table": table, "sessions": sessions, "own": own, "ports": ports, "marks": marks,
+             "att": procs.attribute(table, good, ports, sessions, own=99) if att else {},
+             "pipes": {**{q: set() for q in table if isinstance(q, int) and q >= 1}, **(pipes or {})},
+             "connections": list(conns)}
+        if mine:
+            w["mine"] = mine
+        return w
+
+    def pid(self, pid, w):
+        return procs.kill_plan("pid", {"pid": pid, "start": self.T}, w)
+
+    def test_a_pipe_chain_to_ccwho_or_an_agent_is_followed(self):
+        # `ccwho | tee | head`: kill the head, the tee dies of it, then ccwho
+        extra = {96: (98, self.T, "tee log"), 97: (98, self.T, "head -5")}
+        p = self.pid(97, self.world(extra, pipes={99: {96}, 96: {99, 97}, 97: {96}}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("this ccwho run", self.whys(p))
+        extra2 = {30: (1, self.T, "claude -p x"), 31: (1, self.T, "tee log"), 32: (1, self.T, "cat")}
+        p = self.pid(32, self.world(extra2, pipes={30: {31}, 31: {30, 32}, 32: {31}}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("an agent", self.whys(p))
+        # control: the middle is taken too (head under tee) - nothing stays alive between
+        extra3 = {31: (1, self.T, "tee log"), 32: (31, self.T, "cat")}
+        w = self.world(extra3, pipes={31: {32}, 32: {31}})
+        self.assertEqual(self.kills(self.pid(31, w)), [31, 32])
+
+    def test_a_pipe_known_from_the_other_side_counts(self):
+        extra = {97: (98, self.T, "head -5")}
+        w = self.world(extra, pipes={99: {97}})
+        del w["pipes"][97]
+        p = self.pid(97, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("this ccwho run", self.whys(p))
+        w = self.world({70: (1, self.T, "tee x")}, pipes={10: {70}})
+        del w["pipes"][70]
+        self.assertIn("an agent", self.whys(self.pid(70, w)))
+        w = self.world(extra)                                                       # control
+        del w["pipes"][97]
+        p = self.pid(97, w)
+        self.assertEqual(self.kills(p), [97])
+        self.assertIn("pipes were not read", p["kill"][0]["note"])
+
+    def test_attribute_skips_a_short_mark(self):
+        att = procs.attribute({20: (1, self.T, "node s.js")}, {20: ("claude",)}, {}, [])
+        self.assertEqual(att["left_behind"], [])
+        att = procs.attribute({20: (1, self.T, "node s.js")}, {20: ("claude", DEAD_SID)}, {}, [])  # control
+        self.assertEqual([p["pid"] for p in att["left_behind"]], [20])
+
+    def test_what_is_echoed_has_no_control_characters(self):
+        bad = "\x1b[2J" + self.T
+        w = self.world({70: (1, bad, "node s.js")})
+        p = procs.kill_plan("pid", {"pid": 70, "start": bad}, w)
+        self.assertEqual(self.kills(p), [70])
+        self.assertNotRegex(p["kill"][0]["start"], r"[\x00-\x1f\x7f-\x9f]")
+        p = procs.kill_plan("pid", {"pid": 70, "start": self.T}, w)     # not the same start: raw compare
+        self.assertEqual(p["kill"], [])
+        self.assertEqual(self.pid(99, self.world({}))["spare"][0]["start"], self.T)   # control
+
+    def test_a_client_that_also_listens_is_still_said(self):
+        # libp2p dials from its listening port: both ends listen on the other's port
+        extra = {20: (1, self.T, "node server.js"), 400: (1, self.T, "ipfs daemon")}
+        conns = [(20, "127.0.0.1", 3000, "127.0.0.1", 4001), (400, "127.0.0.1", 4001, "127.0.0.1", 3000)]
+        w = self.world(extra, {20: ("claude", LIVE_SID), 400: None}, ports={20: [3000], 400: [4001]},
+                       conns=conns)
+        p = procs.kill_plan("port", 3000, w)
+        self.assertIn("ipfs (400) may be connected to :3000", p["kill"][0].get("note", ""))
+        w["mine"] = LIVE_SID
+        self.assertEqual(procs.kill_plan("port", 3000, w)["kill"], [])
+        conns = [(20, "127.0.0.1", 3001, "127.0.0.1", 4001), (400, "127.0.0.1", 4001, "127.0.0.1", 3001)]
+        w = self.world(extra, {20: ("claude", LIVE_SID), 400: None}, ports={20: [3000], 400: [4001]},
+                       conns=conns)                                                  # control: outgoing
+        self.assertNotIn("ipfs", procs.kill_plan("port", 3000, w)["kill"][0].get("note", ""))
+
+    def test_marks_not_read_leave_marked_empty(self):
+        extra = {80: (1, self.T, f"tail -f /u/.claude/projects/p/{LIVE_SID}.jsonl")}
+        table = {**self.BASE, **extra}
+        att = procs.attribute(table, {}, {}, [{"sessionId": LIVE_SID, "pid": 10}], own=99,
+                              named={LIVE_SID: [80]})
+        w = self.world(extra)
+        w["att"], w["marks"] = att, None
+        self.assertIsNone(self.pid(80, w)["kill"][0]["marked"])
+        w = self.world({80: (1, self.T, "tail -f x")}, {80: ("claude", DEAD_SID)})     # control
+        self.assertEqual(self.pid(80, w)["kill"][0]["marked"], DEAD_SID)
+
+
+
+class TestKillPlanReview20(unittest.TestCase):
+    """Review 20: a pipe has a direction - killing q ends what writes into q
+    (SIGPIPE), not what only reads q's output (EOF). {"in", "out"} says which;
+    a plain set does not, so it counts both ways. One root per tree in every
+    mode; mapped loopback is loopback; pids are >= 1."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_what_only_reads_a_process_refuses_too(self):
+        # owner's choice (2026-09-26): any pipe link to an agent refuses - even
+        # claude only reading a dev server's output (it would live on)
+        extra = {300: (10, self.T, "/bin/zsh -c 'npm run dev'"), 301: (300, self.T, "node next dev")}
+        w = self.world(extra, {300: ("claude", LIVE_SID), 301: ("claude", LIVE_SID)},
+                       pipes={301: {"out": {10}}, 300: {"out": {10}}, 10: set()})
+        p = self.pid(301, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("301 is piped to 10, an agent", self.whys(p))
+        w = self.world(extra, {300: ("claude", LIVE_SID), 301: ("claude", LIVE_SID)},
+                       pipes={301: set(), 300: set(), 10: set()})                         # control: no pipe
+        self.assertEqual(self.kills(self.pid(301, w)), [301])
+    def test_a_hub_links_what_it_reads_to_an_agent(self):
+        # the VS Code plugin host is an app: no pipe end itself (review 29), but
+        # the walk goes through it to the claude that holds a pipe to it
+        extra = {150: (1, self.T, "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+                 200: (150, self.T, "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"),
+                 11: (200, self.T, "claude"), 220: (200, self.T, "node tsserver.js")}
+        p = self.pid(220, self.world(extra, pipes={220: {"out": {200}}, 11: {"out": {200}}, 200: set()}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("220 is piped to 200, and on to 11, an agent", self.whys(p))
+        p = self.pid(220, self.world(extra, pipes={220: {"out": {200}}, 11: set(), 200: set()}))  # control
+        self.assertEqual(self.kills(p), [220])
+        self.assertIn("a claude runs under it", p["kill"][0]["note"])
+    def test_a_nested_top_is_in_its_tree_once(self):
+        extra = {70: (10, self.T, "node a.js"), 71: (70, self.T, "node b.js"), 72: (71, self.T, "node c.js")}
+        for mid in (("claude", DEAD_SID), None):
+            with self.subTest(mid=mid):
+                w = self.world(extra, {70: ("claude", LIVE_SID), 71: mid, 72: ("claude", LIVE_SID)},
+                               mine=LIVE_SID)
+                p = procs.kill_plan("mine", LIVE_SID, w)
+                self.assertEqual(p["kill"], [])
+                self.assertEqual([s["pid"] for s in p["spare"]].count(72), 1)
+        w = self.world(extra, {k: ("claude", LIVE_SID) for k in extra}, mine=LIVE_SID)   # control
+        p = procs.kill_plan("mine", LIVE_SID, w)
+        self.assertEqual([k["pid"] for k in p["kill"]], [70, 71, 72])
+
+    def test_mapped_loopback_is_loopback(self):
+        self.assertTrue(procs._loopback("::ffff:127.0.0.1"))
+        self.assertFalse(procs._loopback("::ffff:10.0.0.5"))                     # control
+        extra = {70: (1, self.T, "node server.js"),
+                 80: (1, self.T, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")}
+        conns = [(70, "::ffff:127.0.0.1", 3000, "::ffff:127.0.0.1", 52345), (80, "127.0.0.1", 52345, "127.0.0.1", 3000)]
+        w = self.world(extra, {70: ("claude", DEAD_SID), 80: None}, ports={70: [3000]}, conns=conns)
+        note = procs.kill_plan("port", 3000, w)["kill"][0]["note"]
+        self.assertIn("Google Chrome (80) is connected to :3000", note)
+        self.assertNotIn("another machine", note)
+
+    def test_a_large_pipe_hub_is_quick(self):
+        import time
+        extra = {5000: (1, self.T, "cat")}
+        pipes = {5000: set()}
+        for i in range(1, 3001):
+            extra[i + 1000] = (1, self.T, "node x.js")
+            pipes[i + 1000] = {5000}
+        marks = {k: ("claude", DEAD_SID) for k in extra}
+        w = self.world(extra, marks, pipes=pipes)
+        t0 = time.monotonic()
+        p = procs.kill_plan("clean", None, w)
+        self.assertLess(time.monotonic() - t0, 3.0)
+        self.assertIn(1001, self.kills(p))
+
+
+    def test_a_writer_into_a_process_refuses(self):
+        # `claude -p x | tee`: claude writes into the tee - and the other way round
+        extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, "tee log")}
+        for pipes in ({31: {"in": {30}}, 30: {"out": {31}}}, {31: {"out": {30}}, 30: {"in": {31}}}):
+            with self.subTest(pipes=pipes):
+                p = self.pid(31, self.world(extra, pipes=pipes))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("an agent", self.whys(p))
+        self.assertEqual(self.kills(self.pid(31, self.world(extra))), [31])            # control: no pipe
+    def test_a_long_pipe_chain_is_followed_to_its_end(self):
+        # ccwho | tee | tee | head: every hop, not two
+        extra = {95: (98, self.T, "tee a"), 96: (98, self.T, "tee b"), 97: (98, self.T, "head -5")}
+        pipes = {99: {95}, 95: {99, 96}, 96: {95, 97}, 97: {96}}
+        p = self.pid(97, self.world(extra, pipes=pipes))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("this ccwho run", self.whys(p))
+        pipes = {95: {96}, 96: {95, 97}, 97: {96}, 99: set()}                  # control: not to ccwho
+        self.assertEqual(self.kills(self.pid(97, self.world(extra, pipes=pipes))), [97])
+
+    def test_a_peer_whose_own_pipes_were_not_read_is_followed_as_read(self):
+        extra = {301: (1, self.T, "node next dev")}
+        w = self.world(extra, pipes={301: {"out": {10}}})
+        del w["pipes"][10]
+        self.assertEqual(self.pid(301, w)["kill"], [])
+        w = self.world(extra, pipes={301: set(), 10: set()})                             # control
+        self.assertEqual(self.kills(self.pid(301, w)), [301])
+    def test_a_mapped_client_is_matched_too(self):
+        extra = {70: (1, self.T, "node server.js"),
+                 80: (1, self.T, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")}
+        conns = [(70, "127.0.0.1", 3000, "127.0.0.1", 52345), (80, "::ffff:127.0.0.1", 52345, "::ffff:127.0.0.1", 3000)]
+        w = self.world(extra, {70: ("claude", DEAD_SID), 80: None}, ports={70: [3000]}, conns=conns)
+        self.assertIn("Google Chrome (80) is connected to :3000",
+                      procs.kill_plan("port", 3000, w)["kill"][0]["note"])
+
+
+class TestKillPlanReview21(unittest.TestCase):
+    """Review 21: a writer dies with q only through its own stdout/stderr
+    ("out", fd 1 and 2); a note says what a pipe peer will do; a table or a
+    pipes entry that is not whole is not read."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_a_server_claude_feeds_refuses(self):
+        # an MCP stdio server: claude would live on, but no direction is inferred
+        extra = {200: (10, self.T, "node /x/playwright-mcp/cli.js")}
+        for pipes in ({200: {"in": {10}, "out": {10}}, 10: {"in": set(), "out": set()}},
+                      {200: {"in": {10}}, 10: {"out": {200}}}, {200: {10}}):
+            with self.subTest(pipes=pipes):
+                p = self.pid(200, self.world(extra, {200: ("claude", LIVE_SID)}, pipes=pipes))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("an agent", self.whys(p))
+        p = self.pid(200, self.world(extra, {200: ("claude", LIVE_SID)}))                  # control: no pipe
+        self.assertEqual(self.kills(p), [200])
+    def test_stderr_counts_like_any_fd(self):
+        extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, "logger -t claude")}
+        for pipes in ({30: {"out": {31}}, 31: {"in": {30}}}, {30: {"in": {31}}, 31: {"out": {30}}}):
+            with self.subTest(pipes=pipes):
+                p = self.pid(31, self.world(extra, pipes=pipes))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("an agent", self.whys(p))
+        self.assertEqual(self.kills(self.pid(31, self.world(extra))), [31])            # control
+        self.assertIn("any fd", procs.kill_plan.__doc__)
+    def test_a_note_names_every_pipe_peer(self):
+        extra = {301: (1, self.T, "npm run build"), 302: (1, self.T, "tee build.log"),
+                 303: (1, self.T, "grep ERROR")}
+        pipes = {301: {"out": {302}}, 302: {"in": {301}, "out": {303}}, 303: {"in": {302}}}
+        note = self.pid(302, self.world(extra, pipes=pipes))["kill"][0]["note"]
+        self.assertIn("piped to 301 (npm), which may end with it", note)
+        self.assertIn("piped to 303 (grep), which may end with it", note)
+        self.assertNotIn("keeps running", note)
+        w = self.world(extra, pipes={302: {301}, 303: set()})                             # 301 not read
+        del w["pipes"][301]
+        note = self.pid(302, w)["kill"][0]["note"]
+        self.assertIn("piped to 301 (npm), whose own pipes were not read", note)
+    def test_a_table_with_a_hole_was_not_read_whole(self):
+        for label, table in (("short row", {40: (1, self.T, "tmux new -d"), 41: (40, self.T),
+                                            42: (41, self.T, "claude")}),
+                             ("bad key", {40: (1, self.T, "tmux new -d"), "x41": (40, self.T, "script"),
+                                          42: (41, self.T, "claude")}),
+                             ("missing parent", {40: (1, self.T, "tmux new -d"), 42: (41, self.T, "claude")})):
+            with self.subTest(label=label):
+                w = self.world(table, att=False)
+                w["pipes"] = {k: v for k, v in w["pipes"].items() if isinstance(k, int)}
+                p = self.pid(40, w)
+                self.assertEqual(p["kill"], [])
+                self.assertIn("process table was not read whole" if label == "missing parent"
+                              else "not in its shape", p.get("why", ""))
+        w = self.world({1: (0, self.T, "/sbin/launchd"), 70: (1, self.T, "sleep 9")})     # control
+        self.assertEqual(self.kills(self.pid(70, w)), [70])
+
+
+
+class TestKillPlanReview22(unittest.TestCase):
+    """Review 22 and the owner's choice (2026-09-26): ANY pipe link from what a
+    kill takes to a running agent or to ccwho refuses - any fd, any direction,
+    through other processes. Nothing is inferred about who survives. Output
+    fields are one line; a table hole refuses only when it could hide one."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_any_pipe_link_to_an_agent_refuses(self):
+        cases = {
+            "mcp server claude feeds": ({200: (10, self.T, "node /x/playwright-mcp/cli.js")},
+                                        {200: {"in": {10}, "out": {10}}, 10: {"in": set(), "out": set()}}, 200),
+            "output claude reads": ({301: (10, self.T, "node next dev")}, {301: {"out": {10}}, 10: set()}, 301),
+            "writer at fd 3": ({30: (1, self.T, "claude -p x"), 31: (1, self.T, "tee /dev/fd/63 out.log"),
+                                32: (1, self.T, "grep ERROR")},
+                               {30: {"out": {31}}, 31: {"in": {30}}, 32: {"in": {31}}}, 32),
+            "shared read end": ({30: (1, self.T, "claude -p list"), 40: (1, self.T, "zsh -c loop"),
+                                 41: (40, self.T, "node job.js")},
+                                {30: {"out": {40, 41}}, 40: {"in": {30}}, 41: {"in": {30}}}, 41),
+            "driver of a stream-json claude": ({30: (1, self.T, "python3 driver.py"),
+                                                31: (1, self.T, "claude -p --input-format stream-json")},
+                                               {30: {"out": {31}}, 31: {"in": {30}}}, 30)}
+        for label, (extra, pipes, target) in cases.items():
+            with self.subTest(case=label):
+                p = self.pid(target, self.world(extra, pipes=pipes))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("an agent", self.whys(p))
+        extra = {31: (1, self.T, "tee log"), 32: (1, self.T, "grep x"), 33: (1, self.T, "npm run build")}
+        p = self.pid(32, self.world(extra, pipes={33: {"out": {31}}, 31: {"in": {33}, "out": {32}},
+                                                  32: {"in": {31}}}))                   # control
+        self.assertEqual(self.kills(p), [32])
+        self.assertIn("piped to 31 (tee)", p["kill"][0]["note"])
+
+    def test_the_builder_contract_is_written_down(self):
+        for words in ("any fd", "left out", "FIFO"):
+            self.assertIn(words, procs.kill_plan.__doc__)
+
+    def test_every_output_field_is_one_line(self):
+        bad = "dddd\r\nKILL 1 | ok\x1b[2J\t"
+        extra = {70: (1, self.T, "node s.js"), 71: (1, self.T, "cat")}
+        w = self.world(extra, {70: ("claude", bad)}, pipes={70: {"55\n5", 71}})
+        p = self.pid(70, w)
+        for entry in p["kill"] + p["spare"]:
+            for key, value in entry.items():
+                if isinstance(value, str):
+                    self.assertNotRegex(value, r"[\x00-\x1f\x7f-\x9f]", key)
+        w = self.world(extra, {70: ("claude", DEAD_SID)})                               # control
+        self.assertEqual(self.pid(70, w)["kill"][0]["marked"], DEAD_SID)
+
+    def test_a_table_hole_refuses_only_what_it_could_hide(self):
+        extra = {70: (1, self.T, "node server.js"), 4243: (4242, self.T, "sleep 5")}
+        self.assertEqual(self.kills(self.pid(70, self.world(extra, att=False))), [70])
+        for hidden in ("claude", "node /x/@anthropic-ai/claude-code/cli.js"):           # control
+            with self.subTest(hidden=hidden):
+                extra[4243] = (4242, self.T, hidden)
+                p = self.pid(70, self.world(extra, att=False))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("not read whole", p["why"])
+                self.assertIn("run it again", p["why"])
+        extra[4243] = (4242, self.T, "sleep 5")                          # a marked loose row: may be anyone's
+        p = self.pid(70, self.world(extra, {4243: ("claude", LIVE_SID)}, att=False))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("not read whole", p["why"])
+        w = self.world({70: (1, self.T, "node s.js"), 41: (40, self.T)}, att=False)    # out of shape
+        self.assertIn("not in its shape", self.pid(70, w)["why"])
+
+    def test_the_kernels_row_is_no_hole(self):
+        w = self.world({0: (0, self.T, "kernel_task"), 70: (1, self.T, "sleep 9")}, att=False)
+        self.assertEqual(self.kills(self.pid(70, w)), [70])
+        w = self.world({70: (1, self.T, "sleep 9"), 71: (4242, self.T, "claude")}, att=False)   # control
+        self.assertIn("not read whole", self.pid(70, w).get("why", ""))
+
+
+class TestKillPlanReview23(unittest.TestCase):
+    """Review 23: every result leaves through one door that makes it one line;
+    a pipes entry keeps the links it did read; every reading of a mark
+    counts; launchd is no root."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+    CTRL = r"[\x00-\x1f\x7f-\x9f]"
+
+    def texts(self, p):
+        out = [p.get("why", "")]
+        for e in p["kill"] + p["spare"]:
+            out += [v for v in e.values() if isinstance(v, str)]
+        return out
+
+    def test_every_door_out_is_one_line(self):
+        mark = ("codex", "x\ny\tz")
+        cases = {"different process": (self.world({70: (1, self.T, "node s.js")}, {70: mark}),
+                                       "pid", {"pid": 70, "start": "Wed Sep 23 10:00:00 2026"}),
+                 "cannot prove": (self.world({70: (1, "", "node s.js")}, {70: mark}),
+                                  "pid", {"pid": 70, "start": self.T}),
+                 "already exited": (self.world({}, {70: mark}), "pid", {"pid": 70, "start": self.T}),
+                 "unknown mode": (self.world({}), "zz\n", None),
+                 "a spared tree": (self.world({70: (1, self.T, "node a.js"), 71: (70, self.T, "claude")},
+                                              {70: mark}), "pid", {"pid": 70, "start": self.T})}
+        for label, (w, mode, target) in cases.items():
+            with self.subTest(case=label):
+                for text in self.texts(procs.kill_plan(mode, target, w)):
+                    self.assertNotRegex(text, self.CTRL)
+        w = self.world({70: (1, self.T, "node s.js")}, {70: ("claude", DEAD_SID)})     # control
+        p = procs.kill_plan("pid", {"pid": 70, "start": "Wed Sep 23 10:00:00 2026"}, w)
+        self.assertEqual(p["spare"][0]["marked"], DEAD_SID)
+        self.assertIn("fresh", procs.kill_plan.__doc__)          # the signaller's rule is written down
+
+    def test_launchd_is_no_root(self):
+        extra = {1: (0, self.T, "/sbin/launchd"), 70: (1, self.T, "sleep 9")}
+        p = procs.kill_plan("port", 22, self.world(extra, ports={1: [22]}))
+        self.assertEqual(p["kill"], [])
+        self.assertEqual([s["pid"] for s in p["spare"]], [1])
+        self.assertIn("no process ccwho would kill", self.whys(p))
+        w = self.world(extra, {1: ("claude", LIVE_SID)}, mine=LIVE_SID)
+        # mine: launchd is never "what the agent started" - not taken, not listed (review 24)
+        self.assertEqual([s["pid"] for s in procs.kill_plan("mine", LIVE_SID, w)["spare"]], [])
+        self.assertEqual(self.kills(procs.kill_plan("port", 22, self.world(extra, ports={70: [22]}))), [70])
+
+    def test_a_loose_ccwho_or_agent_refuses_and_says_which(self):
+        w = self.world({40: (1, self.T, "tmux new -d"), 98: (41, self.T, "-zsh"),
+                        99: (98, self.T, "python3 ccwho.py")}, att=False)
+        p = self.pid(40, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("not read whole", p["why"])
+        self.assertIn("this ccwho run", p["why"])
+        w = self.world({40: (1, self.T, "tmux new -d"), 70: (4242, self.T, "claude")}, att=False)
+        self.assertIn("not read whole", self.pid(40, w)["why"])
+        w = self.world({40: (1, self.T, "tmux new -d"), 41: (40, self.T, "-zsh"), 98: (41, self.T, "-zsh"),
+                        99: (98, self.T, "python3 ccwho.py")}, att=False)               # control: whole
+        self.assertIn("40 runs ccwho", self.whys(self.pid(40, w)))
+
+    def test_a_pipe_to_ccwhos_shell_refuses(self):
+        w = self.world({70: (1, self.T, "cat")}, pipes={98: {70}})
+        p = self.pid(70, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("this ccwho run", self.whys(p))
+        w = self.world({70: (1, self.T, "cat"), 97: (1, self.T, "tee")}, pipes={97: {70}})   # control
+        self.assertEqual(self.kills(self.pid(70, w)), [70])
+
+    def test_the_table_rule_is_written_down(self):
+        for words in ("run it again", "parent", "text"):
+            self.assertIn(words, procs.kill_plan.__doc__)
+
+    def test_a_member_read_as_unmarked_and_marked_was_not_read(self):
+        extra = {70: (10, self.T, "node a.js"), 71: (70, self.T, "node b.js")}
+        for order in ((71, "71"), ("71", 71)):
+            with self.subTest(order=order):
+                w = self.world(extra, {70: ("claude", LIVE_SID)}, mine=LIVE_SID, att=False)
+                w["marks"][order[0]] = None
+                w["marks"][order[1]] = ("claude", LIVE_SID)
+                self.assertEqual(self.pid(70, w)["kill"], [])
+        w = self.world(extra, {70: ("claude", LIVE_SID), 71: ("claude", LIVE_SID)}, mine=LIVE_SID, att=False)
+        self.assertEqual(self.kills(self.pid(70, w)), [70, 71])                         # control
+
+
+class TestKillPlanReview24(unittest.TestCase):
+    """Review 24: no kill takes pid 0 or 1, root or member; a bare pipes value
+    still links; every reading of a loose mark counts; format characters are
+    no text a person should read."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_no_kill_takes_pid_0_or_1(self):
+        for low in (0, 1):
+            with self.subTest(pid=low):
+                w = self.world({70: (98 if low else 1, self.T, "node a.js"), low: (70, self.T, "kernel")},
+                               {70: ("claude", DEAD_SID)})
+                if low == 1:            # launchd as a member: a table where nothing hangs under it
+                    w = self.world({}, att=False)
+                    w["table"] = {70: (0, self.T, "node a.js"), 1: (70, self.T, "launchd"),
+                                  99: (70, self.T, "python3 ccwho.py")}
+                    w["table"][99] = (0, self.T, "python3 ccwho.py")
+                p = self.pid(70, w)
+                self.assertNotIn(low, self.kills(p))
+                # review 27: pid 0 or 1 under another pid is a table out of shape
+                self.assertIn("not in its shape", self.whys(p))
+        w = self.world({70: (1, self.T, "node a.js"), 71: (70, self.T, "node b.js")}, {70: ("claude", DEAD_SID)})
+        self.assertEqual(self.kills(self.pid(70, w)), [70, 71])                          # control
+
+    def test_a_marked_launchd_hides_no_orphan_of_mine(self):
+        w = self.world({1: (0, self.T, "/sbin/launchd"), 70: (1, self.T, "sleep 9")},
+                       {1: ("claude", LIVE_SID), 70: ("claude", LIVE_SID)}, mine=LIVE_SID)
+        p = procs.kill_plan("mine", LIVE_SID, w)
+        self.assertEqual(self.kills(p), [70])
+        w = self.world({1: (0, self.T, "/sbin/launchd"), 70: (1, self.T, "sleep 9")},       # control
+                       {70: ("claude", LIVE_SID)}, mine=LIVE_SID)
+        self.assertEqual(self.kills(procs.kill_plan("mine", LIVE_SID, w)), [70])
+
+    def test_format_characters_are_not_shown(self):
+        w = self.world({70: (1, self.T, "node s.js")}, {70: ("claude", "x‮y z‏")})
+        k = self.pid(70, w)["kill"][0]
+        self.assertNotRegex(k["marked"], "[‎‏‪-‮⁦-⁩  ]")
+        w = self.world({70: (1, self.T, "node s.js")}, {70: ("claude", DEAD_SID)})          # control
+        self.assertEqual(self.pid(70, w)["kill"][0]["marked"], DEAD_SID)
+
+    def test_the_rules_are_written_down(self):
+        for words in ("launchd", "world_problem"):
+            self.assertIn(words, procs.kill_plan.__doc__)
+
+
+class TestKillPlanReview25(unittest.TestCase):
+    """Review 25: every input is read whole or not read - marks, sessions and
+    att too. Sessions or att not read refuses for everyone (the live-session
+    guard would be blind); a junk reading of a mark is no reading."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    SUB = "5ub5ub00-0000-4000-8000-000000000005"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_a_live_sessions_mark_says_so_without_att(self):
+        w = self.world({70: (1, self.T, "sleep 9")}, {70: ("claude", LIVE_SID)}, att=False)
+        self.assertIn("work of a live session", self.pid(70, w)["kill"][0]["note"])
+        w = self.world({70: (1, self.T, "sleep 9")}, {70: ("claude", DEAD_SID)}, att=False)  # control
+        self.assertNotIn("live session", self.pid(70, w)["kill"][0].get("note", ""))
+
+    def test_an_agent_takes_only_what_att_gives_its_own_session(self):
+        OTHER = TestKillPlanReview17.OTHER
+        w = self.world({70: (98, self.T, "sleep 9")}, {70: ("claude", LIVE_SID)}, mine=LIVE_SID, att=False)
+        w["att"] = {"sessions": {OTHER: [{"pid": 70}]}}
+        self.assertEqual(self.pid(70, w)["kill"], [])
+        w["att"] = {"sessions": {LIVE_SID: [{"pid": 70}]}}                                  # control
+        self.assertEqual(self.kills(self.pid(70, w)), [70])
+
+    def test_every_text_can_be_printed(self):
+        w = self.world({70: (1, self.T, "node s.js")}, {70: ("claude", "x\ud800y")})
+        for e in self.pid(70, w)["kill"]:
+            for v in e.values():
+                if isinstance(v, str):
+                    v.encode("utf-8")
+        w = self.world({70: (1, self.T, "node s.js")}, {70: ("claude", "é日本")})           # control
+        self.assertEqual(self.pid(70, w)["kill"][0]["marked"], "é日本")
+
+    def test_a_pid_has_a_bound(self):
+        w = self.world({2 ** 40: (1, self.T, "sleep 9")}, att=False)
+        self.assertEqual(self.pid(2 ** 40, w)["kill"], [])
+        p = procs.kill_plan("pid", {"pid": 2 ** 40, "start": self.T}, self.world({}, att=False))
+        self.assertEqual(p.get("why"), "no pid given")             # a target too big is no pid
+        w = self.world({9999999: (1, self.T, "sleep 9")}, att=False)                        # control
+        self.assertEqual(self.kills(self.pid(9999999, w)), [9999999])
+
+    def test_every_agent_test_is_the_same_test(self):
+        for child in ("python3 -m agent /x/claude-code/run.py", "claude -p x"):
+            with self.subTest(child=child):
+                extra = {50: (98, self.T, "/bin/zsh -c x"), 51: (50, self.T, child), 52: (50, self.T, "sleep 9")}
+                marks = {k: ("claude", LIVE_SID) for k in extra}
+                p = procs.kill_plan("mine", LIVE_SID, self.world(extra, marks, mine=LIVE_SID))
+                self.assertEqual(self.kills(p), [52])
+
+    def test_the_input_shapes_are_written_down(self):
+        for words in ("\"sessions\" [{", "att", "a list"):
+            self.assertIn(words, procs.kill_plan.__doc__)
+
+    def test_an_agent_path_named_directly_is_refused(self):
+        cmd = "node --stack-size 4000 /x/@anthropic-ai/claude-code/cli.js"
+        p = self.pid(21, self.world({21: (1, self.T, cmd)}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("may be an agent", self.whys(p))
+        self.assertEqual(self.kills(self.pid(21, self.world({21: (1, self.T, "node server.js")}))), [21])
+
+
+class TestWorldShape(unittest.TestCase):
+    """The owner's choice (2026-09-26, after review 26): the world is built by
+    ccwho's own reader, so one strict check reads it whole. Any part not in
+    its shape refuses the whole plan, for everyone - a ccwho bug, not a fact
+    about the processes. The "not read" forms are explicit: None for ports,
+    pipes, marks or connections, and a pid left out of marks or pipes."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    world = TestKillPlanReview19.world
+    BASE = TestKillPlanReview19.BASE
+
+    def good(self):
+        w = self.world({70: (1, self.T, "sleep 9")}, {70: ("claude", DEAD_SID)}, ports={70: [3000]},
+                       conns=[(70, "127.0.0.1", 3000, "127.0.0.1", 50000)])
+        w["sessions"].append({"sessionId": TestKillPlanReview17.OTHER, "kind": "background"})  # no pid yet
+        return w
+
+    BAD = {
+        "world not a map": lambda w: None,
+        "unknown key": lambda w: w.update(extra=1),
+        "table missing": lambda w: w.pop("table"),
+        "table key text": lambda w: w["table"].update({"71": (1, "T", "x")}),
+        "table key bool": lambda w: w["table"].update({True: (0, "T", "x")}),
+        "table key huge": lambda w: w["table"].update({10 ** 5000: (1, "T", "x")}),
+        "table row short": lambda w: w["table"].update({71: (1, "T")}),
+        "table ppid text": lambda w: w["table"].update({71: ("1", "T", "x")}),
+        "table start int": lambda w: w["table"].update({71: (1, 12345, "x")}),
+        "table command list": lambda w: w["table"].update({71: (1, "T", ["claude", "-p"])}),
+        "own text": lambda w: w.update(own="99"),
+        "own bool": lambda w: w.update(own=True),
+        "sessions not a list": lambda w: w.update(sessions="x"),
+        "session not a map": lambda w: w["sessions"].append(None),
+        "session pid text": lambda w: w["sessions"].append({"sessionId": "s", "pid": "ten"}),
+        "session pid float": lambda w: w["sessions"].append({"sessionId": "s", "pid": 30.0}),
+        "session id int": lambda w: w["sessions"].append({"sessionId": 5, "pid": 30}),
+        "att not a map": lambda w: w.update(att=None),
+        "att list not a list": lambda w: w["att"].update(unsure=5),
+        "att entry pid text": lambda w: w["att"].update(left_behind=[{"pid": "x"}]),
+        "att why int": lambda w: w["att"].update(codex=[{"pid": 555, "why": 10 ** 5000}]),
+        "att sessions not a map": lambda w: w["att"].update(sessions=[1]),
+        "att pid in two groups": lambda w: w["att"].update(left_behind=[{"pid": 10}], codex=[{"pid": 10}]),
+        "ports key text": lambda w: w["ports"].update({"70": [3000]}),
+        "port huge": lambda w: w["ports"].update({70: [10 ** 5000]}),
+        "port zero": lambda w: w["ports"].update({70: [0]}),
+        "ports value set": lambda w: w["ports"].update({70: {3000}}),
+        "pipes key text": lambda w: w["pipes"].update({"10x": {70}}),
+        "pipe peer text": lambda w: w["pipes"].update({70: {"10"}}),
+        "pipe peer bool": lambda w: w["pipes"].update({70: {True}}),
+        "pipe peer float": lambda w: w["pipes"].update({70: {10.0}}),
+        "pipe bare value": lambda w: w["pipes"].update({70: 10}),
+        "pipe other key": lambda w: w["pipes"].update({70: {"err": set()}}),
+        "marks key text": lambda w: w["marks"].update({"70": ("claude", DEAD_SID)}),
+        "mark junk": lambda w: w["marks"].update({70: "7x"}),
+        "mark short": lambda w: w["marks"].update({70: ("claude",)}),
+        "mark sid int": lambda w: w["marks"].update({70: ("claude", 5)}),
+        "conn short": lambda w: w.update(connections=[(70, "127.0.0.1", 3000)]),
+        "conn port bool": lambda w: w.update(connections=[(70, "127.0.0.1", True, "127.0.0.1", 5)]),
+        "conn port huge": lambda w: w.update(connections=[(70, "127.0.0.1", 10 ** 5000, "127.0.0.1", 5)]),
+        "mine int": lambda w: w.update(mine=5),
+        "own zero": lambda w: w.update(own=0),
+        "table key negative": lambda w: w["table"].update({-5: (1, "T", "x")}),
+        "session pid zero": lambda w: w["sessions"].append({"sessionId": "s", "pid": 0}),
+        "pipe peer zero": lambda w: w["pipes"].update({70: {0}}),
+        "mark starter text": lambda w: w["marks"].update({70: ("claude", DEAD_SID, "10")}),
+        "att entry marked int": lambda w: w["att"].update(codex=[{"pid": 555, "marked": 5}]),
+    }
+
+    def test_every_malformed_part_refuses_the_whole_plan(self):
+        import json
+        for label, spoil in self.BAD.items():
+            with self.subTest(part=label):
+                w = self.good()
+                w = spoil(w) if label == "world not a map" else (spoil(w), w)[1]
+                self.assertIsNotNone(procs.world_problem(w))
+                for mode, target in (("pid", {"pid": 70, "start": self.T}), ("port", 3000), ("clean", None)):
+                    p = procs.kill_plan(mode, target, w)
+                    self.assertEqual(p["kill"], [])
+                    self.assertIn("not in its shape", p["why"])
+                    json.dumps(p)
+
+    def test_the_not_read_forms_are_no_malformation(self):
+        for label, change in {"good": lambda w: None,
+                              "ports None": lambda w: w.update(ports=None),
+                              "pipes None": lambda w: w.update(pipes=None),
+                              "marks None": lambda w: w.update(marks=None),
+                              "connections None": lambda w: w.update(connections=None),
+                              "a pid left out of marks": lambda w: w["marks"].pop(70),
+                              "a pid left out of pipes": lambda w: w["pipes"].pop(70),
+                              "a session without a pid": lambda w: w["sessions"].append({"sessionId": "q"}),
+                              "a mark with its starter": lambda w: w["marks"].update({70: ("claude", DEAD_SID, 10)}),
+                              "the kernel's row": lambda w: w["table"].update({0: (0, self.T, "kernel_task")}),
+                              "directed pipes": lambda w: w["pipes"].update({70: {"in": set(), "out": [31]}})}.items():
+            with self.subTest(form=label):
+                w = self.good()
+                change(w)
+                self.assertIsNone(procs.world_problem(w))
+                p = procs.kill_plan("pid", {"pid": 70, "start": self.T}, w)
+                self.assertEqual([k["pid"] for k in p["kill"]], [70])
+
+
+class TestKillPlanReview27(unittest.TestCase):
+    """Review 27: the readers and the check agree - what mark_of and
+    parse_lsof_listen give passes world_problem; the table has no loop (pid 0
+    and 1 have parent 0); types are exact; att parts have their shape."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_what_mark_of_gives_passes_the_check(self):
+        for env in ({}, {"CLAUDE_CODE_SESSION_ID": DEAD_SID},
+                    *({"CLAUDE_CODE_SESSION_ID": DEAD_SID, "CLAUDE_PID": v}
+                      for v in ("0", "0000000", "1", "4x", "99999999", "4242")),
+                    {"CODEX_THREAD_ID": "019a-thread"}):
+            with self.subTest(env=env):
+                w = self.world({70: (1, self.T, "sleep 9")})
+                w["marks"][70] = procs.mark_of(env)
+                self.assertIsNone(procs.world_problem(w))
+        self.assertEqual(procs.mark_of({"CLAUDE_CODE_SESSION_ID": DEAD_SID, "CLAUDE_PID": "0"}),
+                         ("claude", DEAD_SID))
+        self.assertEqual(procs.mark_of({"CLAUDE_CODE_SESSION_ID": DEAD_SID, "CLAUDE_PID": "4242"}),
+                         ("claude", DEAD_SID, 4242))                                   # control
+
+    def test_what_lsof_gives_passes_the_check(self):
+        self.assertEqual(procs.parse_lsof_listen("p13\nn*:0\n"), {})
+        self.assertEqual(procs.parse_lsof_listen("p13\nn*:3000\n"), {13: [3000]})          # control
+        w = self.world({13: (1, self.T, "node s.js")})
+        w["ports"] = procs.parse_lsof_listen("p13\nn*:0\np13\nn127.0.0.1:3000\n")
+        self.assertIsNone(procs.world_problem(w))
+
+    def test_the_table_has_no_loop(self):
+        for label, rows in (("launchd under ccwho", {98: (1, self.T, "-zsh"), 1: (99, self.T, "launchd"),
+                                                     13: (1, self.T, "sleep 9")}),
+                            ("kernel under ccwho", {0: (99, self.T, "kernel_task"), 13: (0, self.T, "sleep 9")}),
+                            ("a loop", {70: (71, self.T, "a"), 71: (70, self.T, "b")})):
+            with self.subTest(table=label):
+                w = self.world(rows, pipes={13: {99}} if 13 in rows else None)
+                self.assertIsNotNone(procs.world_problem(w))
+                p = self.pid(13 if 13 in rows else 70, w)
+                self.assertEqual(p["kill"], [])
+                self.assertIn("not in its shape", p["why"])
+        w = self.world({1: (0, self.T, "launchd"), 13: (1, self.T, "sleep 9")}, pipes={13: {99}})  # control
+        self.assertIsNone(procs.world_problem(w))
+        self.assertIn("this ccwho run", self.whys(self.pid(13, w)))
+
+    def test_types_are_exact(self):
+        class S(str):
+            pass
+
+        class P(int):
+            pass
+
+        class D(dict):
+            pass
+        spoil = {"start subclass": lambda w: w["table"].update({70: (1, S(self.T), "sleep 9")}),
+                 "session pid subclass": lambda w: w["sessions"].append({"sessionId": "x", "pid": P(70)}),
+                 "table a dict subclass": lambda w: w.update(table=D(w["table"])),
+                 "session a dict subclass": lambda w: w["sessions"].append(D(sessionId="x", pid=70))}
+        for label, change in spoil.items():
+            with self.subTest(case=label):
+                w = self.world({70: (1, self.T, "sleep 9")})
+                change(w)
+                self.assertIsNotNone(procs.world_problem(w))
+        w = self.world({70: (1, self.T, "sleep 9")})                                      # control
+        self.assertIsNone(procs.world_problem(w))
+        w = D(w)
+        self.assertIsNotNone(procs.world_problem(w))
+
+    def test_att_parts_have_their_shape(self):
+        for att in ({"unsure": ""}, {"left_behind": 0}, {"sessions": []}, {"sessions": ""}):
+            with self.subTest(att=att):
+                w = self.world({70: (1, self.T, "sleep 9")})
+                w["att"] = att
+                self.assertIsNotNone(procs.world_problem(w))
+        for att in ({"unsure": []}, {"sessions": {}}, {}):                                 # control
+            with self.subTest(ok=att):
+                w = self.world({70: (1, self.T, "sleep 9")})
+                w["att"] = att
+                self.assertIsNone(procs.world_problem(w))
+
+    def test_a_member_of_ccwhos_chain_is_refused_as_such(self):
+        # defence in depth: a member that is this ccwho run's own is never taken
+        w = self.world({97: (99, self.T, "ps -axo pid")})
+        p = self.pid(97, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("ccwho", self.whys(p))
+
+    def test_a_session_without_a_pid_is_a_session_with_no_process(self):
+        self.assertIn("a session with no process", procs.kill_plan.__doc__)
+
+
+class TestKillPlanReview28(unittest.TestCase):
+    """Review 28: a process with an agent under it is a pipe end too (a pty
+    wrapper: `script ... claude`); every reader gives only what the check
+    accepts; a session without a pid is read, with no process."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_a_pipe_to_what_runs_an_agent_refuses(self):
+        extra = {20: (1, self.T, "script -q /dev/null claude -p x"), 21: (20, self.T, "claude -p x"),
+                 30: (1, self.T, "tail -f log"), 31: (1, self.T, "tee x")}
+        for pipes in ({30: {20}, 20: {30}}, {30: {31}, 31: {30, 20}, 20: {31}}):
+            with self.subTest(pipes=pipes):
+                p = self.pid(30, self.world(extra, pipes=pipes))
+                self.assertEqual(p["kill"], [])
+                self.assertIn("a claude runs under 20", self.whys(p))
+        extra[20], extra[21] = (1, self.T, "script -q /dev/null sleep 9"), (20, self.T, "sleep 9")   # control
+        p = self.pid(30, self.world(extra, pipes={30: {20}, 20: {30}}))
+        self.assertEqual(self.kills(p), [30])
+        self.assertIn("piped to 20", p["kill"][0]["note"])
+
+    def test_every_reader_gives_what_the_check_accepts(self):
+        for text in ("p0\nn127.0.0.1:5->127.0.0.1:6\n", "p12345678\nn127.0.0.1:5->127.0.0.1:6\n",
+                     "p²\nn1.2.3.4:1->1.2.3.4:2\n", "p13\nn1.2.3.4:²->5.6.7.8:9\n",
+                     "p13\nn1.2.3.4:٣->5.6.7.8:9\n"):
+            with self.subTest(established=text):
+                got = procs.parse_lsof_established(text)
+                if got is not None:
+                    w = self.world({13: (1, self.T, "x")})
+                    w["connections"] = got
+                    self.assertIsNone(procs.world_problem(w))
+        self.assertEqual(procs.parse_lsof_established("p13\nn127.0.0.1:5000->127.0.0.1:6000\n"),
+                         [(13, "127.0.0.1", 5000, "127.0.0.1", 6000)])                  # control
+        for text in ("123456789 Tue Sep 22 13:45:15 2026 x\n", "    0 Tue Sep 22 13:45:15 2026 kernel_task\n",
+                     "² Tue Sep 22 13:45:15 2026 x\n"):
+            with self.subTest(ps=text):
+                for k in procs.parse_ps_table(text):
+                    self.assertTrue(1 <= k < 10 ** 7)
+        self.assertEqual(procs.parse_ps_table("12 Tue  Sep 22 13:45:15 2026 /a b/c\n"),          # control
+                         {12: ("Tue Sep 22 13:45:15 2026", "/a b/c")})
+
+    def test_a_session_without_a_pid_is_read_with_no_process(self):
+        OTHER = TestKillPlanReview17.OTHER
+        w = self.world({70: (1, self.T, "sleep 9")}, {70: ("claude", OTHER)})
+        w["sessions"].append({"sessionId": OTHER})
+        self.assertIsNone(procs.world_problem(w))
+        self.assertIn("work of a live session", self.pid(70, w)["kill"][0]["note"])
+        for bad in (0, "10"):                                                               # control
+            w["sessions"][-1] = {"sessionId": OTHER, "pid": bad}
+            self.assertEqual(procs.world_problem(w), "sessions")
+        self.assertNotIn("without a whole pid - refuses", procs.kill_plan.__doc__)
+        not_read = procs.world_problem.__doc__.split('"not read" forms')[1]
+        self.assertNotIn("a session without a pid", not_read.split(".")[0] + not_read.split(".")[1])
+
+
+class TestKillPlanReview29(unittest.TestCase):
+    """Review 29: a pipe end is what runs an agent (or ccwho) up to the nearest
+    app or multiplexer - the IDE that hosts claude in its terminal is not the
+    agent: a pipe to it is a note that names the agent under it."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    IDEA = "/Applications/IntelliJ IDEA.app/Contents/MacOS/idea"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def ide(self, **kw):
+        extra = {150: (1, self.T, self.IDEA), 152: (150, self.T, "/bin/zsh -il"), 11: (152, self.T, "claude"),
+                 400: (150, self.T, "node server.js"), **kw.pop("extra", {})}
+        return self.world(extra, {400: ("claude", LIVE_SID)}, pipes={400: {"out": {150}}}, ports={400: [3000]},
+                          **kw)
+
+    def test_a_pipe_to_the_ide_that_hosts_claude_is_a_note(self):
+        p = procs.kill_plan("port", 3000, self.ide())
+        self.assertEqual(self.kills(p), [400])
+        self.assertIn("piped to 150 (IntelliJ IDEA)", p["kill"][0]["note"])
+        self.assertIn("a claude runs under it", p["kill"][0]["note"])
+        self.assertEqual(procs.kill_plan("port", 3000, self.ide(mine=LIVE_SID))["kill"], [])   # an agent
+
+    def test_a_pipe_to_the_ide_that_runs_ccwho_is_a_note(self):
+        w = self.ide()
+        w["table"][98] = (150, self.T, "/bin/zsh -il")            # ccwho's shell in the IDE terminal
+        del w["table"][11]
+        self.assertEqual(self.kills(procs.kill_plan("port", 3000, w)), [400])
+
+    def test_the_ide_itself_is_still_never_taken(self):
+        p = self.pid(150, self.ide())
+        self.assertEqual(p["kill"], [])
+        self.assertIn("a claude runs under 150", self.whys(p))
+
+    def test_what_is_between_the_app_and_the_agent_is_still_an_end(self):
+        extra = {150: (1, self.T, self.IDEA), 20: (150, self.T, "script -q /dev/null claude"),
+                 21: (20, self.T, "claude"), 30: (1, self.T, "tail -f log")}
+        p = self.pid(30, self.world(extra, pipes={30: {20}}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("a claude runs under 20", self.whys(p))
+
+    def test_an_agent_is_named_with_the_right_article(self):
+        extra = {20: (1, self.T, "script -q /dev/null zsh -c go"), 21: (20, self.T, "node /opt/claude-code/cli.js"),
+                 30: (1, self.T, "tail -f log")}
+        for target in (30, 20):
+            with self.subTest(target=target):
+                self.assertNotIn("a an ", self.whys(self.pid(target, self.world(extra, pipes={30: {20}}))))
+
+    def test_the_wrapper_rule_is_written_down(self):
+        self.assertIn("a process with an agent under it", procs.kill_plan.__doc__)
+        self.assertIn("this ccwho run", procs.kill_plan.__doc__)
+
+    def test_more_shapes(self):
+        for conn in ((70, "", 5, "127.0.0.1", 6), (70, "127.0.0.1", 5, "", 6)):
+            w = self.world({70: (1, self.T, "sleep 9")}, conns=[conn])
+            self.assertEqual(procs.world_problem(w), "connections")
+        w = self.world({70: (1, self.T, "sleep 9")})
+        w["own"] = 1
+        self.assertEqual(procs.world_problem(w), "own")
+        w = self.world({70: (1, self.T, "sleep 9")})
+        w["att"]["unsure"] = [{"pid": 555}]
+        self.assertEqual(procs.world_problem(w), "att entries")
+        self.assertIsNone(procs.world_problem(self.world({70: (1, self.T, "sleep 9")},       # control
+                                                         conns=[(70, "127.0.0.1", 5, "127.0.0.1", 6)])))

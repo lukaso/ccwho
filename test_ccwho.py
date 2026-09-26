@@ -5237,3 +5237,168 @@ class TestShortTagsKeepTheirColumn(unittest.TestCase):
         out = ccwho.render(rows, {"usage": snap}, color=False, width=150)
         self.assertIn(f"{rows[0]['since']:>5}  q", out)
         self.assertIn(f"{rows[2]['since']:>5}  r", out)
+
+
+class TestTheBriefInParts(unittest.TestCase):
+    """The detail pane copies what you click: each value of the brief is a part
+    that knows its whole value, even where the screen shows it cut. The brief
+    printed by `ccwho brief` must not change for it (the golden fixture was
+    captured from render_brief before the parts existed)."""
+
+    LONG = "a very long thing that goes on " * 6
+    AKA = {"short_id": "4f2b", "tty": "/dev/ttys017", "pid": 4242, "name": "liveapp-40",
+           "cwd": "/Users/u/projects/liveapp",
+           "session_id": "4f2b91ac-1111-4222-8333-abcdefabcdef"}
+
+    def brief(self, **over):
+        b = dict(title="Laptop crash", recap="S4 is paused. Continue?", recap_age="2d",
+                 turns_since_recap=23, you_said=self.LONG, goal="investigate the crash",
+                 progress=["read logs", self.LONG], closing="Do you want me to continue?",
+                 aka=dict(self.AKA))
+        b.update(over)
+        return b
+
+    def copies(self, b, row=None):
+        return [c for line in ccwho.brief_parts(b, row or {}) for _, _, c in line if c]
+
+    def test_render_brief_is_byte_identical_to_before(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "test_fixture_render_brief.json"), encoding="utf-8") as fh:
+            cases = json.load(fh)
+        self.assertGreater(len(cases), 8)
+        for i, case in enumerate(cases):
+            with self.subTest(case=i, color=case["color"]):
+                self.assertEqual(ccwho.render_brief(case["brief"], case["row"],
+                                                    color=case["color"]), case["expected"])
+
+    def test_the_parts_are_the_brief(self):
+        b, row = self.brief(), {"attention": "asks", "project": "liveapp"}
+        lines = ["".join(t for t, _, _ in line) for line in ccwho.brief_parts(b, row)]
+        self.assertEqual("\n".join(lines), ccwho.render_brief(b, row, color=False))
+
+    def test_every_value_can_be_copied_whole(self):
+        b = self.brief()
+        got = self.copies(b, {"project": "liveapp", "tty": "/dev/ttys017"})
+        for want in ("4f2b", "liveapp", "Laptop crash", "S4 is paused. Continue?",
+                     "investigate the crash", self.LONG.strip(), "read logs",
+                     "Do you want me to continue?", "/dev/ttys017", "4242", "liveapp-40",
+                     "/Users/u/projects/liveapp", "4f2b91ac-1111-4222-8333-abcdefabcdef",
+                     "claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef"):
+            with self.subTest(want=want[:30]):
+                self.assertIn(want, got)
+        # the screen cuts the long ones; what you copy is never the cut
+        shown = ccwho.render_brief(b, {}, color=False)
+        self.assertNotIn(self.LONG, shown)                                  # control
+        self.assertFalse(any(c.endswith("…") for c in got), got)
+
+    def test_a_label_is_not_a_value(self):
+        got = self.copies(self.brief(), {"attention": "asks", "project": "liveapp"})
+        for label in ("tty", "pid", "resume", "opened", "you said", "progress", "it said",
+                      "ASKED YOU", "recap 2d old · 23 turns since", " · "):
+            with self.subTest(label=label):
+                self.assertNotIn(label, got)
+        self.assertFalse(any(c != c.strip() for c in got), got)
+
+    def test_what_is_not_there_is_not_offered(self):
+        bare = self.brief(title="", recap="", you_said="", goal="", progress=[], closing="",
+                          aka=dict(self.AKA, tty="", pid=0, name="", cwd=""))
+        got = self.copies(bare, {})
+        self.assertNotIn("", got)
+        self.assertNotIn("0", got)
+        for project in ("?", ""):                   # no project is not a value
+            with self.subTest(project=project):
+                self.assertNotIn(project, self.copies(bare, {"project": project}))
+        self.assertIn("app", self.copies(bare, {"project": "app"}))       # control
+        self.assertEqual(got.count("4f2b91ac-1111-4222-8333-abcdefabcdef"), 1)
+
+    def test_escape_codes_are_not_what_you_paste(self):
+        b = self.brief(you_said="pasted \x1b[31mRED\x1b[0m done",
+                       recap="a\x1b]52;c;aGk=\x07b", closing="c\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\d")
+        got = self.copies(b)
+        self.assertIn("pasted RED done", got)
+        self.assertIn("ab", got)
+        self.assertIn("clinkd", got)
+        # a private CSI (cursor hide) and a bare ESC leave nothing behind
+        # ESC d is a whole escape, as a terminal reads it: the d goes with it
+        got2 = self.copies(self.brief(you_said="a\x1b[?25lb\x1b[?25h c\x1bd e\x1b"))
+        self.assertIn("ab c e", got2)
+        self.assertFalse(any("\x1b" in c or "\x07" in c for c in got), got)
+        self.assertIn("Laptop crash", got)                                 # control
+
+    def test_the_text_the_pane_draws_has_no_escape_left(self):
+        for raw, want in (("c\x1bd e\x1b", "c e"), ("run \x1b[1mmake\x1b(B\x1b[m now", "run make now"),
+                          ("a\x1b]0;title", "a"), ("  keep  my spaces ", "  keep  my spaces "),
+                          ("x [1m] y\r\n", "x [1m] y\r\n")):
+            with self.subTest(raw=raw):
+                self.assertEqual(ccwho.plain_text(raw), want)
+
+    def test_a_project_of_none_is_not_a_crash(self):
+        shown = ccwho.render_brief(self.brief(), {"project": None}, color=False)
+        self.assertEqual(shown.splitlines()[0], "4f2b  ?")
+        self.assertNotIn(None, self.copies(self.brief(), {"project": None}))
+
+    def test_what_you_paste_is_what_the_pane_shows(self):
+        for said, want in (("run \x1b[1mmake\x1b(B\x1b[m now", "run make now"),   # tput sgr0
+                           ("a\x1bMb", "ab"),
+                           ("a\x1b]0;title", "a"),                 # an OSC never ended
+                           ("x [1m] y", "x [1m] y"),               # control: no ESC at all
+                           ("arr[0] (B) M", "arr[0] (B) M")):      # control
+            with self.subTest(said=said):
+                self.assertIn(want, self.copies(self.brief(you_said=said)))
+
+    def test_the_cut_is_made_on_what_is_shown(self):
+        said = "x" * 95 + "\x1b[31mRED\x1b[0m tail " + "y" * 20
+        line = next(l for l in ccwho.render_brief(self.brief(you_said=said), {}, color=False)
+                    .splitlines() if "you said" in l)
+        self.assertNotIn("31", line)
+        self.assertTrue(line.endswith("…"), line)
+        self.assertIn("xRED", line, "the cut counts what is shown, not the codes")
+        link = "x" * 97 + "\x1b]8;;http://example.com\x1b\\link\x1b]8;;\x1b\\ and more"
+        line = next(l for l in ccwho.render_brief(self.brief(you_said=link), {}, color=False)
+                    .splitlines() if "you said" in l)
+        self.assertTrue(line.endswith("…"), line)
+
+    def test_mojibake_is_text_not_escapes(self):
+        for text in ("say “hi” ok and more text".encode().decode("latin-1"),
+                     "Děkuji".encode().decode("latin-1")):
+            with self.subTest(text=text):
+                self.assertEqual(ccwho.plain_text(text), text)
+
+    def test_an_osc_ends_where_a_terminal_ends_it(self):
+        self.assertEqual(ccwho.plain_text("a\x1b]0;secret title\x1bXb rest"), "ab rest")
+        self.assertEqual(ccwho.plain_text("a\x1b]0;title\x18b"), "ab")
+        self.assertEqual(ccwho.plain_text("a\x1b]0;title\x1ab"), "ab")
+        self.assertEqual(ccwho.plain_text("a\x1b]52;c;aGk=\x07b"), "ab")          # control
+
+    def test_a_copy_has_the_line_ends_the_pane_shows(self):
+        got = self.copies(self.brief(you_said="first\r\nsecond", closing="50%\r100% done"))
+        self.assertIn("first\nsecond", got)
+        self.assertIn("100% done", got)
+
+    def test_a_cut_value_is_cut_last(self):
+        for field in ("goal", "you_said", "closing", "progress"):
+            with self.subTest(field=field):
+                def shown_and_copied(raw):
+                    b = self.brief(**{field: [raw] if field == "progress" else raw})
+                    lines = ccwho.brief_parts(b, {})
+                    for line in lines:
+                        for t, _, v in line:
+                            if v and v.startswith(("a" * 20, "rest", "short")) or v == "short":
+                                return t, v
+                    self.fail(f"no part for {raw!r}")
+                t, v = shown_and_copied("a" * 98 + "\r\nrest of it")
+                self.assertTrue(t.startswith("a" * 90), t)
+                t, v = shown_and_copied("x" * 150 + "\rshort")
+                self.assertEqual((t, v), ("short", "short"))
+
+    def test_bel_backspace_vt_and_ff_are_not_pasted(self):
+        for ch in ("\x07", "\x08", "\x0b", "\x0c"):
+            for field in ("you_said", "title"):             # cut, and not cut
+                with self.subTest(ch=repr(ch), field=field):
+                    got = self.copies(self.brief(**{field: f"a{ch}b"}))
+                    self.assertIn("ab", got)
+                    self.assertNotIn(f"a{ch}b", got)
+
+    def test_an_osc_that_never_ends_ends_with_its_line(self):
+        self.assertEqual(ccwho.plain_text("a\x1b]0;t\nnext line"), "a\nnext line")
+        self.assertEqual(ccwho.plain_text("a\x1b]0;title"), "a")                   # control

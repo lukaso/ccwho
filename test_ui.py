@@ -8,7 +8,9 @@ Everything that reaches the world (the session list, iTerm2) is injected, so no
 test here depends on what is running on this machine.
 """
 import asyncio
+import subprocess
 import unittest
+from unittest import mock
 
 import ccwho_ui as ui
 from textual.widgets import Input
@@ -99,10 +101,15 @@ class FakeCollector:
 
 
 class FakeAdapter:
-    def __init__(self, answer="focused s022", hang=False):
+    def __init__(self, answer="focused s022", hang=False, copy_error=""):
         self.answer, self.hang, self.asked = answer, hang, []
         self.attached = []
         self.kept_in_front = 0
+        self.copied, self.copy_error = [], copy_error
+
+    def copy(self, text):
+        self.copied.append(text)
+        return self.copy_error
 
     def keep_in_front(self):
         self.kept_in_front += 1
@@ -3544,3 +3551,339 @@ class TestAMalformedSnapshotNeverCrashesTheList(UiTest):
             app.mark_selected()
             await pilot.pause()
             self.assertIn("usage  unknown", str(app.query_one("#usage").render()))
+
+
+class TestAClickInTheDetailCopiesWhatYouClicked(UiTest):
+    """Selecting text in the list never reached iTerm2: the list takes the mouse.
+    So the detail offers its values to copy - each one a left-click target, as
+    iTerm2 keeps right-click and ctrl-click for itself."""
+
+    async def open_detail(self, pilot):
+        await pilot.pause()
+        await pilot.press("right")
+        await pilot.pause()
+
+    async def click_on(self, pilot, app, text):
+        """Click the middle of `text` where the detail draws it."""
+        box = app.query_one("#brief")
+        lines = [str(line.text) for line in
+                 (box.render_line(y) for y in range(box.size.height))]
+        for y, line in enumerate(lines):
+            if text in line:
+                await pilot.click("#brief", offset=(line.index(text) + len(text) // 2, y))
+                await pilot.pause()
+                return
+        self.fail(f"{text!r} is not on the screen: {lines}")
+
+    async def test_a_click_on_a_value_copies_it_and_says_so(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open_detail(pilot)
+            await self.click_on(pilot, app, "/Users/x/liveapp")
+            self.assertEqual(adapter.copied, ["/Users/x/liveapp"])
+            self.assertIn("copied /Users/x/liveapp", self.screen_text(app))
+            self.assertEqual(adapter.asked, [], "a copy is not a jump")
+            self.assertTrue(app.query_one("#detail").display, "and the detail stays")
+
+    async def test_the_resume_line_copies_as_a_command(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open_detail(pilot)
+            await self.click_on(pilot, app, "claude --resume")
+            self.assertEqual(adapter.copied, [f"claude --resume {LIVE['sessionId']}"])
+
+    async def test_a_label_copies_nothing(self):                        # control
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open_detail(pilot)
+            await self.click_on(pilot, app, "you said")
+            self.assertEqual(adapter.copied, [])
+
+    async def test_what_you_copy_is_the_value_exactly_not_the_cut(self):
+        said = "he said \"run x(1)\", then 'y' - " + "and more " * 20 + "\nthe end"
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, you_said=said)
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open_detail(pilot)
+            await self.click_on(pilot, app, "he said")
+            self.assertEqual(adapter.copied, [said.strip()])
+
+    async def test_a_copy_that_failed_says_so(self):
+        adapter = FakeAdapter(copy_error="pbcopy is not there")
+        app = self.app(adapter=adapter)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open_detail(pilot)
+            await self.click_on(pilot, app, "liveapp-b2")
+            self.assertIn("could not copy: pbcopy is not there", self.screen_text(app))
+            self.assertNotIn("copied liveapp-b2", self.screen_text(app))
+
+
+class TestTheAdapterCopiesThroughPbcopy(unittest.TestCase):
+    """pbcopy reads bytes in the locale's encoding: without UTF-8, "日本語"
+    arrives on the clipboard as something else."""
+
+    def run_copy(self, result=None, raises=None):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen.update(cmd=cmd, **kw)
+            if raises:
+                raise raises
+            return result or subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(ui.subprocess, "run", fake_run):
+            answer = ui.Adapter().copy("日本語 liveapp-40")
+        return answer, seen
+
+    def test_it_sends_the_text_as_utf8(self):
+        answer, seen = self.run_copy()
+        self.assertEqual(answer, "")
+        self.assertEqual(seen["cmd"], ["pbcopy"])
+        self.assertEqual(seen["input"], "日本語 liveapp-40")
+        self.assertIn("UTF-8", seen["env"].get("LC_CTYPE", ""))
+        self.assertEqual(seen.get("encoding"), "utf-8", "and Python must write UTF-8 too")
+        self.assertTrue(seen.get("timeout"))
+
+    def test_a_failure_is_said_not_raised(self):
+        answer, _ = self.run_copy(raises=OSError("No such file: pbcopy"))
+        self.assertIn("pbcopy", answer)
+        answer, _ = self.run_copy(raises=subprocess.TimeoutExpired("pbcopy", 2))
+        self.assertTrue(answer)
+        answer, _ = self.run_copy(result=subprocess.CompletedProcess(["pbcopy"], 1, "", "boom"))
+        self.assertIn("boom", answer)
+
+
+class TestWhatYouCanCopyLightsUp(UiTest):
+    """iTerm2 gives ccwho only the left click, so what a click would copy must
+    show itself: it lights up under the mouse, and a label does not."""
+
+    def styles_at(self, app, text):
+        box = app.query_one("#brief")
+        for y in range(box.size.height):
+            strip = box.render_line(y)
+            if text in strip.text:
+                at, x = strip.text.index(text), 0
+                for seg in strip:
+                    if x <= at < x + len(seg.text):
+                        return (y, at), seg.style
+                    x += len(seg.text)
+        self.fail(f"{text!r} is not on the screen")
+
+    async def test_a_value_lights_up_under_the_mouse_and_a_label_does_not(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            _, resume = self.styles_at(app, "claude --resume")
+            for text, lights in (("/Users/x/liveapp", True), ("you said", False)):
+                with self.subTest(text=text):
+                    (y, x), before = self.styles_at(app, text)
+                    await pilot.hover("#brief", offset=(x + 1, y))
+                    await pilot.pause()
+                    _, after = self.styles_at(app, text)
+                    self.assertEqual(before != after, lights, (before, after))
+                    # only what a click there would copy: not every value at once
+                    _, other = self.styles_at(app, "claude --resume")
+                    self.assertEqual(other, resume, "another value lit up too")
+                    await pilot.hover("#header")
+                    await pilot.pause()
+
+
+class TestTheDetailRound1(UiTest):
+    """Review of the copy slice: codes in a value, a value pbcopy cannot take,
+    and what lights up after a repaint."""
+
+    def reversed_rows(self, app):
+        box = app.query_one("#brief")
+        return [y for y in range(box.size.height)
+                if any(seg.style and seg.style.reverse and seg.text.strip()
+                       for seg in box.render_line(y))]
+
+    async def hover(self, pilot, app, text):
+        box = app.query_one("#brief")
+        for y in range(box.size.height):
+            line = box.render_line(y).text
+            if text in line:
+                await pilot.hover("#brief", offset=(line.index(text) + 1, y))
+                await pilot.pause()
+                return y
+        self.fail(f"{text!r} is not on the screen")
+
+    async def test_terminal_codes_in_a_value_do_not_reach_the_screen(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value,
+                                     you_said="pasted \x1b[31mRED\x1b[0m done",
+                                     recap="a\x1b]52;c;aGk=\x07b")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            box = app.query_one("#brief")
+            lines = [box.render_line(y) for y in range(box.size.height)]
+            self.assertFalse(any("\x1b" in seg.text or "\x07" in seg.text
+                                 for line in lines for seg in line))
+            self.assertIn("pasted RED done", "\n".join(line.text for line in lines))
+
+    async def test_a_click_never_ends_the_list(self):
+        class Broken(FakeAdapter):
+            def copy(self, text):
+                raise UnicodeEncodeError("utf-8", text, 0, 1, "surrogates not allowed")
+        app = self.app(adapter=Broken())
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            app.action_copy_value("x")
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+            self.assertIn("could not copy", self.screen_text(app))
+
+    async def test_a_repaint_under_a_still_mouse_does_not_light_the_wrong_place(self):
+        # the title says the name, and the name is on the aka line too: after
+        # the title changes, the light must not jump to the aka line
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, title="liveapp-b2")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            y = await self.hover(pilot, app, "liveapp-b2")
+            self.assertIn(y, self.reversed_rows(app))                       # control
+            app.collector.brief_value = dict(app.collector.brief_value,
+                                             title="Something else entirely")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertIn(self.reversed_rows(app), ([], [y]))
+
+    async def test_a_repaint_that_adds_a_line_lights_nothing_that_is_not_under_the_mouse(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, recap="", goal="",
+                                     you_said="", progress=[], closing="")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            y = await self.hover(pilot, app, "/Users/x/liveapp")
+            self.assertEqual(self.reversed_rows(app), [y])                  # control
+            app.collector.brief_value = dict(app.collector.brief_value,
+                                             recap="now there is a recap", goal="a goal",
+                                             you_said="said", closing="closing")
+            app.paint_detail()
+            await pilot.pause()
+            self.assertIn(self.reversed_rows(app), ([], [y]))
+
+    async def test_one_value_in_two_places_lights_only_where_the_mouse_is(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, title="liveapp-b2")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            y = await self.hover(pilot, app, "liveapp-b2")
+            self.assertEqual(self.reversed_rows(app), [y])
+
+
+class TestPbcopyGetsWhatItCanTake(unittest.TestCase):
+    """The real pbcopy path, with a stand-in pbcopy on PATH that keeps its bytes."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.out = os.path.join(self.dir, "clip")
+        tool = os.path.join(self.dir, "pbcopy")
+        with open(tool, "w") as fh:
+            fh.write(f"#!/bin/sh\ncat > '{self.out}'\n")
+        os.chmod(tool, 0o755)
+        self.env = mock.patch.dict(os.environ, {"PATH": self.dir + os.pathsep + os.environ["PATH"]})
+        self.env.start()
+
+    def tearDown(self):
+        import shutil
+        self.env.stop()
+        shutil.rmtree(self.dir)
+
+    def clip(self):
+        with open(self.out, "rb") as fh:
+            return fh.read()
+
+    def test_utf8_arrives_as_utf8(self):
+        self.assertEqual(ui.Adapter().copy("日本語 liveapp-40"), "")
+        self.assertEqual(self.clip(), "日本語 liveapp-40".encode("utf-8"))
+
+    def test_a_half_emoji_is_copied_not_a_crash(self):
+        self.assertEqual(ui.Adapter().copy("cut emoji \ud83d end"), "")
+        self.assertEqual(self.clip(), b"cut emoji ? end")
+
+
+class TestTheDetailRound2(UiTest):
+    """Review of the copy slice, round 2: the first value lights too, a copy is
+    what the pane shows, and a Windows line end does not blank a line."""
+
+    reversed_rows = TestTheDetailRound1.reversed_rows
+    hover = TestTheDetailRound1.hover
+
+    async def open(self, pilot):
+        await pilot.pause()
+        await pilot.press("right")
+        await pilot.pause()
+
+    async def test_the_first_value_lights_up_and_goes_out(self):
+        app = self.app()
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open(pilot)
+            y = await self.hover(pilot, app, "aaaa")
+            self.assertEqual(self.reversed_rows(app), [y])
+            await pilot.hover("#header")
+            await pilot.pause()
+            self.assertEqual(self.reversed_rows(app), [])
+            self.assertIsNone(app.query_one("#brief").lit)
+
+    async def test_a_copy_is_what_the_pane_shows(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter)
+        base = dict(app.collector.brief_value)
+        cases = ("run \x1b[1mmake\x1b(B\x1b[m now", "a\x1bMb", "a\x1b]0;title",
+                 "c\x1bd e\x1b", "x [1m] y", "pasted \x1b[31mRED\x1b[0m done",
+                 "a\x1b[?25lb")
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open(pilot)
+            for said in cases:
+                with self.subTest(said=said):
+                    adapter.copied.clear()
+                    app.collector.brief_value = dict(base, you_said=said)
+                    app.paint_detail()
+                    await pilot.pause()
+                    box = app.query_one("#brief")
+                    lines = [box.render_line(y) for y in range(box.size.height)]
+                    self.assertFalse(any("\x1b" in seg.text
+                                         for line in lines for seg in line))
+                    y, line = next((y, line.text) for y, line in enumerate(lines)
+                                   if "you said" in line.text)
+                    shown = line.split("you said", 1)[1].strip()
+                    await pilot.click("#brief", offset=(line.index("you said") + 10, y))
+                    await pilot.pause()
+                    self.assertEqual(adapter.copied, [shown])
+
+    async def test_a_windows_line_end_does_not_blank_the_line(self):
+        collector = FakeCollector()
+        collector.brief_value = dict(collector.brief_value, recap="first\r\nsecond",
+                                     you_said="10%\r100%")
+        app = self.app(collector=collector)
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.open(pilot)
+            box = app.query_one("#brief")
+            shown = "\n".join(box.render_line(y).text for y in range(box.size.height))
+            self.assertIn("first", shown)
+            self.assertIn("second", shown)
+            self.assertIn("100%", shown)
+            self.assertNotIn("10%1", shown, "a bare \\r still overwrites, as a terminal does")

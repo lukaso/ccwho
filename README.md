@@ -88,6 +88,15 @@ no name shows its project there. A renamed session's name no longer starts with
 its project, so the project follows in the dim part of the line, where there is
 room for it.
 
+**Copying.** The list takes the mouse, so dragging over it selects nothing for
+iTerm2 (hold ⌥ while you drag for iTerm2's own selection). Instead, every value in
+the detail - the id, project, title, recap, what it opened with, what you said,
+each progress step, what it said, the tty, pid, name, cwd, session id and the
+`claude --resume` line - is underlined and lights up under the mouse: a left
+click copies it, whole even where the pane shows it cut, and the status line says
+what it copied. What you paste is what the pane shows, without the terminal codes
+a session printed. Labels copy nothing.
+
 It notices a session start needing you within a second, by stat-ing transcript
 files - no program is started for that - and does a full scan every 20 seconds.
 Collection runs in a worker thread, because `claude agents --json` can take 30

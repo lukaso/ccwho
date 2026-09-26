@@ -2112,51 +2112,118 @@ _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
           "ready": "ready", "shell": "shell", "idle": "idle", "program": "program"}
 
 
-def render_brief(b, row=None, color=True):
+# Every escape a session might have printed, as a terminal reads it: an OSC up
+# to what ends it (BEL, ST, a CAN or SUB that aborts it, the next ESC - or, one
+# never ended, its line: a terminal would eat the rest, but the rest of a recap
+# is worth more than that), any CSI - the private ones too (\x1b[?25l hides the
+# cursor) - and the short ones, ESC and a final (tput sgr0 prints \x1b(B). Not
+# the C1 forms: in a str those are code points, and in mojibake they are text.
+_ESCAPES = re.compile(r"\x1b\][^\x07\x1b\x18\x1a\n]*(?:\x07|\x1b\\|[\x18\x1a]|(?=[\x1b\n])|$)"
+                      r"|\x1b\[[0-?]*[ -/]*[@-~]"
+                      r"|\x1b[ -/]*[0-~]")
+
+
+def brief_parts(b, row=None):
     """The brief as a human reads it: what it is about first, then how it got here.
 
     Order is the argument. The recap answers "is this the one?", so it leads; the
     machinery that lets you ACT on the answer (the other names of this session)
     goes last, where it is available without being in the way.
+
+    Line by line, in parts of (text, style, value): the style a _paint key or
+    None, the value what a click on the part copies - whole, where the text is
+    cut - or None for a label, which is not something you would paste.
     """
     row = row or {}
     att = row.get("attention", "")
+    aka = b["aka"]
     out = []
-    head = f"{b['aka']['short_id']}  {row.get('project', '?')}"
+    project = row.get("project", "?")
+    project = "?" if project is None else project
+    style = None if att else "bold"
+    head = [(aka["short_id"], style, aka["short_id"] or None), ("  ", style, None),
+            (project, style, project if project not in ("", "?") else None)]
     if att:
-        head += "  " + _paint(_LABEL.get(att, att), att, color)
-    out.append(_paint(head, "bold", color) if not att else head)
+        head += [("  ", None, None), (_LABEL.get(att, att), att, None)]
+    out.append(head)
     if b["title"]:
-        out.append(_paint(f"  {b['title']}", "bold", color))
+        out.append([("  ", "bold", None), (b["title"], "bold", b["title"])])
     if b["recap"]:
         age = b["recap_age"] or "?"
         turns = b["turns_since_recap"]
         plural = "" if turns == 1 else "s"
         stale = f"recap {age} old" + (f" · {turns} turn{plural} since" if turns else "")
-        out.append(f"  {_paint(stale, 'dim', color)}")
-        out.append(f"  {b['recap']}")
+        out.append([("  ", None, None), (stale, "dim", None)])
+        out.append([("  ", None, None), (b["recap"], None, b["recap"])])
     elif not (b["you_said"] or b["goal"] or b["progress"] or b["closing"]):
-        out.append(f"  {_paint('nothing typed in this session yet', 'dim', color)}")
+        out.append([("  ", None, None), ("nothing typed in this session yet", "dim", None)])
     else:
-        out.append(f"  {_paint('(no recap yet)', 'dim', color)}")
+        out.append([("  ", None, None), ("(no recap yet)", "dim", None)])
     if b["goal"]:
-        out.append(f"  {_paint('opened', 'dim', color)}    {truncate(b['goal'], 100)}")
+        out.append([("  ", None, None), ("opened", "dim", None), ("    ", None, None),
+                    (truncate(_as_shown(plain_text(b["goal"])), 100), None, b["goal"])])
     if b["you_said"]:
-        out.append(f"  {_paint('you said', 'dim', color)}  {truncate(b['you_said'], 100)}")
+        out.append([("  ", None, None), ("you said", "dim", None), ("  ", None, None),
+                    (truncate(_as_shown(plain_text(b["you_said"])), 100), None, b["you_said"])])
     if b["progress"]:
-        out.append("  " + _paint("progress", "dim", color))
+        out.append([("  ", None, None), ("progress", "dim", None)])
         for step in b["progress"]:
-            out.append(f"    · {truncate(step, 96)}")
+            out.append([("    · ", None, None), (truncate(_as_shown(plain_text(step)), 96), None, step)])
     if b["closing"]:
-        out.append("  " + _paint("it said", "dim", color))
-        out.append(f"    {truncate(b['closing'], 96)}")
-    aka = b["aka"]
-    bits = [f"tty {short_tty(aka['tty'] or row.get('tty', ''))}" if (aka["tty"] or row.get("tty")) else "",
-            f"pid {aka['pid']}" if aka["pid"] else "",
-            aka["name"], aka["cwd"], aka["session_id"]]
-    out.append("  " + _paint(" · ".join(x for x in bits if x), "dim", color))
-    out.append(f"  {_paint('resume', 'dim', color)}    claude --resume {aka['session_id']}")
-    return "\n".join(out)
+        out.append([("  ", None, None), ("it said", "dim", None)])
+        out.append([("    ", None, None), (truncate(_as_shown(plain_text(b["closing"])), 96), None, b["closing"])])
+    tty = aka["tty"] or row.get("tty", "")
+    bits = ([[("tty ", "dim", None), (short_tty(tty), "dim", tty)]] if tty else []) + (
+        [[("pid ", "dim", None), (str(aka["pid"]), "dim", str(aka["pid"]))]]
+        if aka["pid"] else []) + [
+        [(x, "dim", x)] for x in (aka["name"], aka["cwd"], aka["session_id"]) if x]
+    line = [("  ", None, None)]
+    for i, bit in enumerate(bits):
+        line += ([(" · ", "dim", None)] if i else []) + bit
+    out.append(line if bits else line + [("", "dim", None)])
+    resume = f"claude --resume {aka['session_id']}"
+    out.append([("  ", None, None), ("resume", "dim", None), ("    ", None, None),
+                (resume, None, resume)])
+    # the text without a session's own terminal codes, which the pane draws
+    # (cut above LAST, after the codes and the \r went: a cut through a code left
+    # "31" behind, and one through "\r\n" left a \r that blanked the line); and
+    # what you paste is what the pane shows, whole - no space at either end
+    return [[(plain_text(t).replace("\r\n", "\n"), s,
+              (_as_shown(plain_text(v)).strip() or None) if v else None)
+             for t, s, v in line] for line in out]
+
+
+def _as_shown(text):
+    """A Windows line end is a line end, and a bare \\r starts the line over:
+    only what follows the last one is what the pane shows."""
+    return "\n".join(line.rsplit("\r", 1)[-1] for line in text.replace("\r\n", "\n").split("\n"))
+
+
+def plain_text(text):
+    """What a terminal would show of `text`, without its escapes: pasted coloured
+    output is common in a prompt, and neither the pane nor a paste wants it."""
+    # and the controls the pane drops (BEL, backspace, VT, FF): a paste drops them too
+    return re.sub(r"[\x1b\x07\x08\x0b\x0c]", "", _ESCAPES.sub("", text))
+
+
+def brief_ansi(text, style):
+    """One part of brief_parts, painted, for a screen that reads ANSI."""
+    return _paint(text, style, True) if style else text
+
+
+def render_brief(b, row=None, color=True):
+    """brief_parts as text: one paint over each run of parts in one style, so the
+    codes are the ones a line painted whole always had."""
+    lines = []
+    for parts in brief_parts(b, row):
+        runs = []
+        for text, style, _ in parts:
+            if runs and runs[-1][1] == style:
+                runs[-1][0] += text
+            else:
+                runs.append([text, style])
+        lines.append("".join(_paint(t, s, color) if s else t for t, s in runs))
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------- the ui's model

@@ -37,6 +37,7 @@ from textual.binding import Binding                                # noqa: E402
 from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
 from textual.widgets import Footer, Input, OptionList, Static      # noqa: E402
 from textual.widgets.option_list import Option                     # noqa: E402
+from rich.style import Style                                       # noqa: E402
 from rich.text import Text                                         # noqa: E402
 
 import ccwho_engine as engine                                      # noqa: E402
@@ -131,6 +132,42 @@ class Fleet:
 
     def groups(self, query):
         return engine.ui_groups(self.visible(query))
+
+
+class Brief(Static):
+    """The detail's text. A value you can click lights up under the mouse, as a
+    row's arrow does: Textual 8 marks it as a link but no longer draws the hover,
+    and iTerm2 keeps every click but the left one - what a click does must show."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.base = Text()
+        self.lit = None         # the click under the mouse, or None
+
+    def show(self, text):
+        self.base = text
+        self.lit = None         # a part's number means nothing in new text
+        self.paint()
+
+    def paint(self):
+        text = self.base.copy()
+        if self.lit is not None:        # part 0 is a part: the id
+            for span in self.base.spans:
+                meta = getattr(span.style, "meta", None) or {}
+                if meta.get("part") == self.lit:
+                    text.stylize("reverse", span.start, span.end)
+        self.update(text)
+
+    def on_mouse_move(self, event):
+        lit = (event.style.meta or {}).get("part")
+        if lit != self.lit:
+            self.lit = lit
+            self.paint()
+
+    def on_leave(self, event):
+        if self.lit is not None:
+            self.lit = None
+            self.paint()
 
 
 class Row(Static):
@@ -397,7 +434,7 @@ class CcwhoUi(App):
             # a long detail scrolls under it
             yield VerticalScroll(Horizontal(Static(" ✕ ", id="close", markup=False),
                                             id="closebar"),
-                                 Static("", id="brief", markup=False), id="detail")
+                                 Brief("", id="brief", markup=False), id="detail")
         # what was left behind, and Codex's: one collapsed line each
         yield Static("", id="procline", markup=False)
         yield Input(placeholder="search", id="search")
@@ -771,15 +808,29 @@ class CcwhoUi(App):
                                                procs, width=max(20, width))
             except Exception:           # an odd shape is "unknown", never a crash
                 text = "processes unknown"
-            brief_box.update(Text(text, no_wrap=True, overflow="crop"))
+            brief_box.show(Text(text, no_wrap=True, overflow="crop"))
         else:
             if not row:
                 return
-            # color=True and then from_ansi: the brief already knows which words
-            # are labels and which are the answer. Asking for plain text and
-            # drawing it all the same way made the pane a wall of white.
-            brief = engine.render_brief(self.collector.brief(row), row, color=True)
-            text = Text.from_ansi(brief, no_wrap=False)
+            # from_ansi, part by part: the brief already knows which words are
+            # labels and which are the answer. Asking for plain text and drawing
+            # it all the same way made the pane a wall of white.
+            text, n = Text(no_wrap=False), 0
+            for i, parts in enumerate(engine.brief_parts(self.collector.brief(row), row)):
+                if i:
+                    text.append("\n")
+                for part, style, value in parts:
+                    # every part through from_ansi, the plain ones too: codes a
+                    # session printed are decoded here, never drawn as text
+                    piece = Text.from_ansi(engine.brief_ansi(part, style))
+                    if value:
+                        # a click copies the value itself, not a place in a list
+                        # a refresh may have rebuilt; the part's number is what
+                        # lights up, so one value in two places lights once
+                        piece.stylize(Style(meta={"@click": f"app.copy_value({value!r})",
+                                                  "part": n}))
+                        n += 1
+                    text.append_text(piece)
             try:
                 mine = engine.session_procs_lines(self.fleet.procs, row.get("sessionId"))
             except Exception:
@@ -787,7 +838,7 @@ class CcwhoUi(App):
             if mine:
                 text.append("\n\nprocesses\n", style="bold")
                 text.append("\n".join(mine), style="dim")
-            brief_box.update(text)
+            brief_box.show(text)
         detail.display = True
         detail.set_class(self.size.width < engine.UI_WIDE, "full")
         self.part("#list").display = self.size.width >= engine.UI_WIDE
@@ -1216,6 +1267,15 @@ class CcwhoUi(App):
                            looked.get("ts", ""))
         self.paint_header(self.fleet.groups(self.filter_text))
 
+    def action_copy_value(self, value):
+        """A click on a value in the detail: onto the clipboard, and said."""
+        try:
+            answer = self.adapter.copy(value)
+        except Exception as ex:         # a click must never end the list
+            answer = str(ex) or type(ex).__name__
+        shown = engine.truncate(" ".join(value.split()), 40)
+        self.said(f"could not copy: {answer}" if answer else f"copied {shown}")
+
     def said(self, text, row=None):
         """What happened, in the words you chose the session by.
 
@@ -1444,6 +1504,23 @@ class Adapter:
         if done.returncode:
             return f"could not open a window: {(done.stderr or '').strip()}"
         return "attached it in a new window"
+
+    def copy(self, text, deadline=2.0):
+        """Onto the clipboard, or what went wrong. pbcopy reads the locale's
+        encoding, and Python writes its own: UTF-8 on both ends."""
+        try:
+            # errors="replace": half an emoji (a lone surrogate) is a ?, not a crash
+            done = subprocess.run(["pbcopy"], input=text, text=True, encoding="utf-8",
+                                  errors="replace",
+                                  capture_output=True, timeout=deadline,
+                                  env=dict(os.environ, LC_CTYPE="UTF-8"))
+        except subprocess.TimeoutExpired:
+            return f"pbcopy did not answer in {deadline:g}s"
+        except OSError as ex:
+            return f"could not run pbcopy: {ex}"
+        if done.returncode:
+            return (done.stderr or "").strip() or f"pbcopy failed ({done.returncode})"
+        return ""
 
     def keep_in_front(self):
         """The hotkey panel only: take back the focus iTerm2 gives it and then

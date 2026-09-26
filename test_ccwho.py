@@ -2700,6 +2700,169 @@ class TestTheViewModelBehindTheUi(unittest.TestCase):
         for line in ccwho.ui_row_lines(row, width=60):
             self.assertLessEqual(ccwho.visible_len(line), 60, repr(line))
 
+    # The third part is the session's name: the address another session sends a
+    # message to. A cut name is no address at all.
+    def _parts(self, row, width=100):
+        return [text.strip() for text, _ in ccwho.ui_row_cells(row, width=width)[0]]
+
+    def test_the_third_part_is_the_name_you_message_it_by(self):
+        parts = self._parts(self.rows()[1])
+        self.assertEqual(parts[2], "liveapp-b2")
+
+    def test_a_long_name_is_never_cut(self):
+        long = "update-landing-page-whatsapp-faq"
+        row = dict(self.rows()[1], name=long)
+        for width in (100, 70):
+            with self.subTest(width=width):
+                self.assertEqual(self._parts(row, width)[2], long)
+
+    def test_a_long_name_takes_its_room_from_the_title_not_the_age(self):
+        row = dict(self.rows()[1], name="update-landing-page-whatsapp-faq",
+                   tab_title="✳ " + "a long title " * 8)
+        line = ccwho.ui_row_lines(row, width=80)[0]
+        self.assertIn("· 5h · s022", line)
+        self.assertIn("…", line, "the title is what gives way")
+        # all the way down to where the name and the age fit and nothing else:
+        # the title gives way to nothing before the age or the account is cut
+        for width in range(58, 81):
+            with self.subTest(width=width):
+                self.assertIn("· 5h · s022", ccwho.ui_row_lines(row, width=width)[0])
+                first = ccwho.ui_row_cells(row, width=width, tag="1a2b")[0]
+                self.assertIn("· 5h · s022", "".join(t for t, _ in first))
+                # the account whole or not at all: "· 1…" is no account
+                shown = [t for t, role in first if role == "account"]
+                self.assertIn(shown, ([], [" · 1a2b"]))
+                if width >= 65:             # where it fits, it is there
+                    self.assertEqual(shown, [" · 1a2b"])
+        for width in range(52, 58):
+            with self.subTest(width=width):
+                self.assertIn("· 5h", ccwho.ui_row_lines(row, width=width)[0])
+
+    def test_a_name_too_long_for_the_line_is_not_followed_by_a_stray_title(self):
+        for name in ("update-landing-page-whatsapp-faq", "把持久化文件移到状态目录把持久化"):
+            with self.subTest(name=name):
+                row = dict(self.rows()[1], name=name)
+                first = ccwho.ui_row_cells(row, width=40)[0]
+                self.assertNotIn(("…", "name"), first, first)
+                self.assertTrue(all(ccwho.visible_len(t) or not t for t, _ in first))
+
+    def test_a_tab_title_that_repeats_the_name_gives_way_to_the_real_title(self):
+        row = dict(self.rows()[1], tab_title="liveapp-b2", title="Laptop crash")
+        self.assertIn("~Laptop crash", ccwho.ui_row_lines(row, width=100)[0])
+        row = dict(self.rows()[1], tab_title="✳ liveapp-b2", title="")
+        line = ccwho.ui_row_lines(row, width=100)[0]
+        self.assertEqual(line.count("liveapp-b2"), 1, line)
+        row = dict(self.rows()[1], tab_title="✳ Issue 362")                 # control
+        self.assertIn("✳ Issue 362", ccwho.ui_row_lines(row, width=100)[0])
+
+    def test_the_project_is_only_the_start_of_a_name_up_to_a_dash(self):
+        row = dict(self.rows()[1], project="app", name="apple-12")
+        self.assertIn("· app ·", ccwho.ui_row_lines(row, width=100)[0])
+        for name in ("app-12", "app"):                                      # control
+            with self.subTest(name=name):
+                line = ccwho.ui_row_lines(dict(row, name=name), width=100)[0]
+                self.assertEqual(line.count("app"), 1, line)
+
+    def test_no_project_is_not_a_question_mark(self):
+        for project in ("", None, "?"):
+            with self.subTest(project=project):
+                row = dict(self.rows()[1], project=project, name="foo-1")
+                self.assertNotIn("?", ccwho.ui_row_lines(row, width=100)[0])
+
+    def test_a_name_cannot_break_the_row(self):
+        for field in ("name", "tab_title", "title", "project"):
+            with self.subTest(field=field):
+                row = dict(self.rows()[1], tab_title="", name="x-1")
+                row[field] = "a\nb\tc\x1b[31md"
+                for text, _ in ccwho.ui_row_cells(row, width=100)[0]:
+                    self.assertFalse(any(not c.isprintable() for c in text), repr(text))
+        row = dict(self.rows()[1], name="a\nb")                             # control
+        self.assertEqual(self._parts(row)[2], "a b")
+
+    def test_a_blank_name_shows_the_project(self):
+        for name in (" ", "\n", "\t "):
+            with self.subTest(name=name):
+                row = dict(self.rows()[1], name=name)
+                self.assertEqual(self._parts(row)[2], "liveapp")
+                self.assertNotIn("· liveapp", ccwho.ui_row_lines(row, width=100)[0])
+
+    def test_the_meta_is_drawn_in_whole_pieces_after_a_whole_name(self):
+        long = "update-landing-page-whatsapp-faq"
+        row = dict(self.rows()[1], name=long)
+        for width in range(40, 61):
+            with self.subTest(width=width):
+                first = ccwho.ui_row_cells(row, width=width)[0]
+                meta = "".join(t for t, role in first if role == "meta")
+                self.assertNotIn("…", meta, first)
+                self.assertIn(meta, ("", " · 5h", " · 5h · s022"), first)
+                for text, role in first:
+                    if role != "project":
+                        self.assertFalse(text.endswith("…"), first)
+        line = ccwho.ui_row_lines(row, width=58)[0]                         # control
+        self.assertIn("· 5h · s022", line)
+
+    def test_with_no_title_a_name_that_just_fits_is_whole(self):
+        for width in (40, 60):
+            with self.subTest(width=width):
+                row = dict(sessionId="abcd1234", attention="idle", since="5h",
+                           project="liveapp", name="n" * (width - 12))
+                line = ccwho.ui_row_lines(row, width=width)[0]
+                self.assertIn("n" * (width - 12), line)
+                self.assertNotIn("…", line)
+                row["name"] = "n" * (width - 11)                            # control
+                self.assertIn("…", ccwho.ui_row_lines(row, width=width)[0])
+
+    def test_with_no_title_the_account_and_ports_take_the_room_there_is(self):
+        row = dict(sessionId="abcd1234", attention="idle", name="?", project="liveapp",
+                   tab_title="Short", tty="/dev/ttys012", since="5h")
+        # "· abcd  liveapp · 5h · s012 · acct2" and a cell before the arrow: 40
+        first = ccwho.ui_row_cells(row, width=40, tag="acct2")[0]
+        self.assertIn((" · acct2", "account"), first)
+        first = ccwho.ui_row_cells(row, width=39, tag="acct2")[0]          # control
+        self.assertEqual([t for t, role in first if role == "account"], [])
+        held = dict(row, ports=[3000])
+        self.assertIn(" · :3000", ccwho.ui_row_lines(held, width=40)[0])
+        self.assertNotIn(":3000", ccwho.ui_row_lines(held, width=39)[0])  # control
+
+    def test_an_account_that_does_not_fit_leaves_its_room_to_the_ports(self):
+        row = dict(sessionId="abcd1234", attention="idle", since="5h", project="",
+                   name="update-landing-page-whatsapp-faq", tab_title="", title="",
+                   tty="/dev/ttys012", ports=[3000])
+        first = ccwho.ui_row_cells(row, width=65, tag="长账户")[0]
+        self.assertIn(" · :3000", "".join(t for t, _ in first), first)
+        self.assertEqual([t for t, role in first if role == "account"], [])
+        first = ccwho.ui_row_cells(row, width=64, tag="长账户")[0]          # control
+        self.assertNotIn(":3000", "".join(t for t, _ in first))
+        self.assertIn(" · :3000", ccwho.ui_row_lines(row, width=65)[0])  # control
+
+    def test_no_title_leaves_two_spaces_before_the_meta(self):
+        row = dict(self.rows()[1], tab_title="", title="")
+        self.assertIn("liveapp-b2  · 5h", ccwho.ui_row_lines(row, width=100)[0])
+
+    def test_a_renamed_session_still_says_its_project(self):
+        row = dict(self.rows()[1], name="update-landing-page-whatsapp-faq")
+        line = ccwho.ui_row_lines(row, width=100)[0]
+        self.assertIn("· liveapp", line)
+
+    def test_an_auto_name_does_not_say_the_project_twice(self):
+        line = ccwho.ui_row_lines(self.rows()[1], width=100)[0]
+        self.assertEqual(line.count("liveapp"), 1, line)
+
+    def test_the_name_is_not_said_twice_when_there_is_no_title(self):
+        for tab_title, title in (("", ""), ("liveapp-b2", ""), ("", "liveapp-b2")):
+            with self.subTest(tab_title=tab_title, title=title):
+                row = dict(self.rows()[1], tab_title=tab_title, title=title)
+                line = ccwho.ui_row_lines(row, width=100)[0]
+                self.assertEqual(line.count("liveapp-b2"), 1, line)
+        row = dict(self.rows()[1], tab_title="", title="Issue 362")          # control
+        self.assertIn("~Issue 362", ccwho.ui_row_lines(row, width=100)[0])
+
+    def test_no_name_shows_the_project(self):
+        for name in ("", "?", None):
+            with self.subTest(name=name):
+                row = dict(self.rows()[1], name=name)
+                self.assertEqual(self._parts(row)[2], "liveapp")
+
     def test_search_matches_any_of_the_names_and_the_recap(self):
         rows = self.rows()
         rows[1]["recap"] = "the gate flake"

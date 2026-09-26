@@ -2235,7 +2235,6 @@ def ui_row_cells(row, width=100, tag=""):
     yet, and it says so and shows the last thing the session did instead.
     """
     sid = brief.short_id(row.get("sessionId", ""))
-    name = row.get("tab_title") or ("~" + (row.get("title") or row.get("name") or ""))
     tail = f" · {row.get('since', '')}"
     if row.get("kind") == "background" and row.get("windowed") is False:
         # not "no window", which reads as broken: this is a session you can
@@ -2259,18 +2258,53 @@ def ui_row_cells(row, width=100, tag=""):
             + (f" +{len(ports) - 3}" if len(ports) > 3 else "")) if ports else (
         f" · {_plural(row['procs'], 'proc')}" if row.get("procs") else "")
     glyph = UI_STATE_MARK.get(row.get("attention", ""), UI_UNKNOWN_MARK) + " "
-    head = f"{sid}  {row.get('project', '?')[:12]}  "
+    # The session's name, whole wherever the line can hold it: it is the address
+    # another session sends a message to, and a cut name is no address. An
+    # auto-name is the project and a dash; a renamed one is not, and says its
+    # project in the meta - where the title keeps room to be read, like the ports.
+    def printable(value):
+        # a newline in a name or a title would paint a third line into a row of two
+        return "".join(c if c.isprintable() else " " for c in str(value or "")).strip()
+    project = printable(row.get("project"))
+    project = "" if project == "?" else project
+    handle = printable(row.get("name"))
+    handle = handle if handle not in ("", "?") else (project or "?")
+    head = f"{sid}  {handle}"
+    # the title, unless it only says the name again (the tab's ✳ aside): the
+    # name is already on the row
+    said = [t for t in (printable(row.get("tab_title")), "~" + printable(row.get("title")))
+            if re.sub(r"^[\W_]+", "", t) not in ("", handle)]
+    name = said[0] if said else ""
     # the account this row spends (usage, 2+ accounts only): last, and the name
     # gives way for it - never the mark, the id or the project
     account = [(f" · {tag}", "account")] if tag else []
-    # and the detail's room, with one cell between it and the words
-    room = max(8, width - _cells(glyph) - _cells(head) - _cells(tail)
-               - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL[0]) - 1)
-    shown = _cut(name, room)
-    if _cells(shown) + _cells(held) <= room:
+
+    def room_for_title(tail, gap=2):
+        # after the name, two spaces before a title and one before the meta,
+        # which brings its own; and the detail's room, with one cell before it
+        return (width - _cells(glyph) - _cells(head) - gap - _cells(tail)
+                - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL[0]) - 1)
+    if (project and handle != project and not handle.startswith(project + "-")
+            and room_for_title(f" · {project}" + tail) >= 20):
+        tail = f" · {project}" + tail
+    # the title is what gives way, down to nothing: the name says which session
+    # this is, and a title of two letters and a … says nothing
+    room = room_for_title(tail)
+    shown = _cut(name, room) if room >= 8 else ""
+    gap = 2 if shown else 1
+    if room_for_title(tail, gap) < _cells(shown):
+        account = []            # whole or not at all: "· 1…" is no account
+    # the ports after the account, in the room it leaves - or gives up
+    if _cells(shown) + _cells(held) <= room_for_title(tail, gap):
         tail += held
+    # and the meta in whole pieces, the last first: "…" after a whole name
+    # reads as a cut name, and "· 5h…" is no age
+    while tail and room_for_title(tail, gap) < _cells(shown):
+        tail = tail[:tail.rfind(" · ")] if " · " in tail else ""
+    if not (shown or tail or account):
+        gap = 0                 # nothing follows the name: the arrow's cell will do
     first = [(glyph, "mark"), (f"{sid}  ", "id"),
-             (f"{row.get('project', '?')[:12]}  ", "project"),
+             (handle + " " * gap, "project"),
              (shown, "name"), (tail, "meta")] + account
 
     # The age goes FIRST. At the end of a long recap it is the first thing

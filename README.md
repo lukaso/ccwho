@@ -80,6 +80,14 @@ The second line of every row is the **recap** Claude Code writes into the
 transcript itself (`away_summary`), always with its age: one session's newest recap
 was 2 days and 23 turns old, and a recap without its age reads as the current state.
 
+The first line names the session: its short id, then its **name** (`liveapp-40`),
+whole wherever the line can hold it - it is the address another session sends a
+message to, and a cut name is no address. The title says what it is about, and it
+is what gives way, down to nothing, before the name or the age does. A session with
+no name shows its project there. A renamed session's name no longer starts with
+its project, so the project follows in the dim part of the line, where there is
+room for it.
+
 It notices a session start needing you within a second, by stat-ing transcript
 files - no program is started for that - and does a full scan every 20 seconds.
 Collection runs in a worker thread, because `claude agents --json` can take 30
@@ -465,8 +473,10 @@ ccwho setup             # install what it needs, once
 | doing | the last tool call, using Bash's human `description` when present |
 | since | time since the last real **turn**, from its `timestamp` - see below |
 
-The session *name* is deliberately not a column. `liveapp-4e` told you nothing,
-which is what started this.
+The session *name* is deliberately not a column here. `liveapp-4e` told you
+nothing about the work, which is what started this. The live list does show it,
+next to the title: there it is not a description but the address you message the
+session by.
 
 ### What actually needs you
 

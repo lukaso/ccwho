@@ -1338,6 +1338,141 @@ def proc_marks(table, cache=None):
     return out
 
 
+def _lsof(args):
+    """lsof's text, or None when it could not be asked. lsof exits 1 with
+    nothing on stderr when nothing matched; exit 1 with an error, any other
+    exit, or a timeout is None. Another user's processes are simply not listed
+    (the whole-machine read still exits 0): "not read", as kill_plan wants."""
+    exe = find_tool("lsof") or "/usr/sbin/lsof"
+    try:
+        done = subprocess.run([exe] + args, capture_output=True, text=True,
+                              errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0 or (done.returncode == 1 and not (done.stderr or "").strip()):
+        return done.stdout
+    return None
+
+
+def established_connections():
+    """[(pid, laddr, lport, raddr, rport)] for every ESTABLISHED TCP socket, or
+    None when lsof could not be asked or a line did not parse."""
+    text = _lsof(["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fpn"])
+    return None if text is None else procs.parse_lsof_established(text)
+
+
+def unix_sockets():
+    """The kernel's unix sockets (address -> Conn) from `netstat -f unix -n`, or
+    None when netstat could not be asked."""
+    try:
+        done = subprocess.run(["netstat", "-f", "unix", "-n"], capture_output=True, text=True,
+                              errors="replace", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return procs.parse_netstat_unix(done.stdout) if done.returncode == 0 else None
+
+
+def pipe_links():
+    """pid -> {"stdio", "other"} pipe peers for the whole machine (about 0.4s),
+    or None when lsof could not be asked. See procs.parse_lsof_pipes."""
+    text = _lsof(["-nP", "-F", "pftdn"])
+    return None if text is None else procs.parse_lsof_pipes(text, unix_sockets())
+
+
+def ps_world_text():
+    """`ps -axo pid=,ppid=,lstart=,command=` in the C locale and UTC - the start
+    in the text a session file stores - or None when ps could not be run or
+    failed: that is no empty machine."""
+    try:
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,lstart=,command="],
+                              capture_output=True, text=True, errors="replace", timeout=20,
+                              env=dict(os.environ, LC_ALL="C", TZ="UTC"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def world_sessions(rows):
+    """The live sessions as kill_plan takes them - {"sessionId": str, "pid": an
+    int >= 2 or None} - and how many rows could not be read. A pid as ASCII
+    digits is that pid; anything else is not guessed: the row is counted, and
+    the caller refuses (the live-session guard would be blind to it)."""
+    out, bad = [], 0
+    for r in rows or []:
+        sid, pid = r.get("sessionId"), r.get("pid")
+        if type(pid) is str and pid.isascii() and pid.isdigit() and len(pid) < 8:
+            pid = int(pid)
+        if type(sid) is not str or not (pid is None or (type(pid) is int and 2 <= pid < 10 ** 7)):
+            bad += 1
+            continue
+        out.append({"sessionId": sid, "pid": pid})
+    return out, bad
+
+
+def _world_session_rows(table):
+    """The session rows collect() reads - the agents list and the session files -
+    and whether they are whole. `table` is pid -> (ppid, start, command)."""
+    raw = agents_json()
+    parsed = parse_sessions(raw) if raw is not None else None
+    starts = {pid: (start, cmd) for pid, (_pp, start, cmd) in table.items()}
+    try:
+        file_rows, bad = live_file_sessions(starts)
+    except Exception:           # a second source: its failure is "not whole", never a crash
+        file_rows, bad = [], None
+    whole = parsed is not None and read_is_complete(raw) and bad == 0
+    return procs.merge_sessions(parsed or [], file_rows), whole
+
+
+WORLD_READERS = {
+    "ps": ps_world_text, "env": read_procargs, "sessions": _world_session_rows,
+    "ports": listen_ports, "connections": established_connections, "pipes": pipe_links,
+    "own": os.getpid,
+}
+
+
+def build_world(mine=None, readers=None, status=None):
+    """The world kill_plan plans on, read now: the process table (one ps), each
+    process's session mark (its environment; left out when it could not be
+    read), the live sessions, attribute()'s answer, listening ports, ESTABLISHED
+    connections and the pipe links - None for any that could not be read.
+
+    `readers` replaces any of WORLD_READERS (tests). `status` is a caller-owned
+    dict: status["trouble"] says why the caller must refuse although the world
+    is in shape (a live session's pid could not be read)."""
+    r = dict(WORLD_READERS, **(readers or {}))
+    text = r["ps"]()
+    if text is None:                    # no empty machine: nothing to plan on
+        if status is None:
+            raise ValueError("the process table could not be read")
+        status.setdefault("trouble", "the process table could not be read")
+    table = procs.parse_ps_world(text or "")
+    marks = {}
+    for pid in table:
+        if pid < 1:
+            continue                    # the kernel: no environment, no pid a kill takes
+        env = r["env"](pid)
+        if env is not None:
+            marks[pid] = procs.mark_of(env)
+    rows, whole = r["sessions"](table)
+    sessions, bad = world_sessions(rows)
+    ports, own = r["ports"](), r["own"]()
+    running = procs.claude_pids({pid: (start, cmd) for pid, (_pp, start, cmd) in table.items()})
+    known = (whole and bad == 0 and all(pid in marks for pid in running)
+             and set(running) <= {s["pid"] for s in sessions})
+    att = procs.attribute(table, marks, ports or {}, sessions, sessions_known=known, own=own)
+    world = {"table": table, "att": att, "sessions": sessions, "own": own, "ports": ports,
+             "pipes": r["pipes"](), "marks": marks, "connections": r["connections"]()}
+    if mine is not None:
+        world["mine"] = mine
+    if bad:
+        # the live-session guard is blind to that session: a caller that does
+        # not take the trouble must not get a world it could plan on
+        if status is None:
+            raise ValueError("a live session's pid could not be read")
+        status.setdefault("trouble", "a live session's pid could not be read")
+    return world
+
+
 def agents_json():
     """The live session list as JSON text, or None when the SOURCE is unavailable.
 

@@ -319,6 +319,113 @@ def parse_lsof_established(text):
     return out
 
 
+def _pid_text(text, low=1):
+    # a pid as ps or lsof prints it: ASCII digits ("²".isdigit() is True), in range
+    return int(text) if text.isascii() and text.isdigit() and low <= int(text) < 10 ** 7 else None
+
+
+def parse_ps_world(text):
+    """pid -> (ppid, start, command) from ONE `ps -axo pid=,ppid=,lstart=,command=`
+    under LC_ALL=C TZ=UTC - parent, start and command from one snapshot (two ps
+    runs can race). The start is five words, as parse_ps_table gives it. A line
+    that is no row is left out: kill_plan's table check sees the hole."""
+    out = {}
+    for line in (text or "").splitlines():
+        f = line.split()
+        if len(f) < 8:
+            continue
+        pid, ppid = _pid_text(f[0], 0), _pid_text(f[1], 0)
+        if pid is None or ppid is None:
+            continue
+        out[pid] = (ppid, " ".join(f[2:7]), " ".join(f[7:]))
+    return out
+
+
+def parse_netstat_unix(text):
+    """The kernel's unix sockets from `netstat -f unix -n`: address -> Conn, the
+    address of the socket it is connected to, "0" when that one closed. lsof
+    can keep showing a closed peer's old address; this says it is gone."""
+    out = {}
+    for line in (text or "").splitlines():
+        f = line.split()
+        if len(f) >= 6 and all(c in "0123456789abcdef" for c in f[0]) and f[0]:
+            out[f[0]] = f[5]
+    return out
+
+
+def parse_lsof_pipes(text, sockets=None):
+    """pid -> {"stdio": peers, "other": peers} from `lsof -nP -F pftdn` for the
+    whole machine. A pipe or socket end has its own address (d) and may name
+    its peer's (n->); a FIFO is its path, and its holders are peers. Each side
+    of a link is classed by ITS OWN fd: on fds 0-2 "stdio" - a break there can
+    end the process; a pipe or FIFO on fds 3+ "other"; a unix socket on fds 3+
+    is left out - it is how every process talks to a daemon, and how claude
+    keeps the stdin of what it starts (killing that process does not end it).
+
+    Not read - left out: a pid lsof did not list (another user's: lsof lists
+    none), one whose fds it could not list (NOFD, or no numeric fd at all), and
+    one with a counted end whose peer nobody listed - the link is there, to a
+    process ccwho cannot see. An end whose peer closed is no link: a pipe then
+    shows no name, a socket "->(none)" or a stale address that `sockets`
+    (parse_netstat_unix: the kernel's own list) says is connected to nothing.
+    Without `sockets`, a stale address counts as a peer nobody listed."""
+    listed, fds, broken = {}, set(), set()
+    holders, ends = {}, []
+    pid = fd = typ = dev = None
+    for line in (text or "").splitlines():
+        tag, val = line[:1], line[1:]
+        if tag == "p":
+            pid, fd, typ, dev = _pid_text(val), None, None, None
+            if pid is not None:
+                listed.setdefault(pid, {"stdio": set(), "other": set()})
+        elif pid is None:
+            continue
+        elif tag == "f":
+            fd, typ, dev = val, None, None
+            if val == "NOFD":
+                broken.add(pid)
+            elif val.isascii() and val.isdigit():
+                fds.add(pid)
+        elif tag == "t":
+            typ = val
+        elif tag == "d":
+            dev = val
+        elif tag == "n" and typ in ("PIPE", "unix") and dev:
+            holders.setdefault(dev, []).append((pid, fd, typ))     # whatever its name shows
+            if val.startswith("->") and len(val) > 2 and val != "->(none)":   # it names its peer
+                ends.append((pid, fd, typ, val[2:], dev))
+        elif tag == "n" and typ == "FIFO" and val:
+            holders.setdefault("fifo:" + val, []).append((pid, fd, typ))
+            ends.append((pid, fd, typ, "fifo:" + val, None))
+
+    def side(fd, typ):
+        stdio = fd in ("0", "1", "2")
+        return None if typ == "unix" and not stdio else ("stdio" if stdio else "other")
+    def hexnum(addr):
+        try:
+            return int(addr, 16)
+        except (TypeError, ValueError):
+            return None
+    conn = None if sockets is None else {hexnum(a): hexnum(c) for a, c in sockets.items()}
+    for pid, fd, typ, peer, dev in ends:
+        held = holders.get(peer, [])
+        if typ == "FIFO":               # its path names itself too: the peers are the others
+            held = [h for h in held if h[0] != pid]
+        if not held:
+            closed = typ == "unix" and conn is not None and conn.get(hexnum(dev)) == 0
+            if side(fd, typ) and not closed:
+                broken.add(pid)         # a counted link to a process lsof did not list
+            continue
+        for hpid, hfd, htyp in held:
+            if hpid == pid:
+                continue                # a self-pipe: both ends its own
+            if side(fd, typ):
+                listed[pid][side(fd, typ)].add(hpid)
+            if side(hfd, htyp):
+                listed[hpid][side(hfd, htyp)].add(pid)
+    return {p: v for p, v in listed.items() if p in fds and p not in broken}
+
+
 def _plain_addr(addr):
     # a dual-stack socket shows an IPv4 peer as ::ffff:127.0.0.1
     return addr[7:] if addr.lower().startswith("::ffff:") and "." in addr else addr
@@ -417,6 +524,24 @@ def _is_app(cmd):
     """The program is inside an app bundle - not merely a path among its
     arguments - and it is not the framework Python (a script runner)."""
     return _app_bundle(cmd) is not None and not _PY_FRAMEWORK.match(cmd or "")
+
+
+_SCRIPT = re.compile(r"\s\S+\.[cm]?js(?:\s|\Z)")
+
+
+def _node_mode(cmd):
+    # an app's binary running a script (Electron as node): a CLI, not the app
+    return _is_app(cmd) and bool(_SCRIPT.search(cmd or ""))
+
+
+def _app_main(cmd):
+    """An app's main executable: one bundle, run from its Contents/MacOS/, not
+    as a script runner. A helper app nested in it, a CLI from its Resources or
+    Developer folder, or its binary in node mode is none (builder review 4)."""
+    head = _app_bundle(cmd)
+    if head is None or not _is_app(cmd) or _node_mode(cmd):
+        return False
+    return cmd[len(head) + len(".app/Contents/"):].startswith("MacOS/")
 
 
 def _app_name(cmd):
@@ -1313,7 +1438,7 @@ def world_problem(world):
         return "ports"
     pipes = world.get("pipes")
     if pipes is not None and (type(pipes) is not dict or not all(
-            pid(k) and (pids(v) or (type(v) is dict and set(v) <= {"in", "out"}
+            pid(k) and (pids(v) or (type(v) is dict and set(v) <= {"in", "out", "stdio", "other"}
                                     and all(pids(x) for x in v.values())))
             for k, v in pipes.items())):
         return "pipes"
@@ -1390,9 +1515,12 @@ def _kill_plan(mode, target, world):
     ccwho bug - the whole plan refuses).
     Also a member linked by a pipe to an agent, to this ccwho run, or to
     a process with an agent under it (up to the nearest app or multiplexer:
-    an IDE hosting claude is a note) - any fd, either direction, through
-    other processes (owner's choice, 2026-09-26: who survives a broken pipe
-    is not inferred) - and a member carrying another
+    an IDE hosting claude is a note) - through other processes: a process
+    ends through a link only on its OWN counted end - a pipe or FIFO on any
+    fd, a socket on its fds 0-2; an agent's or ccwho's end counts only on its
+    own fd 0-2, and so does an app's main executable (Contents/MacOS, not a
+    helper, a bundled CLI or node mode) (owner's choices, 2026-09-26) - and a
+    member carrying another
     session's mark than the tree's top (an agent no name list knows runs there).
 
     An agent runs ccwho: world["mine"] is its own session id, from its own
@@ -1412,9 +1540,11 @@ def _kill_plan(mode, target, world):
     (ccwho's pid), "ports" pid ->
     [ports], "pipes" pid -> the pids holding the other end of any pipe it
     holds, at any fd (stdio, `>(...)`, /dev/fd/N, a child's pipe), read at
-    kill time - a set, a list or a tuple of pids, or {"in", "out"} of those
-    (the same, both counted). A FIFO or a socketpair counts as a pipe. A pid lsof
-    did not list is left out (not read), never given an empty entry.
+    kill time - a set, a list or a tuple of pids (fds not known), or a map:
+    "in", "out", "stdio" (peers on its own fds 0-2) and "other" (peers through
+    a pipe or FIFO on its fds 3+; a unix socket there is left out - it is how
+    every process talks to a daemon). A socketpair on fds 0-2 counts as a pipe.
+    A pid lsof did not list is left out (not read), never given an empty entry.
     "marks" pid -> mark_of(...) (None: read, no mark).
     "marked" is shown one line: the signaller refuses a fresh session id that
     is no UUID, and one whose shown form differs from "marked".
@@ -1445,18 +1575,32 @@ def _kill_plan(mode, target, world):
     ports_read = world.get("ports") is not None
     ports = {k: list(v) for k, v in (world.get("ports") or {}).items()}
     own = world["own"]
-    # pipes: one graph, every edge both ways (`linked`). Who survives a broken
-    # pipe depends on the fd, the direction and the program (SIGPIPE on any
-    # fd, EOF on stdin, a child pipe handled): six review rounds of inferring
-    # it kept missing shapes, so nothing is inferred - the owner's choice
-    # (2026-09-26): any link to an agent or to ccwho refuses. `pipes_read`:
-    # the pids whose own pipes were read; one left out was not
+    # pipes: `linked` is every edge both ways. A process ends through a link
+    # only on its OWN counted end (a pipe or FIFO on any fd, a socket on its
+    # fds 0-2); an agent or ccwho itself only on its own fds 0-2 (owner's
+    # choices, 2026-09-26). `pipes_read`: the pids whose own pipes were read;
+    # one left out was not - then every link counts
     raw_pipes = world.get("pipes")
-    pipes_read, linked = set(raw_pipes or ()), {}
+    # stdio_of[p]: the peers on p's own fds 0-2 ("in", "out", "stdio"; a plain
+    # set is not known, so it is stdio). An agent or ccwho ends only when a
+    # link on its OWN stdio breaks (owner's choice, after the builder spike):
+    # every process an agent starts holds a socketpair whose other end claude
+    # keeps on its fd 3+, and killing that process does not end claude
+    pipes_read, linked, stdio_of, own_of = set(raw_pipes or ()), {}, {}, {}
     for k, v in (raw_pipes or {}).items():
-        for x in (x for part in (v.values() if isinstance(v, dict) else [v]) for x in part):
+        parts = list(v.values()) if isinstance(v, dict) else [v]
+        stdio_of[k] = ({x for key in ("in", "out", "stdio") for x in v.get(key, ())}
+                       if isinstance(v, dict) else set(v))
+        own_of[k] = {x for part in parts for x in part}
+        for x in (x for part in parts for x in part):
             linked.setdefault(k, set()).add(x)
             linked.setdefault(x, set()).add(k)
+    # a plain set says no fd: its link counts as stdio on BOTH sides
+    for k, v in (raw_pipes or {}).items():
+        if not isinstance(v, dict):
+            for x in v:
+                stdio_of.setdefault(x, set()).add(k)
+                own_of.setdefault(x, set()).add(k)
     marks_read = world.get("marks") is not None
     marks = {k: tuple(v) if v else None for k, v in (world.get("marks") or {}).items()}
     conns = world.get("connections")
@@ -1576,18 +1720,31 @@ def _kill_plan(mode, target, world):
             out.append(a)
         return out
     ccwho_pipes = ({own} | set(subtree(own)) | set(up_to_app(own))) if own in table else set()
+
+    def counted(p):
+        # what p ends through: an app's main executable reads its helpers' pipes on
+        # its fds 3+ and lives on when one ends - only its own stdio counts, as
+        # for an agent (owner's choice, builder review 3); anything else, every
+        # counted end it holds
+        return stdio_of.get(p, set()) if _app_main(cmd_of(p)) else own_of.get(p, set())
     wrappers = {a for q in agents if q in table for a in up_to_app(q)} - agents - ccwho_pipes
     ends = agents | ccwho_pipes | wrappers
     linked_to, todo = {}, []
     for end in (sorted(agents, key=str) + sorted(ccwho_pipes - agents, key=str)
                 + sorted(wrappers, key=str)):
-        for q in sorted(linked.get(end, ()), key=str):
+        # an agent or ccwho itself: its own stdio; anything else that runs one:
+        # its own counted ends; every link when its pipes were not read
+        mine_ = stdio_of if end in agents or end == own else own_of
+        for q in sorted(mine_.get(end, ()) if end in pipes_read else linked.get(end, ()), key=str):
             if q not in linked_to and q not in ends:
                 linked_to[q] = (end, end)
                 todo.append(q)
     while todo:
         p = todo.pop(0)
-        for q in sorted(linked.get(p, ()), key=str):
+        # p ends when q does only through p's OWN counted end (a pipe or FIFO
+        # on any fd, a socket on its stdio): the VS Code extension host keeps
+        # its children's sockets on its fds 3+ and lives on. Not read: all links
+        for q in sorted(counted(p) if p in pipes_read else linked.get(p, ()), key=str):
             if q not in linked_to and q not in ends:
                 linked_to[q] = (p, linked_to[p][1])
                 todo.append(q)
@@ -1623,7 +1780,8 @@ def _kill_plan(mode, target, world):
         return None
 
     def name_of(pid):
-        return _app_name(cmd_of(pid)) or _name(cmd_of(pid))
+        cmd = cmd_of(pid)                   # a node-mode CLI is no "Visual Studio Code"
+        return (None if _node_mode(cmd) else _app_name(cmd)) or _name(cmd)
 
     def notes_of(q, root, taking):
         """What ccwho doubts about `q`: said with the kill, never a refusal."""
@@ -1655,15 +1813,25 @@ def _kill_plan(mode, target, world):
         if q not in pipes_read:
             out.append("its pipes were not read - it may be piped to a process that keeps running")
         for peer in sorted(linked.get(q, ()), key=str):
-            if peer == q or peer in taking:
+            # an agent or ccwho linked on its fd 3+ does not end (on its stdio,
+            # the guard refused already): no note to put a person off
+            if peer == q or peer in taking or peer in agents or peer == own:
                 continue
             who = (name_of(peer) if peer in table
                    else "a process newer than the scan - it may be an agent")
-            fate = ("which may end with it" if peer in pipes_read
-                    else "whose own pipes were not read - it may lead on to an agent")
+            if peer not in pipes_read:
+                fate = ", whose own pipes were not read - it may lead on to an agent"
+            elif q in counted(peer):
+                fate = ", which may end with it"
+            else:
+                fate = ""                   # its own end is not counted: it lives on
+                if peer in linked_to and peer not in over_agent:   # it leads on to one: say which
+                    end = linked_to[peer][1]
+                    fate = (f" - it is piped on to an agent ({printable(str(end))[:12]})" if end in agents
+                            else " - it is piped on to this ccwho run")
             if peer in over_agent:              # an app hosting one: said, not refused
                 fate += f" - {_a(over_agent[peer])} runs under it"
-            out.append(f"it is piped to {printable(str(peer))[:12]} ({who}), {fate}")
+            out.append(f"it is piped to {printable(str(peer))[:12]} ({who}){fate}")
         if conns is None:
             if q == root:
                 out.append("its connections were not read - someone may be using it")

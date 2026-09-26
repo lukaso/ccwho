@@ -3396,30 +3396,32 @@ class TestKillPlanReview20(unittest.TestCase):
     pid = TestKillPlanReview19.pid
     BASE = TestKillPlanReview19.BASE
 
-    def test_what_only_reads_a_process_refuses_too(self):
-        # owner's choice (2026-09-26): any pipe link to an agent refuses - even
-        # claude only reading a dev server's output (it would live on)
+    def test_what_claude_only_reads_is_killable(self):
+        # owner's choice after the builder spike: claude reading a dev server's
+        # output holds that pipe on its fd 3+, not its own stdio - it lives on
         extra = {300: (10, self.T, "/bin/zsh -c 'npm run dev'"), 301: (300, self.T, "node next dev")}
         w = self.world(extra, {300: ("claude", LIVE_SID), 301: ("claude", LIVE_SID)},
-                       pipes={301: {"out": {10}}, 300: {"out": {10}}, 10: set()})
+                       pipes={301: {"out": {10}}, 300: {"out": {10}}, 10: {"stdio": set(), "other": {300, 301}}})
+        self.assertEqual(self.kills(self.pid(301, w)), [301])
+        w = self.world(extra, {300: ("claude", LIVE_SID), 301: ("claude", LIVE_SID)},     # control: stdout
+                       pipes={301: {"out": {10}}, 300: {"out": {10}}, 10: {"in": {301}}})
         p = self.pid(301, w)
         self.assertEqual(p["kill"], [])
         self.assertIn("301 is piped to 10, an agent", self.whys(p))
-        w = self.world(extra, {300: ("claude", LIVE_SID), 301: ("claude", LIVE_SID)},
-                       pipes={301: set(), 300: set(), 10: set()})                         # control: no pipe
-        self.assertEqual(self.kills(self.pid(301, w)), [301])
-    def test_a_hub_links_what_it_reads_to_an_agent(self):
-        # the VS Code plugin host is an app: no pipe end itself (review 29), but
-        # the walk goes through it to the claude that holds a pipe to it
+    def test_a_hub_that_keeps_its_links_on_fd_3_plus_is_no_path(self):
+        # the VS Code plugin host keeps claude's and tsserver's sockets on its fds
+        # 3+: a process ends through a link only on its own counted end, so
+        # killing tsserver ends neither the host nor claude (builder review 1)
         extra = {150: (1, self.T, "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
                  200: (150, self.T, "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"),
                  11: (200, self.T, "claude"), 220: (200, self.T, "node tsserver.js")}
-        p = self.pid(220, self.world(extra, pipes={220: {"out": {200}}, 11: {"out": {200}}, 200: set()}))
-        self.assertEqual(p["kill"], [])
-        self.assertIn("220 is piped to 200, and on to 11, an agent", self.whys(p))
-        p = self.pid(220, self.world(extra, pipes={220: {"out": {200}}, 11: set(), 200: set()}))  # control
+        p = self.pid(220, self.world(extra, pipes={220: {"stdio": {200}}, 11: {"stdio": {200}}, 200: set()}))
         self.assertEqual(self.kills(p), [220])
         self.assertIn("a claude runs under it", p["kill"][0]["note"])
+        p = self.pid(220, self.world(extra, pipes={220: {"stdio": {200}}, 11: {"stdio": {200}},   # control
+                                                   200: {"stdio": {220}}}))              # the host's own stdout (review 3)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("220 is piped to 200, and on to 11, an agent", self.whys(p))
     def test_a_nested_top_is_in_its_tree_once(self):
         extra = {70: (10, self.T, "node a.js"), 71: (70, self.T, "node b.js"), 72: (71, self.T, "node c.js")}
         for mid in (("claude", DEAD_SID), None):
@@ -3506,17 +3508,16 @@ class TestKillPlanReview21(unittest.TestCase):
     pid = TestKillPlanReview19.pid
     BASE = TestKillPlanReview19.BASE
 
-    def test_a_server_claude_feeds_refuses(self):
-        # an MCP stdio server: claude would live on, but no direction is inferred
-        extra = {200: (10, self.T, "node /x/playwright-mcp/cli.js")}
-        for pipes in ({200: {"in": {10}, "out": {10}}, 10: {"in": set(), "out": set()}},
-                      {200: {"in": {10}}, 10: {"out": {200}}}, {200: {10}}):
-            with self.subTest(pipes=pipes):
-                p = self.pid(200, self.world(extra, {200: ("claude", LIVE_SID)}, pipes=pipes))
-                self.assertEqual(p["kill"], [])
-                self.assertIn("an agent", self.whys(p))
-        p = self.pid(200, self.world(extra, {200: ("claude", LIVE_SID)}))                  # control: no pipe
+    def test_a_server_claude_feeds_is_killable(self):
+        # an MCP stdio server: claude feeds it from its fd 3+ and lives on
+        extra = {200: (10, self.T, "node /x/mcp.js")}
+        p = self.pid(200, self.world(extra, {200: ("claude", LIVE_SID)},
+                                     pipes={200: {"in": {10}, "out": {10}}, 10: {"in": set(), "out": set()}}))
         self.assertEqual(self.kills(p), [200])
+        p = self.pid(200, self.world(extra, {200: ("claude", LIVE_SID)},             # control: claude's stdout
+                                     pipes={200: {"in": {10}}, 10: {"out": {200}}}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("an agent", self.whys(p))
     def test_stderr_counts_like_any_fd(self):
         extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, "logger -t claude")}
         for pipes in ({30: {"out": {31}}, 31: {"in": {30}}}, {30: {"in": {31}}, 31: {"out": {30}}}):
@@ -3571,12 +3572,11 @@ class TestKillPlanReview22(unittest.TestCase):
 
     def test_any_pipe_link_to_an_agent_refuses(self):
         cases = {
-            "mcp server claude feeds": ({200: (10, self.T, "node /x/playwright-mcp/cli.js")},
-                                        {200: {"in": {10}, "out": {10}}, 10: {"in": set(), "out": set()}}, 200),
-            "output claude reads": ({301: (10, self.T, "node next dev")}, {301: {"out": {10}}, 10: set()}, 301),
+            "mcp server whose stdout is claude's stdin": ({200: (10, self.T, "node /x/mcp.js")},
+                                                          {200: {"out": {10}}, 10: {"in": {200}}}, 200),
             "writer at fd 3": ({30: (1, self.T, "claude -p x"), 31: (1, self.T, "tee /dev/fd/63 out.log"),
                                 32: (1, self.T, "grep ERROR")},
-                               {30: {"out": {31}}, 31: {"in": {30}}, 32: {"in": {31}}}, 32),
+                               {30: {"out": {31}}, 31: {"in": {30}, "other": {32}}, 32: {"in": {31}}}, 32),
             "shared read end": ({30: (1, self.T, "claude -p list"), 40: (1, self.T, "zsh -c loop"),
                                  41: (40, self.T, "node job.js")},
                                 {30: {"out": {40, 41}}, 40: {"in": {30}}, 41: {"in": {30}}}, 41),
@@ -3978,7 +3978,8 @@ class TestKillPlanReview27(unittest.TestCase):
                 p = self.pid(13 if 13 in rows else 70, w)
                 self.assertEqual(p["kill"], [])
                 self.assertIn("not in its shape", p["why"])
-        w = self.world({1: (0, self.T, "launchd"), 13: (1, self.T, "sleep 9")}, pipes={13: {99}})  # control
+        w = self.world({1: (0, self.T, "launchd"), 13: (1, self.T, "sleep 9")},
+                       pipes={13: {99}, 99: {13}})                                   # control
         self.assertIsNone(procs.world_problem(w))
         self.assertIn("this ccwho run", self.whys(self.pid(13, w)))
 
@@ -4127,7 +4128,7 @@ class TestKillPlanReview29(unittest.TestCase):
     def test_what_is_between_the_app_and_the_agent_is_still_an_end(self):
         extra = {150: (1, self.T, self.IDEA), 20: (150, self.T, "script -q /dev/null claude"),
                  21: (20, self.T, "claude"), 30: (1, self.T, "tail -f log")}
-        p = self.pid(30, self.world(extra, pipes={30: {20}}))
+        p = self.pid(30, self.world(extra, pipes={30: {20}, 20: {30}}))       # on script's stdio
         self.assertEqual(p["kill"], [])
         self.assertIn("a claude runs under 20", self.whys(p))
 
@@ -4154,3 +4155,164 @@ class TestKillPlanReview29(unittest.TestCase):
         self.assertEqual(procs.world_problem(w), "att entries")
         self.assertIsNone(procs.world_problem(self.world({70: (1, self.T, "sleep 9")},       # control
                                                          conns=[(70, "127.0.0.1", 5, "127.0.0.1", 6)])))
+
+
+class TestPipeEndsOnOwnStdio(unittest.TestCase):
+    """The owner's choice (2026-09-26, after the builder spike): a link to an
+    agent or ccwho counts only when THEIR end is on their own fd 0-2 - a break
+    there ends them (`claude -p | tee`, `ccwho | head`). Every process an agent
+    starts holds a socketpair on its stdin whose other end claude holds on one
+    of its fds 3+: killing that process does not end claude. pipes[p] may say
+    which: {"in"/"out"/"stdio": peers on p's fds 0-2, "other": peers on fds 3+};
+    a plain set is stdio (not known: counted)."""
+
+    T = "Tue Sep 22 13:45:15 2026"
+    kills = TestKillPlanTrustsThePerson.kills
+    whys = TestKillPlanTrustsThePerson.whys
+    world = TestKillPlanReview19.world
+    pid = TestKillPlanReview19.pid
+    BASE = TestKillPlanReview19.BASE
+
+    def test_what_an_agent_started_is_no_link_to_it(self):
+        # claude 10 holds the tool socket on its fd 3+: its stdio (a pty) names nobody
+        extra = {40: (98, self.T, "node server.js")}
+        pipes = {40: {"stdio": {10}}, 10: {"stdio": set(), "other": {40}}}
+        p = self.pid(40, self.world(extra, {40: ("claude", LIVE_SID)}, pipes=pipes))
+        self.assertEqual(self.kills(p), [40])
+        self.assertNotIn("piped to 10", p["kill"][0].get("note", ""))      # claude does not end: no note
+        p = procs.kill_plan("mine", LIVE_SID, self.world(extra, {40: ("claude", LIVE_SID)},
+                                                         pipes=pipes, mine=LIVE_SID))
+        self.assertEqual(self.kills(p), [40])                                # --mine works
+        pipes = {40: {"stdio": {10}}, 10: {"stdio": {40}}}                    # control: claude's stdout
+        p = self.pid(40, self.world(extra, pipes=pipes))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("40 is piped to 10, an agent", self.whys(p))
+
+    def test_an_end_whose_pipes_were_not_read_counts_every_link(self):
+        extra = {40: (98, self.T, "node server.js")}
+        w = self.world(extra, pipes={40: {"stdio": {10}}})
+        del w["pipes"][10]
+        self.assertEqual(self.pid(40, w)["kill"], [])
+
+    def test_a_chain_through_a_middle_still_ends_the_agent(self):
+        # claude -p | tee >(grep): tee writes into grep on fd 3+; kill grep, tee dies, then claude
+        extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, "tee /dev/fd/63"), 32: (1, self.T, "grep E")}
+        pipes = {30: {"stdio": {31}}, 31: {"stdio": {30}, "other": {32}}, 32: {"stdio": {31}}}
+        p = self.pid(32, self.world(extra, pipes=pipes))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("32 is piped to 31, and on to 30, an agent", self.whys(p))
+        pipes = {30: {"stdio": set(), "other": {31}}, 31: {"stdio": {30}, "other": {32}},
+                 32: {"stdio": {31}}}                                        # control: claude's fd 3+
+        self.assertEqual(self.kills(self.pid(32, self.world(extra, pipes=pipes))), [32])
+
+    def test_ccwhos_own_stdio_still_counts(self):
+        extra = {97: (98, self.T, "head -5")}
+        p = self.pid(97, self.world(extra, pipes={99: {"stdio": {97}}, 97: {"stdio": {99}}}))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("this ccwho run", self.whys(p))
+        p = self.pid(97, self.world(extra, pipes={99: {"stdio": set(), "other": {97}}, 97: {"other": {99}}}))
+        self.assertEqual(self.kills(p), [97])                                # control
+
+    def test_the_shape_and_the_rule_are_written_down(self):
+        w = self.world({40: (1, self.T, "x")}, pipes={40: {"stdio": [10], "other": (98,)}})
+        self.assertIsNone(procs.world_problem(w))
+        w["pipes"][40] = {"stdio": [10], "err": []}
+        self.assertEqual(procs.world_problem(w), "pipes")                    # control
+        self.assertIn("own fd 0-2", procs.kill_plan.__doc__)
+
+    def test_a_middle_whose_pipes_were_not_read_is_followed_on_every_link(self):
+        extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, "tee x"), 32: (1, self.T, "grep E")}
+        w = self.world(extra, pipes={30: {"stdio": {31}}, 32: {"stdio": {31}}})
+        del w["pipes"][31]
+        p = self.pid(32, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("32 is piped to 31, and on to 30, an agent", self.whys(p))
+        w = self.world(extra, pipes={30: {"stdio": {31}}, 32: {"stdio": {31}}, 31: {"stdio": {30}}})
+        self.assertEqual(self.kills(self.pid(32, w)), [32])        # control: 31 read, its own end has no grep
+
+    def test_a_process_that_runs_an_agent_ends_on_any_counted_end(self):
+        # an Agent SDK app keeps claude's and git's pipes on its fds 5-7: only an
+        # agent and ccwho itself end on their stdio alone (review 2 of the builder)
+        extra = {500: (1, self.T, "python3 app.py"), 501: (500, self.T, "claude -p x"),
+                 502: (500, self.T, "git log")}
+        pipes = {500: {"stdio": set(), "other": {501, 502}}, 501: {"stdio": {500}}, 502: {"stdio": {500}}}
+        p = self.pid(502, self.world(extra, pipes=pipes))
+        self.assertEqual(p["kill"], [])
+        self.assertIn("a claude runs under 500", self.whys(p))
+        pipes = {500: {"stdio": set(), "other": {501}}, 501: {"stdio": {500}}, 502: {"stdio": {500}}}
+        p = self.pid(502, self.world(extra, pipes=pipes))                      # control: a socket on 500's fd 3+
+        self.assertEqual(self.kills(p), [502])
+        self.assertIn("piped to 500", p["kill"][0]["note"])          # a wrapper may end: a person is told
+
+    def test_a_plain_set_link_counts_on_both_sides(self):
+        extra = {200: (10, self.T, "node /x/mcp.js")}
+        p = self.pid(200, self.world(extra, pipes={200: {10}, 10: set()}))
+        self.assertEqual(p["kill"], [])
+        p = self.pid(200, self.world(extra, pipes={200: {"stdio": {10}}, 10: {"stdio": set(), "other": set()}}))
+        self.assertEqual(self.kills(p), [200])                                            # control
+
+    APP = "/Applications/Foo.app/Contents/MacOS/Foo"
+
+    def test_an_app_passes_on_only_through_its_own_stdio(self):
+        # an app reads its helpers' pipes on its fds 3+ and lives on when one ends
+        extra = {100: (1, self.T, self.APP), 101: (100, self.T, "claude"), 102: (100, self.T, "node server.js")}
+        pipes = {100: {"other": {101, 102}}, 101: {"stdio": {100}}, 102: {"stdio": {100}}}
+        p = self.pid(102, self.world(extra, pipes=pipes))
+        self.assertEqual(self.kills(p), [102])
+        self.assertIn("piped to 100 (Foo) - a claude runs under it", p["kill"][0]["note"])
+        pipes = {100: {"stdio": {102}, "other": {101}}, 101: {"stdio": {100}}, 102: {"stdio": {100}}}
+        p = self.pid(102, self.world(extra, pipes=pipes))                           # control: the app's stdout
+        self.assertEqual(p["kill"], [])
+        self.assertIn("an agent", self.whys(p))
+
+    def test_a_peer_whose_own_end_is_not_counted_may_not_end(self):
+        extra = {100: (1, self.T, self.APP), 101: (100, self.T, "claude"), 102: (100, self.T, "node server.js")}
+        note = self.pid(102, self.world(extra, pipes={100: {"stdio": set(), "other": set()},
+                                                      102: {"stdio": {100}}}))["kill"][0]["note"]
+        self.assertIn("piped to 100 (Foo)", note)
+        self.assertIn("a claude runs under it", note)
+        self.assertNotIn("may end with it", note)
+        extra = {100: (1, self.T, "tee log"), 102: (1, self.T, "node server.js")}    # control: a tee, no agent
+        p = self.pid(102, self.world(extra, pipes={100: {"other": {102}}, 102: {"stdio": {100}}}))
+        self.assertIn("piped to 100 (tee), which may end with it", p["kill"][0]["note"])
+
+    def chain(self, middle):
+        extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, middle), 32: (31, self.T, "grep E")}
+        pipes = {30: {"stdio": {31}}, 31: {"stdio": {30}, "other": {32}}, 32: {"stdio": {31}}}
+        return self.pid(32, self.world(extra, pipes=pipes))
+
+    def test_only_an_apps_main_executable_passes_on_through_stdio_alone(self):
+        for cli in ("/Applications/X.app/Contents/Resources/bin/tool",
+                    "/Applications/Xcode.app/Contents/Developer/usr/bin/git fetch",
+                    "/Applications/Visual Studio Code.app/Contents/MacOS/Code /x/out/cli.js -",
+                    "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper /x/s.js"):
+            with self.subTest(cli=cli):
+                p = self.chain(cli)
+                self.assertEqual(p["kill"], [])
+                self.assertIn("32 is piped to 31, and on to 30, an agent", self.whys(p))
+        self.assertTrue(procs._app_main("/Applications/Foo.app/Contents/MacOS/Foo --flag"))
+        self.assertTrue(procs._app_main("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+        self.assertFalse(procs._app_main("/Applications/Foo.app/Contents/Resources/bin/foo"))    # control
+
+    def test_the_note_names_the_agent_a_peer_leads_on_to(self):
+        # the app main reads claude -p on its stdin; its helper 32 is on its fd 3+
+        extra = {30: (1, self.T, "claude -p x"), 31: (1, self.T, self.APP), 32: (31, self.T, "node helper.js")}
+        pipes = {30: {"stdio": {31}}, 31: {"stdio": {30}, "other": {32}}, 32: {"stdio": {31}}}
+        p = self.pid(32, self.world(extra, pipes=pipes))
+        self.assertEqual(self.kills(p), [32])
+        self.assertIn("it is piped to 31 (Foo) - it is piped on to an agent (30)", p["kill"][0]["note"])
+        self.assertNotIn("may end with it", p["kill"][0]["note"])
+        p = self.pid(32, self.world(extra, pipes={31: {"other": {32}}, 32: {"stdio": {31}}}))   # control
+        self.assertNotIn("agent", p["kill"][0]["note"].replace("no agent started it", ""))
+
+    def test_a_node_mode_cli_is_named_by_its_program(self):
+        extra = {31: (1, self.T, "/Applications/Visual Studio Code.app/Contents/MacOS/Code /x/out/cli.js -"),
+                 32: (1, self.T, "node s.js")}
+        note = self.pid(32, self.world(extra, pipes={31: {"stdio": {32}}, 32: {"stdio": {31}}}))["kill"][0]["note"]
+        self.assertNotIn("(Visual Studio Code)", note)
+        extra[31] = (1, self.T, self.APP)                                            # control
+        note = self.pid(32, self.world(extra, pipes={31: {"stdio": {32}}, 32: {"stdio": {31}}}))["kill"][0]["note"]
+        self.assertIn("(Foo)", note)
+
+    def test_the_app_rule_is_written_down(self):
+        self.assertIn("an app's main executable", procs.kill_plan.__doc__)

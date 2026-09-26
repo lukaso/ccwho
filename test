@@ -12,7 +12,7 @@
 set -e
 cd "$(dirname "$0")"
 
-CORE="test_ccwho test_procs test_runner test_brief test_index test_setup test_contract test_panel test_usage"
+CORE="test_ccwho test_procs test_world test_runner test_brief test_index test_setup test_contract test_panel test_usage"
 echo "== engine, brief, index, setup, runner (stdlib) =="
 python3 -m unittest $CORE "$@"
 

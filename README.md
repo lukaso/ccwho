@@ -71,9 +71,10 @@ ccwho                         # on a terminal
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
-| `p` | every process agents started, grouped: each session, left behind, Codex, not sure |
-| `x` `x` | on a STUCK row: kill its wait loop that cannot end (or click `[kill loop]` twice) |
-| `o` | reopen the last saved fleet - only offered when nothing is running |
+| `p` | every process agents started, grouped: each session, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
+| `x` | on a process (after `p`): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
+| `x` `x` | on a row with a loop or reader that can never end (a STUCK row, or one that also needs you): kill it (or click `[kill loop]` twice) |
+| `o` | a menu of every save, newest first, with how many of its sessions run now; the last save before the restart is marked. Running sessions are left alone |
 | `r` | restart the list |
 | `q` | quit |
 
@@ -560,11 +561,12 @@ So `ccwho` derives the state instead:
 | state | how it is decided | label |
 |---|---|---|
 | blocked | an unanswered `tool_use` in the transcript | NEEDS YOU |
-| asks | the closing line of an **ended** turn is a question or a request - even while the harness says busy | ASKED YOU |
-| stuck | harness says busy, the turn has ended, and a wait loop under it can never end | STUCK |
+| asks | the closing line of an **ended** turn is a question or a request - even while the harness says busy. Text in quotation marks does not count: a question put to someone else is not one put to you | ASKED YOU |
+| stuck | not asking you, not mid-turn, and a wait loop or stdin reader under it can never end | STUCK |
 | stopped | not busy, and **nothing running under it** | STOPPED |
 | busy | harness says busy, mid-turn | busy |
 | running | background work is in flight: not busy, or busy with the turn over | running |
+| program | a program started it (see [Started by a program](#started-by-a-program)), and it is not stuck | program |
 
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.
@@ -604,6 +606,21 @@ is still that session's dead loop. Killing it reports the task
 as failed to the session, which wakes the agent. A file that cannot be read, or
 has no end line, is never called dead.
 
+**A reader that waits for input no one sends** is stuck too. Claude Code runs a
+Bash tool command with `< /dev/null` - except a command with a heredoc: then the
+tool shell's stdin is a socket that the session's claude holds and never writes to.
+A `cat $l` with `$l` empty, in such a command moved to the background, waited 20
+hours while the row said `running`. So a stdin reader (`cat`, `tr`, `cut`, `head`,
+`tail`, `wc`, `sort`, `uniq` with no file) in a Bash tool task, older than two
+minutes, whose fd 0 lsof shows is the claude's socket, makes the row STUCK: `cat N
+waits for input Claude Code never sends`. Never one under an MCP server (Claude Code
+does write to that socket) or under an agent. `x` twice stops the reader's whole
+task, parents first, so the tool shell cannot go on to its next command (a script
+that traps TERM is not reached); ccwho and any agent in the task are spared.
+
+A dead loop or reader makes the row STUCK whenever the session is not asking you
+and not mid-turn - idle or waiting too, not only busy with the turn over.
+
 ### Stopped, or waiting on a machine
 
 The signal that matters most is not what the last message said - it is whether
@@ -619,9 +636,26 @@ real ones. Counting MCP servers would make every session look busy forever.
 STOPPED outranks busy, because a stopped session is the one that needs a human.
 
 An ASKED YOU row shows **the question itself** in place of its last tool call, so
-the list answers "what does it want" without opening the session. Within each state,
-rows sort **most recent first**, so a fresh ask lands above ones you have already
-seen and parked.
+the list answers "what does it want" without opening the session.
+
+In the live list's NEEDS YOU group the kinds keep their order - a tool call waiting on you, then a
+question, then a finished turn you have not looked at - and inside each kind the
+**oldest** is first: you take the top one, so newest-first let each
+fresh ask go above the one that had waited longest. An ask with no known time
+comes after the ones that have one. The other groups, and the table (`ccwho ls`,
+`--watch`, `--json`), sort each state most recent first.
+
+### Started by a program
+
+A session that a program started with the SDK (entrypoint `sdk-cli`, `sdk-py`,
+`sdk-ts`, `sdk`) never needs you: mid tool call, its unanswered `tool_use` reads
+like a permission prompt, but the program answers its own prompts, and it has no
+window because it never had one. Such a session has its own state, `program`, in a
+last, quiet PROGRAMS group. It is never in NEEDS YOU; `--blocked` shows it only
+when it is STUCK while waiting, or left detached work behind. Its row says
+`· program` where a row would say `· no window`. Enter, `ccwho open` and the link handler do not attach it. A loop
+that can never end still makes it STUCK. Every row in `--json` carries its
+`entrypoint`.
 
 ### Why `since` does not use file mtime
 
@@ -710,8 +744,8 @@ Pure functions and plain dicts only.
 ./test
 ```
 
-881 tests: 767 for the engine, runner, brief, index and setup (stdlib only), and
-114 for the live list, which `uv` runs with Textual. If uv cannot fetch Textual the
+2487 tests: 2146 for the engine, processes, kill, usage, runner, brief, index and
+setup (stdlib only), and 341 for the live list, which `uv` runs with Textual. If uv cannot fetch Textual the
 UI tests FAIL rather than skip - "OK (skipped=12)" while the screen is broken is a
 green light for nothing. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.

@@ -3848,6 +3848,21 @@ class TestUsageWords(unittest.TestCase):
             runner.main(["--help"])
         self.assertIn("5h 42%↓/60%", out.getvalue())
 
+    def test_help_names_every_command(self):
+        # The commands come from main's own dispatch, so a new one that --help
+        # leaves out fails here: kill, clean and reap shipped without a line.
+        # hotkey is left out on purpose: only the hotkey window starts it.
+        import inspect
+        import re
+        cmds = set(re.findall(r'argv\[0\] == "([a-z]+)"', inspect.getsource(runner.main)))
+        self.assertGreaterEqual(len(cmds), 16)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["--help"])
+        missing = sorted(c for c in cmds - {"hotkey"}
+                         if not re.search(rf"^\s*(usage: )?ccwho {c}\b", out.getvalue(), re.M))
+        self.assertEqual(missing, [])
+
     def test_setup_says_when_sessions_report(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)

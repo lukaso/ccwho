@@ -1009,6 +1009,93 @@ class TestAttributeByTree(unittest.TestCase):
         self.assertEqual(procs.row_summary(w["sessions"][LIVE_SID])["procs"], 3)
 
 
+class TestStdinReader(unittest.TestCase):
+    """A program that reads its standard input because the command gives it no
+    file: in a Bash tool shell whose stdin is Claude Code's socket (a command
+    with a heredoc gets no `< /dev/null`, measured 2026-09-27), it waits for
+    input that never comes. An allowlist: anything else is not judged."""
+
+    def test_readers(self):
+        for cmd in ("cat", "/bin/cat", "cat -", "cat -u", "tr \\n ;", "/usr/bin/tr -d x",
+                    "cut -c1-300", "head -5", "tail -n5", "wc -l", "sort -u", "uniq -c"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(procs.stdin_reader(cmd))
+
+    def test_not_readers(self):                                         # control
+        for cmd in ("cat notes.md", "cat -n notes.md", "cut -c1-300 f.txt", "wc -l f",
+                    # a flag's value on its own looks like a file: not judged
+                    "head -n 5", "sort -k 2",
+                    "sleep 100", "zsh -c cat", "grep x", "catx", "concat",
+                    "cat 'unbalanced", "", None):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(procs.stdin_reader(cmd))
+
+
+class TestIsToolShell(unittest.TestCase):
+    """The Bash tool's own shell, as ps shows it (measured 2026-09-27)."""
+
+    def test_tool_shells(self):
+        for cmd in ("/bin/zsh -c source /Users/u/.claude/shell-snapshots/snapshot-zsh-1.sh "
+                    "2>/dev/null || true && eval 'cat'",
+                    "/bin/zsh -c -l source /Users/u/.claude/shell-snapshots/snap.sh && eval 'x'",
+                    "/bin/bash -c source /Users/u/.claude-work/shell-snapshots/s.sh && eval 'x'"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(procs.is_tool_shell(cmd))
+
+    def test_a_home_with_a_space_is_not_matched(self):
+        # on purpose: ps joins argv with spaces, so the path's end is a guess.
+        # Not matched is the safe side - such a reader is never called dead
+        self.assertFalse(procs.is_tool_shell(
+            "/bin/zsh -c source /Users/First Last/.claude/shell-snapshots/s.sh && eval 'x'"))
+
+    def test_not_tool_shells(self):                                     # control
+        for cmd in ("npm exec chrome-devtools-mcp@latest", "/bin/sh -c cat | docker run -i s",
+                    "/bin/zsh -c echo source /x/shell-snapshots/s.sh", "zsh", "", None,
+                    "vim /Users/u/.claude/shell-snapshots/s.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(procs.is_tool_shell(cmd))
+
+
+class TestStdinFromClaude(unittest.TestCase):
+    """Proof that a reader can never read anything: its fd 0 is a socket whose
+    other end the session's own claude holds - and Claude Code never writes to
+    a tool's stdin (measured 2026-09-27: a `cat` on it waited 20 hours)."""
+
+    # `lsof -nP -a -U -p SHELL,CLAUDE -F pfdn`, as measured
+    LSOF = ("p43074\nf0\nd0x55b5d57778ff9c3d\nn->0x1ca4634a1af23592\n"
+            "p83454\nf10\nd0x3a8366158e643adb\nn->0xee6cb0d91607060f\n"
+            "f12\nd0x1ca4634a1af23592\nn->0x55b5d57778ff9c3d\n"
+            "f20\nd0x61b5aca5c588f868\nn/tmp/cc-socks/83454.sock\n")
+
+    def test_the_lsof_fields_are_read(self):
+        got = procs.parse_lsof_unix(self.LSOF)
+        self.assertEqual(got[43074], {"0": ("0x55b5d57778ff9c3d", "->0x1ca4634a1af23592")})
+        self.assertEqual(sorted(got[83454]), ["10", "12", "20"])
+
+    def test_nothing_listed_is_empty_not_unknown(self):                 # control
+        self.assertEqual(procs.parse_lsof_unix(""), {})
+
+    def test_a_line_out_of_place_is_unknown(self):
+        for bad in ("f0\nd0x1\n", "p12\nd0x1\n", "px\nf0\n", "p12\nf0\nzjunk\n"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(procs.parse_lsof_unix(bad))
+
+    def test_stdin_from_the_claude_is_proven(self):
+        self.assertTrue(procs.stdin_from(procs.parse_lsof_unix(self.LSOF), 43074, 83454))
+
+    def test_stdin_from_anyone_else_is_not(self):                        # control
+        unix = procs.parse_lsof_unix(self.LSOF.replace("n->0x1ca4634a1af23592",
+                                                       "n->0x0000000000000001"))
+        self.assertFalse(procs.stdin_from(unix, 43074, 83454))
+        self.assertFalse(procs.stdin_from(procs.parse_lsof_unix(self.LSOF), 43074, 555))
+        self.assertFalse(procs.stdin_from({}, 43074, 83454))
+        self.assertFalse(procs.stdin_from(None, 43074, 83454))
+
+    def test_another_fd_on_that_socket_is_not_stdin(self):               # control
+        unix = procs.parse_lsof_unix(self.LSOF.replace("p43074\nf0\n", "p43074\nf3\n"))
+        self.assertFalse(procs.stdin_from(unix, 43074, 83454))
+
+
 class TestHelpers(unittest.TestCase):
     """A helper (an MCP server, the npm proxy) is hidden from rows. A dev server
     that happens to run from the npx cache or a folder named *-mcp* is not one."""

@@ -52,7 +52,8 @@ class MachinelessCollect(unittest.TestCase):
 
     def setUp(self):
         self._saved = (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
-                       ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports)
+                       ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports,
+                       ccwho.stdin_sockets)
         ccwho.ps_snapshot = lambda: ""
         ccwho.tty_snapshot = lambda: ""
         ccwho.titles_snapshot = lambda timeout=5.0: {}
@@ -61,10 +62,12 @@ class MachinelessCollect(unittest.TestCase):
         ccwho.live_file_sessions = lambda *a, **k: ([], 0)
         ccwho.ps_table = lambda: {}
         ccwho.listen_ports = lambda: {}
+        ccwho.stdin_sockets = lambda pids: {}
 
     def tearDown(self):
         (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
-         ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports) = self._saved
+         ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports,
+         ccwho.stdin_sockets) = self._saved
 
 
 class TestParseSessions(unittest.TestCase):
@@ -828,6 +831,36 @@ class TestStuckOnALoopThatCannotEnd(unittest.TestCase):
         tail = [self._said("Want me to run the full gate?")] + self.END
         self.assertEqual(self._stuck(tail)["dead_loops"], [self.LOOP])
 
+    # 2026-09-27: a task that cannot end needs a person whatever the feed says
+    # between turns - `idle` or `waiting` at the prompt as much as `busy`
+    def _as(self, status, tail, dead=None):
+        return ccwho.build_row(dict(self.SESSION, status=status), [], tail, mtime=0,
+                               now=1790267620.0, work=2,
+                               dead_loops=[self.LOOP] if dead is None else dead)
+
+    def test_idle_with_a_dead_wait_is_stuck(self):
+        tail = [self._said("Started the runs in the background.")] + self.END
+        self.assertEqual(self._as("idle", tail)["attention"], "stuck")
+        self.assertEqual(self._as("idle", tail, dead=[])["attention"], "running")  # control
+
+    def test_at_the_prompt_with_a_dead_wait_is_stuck(self):
+        tail = [self._said("Started the runs in the background.")] + self.END
+        self.assertEqual(self._as("waiting", tail)["attention"], "stuck")
+        self.assertEqual(self._as("waiting", tail, dead=[])["attention"], "running")  # control
+
+    def test_mid_turn_a_dead_reader_is_busy_and_not_offered(self):         # control
+        # a foreground heredoc `cat`: the tool timeout ends it; the agent is at work
+        reader = {"pid": 54329, "tasks": [], "kind": "reader", "program": "cat", "root": 1}
+        row = self._as("busy", [self._said("Checking.")], dead=[reader])
+        self.assertEqual(row["attention"], "busy")
+        self.assertFalse(ccwho.loop_kill_offered(row))
+
+    def test_a_question_outranks_a_dead_wait_in_every_state(self):          # control
+        tail = [self._said("Want me to run the full gate?")] + self.END
+        for status in ("idle", "waiting", "busy"):
+            with self.subTest(status=status):
+                self.assertEqual(self._as(status, tail)["attention"], "asks")
+
 
 class TestStuckOnScreen(unittest.TestCase):
     """STUCK is its own group, after NEEDS YOU: the session needs you - to kill
@@ -1023,6 +1056,27 @@ class TestTheDetailIsOneClickAway(unittest.TestCase):
         self.assertIsNone(ccwho.ui_action_at(row, 100, 1, 30))
 
 
+class TestTheRowSaysWhatIsStuck(unittest.TestCase):
+    """The second line says what cannot end, before anything else: a loop on a
+    finished task, or a reader waiting for input Claude Code never sends."""
+    READER = {"pid": 54329, "kind": "reader", "program": "cat", "root": 86083}
+    LOOP = {"pid": 86246, "tasks": ["bscl8fc6k"]}
+
+    def second(self, dead, width=160):
+        row = {"sessionId": "s", "attention": "stuck", "title": "t", "recap": "r",
+               "dead_loops": dead}
+        return "".join(t for t, _ in ccwho.ui_row_cells(row, width=width)[1])
+
+    def test_a_reader_says_what_it_waits_for(self):
+        self.assertIn("cat 54329 waits for input Claude Code never sends", self.second([self.READER]))
+
+    def test_a_loop_still_says_its_task(self):                              # control
+        self.assertIn("loop 86246 waits on bscl8fc6k, which has ended", self.second([self.LOOP]))
+
+    def test_both_count_as_more(self):
+        self.assertIn("(+1 more)", self.second([self.READER, self.LOOP]))
+
+
 class TestKillDeadLoops(unittest.TestCase):
     """The kill looks again first. Between the scan and the key press a loop can
     end, and its pid can go to something else: only a pid that is STILL a dead
@@ -1082,6 +1136,310 @@ class TestKillDeadLoops(unittest.TestCase):
                                     matches=lambda argv, files: False)
         self.assertEqual(got, [])
 
+
+class TestFindDeadReaders(unittest.TestCase):
+    """A `cat` with no file in a tool shell whose stdin is Claude Code's socket
+    waits forever (2026-09-26: 20 hours, in a heredoc command moved to the
+    background). Found in the session's own tree, proven by its fd 0."""
+    # the tree measured on 2026-09-26, commands shortened
+    START = "Sat Sep 26 15:12:13 2026"          # lstart, C locale, UTC
+    NOW = 1790435533.0 + 3600                   # an hour later
+    TOOL = "/bin/zsh -c source /Users/u/.claude/shell-snapshots/s.sh && eval 'x'"
+
+    def ptable(self, reader="cat", ppid=54328, start=START):
+        return {82755: (1, self.START, "claude --resume e78b"),
+                86083: (82755, self.START, self.TOOL), 54328: (86083, self.START, self.TOOL),
+                54329: (ppid, start, reader), 54330: (54328, self.START, "tr \\n ;"),
+                54331: (54328, self.START, "cut -c1-300")}
+
+    def unix(self, peer="0x4283419ab8f9493c", seen=None):
+        def read(pids):
+            if seen is not None:
+                seen.append(sorted(pids))
+            return {82755: {"16": ("0x4283419ab8f9493c", "->0xbbb423ce77188bdd")},
+                    54329: {"0": ("0xbbb423ce77188bdd", "->" + peer)}}
+        return read
+
+    def find(self, ptable=None, unix=None, now=NOW, **kw):
+        return ccwho.find_dead_readers(82755, ptable or self.ptable(), unix=unix or self.unix(),
+                                       now=now, **kw)
+
+    def test_the_20_hour_cat_is_found(self):
+        # `tasks` too: a script reads every entry of dead_loops the same way;
+        # `start`, so the kill knows it is still the cat you saw
+        self.assertEqual(self.find(), [{"pid": 54329, "tasks": [], "kind": "reader",
+                                        "program": "cat", "root": 86083,
+                                        "start": self.START}])
+
+    def test_under_an_mcp_server_it_is_not_dead(self):
+        # an MCP server is the claude's child too, its stdin a claude socket
+        # Claude Code DOES write to: a `cat` there carries the JSON-RPC
+        t = self.ptable()
+        t[86083] = (82755, self.START, "npm exec chrome-devtools-mcp@latest")
+        self.assertEqual(self.find(t), [])
+
+    def test_below_an_agent_it_is_not_this_sessions_reader(self):
+        # a `claude -p` in the tool shell passes the socket on to its own work
+        t = self.ptable()
+        t[54340] = (54328, self.START, "claude -p hi")
+        t[54329] = (54340, self.START, "cat")
+        self.assertEqual(self.find(t), [])
+
+    def test_under_any_other_child_of_the_claude_it_is_not_judged(self):   # control
+        t = self.ptable()
+        t[86083] = (82755, self.START, "/bin/sh -c cat | docker run -i srv")
+        self.assertEqual(self.find(t), [])
+
+    def test_lsof_failing_keeps_what_was_proven(self):
+        # a new candidate and an lsof that fails: the cat proven before stays
+        cache = {}
+        self.find(cache=cache)
+        t = self.ptable()
+        t[54340] = (54328, self.START, "cat")
+        self.assertEqual([d["pid"] for d in self.find(t, unix=lambda pids: None, cache=cache)],
+                         [54329])
+
+    def test_its_stdin_from_anyone_else_is_not_dead(self):                  # control
+        self.assertEqual(self.find(unix=self.unix(peer="0x1")), [])
+
+    def test_a_reader_younger_than_the_grace_is_not_judged(self):           # control
+        self.assertEqual(self.find(now=1790435533.0 + 60), [])
+
+    def test_an_unreadable_start_is_not_judged(self):                       # control
+        self.assertEqual(self.find(self.ptable(start="")), [])
+
+    def test_with_no_grace_its_age_is_not_asked(self):
+        # the kill looks again on a ps with no start times: the list already
+        # waited out the grace, and the proof is its fd 0
+        self.assertEqual([d["pid"] for d in self.find(self.ptable(start=""), grace=0)], [54329])
+
+    def test_a_file_to_read_is_not_a_dead_reader(self):                     # control
+        self.assertEqual(self.find(self.ptable(reader="cat notes.md")), [])
+
+    def test_another_sessions_reader_is_not_this_ones(self):               # control
+        t = self.ptable()
+        t[54329] = (999, self.START, "cat")
+        self.assertEqual(self.find(t), [])
+
+    def test_lsof_is_asked_only_about_candidates(self):
+        seen = []
+        self.find(unix=self.unix(seen=seen))
+        # tr and cut read stdin too - from the pipe, so they are not found
+        self.assertEqual(seen, [[54329, 54330, 54331, 82755]])
+        seen.clear()
+        t = self.ptable(reader="sleep 100")
+        t[54330] = t[54331] = (54328, self.START, "cargo test")
+        self.find(t, unix=self.unix(seen=seen))
+        self.assertEqual(seen, [], "no candidate, no lsof")
+
+    def test_the_real_lsof_path_runs(self):
+        # every test above injects `unix`: this one takes the default, which
+        # once was shadowed by another function of the same name (TypeError)
+        t = {99999990: (1, self.START, "claude"), 99999991: (99999990, self.START, "cat")}
+        self.assertEqual(ccwho.find_dead_readers(99999990, t, now=self.NOW), [])
+
+    def test_lsof_unknown_finds_nothing(self):                             # control
+        self.assertEqual(self.find(unix=lambda pids: None), [])
+
+    def test_a_verdict_is_asked_once(self):
+        # the fd 0 of a running cat does not change: not asked on every scan
+        seen, cache = [], {}
+        self.find(unix=self.unix(seen=seen), cache=cache)
+        again = self.find(unix=self.unix(seen=seen), cache=cache)
+        self.assertEqual((len(seen), again[0]["pid"]), (1, 54329))
+
+
+class FakeKernel:
+    """What `kill` does to a task, as the kernel does it. A process that got
+    its TERM is gone, and its children go to launchd. A shell whose child dies
+    while the shell still runs goes on to its next command: a new pid - the way
+    a task outlives a leaves-first kill. `ps` answers from what is alive now."""
+
+    def __init__(self, table, shells):
+        self.table = dict(table)            # pid -> (ppid, start, cmd), alive
+        self.shells = set(shells)
+        self.sent, self.tried, self.forked, self.next = [], [], [], 70000
+
+    def kill(self, pid, sig):
+        self.tried.append(pid)              # every attempt, the failed ones too
+        if pid not in self.table:
+            raise ProcessLookupError
+        self.sent.append((pid, sig))
+        ppid = self.table.pop(pid)[0]
+        for c, (pp, st, cmd) in list(self.table.items()):
+            if pp == pid:
+                self.table[c] = (1, st, cmd)
+        if ppid in self.shells and ppid in self.table:
+            self.next += 1
+            self.table[self.next] = (ppid, "Sun Sep 27 12:00:00 2026", "rm -r x/")
+            self.forked.append(self.next)
+
+    def ps(self):
+        return "".join(f"{p} {pp} {cmd}\n" for p, (pp, _s, cmd) in sorted(self.table.items()))
+
+    def starts(self):
+        return {p: (st, cmd.split()[0]) for p, (_pp, st, cmd) in self.table.items()}
+
+
+class TestKillDeadReaders(unittest.TestCase):
+    """`x` on a dead reader stops its whole task - the tool shell under the
+    claude and all below it - as a person did by hand on 2026-09-27. Looked
+    for again first: only a reader still proven dead, still the one listed."""
+    TOOL = TestFindDeadReaders.TOOL
+    START = TestFindDeadReaders.START
+
+    def machine(self, extra=()):
+        t = {82755: (1, self.START, "claude --resume e78b"),
+             86083: (82755, self.START, self.TOOL), 54328: (86083, self.START, self.TOOL),
+             54329: (54328, self.START, "cat"), 54330: (54328, self.START, "tr \\n ;"),
+             54331: (54328, self.START, "cut -c1-300"),
+             90000: (82755, self.START, self.TOOL), 90001: (90000, self.START, "cargo test")}
+        t.update(dict(extra))
+        return FakeKernel(t, shells={86083, 54328, 90000})
+
+    def unix(self, peer="0xa"):
+        return lambda pids: {82755: {"16": ("0xa", "->0xb")}, 54329: {"0": ("0xb", "->" + peer)}}
+
+    def _kill(self, k=None, peer="0xa", own=None, pids=(54329,), started=None, report=None):
+        k = k or self.machine()
+        got = ccwho.kill_dead_loops(82755, list(pids), ps=k.ps, kill=k.kill, starts=k.starts,
+                                    unix=self.unix(peer), own=own, report=report,
+                                    started={54329: self.START} if started is None else started,
+                                    read=lambda path: None, matches=lambda a, f: False)
+        return got, k
+
+    TASK = {86083, 54328, 54329, 54330, 54331}
+
+    def test_the_whole_task_is_gone(self):
+        got, k = self._kill()
+        self.assertEqual(got, [54329])
+        self.assertFalse(self.TASK & set(k.table), "nothing of the task still runs")
+
+    def test_the_shell_never_goes_on_to_its_next_command(self):
+        # leaves first, cat's death let zsh run the next line - a process the
+        # kill never saw, left running under launchd (review 1, finding 2)
+        _, k = self._kill()
+        self.assertEqual(k.forked, [])
+        self.assertTrue(all(sig == ccwho.signal.SIGTERM for _, sig in k.sent))
+
+    def test_nothing_outside_the_task(self):                                # control
+        _, k = self._kill()
+        self.assertFalse({82755, 90000, 90001} & {p for p, _ in k.sent})
+
+    def test_a_reader_no_longer_proven_is_left_alone(self):                 # control
+        got, k = self._kill(peer="0x1")
+        self.assertEqual((got, k.sent), ([], []))
+
+    def test_only_what_was_asked(self):                                     # control
+        got, k = self._kill(pids=(90001,))
+        self.assertEqual((got, k.sent), ([], []))
+
+    def test_a_reused_pid_is_left_alone(self):
+        # the listed cat ended; a new cat got its pid: not the one you saw
+        got, k = self._kill(started={54329: "Sun Sep 27 09:00:00 2026"})
+        self.assertEqual((got, k.sent), ([], []))
+
+    def test_ccwho_and_what_runs_it_are_never_signalled(self):
+        # ccwho started inside that very task: its shells are not stopped under it
+        _, k = self._kill(own=54331)
+        self.assertFalse({54331, 54328, 86083} & {p for p, _ in k.sent})
+
+    def test_an_agent_in_the_task_is_spared_with_its_tree(self):
+        # a claude the task started is a session of its own - a hard guard;
+        # the one under it is its business, not named again
+        k = self.machine({54332: (54328, self.START, "claude -p hi"),
+                          54333: (54332, self.START, "codex exec x"),
+                          54334: (54333, self.START, "node x.js")})
+        report = {}
+        got, k = self._kill(k, report=report)
+        self.assertEqual(got, [54329])
+        self.assertFalse({54332, 54333, 54334} & {p for p, _ in k.sent})
+        self.assertEqual(report.get("spared"), [54332])
+
+    def test_a_reader_under_an_agent_is_not_reported_stopped(self):
+        # `claude -p` in the task passes the socket on: its cat is spared, so
+        # it must never be said to be stopped (round 2, M1)
+        k = self.machine({54332: (54328, self.START, "claude -p hi"),
+                          54335: (54332, self.START, "cat")})
+        got = ccwho.kill_dead_loops(
+            82755, [54335], ps=k.ps, kill=k.kill, starts=k.starts, started={54335: self.START},
+            unix=lambda pids: {82755: {"16": ("0xa", "->0xb")}, 54335: {"0": ("0xb", "->0xa")}},
+            read=lambda path: None, matches=lambda a, f: False)
+        self.assertEqual(got, [])
+        self.assertNotIn(54335, {p for p, _ in k.sent})
+
+    def test_a_reader_that_ended_first_is_not_said_stopped(self):
+        # it exited between the look and the signal: its task still goes, but
+        # "stopped the task of cat" would be about a cat nobody stopped
+        k = self.machine()
+        real = k.kill
+
+        def kill(pid, sig):
+            if pid == 54329:
+                k.table.pop(54329, None)
+                raise ProcessLookupError
+            real(pid, sig)
+        got = ccwho.kill_dead_loops(82755, [54329], ps=k.ps, kill=kill, starts=k.starts,
+                                    unix=self.unix(), started={54329: self.START},
+                                    read=lambda path: None, matches=lambda a, f: False)
+        self.assertEqual(got, [])
+        self.assertIn(86083, {p for p, _ in k.sent})                        # control
+
+    def test_two_readers_in_one_task_are_both_stopped_once(self):
+        # `cat | cut` with both on the socket: one task, one pass (round 2, M2)
+        k = self.machine({54336: (54328, self.START, "cut -c1-9")})
+        report = {}
+        got = ccwho.kill_dead_loops(
+            82755, [54329, 54336], ps=k.ps, kill=k.kill, starts=k.starts, report=report,
+            unix=lambda pids: {82755: {"16": ("0xa", "->0xb")},
+                               54329: {"0": ("0xb", "->0xa")}, 54336: {"0": ("0xb", "->0xa")}},
+            started={54329: self.START, 54336: self.START},
+            read=lambda path: None, matches=lambda a, f: False)
+        self.assertEqual(sorted(got), [54329, 54336])
+        self.assertEqual(len(k.tried), len(set(k.tried)), "each pid tried once")
+        self.assertEqual(report.get("spared", []), [])
+
+    def test_in_one_task_only_the_listed_reader_is_said_stopped(self):
+        # the cut's pid went to a new cut since the list: the task still goes
+        # for the cat you saw, but the new cut is not "the one you stopped"
+        k = self.machine({54336: (54328, "Sun Sep 27 09:00:00 2026", "cut -c1-9")})
+        got = ccwho.kill_dead_loops(
+            82755, [54329, 54336], ps=k.ps, kill=k.kill, starts=k.starts,
+            unix=lambda pids: {82755: {"16": ("0xa", "->0xb")},
+                               54329: {"0": ("0xb", "->0xa")}, 54336: {"0": ("0xb", "->0xa")}},
+            started={54329: self.START, 54336: self.START},
+            read=lambda path: None, matches=lambda a, f: False)
+        self.assertEqual(got, [54329])
+        self.assertTrue({54329, 54336, 86083} <= {p for p, _ in k.sent})   # control
+
+    def test_a_loop_in_the_readers_task_lets_nothing_fork(self):
+        # the loop killed first let its shell run the next line (round 3, #3)
+        loop = ("until grep -q 'Test Files' /private/tmp/claude-501/p/s/tasks/b1.output; "
+                "do sleep 5; done")
+        k = self.machine({54337: (54328, self.START, loop)})
+        got = ccwho.kill_dead_loops(
+            82755, [54329, 54337], ps=k.ps, kill=k.kill, starts=k.starts, unix=self.unix(),
+            started={54329: self.START}, read=lambda path: ("x\n[exited with code 0]\n", 600),
+            matches=lambda a, f: False)
+        self.assertEqual(sorted(got), [54329, 54337])
+        self.assertEqual(k.forked, [])
+        self.assertEqual(len(k.tried), len(set(k.tried)), "each pid tried once")
+
+    def test_without_the_listed_starts_no_reader_is_signalled(self):
+        # the start check fails closed: no caller may skip it by leaving it out
+        k = self.machine()
+        got = ccwho.kill_dead_loops(82755, [54329], ps=k.ps, kill=k.kill, starts=k.starts,
+                                    unix=self.unix(), read=lambda path: None,
+                                    matches=lambda a, f: False)
+        self.assertEqual((got, k.sent), ([], []))
+        self.assertEqual(self._kill(started={})[0], [])
+
+    def test_under_an_mcp_server_nothing_is_signalled(self):
+        # an MCP server's stdin is a claude socket too - a LIVE one (review 1, #1)
+        k = self.machine()
+        k.table[86083] = (82755, self.START, "npm exec some-mcp")
+        got, k = self._kill(k)
+        self.assertEqual((got, k.sent), ([], []))
 
 class TestTaskFile(unittest.TestCase):
     """The two facts the dead-loop rule needs about a task output: how it ends,
@@ -5045,6 +5403,30 @@ class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
         self.assertEqual(fleet["unknown_ports"], [8080])
         # named, so a person sees who holds it without a guess in the exit code
         self.assertEqual(fleet["unknown_holders"], {8080: [{"pid": 40, "name": "python3"}]})
+
+    def test_a_dead_reader_makes_the_row_stuck(self):
+        # the 2026-09-26 shape: a heredoc command's `cat` reads the claude's socket
+        ccwho.ps_snapshot = lambda: self.PS + (
+            "  50    10 /bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'x'\n"
+            "  51    50 cat\n")
+        ccwho.ps_table = lambda: {pid: (START, "claude" if pid == 10 else "node")
+                                  for pid in (10, 11, 12, 13, 20, 30, 40, 41, 50, 51)}
+        ccwho.stdin_sockets = lambda pids: {10: {"16": ("0xa", "->0xb")},
+                                           51: {"0": ("0xb", "->0xa")}}
+        rows, _ = self.collect()
+        self.assertEqual(rows[0]["dead_loops"], [{"pid": 51, "tasks": [], "kind": "reader",
+                                                  "program": "cat", "root": 50,
+                                                  "start": START}])
+        self.assertEqual(rows[0]["attention"], "stuck")
+
+    def test_a_reader_on_a_pipe_leaves_the_row_alone(self):                # control
+        ccwho.ps_snapshot = lambda: self.PS + "  50    10 /bin/zsh -c x\n  51    50 cat\n"
+        ccwho.ps_table = lambda: {pid: (START, "claude" if pid == 10 else "node")
+                                  for pid in (10, 11, 12, 13, 20, 30, 40, 41, 50, 51)}
+        ccwho.stdin_sockets = lambda pids: {10: {"16": ("0xa", "->0xb")},
+                                           51: {"0": ("0xc", "->0xd")}}
+        rows, _ = self.collect()
+        self.assertEqual((rows[0]["dead_loops"], rows[0]["attention"]), ([], "running"))
 
     def test_a_holder_the_tree_gives_a_session_is_not_unknown(self):
         # `/usr/bin/nc -l 8081` in a tool shell: unread, and still the session's

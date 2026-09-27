@@ -13,6 +13,7 @@ that makes the new field legal; nothing enforces the meaning but this comment.
 Stdlib only: python3 -m unittest -v
 """
 import json
+import os
 import unittest
 
 import ccwho_engine as ccwho
@@ -29,6 +30,8 @@ ROW_KEYS = {
     "configDir",          # added 2026-09-24: set for a session in another config dir
     "procs", "ports",     # added 2026-09-24: the session's work processes, their ports
     "dead_loops",         # added 2026-09-24: its wait loops that can never end
+                          # 2026-09-27: and its stdin readers - each still has
+                          # pid and tasks; a reader adds kind, program and root
     "entrypoint",         # added 2026-09-26: who started it - cli, or a program (sdk-*)
     "parked",             # added 2026-09-26: ids of terminals that parked this job
                           # (ctrl+b) - they show it, and have no row of their own
@@ -102,3 +105,26 @@ class TestManifestShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNoNameIsDefinedTwice(unittest.TestCase):
+    """A second top-level `def` of the same name replaces the first without a
+    word. 2026-09-27: a new `unix_sockets(pids)` was shadowed by the netstat
+    `unix_sockets()` further down - every test injected a fake, so only the
+    live list raised TypeError."""
+
+    def test_each_module_defines_each_name_once(self):
+        import ast
+        import collections
+        import glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        files = sorted(glob.glob(os.path.join(here, "ccwho*.py"))) + [os.path.join(here, "ccwho")]
+        self.assertGreater(len(files), 5, "the modules were not found")
+        for path in files:
+            with open(path) as f:
+                tree = ast.parse(f.read())
+            names = collections.Counter(
+                n.name for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+            with self.subTest(module=os.path.basename(path)):
+                self.assertEqual({k: v for k, v in names.items() if v > 1}, {})

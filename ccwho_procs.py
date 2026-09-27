@@ -948,6 +948,69 @@ def cannot_end(files, grace):
     return all(_TASK_END.search(tail or "") and age >= grace for tail, age in files)
 
 
+# ------------------------------------------------ a reader that cannot end
+
+# Programs that read standard input when the command gives them no file. `tr`
+# never takes a file; the rest do, so each of their words must be a flag (a
+# value on its own - `head -n 5` - looks like a file, and is not judged)
+_ALWAYS_STDIN = {"tr"}
+_STDIN_WITHOUT_FILES = {"cat", "cut", "head", "tail", "wc", "sort", "uniq"}
+
+
+def stdin_reader(cmd):
+    """Does `cmd` read its standard input - no file to read instead? Only the
+    programs named above; anything else, or a line that does not split, is no."""
+    try:
+        words = shlex.split(cmd or "")
+    except ValueError:
+        return False
+    if not words:
+        return False
+    program = words[0].rsplit("/", 1)[-1]
+    if program in _ALWAYS_STDIN:
+        return True
+    return program in _STDIN_WITHOUT_FILES and all(w.startswith("-") for w in words[1:])
+
+
+# The Bash tool's own shell (measured 2026-09-27): the user's shell, sourcing
+# Claude Code's snapshot of it before the command. Not an MCP server, a hook or
+# the status line - claude's other children, whose stdin it does write to
+_TOOL_SHELL = re.compile(r"^(?:\S*/)?(?:zsh|bash|sh)\s+-c\s+(?:-\w+\s+)*source\s+"
+                         r"\S*/shell-snapshots/\S+")
+
+
+def is_tool_shell(cmd):
+    return bool(_TOOL_SHELL.match(cmd or ""))
+
+
+def parse_lsof_unix(text):
+    """`lsof -a -U -p PIDS -F pfdn`: pid -> {fd: (socket, "->peer" or a path)}.
+    Nothing listed is {}; a line out of place is None - unknown, not "none"."""
+    out, pid, fd = {}, None, None
+    for line in (text or "").splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p" and value.isdigit():
+            pid, fd = int(value), None
+            out.setdefault(pid, {})
+        elif tag == "f" and pid is not None:
+            fd = value
+            out[pid][fd] = ("", "")
+        elif tag in ("d", "n") and fd is not None:
+            dev, name = out[pid][fd]
+            out[pid][fd] = (value, name) if tag == "d" else (dev, value)
+        else:
+            return None
+    return out
+
+
+def stdin_from(unix, pid, claude):
+    """Is `pid`'s fd 0 a socket whose other end `claude` holds? From
+    parse_lsof_unix's answer; unknown is no."""
+    peer = ((unix or {}).get(pid) or {}).get("0", ("", ""))[1]
+    return peer.startswith("->") and any(
+        dev == peer[2:] for dev, _name in ((unix or {}).get(claude) or {}).values())
+
+
 def row_summary(mine):
     """What a live row says about its processes: work only, helpers left out."""
     work = [p for p in mine or [] if not p.get("helper")]

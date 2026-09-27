@@ -3164,7 +3164,7 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
         real = ui.engine.kill_dead_loops
         asked = []
 
-        def fake(session_pid, pids):
+        def fake(session_pid, pids, **_):
             asked.append((session_pid, pids))
             return killed
         ui.engine.kill_dead_loops = fake
@@ -3182,6 +3182,24 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
     def test_nothing_killed_says_so(self):                               # control
         _, said = self.kill([])
         self.assertNotIn("killed loop", said)
+
+    def test_a_readers_task_says_it_was_stopped(self):
+        row = dict(STUCK, dead_loops=[{"pid": 54329, "kind": "reader", "program": "cat",
+                                       "root": 86083, "start": "Sat Sep 26 15:12:13 2026"}])
+        real, asked = ui.engine.kill_dead_loops, []
+
+        def fake(session_pid, pids, started=None, report=None):
+            asked.append(started)
+            report["spared"] = [54332]
+            return [54329]
+        ui.engine.kill_dead_loops = fake
+        try:
+            said = ui.Collector().kill_loops(row)
+        finally:
+            ui.engine.kill_dead_loops = real
+        # the start it was listed with: a new cat on that pid is not killed
+        self.assertEqual(asked, [{54329: "Sat Sep 26 15:12:13 2026"}])
+        self.assertEqual(said, "stopped the task of cat 54329; spared the agent 54332")
 
 
 class TestTheProcessScreenVerify(UiTest):

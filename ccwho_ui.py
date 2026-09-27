@@ -1880,13 +1880,25 @@ class Collector:
 
     def kill_loops(self, row):
         pids = [d["pid"] for d in row.get("dead_loops") or []]
+        readers = {d["pid"]: d for d in row.get("dead_loops") or []
+                   if d.get("kind") == "reader"}
+        report = {}
         try:
-            killed = engine.kill_dead_loops(row.get("pid"), pids)
+            # a reader is killed only while it has the start it was listed with
+            killed = engine.kill_dead_loops(
+                row.get("pid"), pids, started={p: d.get("start") for p, d in readers.items()},
+                report=report)
         except Exception as ex:
             return f"could not kill: {ex}"
         if not killed:
             return "nothing killed: no loop there is stuck any more"
-        return "killed loop " + ", ".join(str(p) for p in killed)
+        said = [f"stopped the task of {readers[p].get('program')} {p}"
+                for p in killed if p in readers]
+        loops = [str(p) for p in killed if p not in readers]
+        if loops:
+            said.insert(0, "killed loop " + ", ".join(loops))
+        said += [f"spared the agent {p}" for p in report.get("spared") or []]
+        return "; ".join(said)
 
     def brief(self, row):
         head, tail, _ = engine.read_windows(row.get("sessionId", ""), cache=self.cache)

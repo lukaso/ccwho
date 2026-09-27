@@ -14,6 +14,7 @@ Reads only what Claude Code already writes to disk. No daemon, no hooks, no tmux
 """
 from __future__ import annotations
 
+import calendar
 import glob
 import json
 import os
@@ -535,26 +536,164 @@ def find_dead_loops(pid, ptable, read=task_file, grace=DEAD_LOOP_GRACE,
 
 
 def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
-                    matches=None):
-    """SIGTERM each of `pids` that is STILL a dead loop of that session.
+                    matches=None, unix=None, own=None, started=None, starts=None,
+                    report=None):
+    """SIGTERM each of `pids` that is STILL a dead loop of that session - and
+    for a dead reader, its whole task: the tool shell under the claude and all
+    below it, parents first. Never ccwho (`own`) or what runs it, and never an
+    agent the task started, nor anything under one: those go to report["spared"].
 
     Looked for again, not taken from the last scan: by the time you press the
-    key the loop may have ended and its pid gone to something else. Returns the
-    pids that got the signal.
+    key the loop may have ended and its pid gone to something else. A reader
+    must still have the start it was listed with (`started`, pid -> lstart).
+    Returns the pids of `pids` that got the signal, or whose task did.
     """
-    ptable = {int(pid): (ppid, "", cmd) for pid, ppid, cmd in
-              _ps_rows((ps or ps_snapshot)()) if pid.isdigit()}
+    rows = [(int(pid), ppid, cmd) for pid, ppid, cmd in _ps_rows((ps or ps_snapshot)())
+            if pid.isdigit()]
+    ptable = {pid: (ppid, "", cmd) for pid, ppid, cmd in rows}
     wanted = set(pids or ())
-    killed = []
-    for d in find_dead_loops(session_pid, ptable, read, matches=matches):
-        if d["pid"] not in wanted:
+    send = kill or os.kill
+    killed, hit = [], set()
+    # both looked for on the one snapshot, before anything is signalled
+    loops = [d["pid"] for d in find_dead_loops(session_pid, ptable, read, matches=matches)
+             if d["pid"] in wanted]
+    readers = [d for d in find_dead_readers(session_pid, ptable, unix=unix, grace=0)
+               if d["pid"] in wanted]
+    if readers:
+        killed = _stop_reader_tasks(session_pid, readers, rows, send, own, started,
+                                    starts, report, hit)
+    # a reader's task first: a loop killed alone lets its shell run on, and a
+    # loop in a task already stopped got its TERM there
+    for pid in loops:
+        if pid in hit:
+            killed.append(pid)
             continue
         try:
-            (kill or os.kill)(d["pid"], signal.SIGTERM)
+            send(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             continue
-        killed.append(d["pid"])
+        killed.append(pid)
     return killed
+
+
+def _stop_reader_tasks(session_pid, readers, rows, send, own, started, starts, report, hit):
+    """kill_dead_loops' part for readers: each listed reader's whole task,
+    once, parents first. Every pid signalled goes into `hit`."""
+    killed = []
+    begun = (starts or ps_table)()
+    ptable = {pid: (ppid, (begun.get(pid) or ("",))[0], cmd) for pid, ppid, cmd in rows}
+    own = os.getpid() if own is None else own
+    spared = {own, *procs._ancestors(ptable, own)}
+    kids = {}
+    for cpid, (ppid, _start, _cmd) in ptable.items():
+        kids.setdefault(ppid, []).append(cpid)
+
+    def below(root):
+        out, stack = set(), [root]
+        while stack:
+            p = stack.pop()
+            if p not in out:
+                out.add(p)
+                stack += kids.get(p, [])
+        return out
+    # the start each was listed with, or nothing: a reader is killed only as
+    # the one you saw
+    by_root = {}
+    for d in readers:
+        if (started or {}).get(d["pid"]) == ptable[d["pid"]][1] != "":
+            by_root.setdefault(d["root"], []).append(d["pid"])
+    for root, wanted_here in sorted(by_root.items()):
+        task = below(root)
+        # a claude or codex the task started is a session of its own
+        agents = sorted(p for p in task if procs._is_an_agent(ptable[p][2]))
+        out = set().union(*(below(a) for a in agents)) if agents else set()
+        if report is not None:
+            report.setdefault("spared", []).extend(
+                a for a in agents if not any(b in agents for b in procs._ancestors(ptable, a)))
+        # parents first: a shell whose child dies while it runs goes on to its
+        # next command - one this list never saw. Its parent gone, it cannot.
+        # A script that traps TERM, or what forks after the snapshot, is not
+        # reached: no process-group kill, which would reach the spared too
+        for p in reversed(procs.leaves_first(sorted(task - spared - out), ptable)):
+            try:
+                send(p, signal.SIGTERM)
+                hit.add(p)
+            except (ProcessLookupError, PermissionError):
+                continue
+        killed += [p for p in wanted_here if p in hit]
+    return killed
+
+
+def stdin_sockets(pids):
+    """parse_lsof_unix for `pids`, or None when lsof could not say."""
+    text = _lsof(["-nP", "-a", "-U", "-p", ",".join(str(p) for p in pids), "-F", "pfdn"])
+    return None if text is None else procs.parse_lsof_unix(text)
+
+
+def _started(start):
+    """Seconds since the epoch of a `ps -o lstart` text (C locale, UTC), or None."""
+    try:
+        return calendar.timegm(time.strptime(start or "", "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
+
+
+_READER_KEEP = 256
+
+
+def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, cache=None):
+    """A session's readers that cannot end: [{"pid", "tasks", "kind", "program",
+    "root", "start"}] - `tasks` empty, there for a script reading dead_loops as
+    loops; `start` so a kill knows it is still the reader that was listed.
+
+    A program reading its stdin (procs.stdin_reader) in the session's own tree,
+    whose fd 0 is a socket the session's claude holds. Claude Code never writes
+    to it: a command with a heredoc gets no `< /dev/null`, and a `cat` in one
+    moved to the background waited 20 hours (2026-09-26). `root` is the tool
+    shell under the claude: the task a person stops. Younger than `grace` or of
+    unknown age, it is not judged; lsof is asked only about candidates.
+    """
+    kids = {}
+    for cpid, (ppid, _start, _cmd) in (ptable or {}).items():
+        kids.setdefault(ppid, []).append(cpid)
+    now = time.time() if now is None else now
+    # only in a Bash tool's task: an MCP server's stdin is a claude socket too,
+    # and Claude Code writes to that one
+    found, seen = [], {pid}
+    stack = [(c, c) for c in sorted(kids.get(pid, [])) if procs.is_tool_shell(ptable[c][2])]
+    cands = {}
+    while stack:
+        cpid, root = stack.pop()
+        if cpid in seen:
+            continue
+        seen.add(cpid)
+        _ppid, start, cmd = ptable[cpid]
+        if procs._is_an_agent(cmd):
+            continue            # a claude the task started: its socket, its work
+        stack += [(k, root) for k in sorted(kids.get(cpid, []))]
+        began = _started(start)
+        if procs.stdin_reader(cmd) and (grace <= 0 or began is not None
+                                         and now - began >= grace):
+            cands[cpid] = root
+    if not cands:
+        return []
+    kept = {} if cache is None else cache.setdefault("_readers", {})
+    if len(kept) > _READER_KEEP:
+        kept.clear()
+    # its fd 0 does not change while it runs, nor does the claude's end close
+    # while the reader lives: asked once per (reader, claude)
+    key = {c: (pid, c, ptable[c][1], ptable[c][2]) for c in cands}
+    if any(key[c] not in kept for c in cands):
+        sockets = (unix or stdin_sockets)(sorted(set(cands) | {pid}))
+        # lsof could not say: what was proven before still stands
+        for c in cands if sockets is not None else ():
+            kept[key[c]] = procs.stdin_from(sockets, c, pid)
+    for c in sorted(cands):
+        if kept.get(key[c]):
+            found.append({"pid": c, "tasks": [], "kind": "reader",
+                          "program": ptable[c][2].split()[0].rsplit("/", 1)[-1],
+                          "root": cands[c], "start": ptable[c][1]})
+    return found
 
 
 def work_descendants(ps_output, pid):
@@ -2334,7 +2473,8 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         attention = waiting_kind(tail)
         if attention == "ready":  # not a state of its own
             # not a state of its own: decided like any other non-busy session
-            attention = "asks" if ask else ("running" if work else "stopped")
+            attention = "asks" if ask else ("stuck" if dead_loops else
+                                            "running" if work else "stopped")
     elif status != "busy" and ask:
         attention = "asks"
     elif status == "busy" and turn_ended(tail):
@@ -2347,8 +2487,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     elif status == "busy":
         attention = "busy"
     else:
-        # Not busy and not asking: either it stopped, or it is waiting on work.
-        attention = "running" if work else "stopped"
+        # Not busy and not asking: either it stopped, or it is waiting on work -
+        # work that can never end is stuck, whatever the feed says between turns
+        attention = "stuck" if dead_loops else ("running" if work else "stopped")
     ts = last_turn_ts(tail)
     # Anything that finished a turn you have not looked at since is worth
     # reviewing - that is most of what a session ever asks of you. Looking at it
@@ -2595,7 +2736,8 @@ def collect(cache=None, status=None):
                          commands=commands, session_id=sid)
         mine = att["sessions"].get(sid, [])
         summary = procs.row_summary(mine)
-        dead = find_dead_loops(s.get("pid"), ptable, cache=cache)
+        dead = (find_dead_loops(s.get("pid"), ptable, cache=cache)
+                + find_dead_readers(s.get("pid"), ptable, unix=stdin_sockets, cache=cache))
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(short_tty_full(tty), ""),
@@ -2916,6 +3058,14 @@ def ui_state_style(row):
     return UI_STATE_STYLE.get(row.get("attention", ""), "quiet")
 
 
+def dead_words(d):
+    """What one thing that cannot end is waiting for, in a few words."""
+    if d.get("kind") == "reader":
+        # the program is one of stdin_reader's few names, never free text
+        return f"{d.get('program')} {d.get('pid')} waits for input Claude Code never sends"
+    return f"loop {d.get('pid')} waits on {', '.join(d.get('tasks') or [])}, which has ended"
+
+
 def loop_kill_offered(row):
     """Is a dead loop on this row the list's to kill? Not mid-turn: the agent
     may be about to deal with it - said, not offered. A program's session is
@@ -3021,8 +3171,7 @@ def ui_row_cells(row, width=100, tag=""):
     act = [("  ", "pad"), (UI_KILL, "action")] if loop_kill_offered(row) else []
     if loops:
         more = f" (+{len(loops) - 1} more)" if len(loops) > 1 else ""
-        mark = (f"loop {loops[0]['pid']} waits on {', '.join(loops[0]['tasks'])}, "
-                f"which has ended{more} · ")
+        mark = f"{dead_words(loops[0])}{more} · "
     # in screen cells, as _fit cuts the line: a CJK recap counted in characters
     # ran twice as wide, and the cut dropped the kill at the end of the line
     room = (width - _cells(pad) - sum(_cells(t) for t, _ in act)

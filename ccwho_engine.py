@@ -2856,6 +2856,12 @@ UI_WIDE = 140            # below this, the detail replaces the list instead of
                          # sitting beside it
 
 
+def _oldest_first(ts):
+    """Sort key: a known time, oldest first; no time after every known one."""
+    known = isinstance(ts, (int, float)) and not isinstance(ts, bool)
+    return (not known, ts if known else 0)
+
+
 def ui_groups(rows):
     """Rows under the heading that says what each one needs from you.
 
@@ -2866,7 +2872,15 @@ def ui_groups(rows):
         members = [r for r in rows if r.get("attention") in states]
         # certain first: a question you can see beats one we inferred from the
         # English a session happened to end with
-        members.sort(key=lambda r: _RANK.get(r.get("attention", ""), _UNKNOWN_RANK))
+        if heading == "NEEDS YOU":
+            # then oldest first: you take the top one, so newest-first let every
+            # fresh ask jump the queue and the longest wait was never answered.
+            # No time known waits behind the ones that have one.
+            members.sort(key=lambda r: (
+                _RANK.get(r.get("attention", ""), _UNKNOWN_RANK),
+                _oldest_first(r.get("ts"))))
+        else:
+            members.sort(key=lambda r: _RANK.get(r.get("attention", ""), _UNKNOWN_RANK))
         if members:
             out.append({"heading": heading, "rows": members})
     return out

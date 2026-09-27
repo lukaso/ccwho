@@ -3600,6 +3600,37 @@ class TestTheUrgentOnesComeFirst(unittest.TestCase):
         self.assertNotEqual(ccwho.UI_STATE_STYLE["review"],
                             ccwho.UI_STATE_STYLE["blocked"])
 
+    def test_the_oldest_ask_comes_first(self):
+        # you take the top one: newest-first means a fresh ask always jumps the
+        # queue and the one that has waited longest never gets answered.
+        # collect() hands them over newest first.
+        rows = [{"sessionId": s, "attention": "asks", "ts": ts}
+                for s, ts in (("new", 300), ("mid", 200), ("old", 100))]
+        groups = ccwho.ui_groups(rows)
+        self.assertEqual([r["sessionId"] for r in groups[0]["rows"]],
+                         ["old", "mid", "new"])
+
+    def test_the_urgent_kind_still_comes_before_an_older_ask(self):
+        rows = [{"sessionId": "q", "attention": "blocked", "ts": 300},
+                {"sessionId": "a", "attention": "asks", "ts": 100}]
+        groups = ccwho.ui_groups(rows)
+        self.assertEqual([r["sessionId"] for r in groups[0]["rows"]], ["q", "a"])
+
+    def test_an_ask_with_no_time_waits_behind_the_known_ones(self):
+        rows = [{"sessionId": "none", "attention": "asks", "ts": None},
+                {"sessionId": "new", "attention": "asks", "ts": 300},
+                {"sessionId": "old", "attention": "asks", "ts": 100}]
+        groups = ccwho.ui_groups(rows)
+        self.assertEqual([r["sessionId"] for r in groups[0]["rows"]],
+                         ["old", "new", "none"])
+
+    def test_the_other_groups_keep_newest_first(self):                 # control
+        rows = [{"sessionId": s, "attention": "stopped", "ts": ts}
+                for s, ts in (("new", 300), ("old", 100))]
+        groups = ccwho.ui_groups(rows)
+        self.assertEqual([r["sessionId"] for r in groups[0]["rows"]],
+                         ["new", "old"])
+
     def test_stopped_is_still_its_own_group(self):                    # control
         groups = ccwho.ui_groups(self.rows("stopped", "busy"))
         self.assertEqual([g["heading"].split()[0] for g in groups],

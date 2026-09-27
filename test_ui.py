@@ -3024,7 +3024,9 @@ class TestKillingAStuckLoop(UiTest):
             self.assertIsNone(collector.killed)
 
     async def test_an_arm_ends_when_the_row_becomes_a_program(self):
-        app = self.app(collector=self.collector, adapter=self.adapter)
+        # the row changes in place, so it is a copy: STUCK is shared by every test
+        collector = FakeCollector(fleet=ui.Fleet([LIVE, dict(STUCK)], True, "12:00:00"))
+        app = self.app(collector=collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             await pilot.press("j", "x")

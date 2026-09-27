@@ -1473,6 +1473,228 @@ def build_world(mine=None, readers=None, status=None):
     return world
 
 
+def identity_of(pid):
+    """(start, command) of `pid` in the text ps_world_text gives, or None when
+    no process has that pid (or only a zombie: it has ended). An exec keeps
+    the pid and the start; the command tells it. Raises OSError when ps could
+    not answer: "gone" must be seen, never assumed."""
+    try:
+        done = subprocess.run(["ps", "-o", "stat=,lstart=,command=", "-p", str(pid)],
+                              capture_output=True, text=True, errors="replace", timeout=10,
+                              env=dict(os.environ, LC_ALL="C", TZ="UTC"))
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OSError(f"ps could not be run: {e}") from e
+    f = done.stdout.split()
+    if done.returncode == 1 and not f and not done.stderr.strip():
+        return None                     # ps -p matched no process
+    if done.returncode != 0 or len(f) < 7:
+        raise OSError("ps gave no start and command")
+    return None if f[0].startswith("Z") else (" ".join(f[1:6]), " ".join(f[6:]))
+
+
+KILL_GRACE = 3.0        # seconds a signal gets before what still runs is named
+_UNCHECKED = "could not check it again - not killed"
+_UNREAD = object()
+
+
+def carry_out(mode, target, confirmed, force=False, mine=None, act=None):
+    """Signal what a person confirmed - `confirmed`, the "kill" list of
+    kill_plan(mode, target, world) as shown - and say what happened.
+
+    Before each round of signals the world is read again and planned again
+    with the same target: only what both plans take, unchanged, is signalled
+    (procs.still_to_kill) - every guard runs again. Right before each signal
+    the pid's start, command and mark are read once more against that world
+    (the start again after the mark). Pids only, never a group, never pid 1
+    or ccwho; leaves first; SIGTERM, then what survived KILL_GRACE is named.
+    SIGKILL only with `force`, after a new read, plan and check. Then the ports
+    the signalled processes held are read again.
+
+    Returns {"killed" (seen gone), "survivors" (signalled, still running or
+    not seen gone; "why" when SIGKILL was not sent), "spare" (never
+    signalled, with "why"), "new" (taken by the fresh plan, never confirmed:
+    not signalled), "ports" (lines)} - each confirmed pid in exactly one of
+    the first three - and "why" when it stopped short: the world could not be
+    read whole (nothing signalled), an interrupt, or an error after a signal.
+    `act` replaces the machine (tests): build, plan, identity_of, env, send,
+    sleep, clock, ports."""
+    a = {"build": lambda mine=None, status=None: build_world(mine, status=status),
+         "plan": procs.kill_plan, "identity_of": identity_of, "env": read_procargs,
+         "send": os.kill, "sleep": time.sleep, "clock": time.monotonic, "ports": listen_ports}
+    a.update(act or {})
+    out = {"killed": [], "survivors": [], "spare": [], "new": [], "ports": []}
+
+    def read(entries):
+        """A world read now, and what of `entries` it still takes - or why not."""
+        status = {}
+        w = a["build"](mine=mine, status=status)
+        if status.get("trouble"):
+            return None, None, status["trouble"]
+        return w, procs.still_to_kill(entries, a["plan"](mode, target, w), w["table"]), None
+
+    world, d, trouble = read(confirmed)
+    if trouble:
+        why = f"{trouble} - nothing killed"
+        return dict(out, spare=[dict(e, why=why) for e in confirmed], why=why)
+    out["spare"], out["new"] = list(d["spare"]), d["new"]
+    own = {os.getpid(), world["own"]}
+
+    def identity(pid):
+        try:
+            return a["identity_of"](pid)
+        except OSError:
+            return _UNREAD
+
+    def check(e, w):
+        """Why `e` must not be signalled now, or None."""
+        pid = e["pid"]
+        if pid <= 1 or pid in own:
+            return "ccwho never signals it - not killed"
+        first = identity(pid)
+        if first is None:
+            return procs.EXITED
+        row = w["table"].get(pid)
+        if first is _UNREAD:
+            return _UNCHECKED
+        if row is None or procs.printable(first[0]) != e["start"] or first[0] != row[1]:
+            return procs.OTHER
+        if first[1] != row[2]:
+            return procs.EXECED                  # an exec keeps pid and start: it still runs
+        env = a["env"](pid)
+        mark = procs.mark_of(env) if env is not None else None
+        before = w["marks"].get(pid, _UNREAD) if w.get("marks") is not None else _UNREAD
+        if env is None:
+            if e.get("marked") is not None:
+                return _UNCHECKED
+        elif before is not _UNREAD:
+            if (mark[1] if mark else None) != (before[1] if before else None):
+                return "its session mark changed since the list - not killed"
+        elif procs.marked_of(env) != e.get("marked"):
+            return "its session mark changed since the list - not killed"
+        second = identity(pid)
+        if second != first:
+            if second is None or second is _UNREAD:
+                return procs.EXITED if second is None else _UNCHECKED
+            return procs.OTHER if second[0] != first[0] else procs.EXECED
+        return None
+
+    # pid -> (state, entry): "sent", "gone" (seen gone after a signal), "held"
+    # (sent, then refused SIGKILL), "spare" (never sent). One key per pid: an
+    # interrupt cannot leave an entry in two lists.
+    state, flight = {}, [None]
+
+    def send(e, w, sig):
+        """Signal `e` after check(); None when the signal went out, else why not."""
+        why = check(e, w)
+        if why is not None:
+            return why
+        flight[0] = e                       # from here its signal may have gone out
+        try:
+            a["send"](e["pid"], sig)
+        except ProcessLookupError:
+            why = procs.EXITED
+        except PermissionError:
+            why = "belongs to another user - not killed"
+        except OSError as err:
+            why = f"could not be signalled ({err.strerror or type(err).__name__}) - not killed"
+        if why is None:
+            state[e["pid"]] = ("sent", e)
+        flight[0] = None
+        return why
+
+    def running(e):
+        """True, False, or None when ps could not say."""
+        now = identity(e["pid"])
+        if now is _UNREAD:
+            return None
+        return now is not None and procs.printable(now[0]) == e["start"]
+
+    def wait(entries):
+        """Those of `entries` still running after KILL_GRACE - gone must be seen."""
+        end, left = a["clock"]() + KILL_GRACE, list(entries)
+        while left:
+            still = []
+            for e in left:
+                if running(e) is False:
+                    state[e["pid"]] = ("gone", e)
+                else:
+                    still.append(e)
+            left = still
+            if not left or a["clock"]() >= end:
+                break
+            a["sleep"](0.1)
+        return left
+
+    def sigkill(survivors):
+        """Each survivor planned again as its own pid on a world read now - its
+        root may have ended - so every guard runs again; then SIGKILL."""
+        status = {}
+        w2 = a["build"](mine=mine, status=status)
+        by_pid = {e["pid"]: e for e in survivors}
+        killing = []
+        for pid in procs.leaves_first(list(by_pid), w2["table"]):
+            e = by_pid[pid]
+            if status.get("trouble"):
+                why = status["trouble"]
+            else:
+                fresh = a["plan"]("pid", {"pid": pid, "start": e["start"]}, w2)
+                d2 = procs.still_to_kill([e], fresh, w2["table"])
+                # forked since: what neither the person confirmed nor "new" lists yet
+                known = {(x["pid"], x["start"]) for x in confirmed + out["new"]}
+                out["new"] += [x for x in d2["new"] if (x["pid"], x["start"]) not in known]
+                why = send(d2["go"][0], w2, signal.SIGKILL) if d2["go"] else d2["spare"][0]["why"]
+            if why is None:
+                killing.append(e)
+            elif why in (procs.EXITED, procs.OTHER) and running(e) is False:
+                state[pid] = ("gone", e)                # seen: the process that got SIGTERM ended
+            else:
+                state[pid] = ("held", dict(e, why=f"SIGKILL not sent: {why}"))
+        wait(killing)
+
+    try:
+        for e in d["go"]:
+            why = send(e, world, signal.SIGTERM)
+            if why is not None:
+                state[e["pid"]] = ("spare", dict(e, why=why))
+        survivors = wait([e for e in d["go"] if state.get(e["pid"], ("",))[0] == "sent"])
+        if force and survivors:
+            sigkill(survivors)
+    except (Exception, KeyboardInterrupt) as err:
+        signalled = flight[0] is not None or any(k in ("sent", "gone", "held")
+                                                 for k, _e in state.values())
+        if not signalled:
+            raise                           # nothing was signalled: the crash says more
+        stop = "interrupted" if isinstance(err, KeyboardInterrupt) else \
+            f"ccwho failed ({type(err).__name__}: {procs._shown_line(str(err))[:80]})"
+        out["why"] = f"{stop} - run ccwho ps to see what still runs"
+        for e in d["go"]:
+            k, entry = state.get(e["pid"], (None, e))
+            if k == "sent":
+                state[e["pid"]] = ("held", dict(entry, why=f"not seen gone - {stop}"))
+            elif k is None:
+                maybe = flight[0] is not None and flight[0]["pid"] == e["pid"]
+                state[e["pid"]] = (("held", dict(e, why=f"may have got SIGTERM - {stop}")) if maybe
+                                   else ("spare", dict(e, why=f"not signalled - {stop}")))
+    by = {"gone": [], "sent": [], "held": [], "spare": []}
+    for e in d["go"]:
+        k, entry = state[e["pid"]]
+        by[k].append(entry)
+    out["killed"], out["survivors"] = by["gone"], by["sent"] + by["held"]
+    out["spare"] += by["spare"]
+    if "why" in out:
+        return out
+    termed = by["gone"] + by["sent"] + by["held"]
+    try:
+        listen = a["ports"]()
+    except (Exception, KeyboardInterrupt) as err:
+        out["why"] = f"the ports could not be read again ({type(err).__name__})"
+        listen = None
+    out["ports"] = procs.port_report([p for e in termed for p in e.get("ports") or []], listen,
+                                     world["table"], {e["pid"] for e in termed},
+                                     ended={e["pid"] for e in out["killed"]})
+    return out
+
+
 def agents_json():
     """The live session list as JSON text, or None when the SOURCE is unavailable.
 

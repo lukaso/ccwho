@@ -1546,8 +1546,9 @@ def _kill_plan(mode, target, world):
     every process talks to a daemon). A socketpair on fds 0-2 counts as a pipe.
     A pid lsof did not list is left out (not read), never given an empty entry.
     "marks" pid -> mark_of(...) (None: read, no mark).
-    "marked" is shown one line: the signaller refuses a fresh session id that
-    is no UUID, and one whose shown form differs from "marked".
+    "marked" is shown one line (60 characters): the signaller takes only a pid
+    whose fresh plan lists the same "marked", and right before the signal
+    compares the id in its environment whole with the fresh world's mark.
     "connections" [(pid, laddr, lport, raddr, rport)], "mine" (text). Every
     pid an int, every text a str. The "not read" forms: None for ports,
     pipes, marks or connections, a pid left out of marks or pipes - a note,
@@ -2003,3 +2004,98 @@ def _kill_plan(mode, target, world):
 
 
 kill_plan.__doc__ = _kill_plan.__doc__
+
+
+def marked_of(env):
+    """The session id in `env`'s mark, in the form kill_plan lists as "marked":
+    what the signaller compares right before a signal."""
+    mark = mark_of(env)
+    return _shown_line(printable(mark[1])[:60]) if mark else None
+
+
+def leaves_first(pids, table):
+    """`pids` in the order a kill signals them: deeper in the tree first, so a
+    child never outlives the parent that would reap it. A pid the table does
+    not hold goes last, in its given order."""
+    def depth(p):
+        d, seen = 0, set()
+        while p in table and p not in seen:
+            seen.add(p)
+            p, d = table[p][0], d + 1
+        return d
+    known = [p for p in pids if p in table]
+    return sorted(known, key=lambda p: (-depth(p), p)) + [p for p in pids if p not in table]
+
+
+# Why a confirmed pid is not signalled - the signaller decides "seen gone" by
+# EXITED and OTHER (a new start: the process that was listed ended).
+EXITED = "already exited - nothing to do"
+OTHER = "now a different process - not killed; run ccwho ps again"
+EXECED = "now runs another command - not killed; run ccwho ps again"
+
+
+def still_to_kill(confirmed, fresh, table):
+    """What the signaller may signal: the entries a person confirmed (from one
+    kill_plan) that the fresh plan - the same target on a world read again -
+    takes too, with the same start, command and mark. The fresh plan runs every
+    guard again; this adds only that nothing unconfirmed is signalled.
+
+    Returns {"go": fresh entries, leaves first; "spare": confirmed entries with
+    "why"; "new": what the fresh plan takes that nobody confirmed - listed, not
+    signalled}. `table` is the fresh world's."""
+    fresh_kill = {e["pid"]: e for e in fresh.get("kill", [])}
+    fresh_spare = {e["pid"]: e for e in fresh.get("spare", [])}
+    go, spare, seen = {}, [], set()
+    for e in confirmed:
+        pid = e["pid"]
+        seen.add((pid, e.get("start")))
+        now = fresh_kill.get(pid) or fresh_spare.get(pid)
+        start = now["start"] if now else printable(table[pid][1]) if pid in table else None
+        if pid not in table:
+            why = EXITED
+        elif not e.get("start") or start != e["start"]:
+            why = OTHER
+        elif pid in fresh_kill and fresh_kill[pid].get("command") != e.get("command"):
+            why = EXECED                    # an exec keeps pid, start and mark
+        elif pid in fresh_kill:
+            if fresh_kill[pid].get("marked") == e.get("marked"):
+                go[pid] = fresh_kill[pid]
+                continue
+            why = "its session mark changed since the list - not killed"
+        elif pid in fresh_spare:
+            why = fresh_spare[pid]["why"]
+        else:
+            why = fresh.get("why") or "no longer part of this kill - not killed"
+        spare.append(dict(e, why=_shown_line(why)))
+    new = [e for e in fresh.get("kill", []) if (e["pid"], e["start"]) not in seen]
+    return {"go": [go[p] for p in leaves_first(list(go), table)], "spare": spare, "new": new}
+
+
+def port_report(ports, listen, table, signalled, ended=()):
+    """One line per port a kill freed or did not: ":3000 is free", ":3000 still
+    held by 22 esbuild (child of 21)". `listen` is pid -> ports read after the
+    kill (None: not read - never "free"); `signalled` the pids signalled;
+    `ended` those seen gone - a holder with such a pid is a new process, which
+    `table` (read before the kill) cannot name. lsof lists only the user's own
+    processes: "free" means no process of theirs holds it."""
+    ended = set(ended)
+    ports = sorted(set(ports))
+    if not ports:
+        return []
+    if listen is None:
+        return [" ".join(f":{p}" for p in ports) + " - ccwho could not read the ports again"]
+    out = []
+    for port in ports:
+        holders = sorted(pid for pid, held in listen.items() if port in held)
+        if not holders:
+            out.append(f":{port} is free")
+            continue
+        names = []
+        for h in holders:
+            row = table.get(h) if h not in ended else None
+            name = f"{h} {safe_command(row[2])}" if row else str(h)
+            if row and row[0] in signalled:
+                name += f" (child of {row[0]})"
+            names.append(name)
+        out.append(f":{port} still held by " + ", ".join(names))
+    return [_shown_line(line) for line in out]

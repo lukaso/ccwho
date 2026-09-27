@@ -62,6 +62,11 @@ class KillTest(UiTest):
         await pilot.press("x")
         await self.settle(app, pilot)
 
+    def x_says(self, app):
+        """What the footer says `x` does here; None when it shows no `x`."""
+        active = app.active_bindings.get("x")
+        return active.binding.description if active and active.binding.show else None
+
     def box(self, app):
         return app.screen if isinstance(app.screen, ui.KillBox) else None
 
@@ -592,6 +597,156 @@ class TestOneKillAtATime(KillTest):
             await pilot.click("#procline", offset=(2, 0))              # control
             await self.settle(app, pilot)
             self.assertEqual(c.prepared, [("clean", None)])
+
+
+class TestPTakesTheKeys(KillTest):
+    """`p` opens the process screen with the keys in it, and the footer says
+    what `x` does on the line they are on (the owner, 2026-09-27: "there's no
+    indication of what actions are available")."""
+
+    async def test_p_puts_the_keys_on_the_first_process(self):
+        app = self.app(collector=KillCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            brief = app.query_one("#brief")
+            self.assertIs(app.focused, brief)
+            self.assertEqual((brief.values[brief.lit], brief.fields[brief.lit]), ("12", "proc"))
+
+    async def test_x_then_kills_without_a_right(self):
+        c = KillCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.press("down", "down")
+            await pilot.press("x")
+            await self.settle(app, pilot)
+            self.assertEqual(c.prepared, [("pid", 20)])
+
+    async def test_the_footer_says_what_x_does_here(self):
+        app = self.app(collector=KillCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(self.x_says(app), "kill")                  # on 12
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.x_says(app), "clean all")             # on LEFT BEHIND
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(self.x_says(app), "kill")                  # on 20
+
+    async def test_the_brief_offers_no_kill(self):                       # control
+        app = self.app(collector=KillCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertEqual(app.detail_mode, "brief")
+            self.assertNotIn(self.x_says(app), ("kill", "clean all"))
+
+    async def test_x_on_the_heading_cleans(self):
+        c = KillCollector(prep(mode="clean", target=None))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.press("down")
+            await pilot.press("x")
+            await self.settle(app, pilot)
+            self.assertEqual(c.prepared, [("clean", None)])
+
+    async def test_the_actions_act_only_on_their_line(self):
+        # the footer hides them elsewhere; the actions check again themselves
+        c = KillCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            brief = app.query_one("#brief")
+            brief.action_clean()                    # on process 12: not a heading
+            brief.lit = 1                           # on LEFT BEHIND: not a process
+            brief.action_kill()
+            await self.settle(app, pilot)
+            self.assertEqual(c.prepared, [])
+            await pilot.press("escape")
+            await pilot.press("right", "right")     # the session brief
+            await pilot.pause()
+            brief.lit = [p for p, f in brief.fields.items() if f == "pid"][0]
+            brief.action_kill()                     # its pid is the session's claude
+            await self.settle(app, pilot)
+            self.assertEqual(c.prepared, [])
+
+class TestTheFooterFollows(KillTest):
+    """The rest of TestPTakesTheKeys, split off so each class runs under the
+    30 s kill: the footer after a refresh, the brief, and the way back."""
+
+    async def test_the_footer_follows_a_refresh(self):
+        # keys on 12; a refresh without it leaves the keys on nothing: no "kill"
+        app = self.app(collector=KillCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            shown = lambda: [k.description for k in app.query("FooterKey")]
+            self.assertIn("kill", shown())
+            gone = dict(PROCS, by_session={})
+            app.show(ui.Fleet([HOLDING, BUSY], True, "12:00:03", procs=gone))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertNotIn("kill", shown())
+
+    async def test_x_in_a_session_brief_does_nothing(self):
+        # with no kill or clean there, `x` must not fall through to the list's
+        # two-press loop kill of the session the brief is about
+        from test_ui import LIVE, STUCK
+        c = FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00"))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            app.selected = STUCK["sessionId"]
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("right", "right")
+            await pilot.pause()
+            self.assertIs(app.focused, app.query_one("#brief"))
+            await pilot.press("x")
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsNone(c.killed)
+            self.assertNotIn("kill loop", app.status)
+
+    async def test_p_from_a_brief_lands_on_the_first_process(self):
+        app = self.app(collector=KillCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("right", "right")
+            await pilot.press("down", "down", "down")
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            brief = app.query_one("#brief")
+            self.assertEqual((brief.values.get(brief.lit), brief.fields.get(brief.lit)), ("12", "proc"))
+
+    async def test_one_escape_goes_back_to_the_list(self):
+        app = self.app(collector=KillCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            # the Esc is the process list's own, not the list's (which also closes)
+            self.assertIs(app.focused, app.query_one("#brief"))
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(app.detail_open)
+            self.assertFalse(app.query_one("#detail").display)
+            self.assertTrue(isinstance(app.focused, ui.Row))
 
 
 class TestTheCollectorKills(unittest.TestCase):

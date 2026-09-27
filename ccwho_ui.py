@@ -162,7 +162,12 @@ class Brief(Static):
         Binding("down,j", "step(1)", "down", show=False),
         Binding("up,k", "step(-1)", "up", show=False),
         Binding("enter", "copy", "copy"),
-        Binding("x", "kill", "kill", show=False),
+        # the footer says what `x` does on the line the keys are on (check_action)
+        Binding("x", "kill", "kill"),
+        Binding("x", "clean", "clean all"),
+        # neither here (the session brief, or no line): `x` stops here, never
+        # reaching the list's two-press kill of the session's stuck loops
+        Binding("x", "nothing", "", show=False),
         Binding("left,escape", "leave", "back"),
     ]
 
@@ -229,6 +234,12 @@ class Brief(Static):
         return False
 
     def paint(self):
+        # what `x` does follows the line the keys are on: the footer is rebuilt
+        # when that changes, not on every paint (a hover paints too)
+        field = self.fields.get(self.lit)
+        if field != getattr(self, "_x_for", None):
+            self._x_for = field
+            self.refresh_bindings()
         text = self.base.copy()
         if self.lit is not None:        # part 0 is a part: the id
             for span in self.base.spans:
@@ -274,12 +285,29 @@ class Brief(Static):
     def action_leave(self):
         self.app.leave_detail()
 
-    def action_kill(self):
-        """`x` on a process of the process screen kills it, on the left-behind
-        heading cleans it all - after the box lists what that takes."""
+    def check_action(self, action, parameters):
+        """`x` shows - and works - only where it does something: "kill" on a
+        process, "clean all" on the left-behind heading."""
         field = self.fields.get(self.lit)
-        if field in KILL_FIELDS:
-            self.app.ask_kill(field, self.values.get(self.lit))
+        if action == "kill":
+            return field == "proc"
+        if action == "clean":
+            return field == "clean"
+        return True
+
+    def action_kill(self):
+        """`x` on a process of the process screen kills it and what runs under
+        it - after the box lists what that takes."""
+        if self.fields.get(self.lit) == "proc":
+            self.app.ask_kill("proc", self.values.get(self.lit))
+
+    def action_nothing(self):
+        pass
+
+    def action_clean(self):
+        """`x` on the left-behind heading cleans it all - after the box."""
+        if self.fields.get(self.lit) == "clean":
+            self.app.ask_kill("clean", None)
 
     def on_mouse_move(self, event):
         if self.has_focus:
@@ -1409,7 +1437,8 @@ class CcwhoUi(App):
         unless it covers the window: then there is no list to go back to beside
         it, and one ← closes it."""
         self.set_focus(None)            # so restore_selection gives them to the row
-        if close and self.size.width < engine.UI_WIDE:
+        if close and (self.size.width < engine.UI_WIDE or self.detail_mode == "procs"):
+            # the process screen took the keys when `p` opened it: back is closed
             self.action_back()
             return
         self.call_after_refresh(self.restore_selection)
@@ -1490,8 +1519,16 @@ class CcwhoUi(App):
             self.ask_kill("clean", None)
 
     def action_procs(self):
-        """Every process agents started, in the detail pane - `ccwho ps`, here."""
+        """Every process agents started, in the detail pane - `ccwho ps`, here -
+        with the keys in it: ↑↓ to a process, `x` to kill it."""
         self.open_detail("procs")
+        box = self.part("#brief")
+        if box is not None and box.values:
+            # the first process, whichever line the keys were on in the brief
+            procs_ = [p for p, f in box.fields.items() if f == "proc"]
+            box.lit = min(procs_) if procs_ else 0
+            box.paint()
+            box.focus()
 
     def open_detail(self, mode):
         # another screen starts at its top, not where the last one was scrolled

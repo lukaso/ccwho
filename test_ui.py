@@ -3239,7 +3239,7 @@ class TestTheProcessScreenVerify(UiTest):
             await pilot.pause()
             await pilot.press("p")
             await pilot.pause()
-            for _ in range(4):
+            for _ in range(30):             # the keys are in the processes: down them
                 await pilot.press("j")
             await pilot.pause()
             self.assertGreater(app.query_one("#detail").scroll_y, 0)            # control
@@ -3304,6 +3304,13 @@ class TestTheProcessScreenRound3(UiTest):
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
             await pilot.press("p")
+            await pilot.pause()
+            # `p` puts the keys in the process screen: Enter there copies the pid
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertEqual((adapter.asked, adapter.copied), ([], ["12"]))
+            # Esc gives them back to the list: Enter goes to the row
+            await pilot.press("escape")
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause(0.2)

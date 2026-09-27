@@ -5514,6 +5514,72 @@ class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
         self.assertEqual(pick(rows_with), pick(rows_without))
 
 
+class TestTheTableNamesEachSession(unittest.TestCase):
+    """The name on a row is the one you message the session by (`ccwho-b5`), as
+    the live list shows it. A table that shows only the project made a person
+    ask which row `ccwho-b5` was - and made the agent they asked miss it."""
+
+    def row(self, **kw):
+        base = {"project": "ccwho", "status": "idle", "attention": "stopped",
+                "name": "ccwho-b5", "title": "Session 51fd recovery", "doing": "",
+                "since": "1m", "tty": "ttys039", "orphans": 0, "sessionId": LIVE}
+        base.update(kw)
+        return base
+
+    def line(self, rows, width=200):
+        out = ccwho.render(rows, {}, color=False, width=width)
+        return [l for l in out.splitlines() if "s039" in l]
+
+    def test_the_row_leads_with_its_name(self):
+        self.assertTrue(self.line([self.row()])[0].startswith("ccwho-b5  "))
+
+    def test_a_row_with_no_name_says_its_project(self):                # control
+        self.assertTrue(self.line([self.row(name="")])[0].startswith("ccwho  "))
+
+    def test_a_renamed_session_still_says_its_project(self):
+        # "update-landing-page-faq" does not say it is marketing's
+        line = self.line([self.row(name="update-landing-page-faq", project="marketing")])[0]
+        self.assertIn("marketing", line)
+
+    def test_an_auto_name_does_not_say_its_project_twice(self):        # control
+        self.assertEqual(self.line([self.row()])[0].count("ccwho"), 1)
+
+    def test_a_long_name_is_never_cut(self):
+        # a cut name is no address: nothing can be sent to "update-landing-pa…"
+        long = "update-landing-page-whatsapp-faq"
+        lines = self.line([self.row(name=long, project="marketing"), self.row()], width=120)
+        self.assertTrue(lines[0].startswith(long + "  "), lines)
+        self.assertTrue(all(len(l) <= 120 for l in lines), lines)
+
+    def test_short_names_keep_their_columns_in_line(self):
+        lines = self.line([self.row(name="app-1", project="app"), self.row()])
+        self.assertEqual(lines[0].index("s039"), lines[1].index("s039"))
+
+
+class TestAPickListNamesEachSession(unittest.TestCase):
+    """`ccwho show x` and `ccwho jump x` list the sessions x matched. Each line
+    says the name that matched, or nobody can see why a row is on the list."""
+
+    def test_the_line_has_the_name_the_id_and_the_tty(self):
+        row = {"name": "ccwho-b5", "title": "Session 51fd recovery", "tty": "ttys039",
+               "sessionId": "cff47f0d-8106-4972-a5f8-5287cf808347", "project": "ccwho"}
+        line = ccwho.pick_line(row)
+        for part in ("ccwho-b5", "cff4", "s039", "Session 51fd recovery"):
+            self.assertIn(part, line)
+
+    def test_a_row_with_no_name_has_its_project(self):                 # control
+        line = ccwho.pick_line({"name": "", "title": "t", "tty": "", "sessionId": "",
+                                "project": "app"})
+        self.assertIn("app", line)
+
+    def test_the_lines_of_one_list_stay_in_line(self):
+        rows = [{"name": "ccwho-b5", "tty": "ttys039", "sessionId": "cff4", "title": "a"},
+                {"name": "", "project": "app", "tty": "ttys007", "sessionId": "7d19",
+                 "title": "b"}]
+        lines = ccwho.pick_lines(rows)
+        self.assertEqual(lines[0].index("cff4"), lines[1].index("7d19"), lines)
+
+
 class TestTheTableSaysWhatAgentsHold(unittest.TestCase):
     """One dim header line for the ports agents hold, one line each at the bottom
     for Left behind and Codex - and nothing at all when there is nothing."""

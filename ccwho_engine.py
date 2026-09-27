@@ -748,6 +748,42 @@ def truncate(s, width):
     return s if len(s) <= width else s[: max(0, width - 1)] + "…"
 
 
+def _printable(value):
+    # a newline in a name or a title would paint a third line into a row of two
+    return "".join(c if c.isprintable() else " " for c in str(value or "")).strip()
+
+
+def session_handle(row):
+    """The session's name: the address another session sends a message to
+    (`ccwho-b5`). Its project when it has none."""
+    handle = _printable(row.get("name"))
+    project = _printable(row.get("project"))
+    return handle if handle not in ("", "?") else (project or "?")
+
+
+def renamed(row, handle):
+    """The project, when the name does not already say it: an auto-name is the
+    project and a dash; a renamed one (`update-landing-page-faq`) is not."""
+    project = _printable(row.get("project"))
+    project = "" if project == "?" else project
+    return project if (project and handle != project
+                       and not handle.startswith(project + "-")) else ""
+
+
+def pick_lines(rows):
+    """The sessions a query matched, one line each, their columns in line."""
+    w = max((len(session_handle(r)) for r in rows), default=0)
+    return [pick_line(r, w) for r in rows]
+
+
+def pick_line(row, w=0):
+    """One session in the list a query matched, with every name it is known by."""
+    handle = session_handle(row)
+    return (f"{handle:<{w}}  {brief.short_id(row.get('sessionId', '')):<4}  "
+            f"{short_tty(row.get('tty', '')) or '-':<5}  "
+            f"{row.get('title') or renamed(row, handle)}").rstrip()
+
+
 # ------------------------------------------------------------------ disk reads
 
 def all_roots(cache=None):
@@ -3109,13 +3145,9 @@ def ui_row_cells(row, width=100, tag=""):
     # another session sends a message to, and a cut name is no address. An
     # auto-name is the project and a dash; a renamed one is not, and says its
     # project in the meta - where the title keeps room to be read, like the ports.
-    def printable(value):
-        # a newline in a name or a title would paint a third line into a row of two
-        return "".join(c if c.isprintable() else " " for c in str(value or "")).strip()
-    project = printable(row.get("project"))
-    project = "" if project == "?" else project
-    handle = printable(row.get("name"))
-    handle = handle if handle not in ("", "?") else (project or "?")
+    printable = _printable
+    handle = session_handle(row)
+    project = renamed(row, handle)
     head = f"{sid}  {handle}"
     # the title, unless it only says the name again (the tab's ✳ aside): the
     # name is already on the row
@@ -3131,8 +3163,7 @@ def ui_row_cells(row, width=100, tag=""):
         # which brings its own; and the detail's room, with one cell before it
         return (width - _cells(glyph) - _cells(head) - gap - _cells(tail)
                 - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL[0]) - 1)
-    if (project and handle != project and not handle.startswith(project + "-")
-            and room_for_title(f" · {project}" + tail) >= 20):
+    if project and room_for_title(f" · {project}" + tail) >= 20:
         tail = f" · {project}" + tail
     # the title is what gives way, down to nothing: the name says which session
     # this is, and a title of two letters and a … says nothing
@@ -3264,9 +3295,13 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
     if not rows:
         return "no Claude Code sessions found\n"
     width = width or shutil.get_terminal_size((150, 24)).columns
-    w_proj = min(13, max(len(r["project"]) for r in rows))
+    # the name leads: it is the one you message the session by. The column is
+    # as wide as the names, to a point; a longer name is never cut (a cut name
+    # is no address) - its own row gives the room from its title
+    handles = {id(r): session_handle(r) for r in rows}
+    w_name = min(20, max(len(h) for h in handles.values()))
     w_tty = max(4, min(7, max(len(short_tty(r.get("tty", ""))) for r in rows)))
-    fixed = w_proj + w_tty + 14 + 7 + 6
+    fixed = w_name + w_tty + 14 + 7 + 6
     w_title = max(18, min(34, (width - fixed) // 2))
     w_doing = max(18, width - fixed - w_title)
 
@@ -3307,19 +3342,25 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
         # session with no window), fall back to Claude Code's own title and MARK
         # it: a title we could not read off a tab must not pretend it came from one.
         title = r.get("tab_title") or ("~" + (r["title"] or r["name"]))
+        handle = handles[id(r)]
+        if project := renamed(r, handle):
+            title = f"{project} · {title}"      # a renamed session still says whose it is
+        over = max(0, len(handle) - w_name)
+        w_t = max(0, w_title - over)
+        w_d = w_doing - max(0, over - w_title)
         doing = (r.get("ask") if att == "asks" else r["doing"]) or "-"
         if att == "running" and r.get("work"):
             doing = f"[{r['work']} bg] {doing}"
         where = short_tty(r.get("tty", "")) or "-"
         where_cell = _paint(f"{where:<{w_tty}}", "dim", color)
         where_cell = osc8(where_cell, jump_url(r), enabled=links and where != "-")
-        shown_doing = truncate(doing, w_doing)
-        line = (f"{r['project']:<{w_proj}}  "
+        shown_doing = truncate(doing, w_d) if w_d > 0 else ""
+        line = (f"{handle:<{w_name}}  "
                 f"{where_cell}  "
                 f"{_paint(f'{label:<10}', att, color)}  "
-                f"{truncate(title, w_title):<{w_title}}  "
+                f"{(truncate(title, w_t) if w_t else ''):<{w_t}}  "
                 f"{_paint(shown_doing, 'dim', color)}"
-                f"{' ' * max(0, w_doing - len(shown_doing))}  "
+                f"{' ' * max(0, w_d - len(shown_doing))}  "
                 f"{r['since']:>5}")
         if tag_w:
             tag = _cut(tags.get(r.get("sessionId", ""), ""), tag_w - 2)
@@ -3330,7 +3371,7 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
             line += _paint(f"  +{r['orphans']} detached", "waiting", color)
         out.append(line)
         if show_prompt and r["topic"]:
-            out.append(_paint(f"{' ' * (w_proj + w_tty + 16)}\u21b3 {truncate(r['topic'], width - w_proj - 18)}", "dim", color))
+            out.append(_paint(f"{' ' * (w_name + w_tty + 16)}\u21b3 {truncate(r['topic'], width - w_name - 18)}", "dim", color))
     bottom = bottom_lines(fleet)
     if bottom:
         out.append("")

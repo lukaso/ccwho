@@ -122,9 +122,8 @@ def jump(argv):
     if len(hits) > 1:
         print(f"ccwho: {query!r} matches {len(hits)} sessions - be more specific:",
               file=sys.stderr)
-        for r in hits:
-            print(f"  {engine.short_tty(r.get('tty','')):<6} {r.get('title') or r.get('name')}",
-                  file=sys.stderr)
+        for line in engine.pick_lines(hits):
+            print(f"  {line}", file=sys.stderr)
         return 2
     row = hits[0]
     tty = row.get("tty", "")
@@ -168,10 +167,8 @@ def show(argv):
     if len(hits) > 1:
         print(f"ccwho show: {query!r} matches {len(hits)} sessions - be more specific:",
               file=sys.stderr)
-        for r in hits:
-            print(f"  {engine.brief.short_id(r.get('sessionId','')):<6}"
-                  f" {engine.short_tty(r.get('tty','')):<6}"
-                  f" {r.get('title') or r.get('name')}", file=sys.stderr)
+        for line in engine.pick_lines(hits):
+            print(f"  {line}", file=sys.stderr)
         return 2
     if not hits:
         return 1

@@ -162,6 +162,7 @@ class Brief(Static):
         Binding("down,j", "step(1)", "down", show=False),
         Binding("up,k", "step(-1)", "up", show=False),
         Binding("enter", "copy", "copy"),
+        Binding("x", "kill", "kill", show=False),
         Binding("left,escape", "leave", "back"),
     ]
 
@@ -191,6 +192,13 @@ class Brief(Static):
             # nothing to be on here: the keys go back - and only the keys. This
             # runs inside a paint; closing the pane here left it half closed
             self.app.leave_detail(close=False)
+        elif self.has_focus and field in KILL_FIELDS:
+            # a process the keys were on: the same one, or none - never the one
+            # that moved into its place, which `x` would then ask to kill
+            same = [p for p, v in self.values.items() if v == was and self.fields.get(p) == field]
+            self.lit = same[0] if same else None
+            if self.lit is not None:
+                self.call_after_refresh(self.follow)
         elif self.has_focus:
             near = (lambda ps: min(ps, key=lambda p: abs(p - (at or 0))))
             same_field = [p for p, f in self.fields.items() if f == field]
@@ -265,6 +273,13 @@ class Brief(Static):
 
     def action_leave(self):
         self.app.leave_detail()
+
+    def action_kill(self):
+        """`x` on a process of the process screen kills it, on the left-behind
+        heading cleans it all - after the box lists what that takes."""
+        field = self.fields.get(self.lit)
+        if field in KILL_FIELDS:
+            self.app.ask_kill(field, self.values.get(self.lit))
 
     def on_mouse_move(self, event):
         if self.has_focus:
@@ -378,6 +393,155 @@ class Row(Static):
 
     def refresh_text(self, width):
         self.update(self._as_text(width))
+
+
+# the parts of the process screen `x` acts on: a process (its pid), and the
+# left-behind heading (clean it all)
+KILL_FIELDS = ("proc", "clean")
+
+
+class KillBox(ModalScreen):
+    """What a kill takes, before it does: every process with what ccwho doubts
+    about it, and what it spares and why - the list `ccwho kill` prints. Enter,
+    `y` or a click on [kill] kills; Esc, `n` or ✕ closes. The result then
+    replaces the list; Enter or Esc closes it. `on_kill` is set by the list."""
+
+    DEFAULT_CSS = """
+    KillBox { align: center middle; }
+    #killbox { width: 90%; max-width: 110; height: auto;
+               border: round $error; background: $surface; padding: 0 1; }
+    #killtop { height: auto; }
+    #killhead { width: 1fr; text-style: bold; }
+    #killclose { width: 3; color: $text-muted; }
+    #killclose:hover { background: $accent; color: $text; }
+    #killscroll { height: auto; }
+    #killbody { height: auto; }
+    #killbar { height: auto; margin-top: 1; }
+    #killgo { width: auto; background: $error; color: $text; padding: 0 1; }
+    #killgo:hover { text-style: bold reverse; }
+    #killhint { width: 1fr; color: $text-muted; padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("y,enter", "go", "kill"),
+        Binding("n,escape", "close", "close"),
+    ]
+
+    CHROME = 5      # the box's rows besides the list: border 2, title 1, bar and its margin 2
+
+    def __init__(self, title, lines, can_kill):
+        super().__init__()
+        self.title_text, self.lines = title, list(lines)
+        self.state = "ask" if can_kill else "done"
+        self.on_kill = None
+        self.seen = set()       # the list's rows that have been on screen
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="killbox"):
+            with Horizontal(id="killtop"):
+                yield Static(self.title_text, id="killhead", markup=False)
+                yield Static(" ✕ ", id="killclose", markup=False)
+            yield VerticalScroll(Static("\n".join(self.lines), id="killbody", markup=False),
+                                 id="killscroll")
+            with Horizontal(id="killbar"):
+                yield Static(" kill ", id="killgo", markup=False)
+                yield Static(self.hint(), id="killhint", markup=False)
+
+    def on_mount(self):
+        scroll = self.query_one("#killscroll")
+        scroll.focus()                  # ↓ and PgDn scroll the list
+        self.watch(scroll, "scroll_y", lambda _y: self.moved(), init=False)
+        self.fit()
+        self.call_after_refresh(self.looked)
+
+    def on_resize(self, event):
+        # another size wraps the lines anew: what was seen is counted again
+        self.fit()
+        self.seen = set()
+        self.call_after_refresh(self.looked)
+
+    def fit(self):
+        """The list gets what 85% of the window leaves after the box's border,
+        title and [kill] line - the box is its list plus those, so they always
+        show."""
+        found = self.query("#killscroll")
+        if found:
+            box = max(self.CHROME + 3, int(self.size.height * 0.85))
+            found.first().styles.max_height = box - self.CHROME
+
+    REST = 0.25     # seconds the view must stay put for its rows to count as seen
+
+    def moved(self):
+        """The list scrolled: its rows count once the view rests - a scroll that
+        flies past the middle (End, a drag) shows it to nobody."""
+        timer = getattr(self, "_rest", None)
+        if timer is not None:
+            timer.stop()
+        self._rest = self.set_timer(self.REST, self.looked)
+        self.paint()
+
+    def looked(self):
+        """The rows on screen now count as seen; the hint says what is left."""
+        found = self.query("#killscroll")
+        if found:
+            scroll = found.first()
+            y, h = int(scroll.scroll_y), scroll.size.height
+            if h > 0:
+                self.seen.update(range(y, y + h))
+        self.paint()
+
+    def unseen(self):
+        """How many of the list's rows were never on screen - a kill waits for
+        them. Not laid out yet is not seen: 1."""
+        found = self.query("#killscroll")
+        if not found:
+            return 1
+        scroll = found.first()
+        rows = scroll.virtual_size.height
+        if scroll.size.height <= 0 or rows <= 0:
+            return 1
+        return len(set(range(rows)) - self.seen)
+
+    def hint(self):
+        if self.state == "ask" and self.unseen():
+            return "not all of the list was on screen yet - scroll through it (↓ PgDn) to kill"
+        return {"ask": "y or Enter kills · n or Esc closes", "killing": "killing...",
+                "done": "Enter or Esc closes"}[self.state]
+
+    def paint(self, lines=None):
+        if not self.query("#killbody"):
+            return                          # not composed yet
+        if lines is not None:
+            self.query_one("#killbody").update("\n".join(lines))
+        self.query_one("#killgo").display = self.state == "ask"
+        self.query_one("#killhint").update(self.hint())
+
+    def action_go(self):
+        if self.state == "ask" and self.unseen():
+            self.paint()                    # nothing is killed that was not seen
+            return
+        if self.state == "ask":
+            self.state = "killing"
+            self.paint(["killing..."])
+            if self.on_kill:
+                self.on_kill()
+        elif self.state == "done":
+            self.dismiss(None)
+
+    def action_close(self):
+        if self.state != "killing":     # a kill under way reports here when it ends
+            self.dismiss(None)
+
+    def show_result(self, lines):
+        self.state = "done"
+        self.paint(lines)
+
+    def on_click(self, event):
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget.id == "killgo":
+            self.action_go()
+        elif widget is not None and widget.id == "killclose":
+            self.action_close()
 
 
 class SavesMenu(ModalScreen):
@@ -521,6 +685,7 @@ class CcwhoUi(App):
         # (session, its loop pids, when): what the next x or click kills. Only
         # while the question is on screen: a kill is not undone
         self.armed = None
+        self.kill_busy = False  # a kill is being read, asked or carried out
         self.clock = time.monotonic
         self.pulsing = False
         # While a window is being opened nothing on the list moves - you are
@@ -920,11 +1085,23 @@ class CcwhoUi(App):
             wide = self.size.width >= engine.UI_WIDE
             width = (int(self.size.width * 0.38) - 5 if wide else self.size.width - 4)
             try:
-                text = engine.render_ps_screen(engine.ps_listing(self.fleet.rows, procs),
+                parts = engine.ps_screen_parts(engine.ps_listing(self.fleet.rows, procs),
                                                procs, width=max(20, width))
             except Exception:           # an odd shape is "unknown", never a crash
-                text = "processes unknown"
-            brief_box.show(Text(text, no_wrap=True, overflow="crop"))
+                parts = [("processes unknown", None, None)]
+            # a process is a part the keys can be on (`x` kills it, Enter copies
+            # its pid), and so is the left-behind heading (`x` cleans it all)
+            text, n = Text(no_wrap=True, overflow="crop"), 0
+            for i, (line, value, field) in enumerate(parts):
+                if i:
+                    text.append("\n")
+                piece = Text(line)
+                if value:
+                    piece.stylize(Style(meta={"@click": f"app.copy_value({value!r})",
+                                              "part": n, "value": value, "field": field}))
+                    n += 1
+                text.append_text(piece)
+            brief_box.show(text)
         else:
             if not row:
                 return
@@ -1222,9 +1399,8 @@ class CcwhoUi(App):
     def action_detail(self):
         # a second → takes the keys into the brief it opened (Finder's columns)
         box = self.part("#brief")
-        if (self.detail_open and self.detail_mode == "brief" and box is not None
-                and box.values):
-            box.focus()
+        if self.detail_open and box is not None and box.values:
+            box.focus()                 # the brief's values, or the process screen's
             return
         self.open_detail("brief")
 
@@ -1237,6 +1413,81 @@ class CcwhoUi(App):
             self.action_back()
             return
         self.call_after_refresh(self.restore_selection)
+
+    # ------------------------------------------------------------------ kill
+
+    def ask_kill(self, field, value):
+        """Read the machine, plan the kill, and show the box that asks. One at a
+        time: a second `x` while one is read, asked or carried out waits."""
+        if self.kill_busy:
+            self.said("a kill is under way - finish that one first")
+            return
+        if field == "proc":
+            try:
+                mode, target = "pid", int(value)
+            except (TypeError, ValueError):
+                return
+        else:
+            mode, target = "clean", None
+        self.kill_busy = True
+        self.said("reading the machine...")
+        self.preparing(mode, target)
+
+    @work(thread=True)
+    def preparing(self, mode, target):
+        try:
+            prepared = self.collector.kill_prepare(mode, target)
+        except Exception as ex:         # its text may hold a command line: the type only
+            prepared = {"mode": mode, "target": target, "mine": None, "refused": False,
+                        "plan": {"kill": [], "spare": []},
+                        "why": f"failed ({type(ex).__name__}) - nothing killed"}
+        self.call_from_thread(self.show_kill_box, prepared)
+
+    def show_kill_box(self, prepared):
+        if self.status == "reading the machine...":
+            self.said("")
+        plan = prepared["plan"]
+        lines = engine.kill_list_lines(plan)
+        if prepared.get("why"):
+            lines.append(f"ccwho: {prepared['why']}")
+        can = bool(plan.get("kill")) and not prepared.get("why")
+        target = prepared["target"]
+        pid = target.get("pid") if isinstance(target, dict) else target
+        title = ("clean what ended sessions left behind" if prepared["mode"] == "clean"
+                 else f"kill {pid} and what runs under it")
+        box = KillBox(title, lines or ["nothing to kill"], can)
+        box.on_kill = lambda: self.carrying(box, prepared)
+        self.push_screen(box, callback=self.kill_box_closed)
+
+    def kill_box_closed(self, _answer=None):
+        self.kill_busy = False
+
+    @work(thread=True)
+    def carrying(self, box, prepared):
+        try:
+            report = self.collector.kill_carry(prepared)
+            lines, _rc = engine.kill_report_lines(report, prepared.get("refused"))
+        except Exception as ex:         # the type only; and what got a signal is not known
+            what = ("nothing killed" if getattr(ex, "ccwho_nothing_signalled", False)
+                    else "some of these may have been signalled; run ccwho ps")
+            lines = [f"ccwho: failed ({type(ex).__name__}) - {what}"]
+        self.call_from_thread(box.show_result, lines)
+        # the list after the kill: what it took is gone from it. A read that
+        # fails leaves the last list up - the next tick tries again
+        try:
+            mine = self.call_from_thread(self.next_seq)
+            fleet = self.collector.fleet()
+            fleet.seq = mine
+            self.call_from_thread(self.show, fleet)
+        except Exception:
+            pass
+
+    @on(events.Click, "#procline")
+    def clicked_left_behind(self, event):
+        """The left-behind line - the first of the bottom lines when there is
+        one - cleans it all, after the box lists it; the codex line does not."""
+        if (self.fleet.procs or {}).get("left_behind") and getattr(event, "y", 0) == 0:
+            self.ask_kill("clean", None)
 
     def action_procs(self):
         """Every process agents started, in the detail pane - `ccwho ps`, here."""
@@ -1619,6 +1870,13 @@ class Collector:
             return runner.reopen_saved(path)
         except Exception as ex:
             return f"could not reopen: {ex}"
+
+    def kill_prepare(self, mode, target):
+        return engine.kill_prepare(mode, target)
+
+    def kill_carry(self, prepared):
+        return engine.carry_out(prepared["mode"], prepared["target"], prepared["plan"]["kill"],
+                                mine=prepared["mine"])
 
     def kill_loops(self, row):
         pids = [d["pid"] for d in row.get("dead_loops") or []]

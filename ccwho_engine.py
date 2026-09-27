@@ -3272,27 +3272,126 @@ _PS_HEADING = {"left behind": "LEFT BEHIND - their session ended",
 def render_ps_screen(listing, fleet, width=100):
     """The process screen: a heading per session and per group, then one line a
     process - pid, ports, the command in its short form."""
+    return "\n".join(line for line, _v, _f in ps_screen_parts(listing, fleet, width=width))
+
+
+def ps_screen_parts(listing, fleet, width=100):
+    """The process screen as (line, value, field), each line made with its part
+    in one loop - a pid can never land on another line. A process line is its
+    pid (field "proc" - `x` there kills it; not "pid", which in the brief is
+    the session's own claude), the left-behind heading is field "clean" (`x`
+    there cleans it all), any other line is no part."""
     fleet = fleet if isinstance(fleet, dict) else {}
     if fleet.get("collected") is False:
-        return "processes unknown - not collected yet"
+        return [("processes unknown - not collected yet", None, None)]
     if not fleet.get("procs_ok", True):
-        return "processes unknown - " + fleet.get("why", "ps or the environment read failed")
+        return [("processes unknown - " + fleet.get("why", "ps or the environment read failed"),
+                 None, None)]
     if not listing:
-        return "no processes started by agents"
+        return [("no processes started by agents", None, None)]
     known = fleet.get("ports_ok", True)
+    one = (lambda text: truncate(" ".join(str(text).splitlines()), width))
     out, heading = [], None
     for p in listing:
         head = p["who"] if p["group"] == "session" else _PS_HEADING[p["group"]]
         if head != heading:
-            out += ([""] if out else []) + [truncate(head, width)]
+            if out:
+                out.append(("", None, None))
+            out.append((one(head), "ccwho clean", "clean") if p["group"] == "left behind"
+                       else (one(head), None, None))
             heading = head
         ports = (" ".join(f":{n}" for n in _held(p)) or "-") if known else "?"
         pid = p.get("pid")
         line = f"  {'?' if pid is None else pid!s:<7} {ports:<13} {p.get('command', '')}"
         if p["group"] == "unsure":
             line += f"  ({p.get('why', '?')})"
-        out.append(truncate(line, width))
-    return "\n".join(out)
+        out.append((one(line), str(pid), "proc") if isinstance(pid, int) else (one(line), None, None))
+    return out
+
+
+def agent_id(env):
+    """The session an agent runs ccwho from - a Claude Code or Codex id in its
+    environment - or None: a person."""
+    mark = procs.mark_of({k: (env or {}).get(k) for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")})
+    return mark[1] if mark else None
+
+
+def kill_prepare(mode, target, env=None, build=None):
+    """What a kill would take, read now: {"mode", "target", "mine", "plan",
+    "refused", "why"}. A pid target gets its start from this read. The machine
+    not read whole, or an error, plans nothing ("why"; an error by its type
+    only: its text may hold a command line)."""
+    build = build or (lambda mine=None, status=None: build_world(mine, status=status))
+    mine = agent_id(env if env is not None else os.environ)
+    out = {"mode": mode, "target": mine if mode == "mine" else target, "mine": mine,
+           "plan": {"kill": [], "spare": []}, "refused": False, "why": None}
+    try:
+        status = {}
+        world = build(mine=mine, status=status)
+        if status.get("trouble"):
+            out["why"] = f"{status['trouble']} - nothing killed"
+            return out
+        if mode == "pid":
+            row = world["table"].get(target)
+            out["target"] = {"pid": target, "start": row[1] if row else ""}
+        out["plan"] = procs.kill_plan(mode, out["target"], world)
+    except Exception as err:
+        out["why"] = f"failed ({type(err).__name__}) - nothing killed"
+        return out
+    # a tree refused (not clean's "outside" spares): the kill could not take it all
+    out["refused"] = any(not e.get("outside") for e in out["plan"]["spare"])
+    return out
+
+
+def _kill_line(e):
+    """One process of a kill list: pid, ports, command, who started it."""
+    ports = " ".join(f":{p}" for p in e.get("ports") or []) or "-"
+    sid = e.get("session")
+    # the mark is text from another process's environment: shown only as a session id
+    who = ("no agent started it" if not sid else f"session {sid[:8]}"
+           if procs._UUID.match(sid) else "a session ccwho does not know")
+    return f"  {e['pid']:<7} {ports:<12} {truncate(e.get('command') or '', 50):<50}  {who}"
+
+
+def kill_list_lines(plan):
+    """What a kill would take and what it spares, as `ccwho kill` prints it."""
+    kill, out = plan.get("kill") or [], []
+    if kill:
+        out.append(f"{len(kill)} process{'es' if len(kill) != 1 else ''} to kill:")
+        for e in kill:
+            out.append(_kill_line(e))
+            if e.get("note"):
+                out.append(f"          ! {e['note']}")
+    out += [f"not killed: {e['why']}" for e in plan.get("spare") or []]
+    if plan.get("why"):
+        out.append(f"ccwho: {plan['why']}")
+    return out
+
+
+def kill_report_lines(r, refused):
+    """What carry_out did, one line each, and the exit: 0 when all of the target
+    is gone (and the plan refused no part of it), 130 when an interrupt stopped
+    it before any signal, else 1."""
+    out = []
+    if r["killed"]:
+        out.append(f"killed {len(r['killed'])}: " + " ".join(str(e["pid"]) for e in r["killed"]))
+    for e in r["survivors"]:
+        why = f" ({e['why']})" if e.get("why") else ""
+        out.append(f"still running: {e['pid']} {e.get('command') or ''}{why}"
+                   f" - ccwho kill {e['pid']} --force")
+    out += [f"not killed: {e['pid']} {e.get('command') or ''} - {e['why']}" for e in r["spare"]]
+    out += [f"not killed, new since the list: {e['pid']} {e.get('command') or ''}"
+            f" - ccwho kill {e['pid']}" for e in r["new"]]
+    out += list(r["ports"])
+    if r.get("why"):
+        out.append(f"ccwho: {r['why']}")
+    if r.get("why", "").startswith("interrupted") and not (r["killed"] or r["survivors"]):
+        return out, 130                     # nothing got a signal
+    # all of the target is gone: nothing left, nothing new, no port not known free,
+    # no tree refused
+    whole = r["killed"] and not (r["survivors"] or r["spare"] or r["new"] or r.get("why")
+                                 or r["held"] or refused)
+    return out, 0 if whole else 1
 
 
 def _held(p):

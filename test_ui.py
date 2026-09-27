@@ -3223,8 +3223,13 @@ class TestTheProcessScreenVerify(UiTest):
                 await pilot.press("j")
             await pilot.pause()
             self.assertGreater(app.query_one("#detail").scroll_y, 0)            # control
+            # → now takes the keys into the process screen (as into the brief);
+            # the brief is Esc, then →
+            await pilot.press("escape")
+            await pilot.pause()
             await pilot.press("right")
             await pilot.pause()
+            self.assertEqual(app.detail_mode, "brief")
             self.assertEqual(app.query_one("#detail").scroll_y, 0)
 
     async def test_unknown_processes_are_said_in_the_brief(self):

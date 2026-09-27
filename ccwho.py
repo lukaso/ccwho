@@ -1128,16 +1128,6 @@ def _kill_target(argv, clean):
     return ("pid", int(digits))
 
 
-def _kill_line(e):
-    """One process of a kill list: pid, ports, command, who started it."""
-    ports = " ".join(f":{p}" for p in e.get("ports") or []) or "-"
-    sid = e.get("session")
-    # the mark is text from another process's environment: shown only as a session id
-    who = ("no agent started it" if not sid else f"session {sid[:8]}"
-           if engine.procs._UUID.match(sid) else "a session ccwho does not know")
-    return f"  {e['pid']:<7} {ports:<12} {engine.truncate(e.get('command') or '', 50):<50}  {who}"
-
-
 def _can_ask(stdin, stdout):
     """A person can answer only what they see: the list and the question go to
     stdout, the answer comes from stdin - both must be the terminal."""
@@ -1191,8 +1181,7 @@ def kill_cli(argv, clean=False, seams=None):
         return 2
     mode, target = parsed
     env = s["env"]
-    mark = engine.procs.mark_of({k: env.get(k) for k in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")})
-    mine = mark[1] if mark else None        # an agent: its own session's work only
+    mine = engine.agent_id(env)             # an agent: its own session's work only
     if mode == "mine":
         target = mine
     status = {}
@@ -1212,16 +1201,8 @@ def kill_cli(argv, clean=False, seams=None):
         print(f"ccwho: failed ({type(err).__name__}) - nothing killed", file=sys.stderr)
         return 1
     kill, spare = plan["kill"], plan["spare"]
-    if kill:
-        print(f"{len(kill)} process{'es' if len(kill) != 1 else ''} to kill:")
-        for e in kill:
-            print(_kill_line(e))
-            if e.get("note"):
-                print(f"          ! {e['note']}")
-    for e in spare:
-        print(f"not killed: {e['why']}")
-    if plan.get("why"):
-        print(f"ccwho: {plan['why']}")
+    for line in engine.kill_list_lines(plan):
+        print(line)
     if not kill:
         return 1
     # a tree refused (not clean's "outside" spares): the real run could not take it all
@@ -1257,39 +1238,14 @@ def kill_cli(argv, clean=False, seams=None):
               f" - some of these may have been signalled; run ccwho ps", file=sys.stderr)
         return 1
     try:
-        return _kill_report(r, refused)
+        lines, rc = engine.kill_report_lines(r, refused)
+        for line in lines:
+            print(line)
+        return rc
     except (Exception, KeyboardInterrupt):
         print("\nccwho: stopped while reporting - run ccwho ps to see what still runs",
               file=sys.stderr)
         return 1
-
-
-def _kill_report(r, refused):
-    """What carry_out did, one line each; the exit: 0 when all of the target is
-    gone (and the plan refused no part of it), 130 when an interrupt stopped it
-    before any signal, else 1."""
-    if r["killed"]:
-        print(f"killed {len(r['killed'])}: " + " ".join(str(e["pid"]) for e in r["killed"]))
-    for e in r["survivors"]:
-        why = f" ({e['why']})" if e.get("why") else ""
-        print(f"still running: {e['pid']} {e.get('command') or ''}{why}"
-              f" - ccwho kill {e['pid']} --force")
-    for e in r["spare"]:
-        print(f"not killed: {e['pid']} {e.get('command') or ''} - {e['why']}")
-    for e in r["new"]:
-        print(f"not killed, new since the list: {e['pid']} {e.get('command') or ''}"
-              f" - ccwho kill {e['pid']}")
-    for line in r["ports"]:
-        print(line)
-    if r.get("why"):
-        print(f"ccwho: {r['why']}")
-    if r.get("why", "").startswith("interrupted") and not (r["killed"] or r["survivors"]):
-        return 130                          # nothing got a signal
-    # all of the target is gone: nothing left, nothing new, no port not known free,
-    # no tree refused
-    whole = r["killed"] and not (r["survivors"] or r["spare"] or r["new"] or r.get("why")
-                                 or r["held"] or refused)
-    return 0 if whole else 1
 
 
 def reap(argv):

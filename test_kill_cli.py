@@ -626,6 +626,121 @@ class TestTheReport(unittest.TestCase):
         self.assertIn("ccwho: interrupted", out)
 
 
+# ------------------------------------------------ what the list shares with it
+
+class TestPsScreenParts(unittest.TestCase):
+    """The process screen, line by line: which lines the keys can be on, and
+    what `x` there would kill."""
+
+    FLEET = {"ports_ok": True, "procs_ok": True}
+    LISTING = [
+        {"pid": 41, "ports": [3000], "command": "vite --port 3000", "group": "session",
+         "who": "liveapp - Issue 362"},
+        {"pid": 20, "ports": [], "command": "npm run dev", "group": "left behind",
+         "who": "left behind"},
+        {"pid": None, "ports": [], "command": "?", "group": "left behind", "who": "left behind"},
+    ]
+
+    def test_the_lines_are_the_screen(self):
+        parts = engine.ps_screen_parts(self.LISTING, self.FLEET, width=80)
+        self.assertEqual("\n".join(line for line, _v, _f in parts),
+                         engine.render_ps_screen(self.LISTING, self.FLEET, width=80))
+
+    def test_a_process_is_its_pid(self):
+        # its own field: the brief's "pid" is the session's claude, never a kill target
+        parts = engine.ps_screen_parts(self.LISTING, self.FLEET, width=80)
+        self.assertEqual([(v, f) for _l, v, f in parts if f == "proc"], [("41", "proc"), ("20", "proc")])
+
+    def test_left_behind_is_cleaned_whole(self):
+        parts = engine.ps_screen_parts(self.LISTING, self.FLEET, width=80)
+        clean = [(l, v) for l, v, f in parts if f == "clean"]
+        self.assertEqual(len(clean), 1)
+        self.assertIn("LEFT BEHIND", clean[0][0].upper())
+
+    def test_a_session_heading_is_no_part(self):                        # control
+        parts = engine.ps_screen_parts(self.LISTING, self.FLEET, width=80)
+        self.assertEqual([f for l, v, f in parts if l.startswith("liveapp")], [None])
+
+    def test_a_line_break_in_a_command_moves_no_pid(self):
+        listing = [dict(self.LISTING[0], command="a\nb"), dict(self.LISTING[0], pid=42, command="c")]
+        parts = engine.ps_screen_parts(listing, self.FLEET, width=80)
+        by_pid = {v: l for l, v, f in parts if f == "proc"}
+        self.assertIn("a", by_pid["41"])
+        self.assertIn("c", by_pid["42"])
+        self.assertTrue(all("\n" not in l for l, _v, _f in parts))
+
+    def test_unknown_is_one_line_and_no_part(self):
+        parts = engine.ps_screen_parts([], {"collected": False})
+        self.assertEqual(parts, [("processes unknown - not collected yet", None, None)])
+
+
+class TestKillPrepare(unittest.TestCase):
+    """What the list asks about: the machine read now, the plan, and who asks."""
+
+    def build(self, w=None, trouble=None):
+        seen = []
+
+        def build(mine=None, status=None):
+            seen.append(mine)
+            if trouble:
+                status["trouble"] = trouble
+            ww = w or world()
+            return dict(ww, mine=mine) if mine is not None else ww
+        return build, seen
+
+    def test_a_pid_is_planned_on_its_start_now(self):
+        build, seen = self.build()
+        p = engine.kill_prepare("pid", 20, env={}, build=build)
+        self.assertEqual((p["target"], p["mine"], seen), ({"pid": 20, "start": T}, None, [None]))
+        self.assertEqual(sorted(e["pid"] for e in p["plan"]["kill"]), [20, 21, 22])
+        self.assertFalse(p["refused"])
+
+    def test_an_agent_is_its_session(self):
+        build, seen = self.build()
+        p = engine.kill_prepare("clean", None, env={"CLAUDE_CODE_SESSION_ID": DEAD}, build=build)
+        self.assertEqual((p["mine"], seen), (DEAD, [DEAD]))
+        self.assertIn("clean --mine", p["plan"]["why"])
+
+    def test_trouble_plans_nothing(self):
+        build, _ = self.build(trouble="a live session's pid could not be read")
+        p = engine.kill_prepare("pid", 20, env={}, build=build)
+        self.assertEqual(p["plan"]["kill"], [])
+        self.assertEqual(p["why"], "a live session's pid could not be read - nothing killed")
+
+    def test_an_error_names_its_type_only(self):
+        secret = "sk-ant-" + "Q" * 30
+
+        def build(**k):
+            raise RuntimeError(secret)
+        p = engine.kill_prepare("pid", 20, env={}, build=build)
+        self.assertEqual(p["plan"]["kill"], [])
+        self.assertEqual(p["why"], "failed (RuntimeError) - nothing killed")
+
+    def test_a_refused_tree_is_said(self):
+        w = world()
+        w["pipes"][30], w["pipes"][10] = {10}, {30}
+        build, _ = self.build(w)
+        self.assertTrue(engine.kill_prepare("clean", None, env={}, build=build)["refused"])
+
+
+class TestKillText(unittest.TestCase):
+    """The CLI and the list say the same thing: one list, one report."""
+
+    def test_the_list(self):
+        w = dict(world(), connections=[(22, "127.0.0.1", 3000, "8.8.8.8", 443)])
+        lines = engine.kill_list_lines(procs.kill_plan("pid", {"pid": 20, "start": T}, w))
+        self.assertEqual(lines[0], "3 processes to kill:")
+        self.assertTrue(any(ln.lstrip().startswith("! ") and "another machine" in ln for ln in lines))
+        self.assertTrue(any("npm run dev" in ln for ln in lines))
+
+    def test_the_report(self):
+        r = {"killed": [{"pid": 22}, {"pid": 21}], "survivors": [], "spare": [], "new": [],
+             "ports": [":3000 is free"], "held": []}
+        lines, rc = engine.kill_report_lines(r, refused=False)
+        self.assertEqual((lines, rc), (["killed 2: 22 21", ":3000 is free"], 0))
+        self.assertEqual(engine.kill_report_lines(r, refused=True)[1], 1)       # control
+
+
 # ---------------------------------------------------------------- real runs
 
 def _free_port():

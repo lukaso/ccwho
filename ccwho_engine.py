@@ -2621,14 +2621,27 @@ def collect(cache=None, status=None):
     # either scan missing leaves no marks or no parents: "unknown", not "nothing"
     # a port held by a process whose environment could not be read: who started
     # it is not known, and "no agent holds it" would be a guess
-    unknown_ports = sorted({port for pid, held in (ports or {}).items()
-                            if pid not in marks for port in held})
+    # - unless attribute placed it anyway: the tree gives a tool shell's
+    # `/usr/bin/nc -l` to its session, unread or not
+    placed = {p["pid"] for grp in [*att["sessions"].values(), att["left_behind"],
+                                   att["codex"], att["unsure"]] for p in grp}
+    unread = {pid: held for pid, held in (ports or {}).items()
+              if pid not in marks and pid not in placed}
+    unknown_ports = sorted({port for held in unread.values() for port in held})
+    # and who holds it, by name: ControlCenter holds :5000, and macOS hides
+    # its environment - a person knows it at once, a script gets "unknown"
+    unknown_holders = {}
+    for pid, held in sorted(unread.items()):
+        for port in held:
+            unknown_holders.setdefault(port, []).append(
+                {"pid": pid, "name": procs.program_name(ptable.get(pid, (0, "", ""))[2])})
     # any scan missing leaves no marks or no parents: "unknown", not "nothing" -
     # and so does an environment read that failed for every process
     fleet = _fleet(att, rows, ports is not None,
                    procs_ok=bool(table) and bool(ps_out) and bool(marks),
                    sessions_ok=sessions_ok)
     fleet["unknown_ports"] = unknown_ports
+    fleet["unknown_holders"] = unknown_holders
     return rows, fleet
 
 
@@ -3228,8 +3241,8 @@ def ps_listing(rows, fleet, show_all=False):
     listed += [dict(p, group="left behind", who="left behind")
                for p in fleet.get("left_behind") or []]
     listed += [dict(p, group="codex", who="codex") for p in fleet.get("codex") or []]
-    # its session is gone, but there is doubt (the list is incomplete, a claude
-    # ccwho does not list runs it, or it is an app): never offered as litter
+    # doubt about whose it is (the list is incomplete, a claude ccwho does not
+    # list runs it, or it is an app): never offered as litter
     listed += [dict(p, group="unsure", who=f"not sure: {p.get('why', '?')}")
                for p in fleet.get("unsure") or []]
     if not show_all:
@@ -3239,7 +3252,7 @@ def ps_listing(rows, fleet, show_all=False):
 
 _PS_HEADING = {"left behind": "LEFT BEHIND - their session ended",
                "codex": "CODEX - whether its session still runs is not known",
-               "unsure": "NOT SURE - its session is gone, but it may not be litter"}
+               "unsure": "NOT SURE - it may not be litter: each line says why"}
 
 
 def render_ps_screen(listing, fleet, width=100):

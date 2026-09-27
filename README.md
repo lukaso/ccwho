@@ -222,8 +222,13 @@ ccwho's output is read by agents. `ccwho doctor` says if those files stop parsin
 Agents start dev servers and leave them running. The port you want is taken, and
 the session that did it may not even know. Every process Claude Code starts carries
 its session id in its environment (`CLAUDE_CODE_SESSION_ID`; Codex sets
-`CODEX_THREAD_ID`), and the mark survives the process being orphaned - so ccwho can
-say who started what:
+`CODEX_THREAD_ID`), and the mark survives the process being orphaned. macOS hides the environment of its own programs (`/bin/zsh`,
+`/bin/bash`, `/bin/cat`, Apple's `python3`), and a Bash tool shell is the user's
+shell, one of them: so what runs under a listed live `claude` is that session's
+work, mark or not. Once it has left that tree, a process with a hidden environment
+is usually not known (unless its command line names the session) - `ccwho ps
+--port` names the holder and exits 3 (`:5000 is held by ControlCenter (pid 1190)`).
+So ccwho can say who started what:
 
 ```sh
 ccwho ps                    # every process an agent started, its session, its ports

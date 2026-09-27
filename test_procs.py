@@ -84,8 +84,40 @@ class TestParseProcargs(unittest.TestCase):
         # but a rewritten title can put env text anywhere, so an exact KEY=value
         # string still counts; only a string that merely CONTAINS it does not
         got = procs.parse_procargs(procargs(["echo", f"see CLAUDE_CODE_SESSION_ID={SID}"],
-                                            []))
+                                            ["PATH=/bin"]))
         self.assertEqual(got, {})
+
+    # measured 2026-09-27: macOS hands back no environment at all for its own
+    # binaries (/bin/zsh, /bin/sleep, /bin/cat) - the exec path, padding, argv and
+    # nothing after. Every Bash tool shell is /bin/zsh: "no mark" there is a
+    # guess, and ccwho dropped each one from its session
+    HIDDEN_SLEEP = b"\x02\x00\x00\x00/bin/sleep\x00\x00\x00\x00\x00\x00/bin/sleep\x005\x00"
+
+    def test_a_hidden_environment_is_unread_not_empty(self):
+        self.assertIsNone(procs.parse_procargs(self.HIDDEN_SLEEP))
+
+    def test_a_hidden_environment_is_unread_whatever_argv_says(self):
+        # a tool shell's argv is full of `KEY=value` text: it is still argv
+        for argv in (["zsh", "-c", "A=1 PATH=/x cat"], ["", "x"], ["sleep", "5", ""]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(procs.parse_procargs(procargs(argv, [], "/bin/zsh")))
+
+    # a real environment has many variables (measured: 8 or more on every
+    # readable process): an empty argument or a rewritten title never hides it
+    REAL_ENV = ["PATH=/bin", "HOME=/x", "USER=u", "SHELL=/bin/zsh", "LANG=C", "TERM=x",
+                "TMPDIR=/t", "LOGNAME=u"]
+
+    def test_an_empty_argument_does_not_hide_a_real_environment(self):     # control
+        self.assertEqual(procs.parse_procargs(procargs(["", "x"], self.REAL_ENV)), {})
+
+    def test_a_joined_title_does_not_hide_a_real_environment(self):        # control
+        buf = struct.pack("i", 3) + b"/usr/local/bin/node\0\0\0node title\0" + \
+            "".join(e + "\0" for e in self.REAL_ENV).encode()
+        self.assertEqual(procs.parse_procargs(buf), {})
+
+    def test_one_variable_after_argv_is_an_environment(self):            # control
+        buf = self.HIDDEN_SLEEP + b"PATH=/bin\x00"
+        self.assertEqual(procs.parse_procargs(buf), {})
 
     def test_malformed_buffers_are_unreadable(self):
         for name, buf in (("empty", b""), ("short", b"\x01\x00"),
@@ -846,6 +878,135 @@ class TestAttribute(unittest.TestCase):
         table = dict([proc(50, cmd=f"node x --token={TOKEN}")])
         w = procs.attribute(table, {50: ("claude", DEAD_SID)}, {}, [])
         self.assertNotIn(TOKEN, repr(w))
+
+
+class TestAttributeByTree(unittest.TestCase):
+    """What runs under a live session's claude is that session's work, mark or
+    not. A Bash tool shell is /bin/zsh, whose environment macOS hides: without
+    the tree, every tool shell and every system tool under it was nobody's -
+    a hung `cat` in one ran 20 hours and ccwho never listed it (2026-09-27)."""
+
+    TOOL = "/bin/zsh -c source /Users/u/.claude/shell-snapshots/snap.sh && eval 'x'"
+
+    def attribute(self, table, marks=None, own=None, sessions=None):
+        return procs.attribute(dict(table), marks or {}, {},
+                               sessions or [{"sessionId": LIVE_SID, "pid": 10}], own=own)
+
+    def pids(self, w, sid=LIVE_SID):
+        return sorted(p["pid"] for p in w["sessions"].get(sid, []))
+
+    def test_an_unread_tool_shell_and_what_runs_in_it_are_the_sessions(self):
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd=self.TOOL), proc(13, ppid=12, cmd="cat"),
+                            proc(14, ppid=12, cmd="cut -c1-300")])
+        self.assertEqual(self.pids(w), [11, 12, 13, 14])
+
+    def test_a_tree_entry_carries_no_mark_it_did_not_have(self):
+        # the signaller compares "marked" with the environment right before a
+        # signal: a mark made up here would never match, and no kill would go
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL)])
+        p = w["sessions"][LIVE_SID][0]
+        self.assertEqual((p["marked"], p["session"], p["harness"]), (None, LIVE_SID, "claude"))
+
+    def test_read_with_no_mark_under_the_session_is_the_sessions_too(self):
+        # `env -i x` under a tool shell: the tree says whose it is
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="x")], marks={12: None})
+        self.assertEqual(self.pids(w), [11, 12])
+
+    def test_unmarked_outside_every_live_session_stays_nobodys(self):       # control
+        w = self.attribute([proc(10, cmd="claude"), proc(20, ppid=1, cmd=self.TOOL),
+                            proc(21, ppid=20, cmd="cat"), proc(30, ppid=500, cmd="vim")])
+        every = [p["pid"] for g in [*w["sessions"].values(), w["left_behind"], w["codex"],
+                                    w["unsure"]] for p in g]
+        self.assertEqual(every, [])
+
+    def test_the_nearest_claude_owns_it_not_a_farther_one(self):
+        # a claude started in session A's tool shell is its own session: what it
+        # runs is ITS work, not A's
+        other = "bbbb2222-0000-4000-8000-000000000002"
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="claude"), proc(13, ppid=12, cmd=self.TOOL)],
+                           sessions=[{"sessionId": LIVE_SID, "pid": 10},
+                                     {"sessionId": other, "pid": 12}])
+        self.assertEqual(self.pids(w), [11])
+        self.assertEqual(self.pids(w, other), [13])
+
+    def test_under_an_unlisted_agent_the_nearest_session_is_named(self):
+        # "not sure" still says whose tree it is in: B's, not A's above it
+        other = "bbbb2222-0000-4000-8000-000000000002"
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="claude"), proc(13, ppid=12, cmd=self.TOOL),
+                            proc(14, ppid=13, cmd="claude -p hi"), proc(15, ppid=14, cmd="x")],
+                           sessions=[{"sessionId": LIVE_SID, "pid": 10},
+                                     {"sessionId": other, "pid": 12}])
+        self.assertEqual({p["pid"]: p["session"] for p in w["unsure"]}, {14: other, 15: other})
+
+    def test_an_unlisted_agent_under_the_session_is_not_its_work(self):
+        # `claude -p` in a tool shell is an agent of its own: it and what it runs
+        # are "not sure", as they are when their marks can be read
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="claude -p hi"),
+                            proc(13, ppid=12, cmd=self.TOOL)])
+        self.assertEqual(self.pids(w), [11])
+        why = {p["pid"]: p["why"] for p in w["unsure"]}
+        self.assertEqual(sorted(why), [12, 13])
+        self.assertIn("does not list", why[13])
+
+    def test_a_real_mark_under_the_session_is_kept(self):
+        # the tree names the session; the mark stays what the environment said
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="node s.js")],
+                           marks={12: ("claude", DEAD_SID)})
+        p = {p["pid"]: p for p in w["sessions"][LIVE_SID]}
+        self.assertEqual((p[11]["marked"], p[12]["marked"]), (None, DEAD_SID))
+
+    def test_a_codex_mark_under_the_session_stays_codex(self):
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="workerd serve")],
+                           marks={12: ("codex", "01a0abc8-x")})
+        self.assertEqual([p["pid"] for p in w["codex"]], [12])
+        self.assertEqual(self.pids(w), [11])
+
+    def test_the_session_itself_is_never_its_work(self):                   # control
+        # a session inside another one's tool shell is a session, not work
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="claude")],
+                           sessions=[{"sessionId": LIVE_SID, "pid": 10},
+                                     {"sessionId": "bbbb2222-0000-4000-8000-000000000002",
+                                      "pid": 12}])
+        self.assertEqual(self.pids(w), [11])
+
+    def test_a_zombie_is_not_work(self):
+        # ps shows an exited child nobody reaped as `(name)`: nothing runs there
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="(bash)"), proc(13, ppid=10, cmd="(safe-chain)")])
+        self.assertEqual(self.pids(w), [11])
+
+    def test_with_the_session_list_incomplete_a_tool_shell_is_still_the_sessions(self):  # control
+        # its tree names a LIVE session: an incomplete list never makes it litter
+        w = procs.attribute(dict([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                                  proc(12, ppid=11, cmd="cat")]), {}, {},
+                            [{"sessionId": LIVE_SID, "pid": 10}], sessions_known=False)
+        self.assertEqual(self.pids(w), [11, 12])
+        self.assertEqual((w["left_behind"], w["unsure"]), ([], []))
+
+    def test_ccwho_and_what_it_runs_are_not_listed(self):
+        # ccwho run from a tool shell: the shell is the session's work, ccwho not
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd=self.TOOL),
+                            proc(12, ppid=11, cmd="python3 ccwho ps"),
+                            proc(13, ppid=12, cmd="ps -axo pid=")], own=12)
+        self.assertEqual(self.pids(w), [11])
+
+    def test_the_claudes_own_keep_awake_is_a_helper(self):
+        # measured: every claude runs `caffeinate -i -t 300` as its own child
+        w = self.attribute([proc(10, cmd="claude"), proc(11, ppid=10, cmd="caffeinate -i -t 300"),
+                            proc(12, ppid=10, cmd=self.TOOL),
+                            proc(13, ppid=12, cmd="caffeinate -i -t 300"),
+                            proc(14, ppid=12, cmd="caffeinate -i cargo build")])
+        helper = {p["pid"]: p["helper"] for p in w["sessions"][LIVE_SID]}
+        self.assertEqual(helper, {11: True, 12: False, 13: False, 14: False})
+        self.assertEqual(procs.row_summary(w["sessions"][LIVE_SID])["procs"], 3)
 
 
 class TestHelpers(unittest.TestCase):

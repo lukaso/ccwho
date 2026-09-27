@@ -3050,6 +3050,26 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         self.assertIn(":8080", err)
         self.assertEqual(self.run_ps("--port", "4444")[0], 1)                # control
 
+    def test_an_unreadable_holder_is_named(self):
+        # macOS hides ControlCenter's environment: who started it is not known,
+        # but a person reads "AirPlay" in the name at once
+        row, fleet = runner.engine.collect()
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, unknown_ports=[5000],
+                      unknown_holders={5000: [{"pid": 1190, "name": "ControlCenter"}]}))
+        rc, _, err = self.run_ps("--port", "5000")
+        self.assertEqual(rc, 3)
+        self.assertIn("ControlCenter (pid 1190)", err)
+
+    def test_an_unreadable_holders_name_cannot_repaint_the_terminal(self):
+        row, fleet = runner.engine.collect()
+        runner.engine.collect = lambda cache=None, status=None: (
+            row, dict(fleet, unknown_ports=[5000],
+                      unknown_holders={5000: [{"pid": 7, "name": "x\x1b[2Jy"}]}))
+        _, _, err = self.run_ps("--port", "5000")
+        self.assertNotIn("\x1b", err)
+        self.assertIn("x?[2Jy (pid 7)", err)
+
     def test_a_port_question_sees_helpers(self):
         # who holds :9222 - an MCP helper does, and "nobody" would be wrong
         rc, out, _ = self.run_ps("--port", "9222")

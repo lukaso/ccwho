@@ -1077,8 +1077,10 @@ def ps(argv):
             return 3
         listed = [p for p in listed if port in p.get("ports", [])]
         if not listed and port in (fleet.get("unknown_ports") or []):
-            print(f"ccwho ps: :{port} is held by a process whose environment could not"
-                  f" be read - who started it is not known", file=sys.stderr)
+            held = ", ".join(f"{engine.procs.printable(str(h.get('name')))} (pid {h.get('pid')})"
+                             for h in (fleet.get("unknown_holders") or {}).get(port) or [])
+            print(f"ccwho ps: :{port} is held by {held or 'a process'}, whose environment"
+                  f" could not be read - who started it is not known", file=sys.stderr)
             return 3
         if not listed:
             print(f"ccwho ps: nothing an agent started holds :{port}", file=sys.stderr)

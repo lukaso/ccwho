@@ -4495,6 +4495,30 @@ class TestReadProcargsOnARealProcess(unittest.TestCase):
     def test_a_pid_that_does_not_exist_is_none(self):                # control
         self.assertIsNone(ccwho.read_procargs(99999999))
 
+    def test_a_system_binary_is_unread_not_unmarked(self):
+        # the environment macOS hides is unknown: "no session started it" would
+        # drop every Bash tool shell (/bin/zsh) from its session
+        import sys
+        import time
+        if sys.platform != "darwin":
+            self.skipTest("macOS hides a system binary's environment; others do not")
+        child = subprocess.Popen(["/bin/sleep", "5"],
+                                 env={"CLAUDE_CODE_SESSION_ID": "x", "PATH": "/bin"})
+        try:
+            for _ in range(100):            # until it has exec'd: a fork is Python
+                done = subprocess.run(["ps", "-o", "comm=", "-p", str(child.pid)],
+                                      capture_output=True, text=True)
+                if done.stdout.strip() == "/bin/sleep":
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("the child never exec'd /bin/sleep: nothing was measured")
+            got = ccwho.read_procargs(child.pid)
+        finally:
+            child.kill()
+            child.wait()
+        self.assertIsNone(got)
+
 
 class TestReloadPutsEarlierModulesBackWhenALaterOneFails(unittest.TestCase):
     """brief is re-read first. If procs - the LAST rule module - raises, brief
@@ -4988,11 +5012,37 @@ class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
         ccwho.listen_ports = lambda: {12: [5173], 40: [8080]}
         _, fleet = self.collect()
         self.assertEqual(fleet["unknown_ports"], [8080])
+        # named, so a person sees who holds it without a guess in the exit code
+        self.assertEqual(fleet["unknown_holders"], {8080: [{"pid": 40, "name": "python3"}]})
+
+    def test_a_holder_the_tree_gives_a_session_is_not_unknown(self):
+        # `/usr/bin/nc -l 8081` in a tool shell: unread, and still the session's
+        # port - never also "unknown". 40, unread and nobody's, still is (control)
+        real = ccwho.read_procargs
+        ccwho.read_procargs = lambda pid: None if pid in (14, 40) else real(pid)
+        ccwho.ps_snapshot = lambda: self.PS + "  14    10 /usr/bin/nc -l 8081\n"
+        ccwho.listen_ports = lambda: {14: [8081], 40: [8080]}
+        rows, fleet = self.collect()
+        self.assertEqual(rows[0]["ports"], [8081])
+        self.assertEqual(fleet["unknown_ports"], [8080])
+        self.assertEqual(sorted(fleet["unknown_holders"]), [8080])
+
+    def test_a_holder_in_an_app_is_named_by_the_app(self):
+        # a path with spaces: its first word ("Visual") names nothing
+        real = ccwho.read_procargs
+        ccwho.read_procargs = lambda pid: None if pid == 42 else real(pid)
+        ccwho.ps_snapshot = lambda: self.PS + (
+            "  42     1 /Applications/Visual Studio Code.app/Contents/MacOS/Electron\n")
+        ccwho.listen_ports = lambda: {42: [8082]}
+        _, fleet = self.collect()
+        self.assertEqual(fleet["unknown_holders"], {8082: [{"pid": 42,
+                                                           "name": "Visual Studio Code"}]})
 
     def test_a_port_whose_holder_was_read_is_known(self):             # control
         ccwho.listen_ports = lambda: {12: [5173], 40: [8080]}
         _, fleet = self.collect()
         self.assertEqual(fleet["unknown_ports"], [])
+        self.assertEqual(fleet["unknown_holders"], {})
 
     def test_with_the_file_scan_crashed_nothing_is_left_behind(self):
         def crash(*a, **k):
@@ -5237,6 +5287,14 @@ class TestTheListSaysWhatAgentsHold(unittest.TestCase):
             self.assertIn(heading, text)
         self.assertIn(":3000", text)
         self.assertIn("vite --port 3000", text)
+
+    def test_not_sure_does_not_say_the_session_is_gone(self):
+        # what runs under a `claude -p` in a live session is "not sure" too:
+        # its session is not gone
+        text = ccwho.render_ps_screen(ccwho.ps_listing([self.ROW], self.FLEET), self.FLEET,
+                                      width=100)
+        line = next(l for l in text.splitlines() if "NOT SURE" in l)
+        self.assertNotIn("gone", line)
 
     def test_the_process_screen_says_when_it_does_not_know(self):
         text = ccwho.render_ps_screen([], dict(self.FLEET, procs_ok=False), width=100)

@@ -46,7 +46,14 @@ def parse_procargs(buf):
         for prefix in wanted:
             if chunk.startswith(prefix):
                 out[prefix[:-1].decode()] = chunk[len(prefix):].decode("utf-8", "replace")
-    return out
+    if out:
+        return out
+    # macOS hands back nothing after argv for its own binaries (/bin/zsh,
+    # /bin/cat): that environment is unknown, not empty. Only here is argv
+    # walked by argc: where a rewritten title makes the walk eat the
+    # environment, the answer is "unknown" - never a key lost
+    rest = buf[end:].lstrip(b"\0").split(b"\0")[argc:]
+    return {} if any(rest) else None
 
 
 # Control characters (C0, DEL, C1): escape sequences that retitle a window or
@@ -498,6 +505,13 @@ _HELPER = re.compile(r"(?:^|[\s/])(?:[\w.-]*-mcp(?:-server)?|mcp-server[\w.-]*|m
                      # an installed MCP package, whatever file of it runs: not a
                      # project folder that is merely named *-mcp
                      r"|node_modules/(?:@[\w.-]+/)?[\w.-]*-mcp(?:-server)?/", re.I)
+# what every claude runs as its own child to keep the Mac awake (measured
+# 2026-09-27): a helper there, and work anywhere else (`caffeinate -i make`)
+_KEEP_AWAKE = re.compile(r"^(?:/usr/bin/)?caffeinate -i -t \d+\Z")
+# an exited child nobody reaped yet: ps shows its name in brackets. By text,
+# not state (the table has none): a live process that named itself `(x)` is
+# left out of its session's list - none did on the Mac measured 2026-09-27
+_ZOMBIE = re.compile(r"^\(.*\)\Z")
 
 
 # macOS runs python3 - Apple's, Homebrew's, python.org's - as .../Python.framework/
@@ -548,6 +562,13 @@ def _app_name(cmd):
     """The app bundle's name, for a person: "Google Chrome"."""
     bundle = _app_bundle(cmd)
     return printable(bundle.rsplit("/", 1)[-1])[:40] if bundle else None
+
+
+def program_name(cmd):
+    """What a person calls it: the app ("Visual Studio Code" - a path with spaces
+    has no first word that names it), else the program's short name."""
+    # a node-mode CLI is no "Visual Studio Code"
+    return (None if _node_mode(cmd) else _app_name(cmd)) or _name(cmd)
 
 
 def _ancestors(table, pid):
@@ -605,7 +626,7 @@ def _ssh_transport(cmd):
 
 
 def _unsure_why(table, pid, cmd, sessions_known, starter=None, over_claude=()):
-    """Why a process whose session is gone may still not be litter - or None.
+    """Why a process whose session is not listed may still not be litter - or None.
     `left behind` is the group a clean-up agent kills: anything in doubt is not."""
     if not sessions_known:
         return "the session list is incomplete"
@@ -644,8 +665,10 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
     behind - unless there is doubt (`unsure`, with `why`): the session list is
     incomplete (`sessions_known` False) or a running claude is an ancestor. An
     app is `unsure` in every group, whoever started it. A Codex mark is always its own group, because a Codex session's
-    liveness is not known. A session's own process is not its work, an unmarked
-    process is nobody's, and neither is `own` (ccwho) or anything it runs.
+    liveness is not known. A session's own process is not its work. A process
+    with no mark is the nearest live session's when one runs above it (the tree:
+    macOS hides a tool shell's environment), else nobody's; and neither is
+    `own` (ccwho) or anything it runs.
 
     `named` is sessionId -> pids whose command line names that session, for
     processes whose environment could not be read: listed with the session, so
@@ -672,8 +695,22 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
         if sid in live:
             for pid in pids:
                 marks.setdefault(pid, ("claude", sid))
-    for pid in sorted(marks):
-        mark = marks[pid]
+    # no mark - not read, or read with none - under a live session's claude:
+    # the tree says whose it is, and the rules below say what it is (an agent
+    # between them makes it "not sure"). A Bash tool shell is /bin/zsh, whose
+    # environment macOS hides: without this no tool shell was ever listed
+    tree = {}
+    for pid, (_pp, _st, cmd) in (table or {}).items():
+        if (isinstance(marks.get(pid), (tuple, list)) and len(marks[pid]) >= 2
+                or _ZOMBIE.match(cmd or "")):
+            continue
+        owner = next((by_pid[a] for a in _ancestors(table, pid) if a in by_pid), None)
+        if owner is not None:
+            tree[pid] = owner
+    for pid in sorted(set(marks) | set(tree)):
+        # made up for the rules below, never listed as "marked": the signaller
+        # compares that with the environment right before a signal
+        mark = ("claude", tree[pid]) if pid in tree else marks[pid]
         if (not isinstance(mark, (tuple, list)) or len(mark) < 2
                 or pid not in (table or {}) or pid in session_pids):
             continue
@@ -690,14 +727,15 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
             if a in by_pid or _is_an_agent(table[a][2]):
                 nearest = a
                 break
-        marked = sid
+        marked = None if pid in tree else sid
         if harness == "claude" and nearest in by_pid:
             sid = by_pid[nearest]
         starter = mark[2] if len(mark) > 2 else None
         p = {"pid": pid, "ppid": ppid, "start": start, "command": safe_command(cmd),
              "command_full": redact_command(cmd),
              "ports": list((ports or {}).get(pid, [])), "orphan": ppid == 1,
-             "helper": is_helper(cmd), "harness": harness,
+             "helper": is_helper(cmd) or bool(ppid in session_pids and _KEEP_AWAKE.match(cmd)),
+             "harness": harness,
              "session": sid, "marked": marked}
         if _is_app(cmd):
             # an app an agent opened (measured: Docker Desktop, from Codex) is
@@ -1781,8 +1819,7 @@ def _kill_plan(mode, target, world):
         return None
 
     def name_of(pid):
-        cmd = cmd_of(pid)                   # a node-mode CLI is no "Visual Studio Code"
-        return (None if _node_mode(cmd) else _app_name(cmd)) or _name(cmd)
+        return program_name(cmd_of(pid))
 
     def notes_of(q, root, taking):
         """What ccwho doubts about `q`: said with the kill, never a refusal."""

@@ -1101,7 +1101,7 @@ def ps(argv):
     return 0
 
 
-KILL_USAGE = ("usage: ccwho kill <pid>|:<port> [--dry-run] [--yes] [--force]\n"
+KILL_USAGE = ("usage: ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]\n"
               "       ccwho clean [--mine] [--dry-run] [--yes] [--force]")
 KILL_FLAGS = ("--dry-run", "--yes", "--force")
 
@@ -1110,19 +1110,25 @@ def _kill_target(argv, clean):
     """(mode, target) from the arguments, or None: a usage error."""
     flags = [a for a in argv if a.startswith("-")]
     words = [a for a in argv if not a.startswith("-")]
-    if any(f not in KILL_FLAGS + (("--mine",) if clean else ()) for f in flags):
+    if any(f not in KILL_FLAGS + (("--mine",) if clean else ("--pid",)) for f in flags):
         return None
     if clean:
         return None if words else (("mine", None) if "--mine" in flags else ("clean", None))
     if len(words) != 1:
         return None
     w = words[0]
+    # a session, as `ccwho jump` names it: a short id or a name - a letter in
+    # it, so a pid is never read as one - or its full id, or a short id led by
+    # a zero (a pid has none)
+    if ((re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w) and re.search(r"[A-Za-z]", w))
+            or engine.procs._UUID.fullmatch(w) or re.fullmatch(r"0[0-9]{3,7}", w)):
+        return None if "--pid" in flags else ("query", w)
     digits = w[1:] if w.startswith(":") else w
     if not (digits.isascii() and digits.isdigit() and len(digits) < 8 and digits[0] != "0"):
         return None                         # no sign, no leading zero: one spelling each
     if w.startswith(":"):
-        return None if int(digits) > 65535 else ("port", digits)
-    return ("pid", int(digits))
+        return None if int(digits) > 65535 or "--pid" in flags else ("port", digits)
+    return ("pid", int(digits)) if "--pid" in flags else ("digits", int(digits))
 
 
 def _can_ask(stdin, stdout):
@@ -1157,6 +1163,25 @@ def _ask(prompt):
     return line
 
 
+def _names_exactly(row, word):
+    """`word` is one of the row's own names - an id prefix, its name, its tty -
+    not a piece of its title."""
+    w = word.strip().lower()
+    tty = row.get("tty") or ""
+    return bool(w) and ((row.get("sessionId") or "").lower().startswith(w)
+                        or w == (row.get("name") or "").lower()
+                        or w in (tty.lower(), engine.short_tty(tty).lower()))
+
+
+def _live_rows():
+    """The live sessions, or an error: an unread feed is no "no match"."""
+    status = {}
+    rows, _ = engine.collect(cache={}, status=status)
+    if not status.get("source_ok", True):
+        raise LookupError("claude agents could not be read")
+    return rows
+
+
 def kill_cli(argv, clean=False, seams=None):
     """`ccwho kill <pid>|:<port>` and `ccwho clean [--mine]`.
 
@@ -1170,15 +1195,45 @@ def kill_cli(argv, clean=False, seams=None):
     s = {"build": lambda mine=None, status=None: engine.build_world(mine, status=status),
          "ask": lambda prompt: _ask(prompt), "tty": lambda: _can_ask(sys.stdin, sys.stdout),
          "env": os.environ,
-         "carry": engine.carry_out}
+         "carry": engine.carry_out, "rows": _live_rows}
     s.update(seams or {})
     parsed = _kill_target(argv, clean)
     if parsed is None:
         print(KILL_USAGE, file=sys.stderr)
         return 2
     mode, target = parsed
+    asked_digits = mode == "digits"          # a pid, unless it starts a session id
+    mode = "pid" if asked_digits else mode
     env = s["env"]
     mine = engine.agent_id(env)             # an agent: its own session's work only
+    if mode == "query":
+        # a live session: what it started (the owner's D12). One match, or none
+        try:
+            hits = engine.match_rows(s["rows"](), target)
+        except KeyboardInterrupt:
+            print("ccwho: interrupted - nothing killed", file=sys.stderr)
+            return 130
+        except Exception as err:
+            print(f"ccwho: the sessions could not be read ({type(err).__name__})"
+                  f" - nothing killed", file=sys.stderr)
+            return 1
+        if not hits:
+            print(f"ccwho: no live session matches {target!r} - what an ended session"
+                  f" left: ccwho clean", file=sys.stderr)
+            return 1
+        if len(hits) > 1:
+            print(f"ccwho: {target!r} matches {len(hits)} sessions - be more specific:",
+                  file=sys.stderr)
+            for line in engine.pick_lines(hits):
+                print(f"  {line}", file=sys.stderr)
+            return 2
+        if ("--yes" in argv or mine is not None) and not _names_exactly(hits[0], target):
+            # nobody reads the list: a word found in a title is no one's choice
+            print(f"ccwho: {target!r} found {engine.pick_line(hits[0])} - with no one to"
+                  f" confirm, name it exactly: its id, name or tty", file=sys.stderr)
+            return 2
+        print(f"session {engine.pick_line(hits[0])}")
+        mode, target = "session", hits[0].get("sessionId") or ""
     if mode == "mine":
         target = mine
     status = {}
@@ -1187,6 +1242,16 @@ def kill_cli(argv, clean=False, seams=None):
         if status.get("trouble"):
             print(f"ccwho: {status['trouble']} - nothing killed", file=sys.stderr)
             return 1
+        starts = [x.get("sessionId") for x in world["sessions"]
+                  if asked_digits and (x.get("sessionId") or "").startswith(str(target))]
+        if starts:
+            # a short id is four hex, often all digits: asked, never guessed
+            print(f"ccwho: {target} is a pid and the start of a session id - the session:",
+                  file=sys.stderr)
+            for sid in starts:
+                print(f"  ccwho kill {sid}", file=sys.stderr)
+            print(f"  the pid: ccwho kill {target} --pid", file=sys.stderr)
+            return 2
         if mode == "pid":
             row = world["table"].get(target)
             target = {"pid": target, "start": row[1] if row else ""}
@@ -2137,7 +2202,7 @@ def main(argv=None):
         print("                                                  (--all includes sessions a program started)")
         print("       ccwho show <anything>                      what that session was working on")
         print("       ccwho ps [--port N] [--all] [--json] [--full]  what agents started, and their ports")
-        print("       ccwho kill <pid>|:<port> [--dry-run] [--yes] [--force]  kill a tree or a port's holder - lists, then asks")
+        print("       ccwho kill <pid>|:<port>|<session> [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
         print("       ccwho clean [--mine] [--dry-run] [--yes] [--force]      kill what ended sessions left - lists, then asks")
         print("       ccwho reap [pattern] [--older-than 1h] [--kill]  leaked helpers, dry run unless --kill")
         print("       ccwho accounts [--json]                    subscription usage, per account")

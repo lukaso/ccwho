@@ -1684,16 +1684,125 @@ class TestKillPlan(unittest.TestCase):
             self.assertNotIn(pid, self.kills(p))
 
     def test_a_sessions_work_is_that_session_only(self):
-        # v1: session mode is not built; attribute still files the work
-        self.assertEqual(self.kills(self.plan("session", self.LIVE)), [])
-        self.assertEqual([p["pid"] for p in self.world()["att"]["sessions"][self.LIVE]], [11])
+        # the owner's D12 (2026-09-27): what the session's mark started, listed
+        self.assertEqual(self.kills(self.plan("session", self.LIVE)), [11])
+        self.assertEqual(self.kills(self.plan("session", DEAD_SID)), [20, 21])   # control
 
     def test_a_live_sessions_helpers_are_not_its_work(self):
-        # its MCP servers: killing one breaks the session that is still running
+        # its MCP servers: killing one breaks the session that is still running.
+        # Named, as clean names what it is not sure of
         extra = {12: (10, self.T, "npm exec chrome-devtools-mcp@latest")}
         w = self.world(extra=extra, marks={12: ("claude", self.LIVE)})
-        self.assertEqual(procs.kill_plan("session", self.LIVE, w)["kill"], [])
+        p = procs.kill_plan("session", self.LIVE, w)
+        self.assertEqual(self.kills(p), [11])
+        self.assertIn("ccwho kill 12", self.spared(p)[12])
+        self.assertTrue(next(e for e in p["spare"] if e["pid"] == 12).get("outside"))
         self.assertEqual(self.kills(procs.kill_plan("pid", {"pid": 11, "start": self.T}, w)), [11])
+
+    def test_a_session_kill_names_what_ccwho_doubts(self):
+        # a dead session's app and daemon: named with `ccwho kill`, not taken
+        p = self.plan("session", DEAD_SID)
+        for pid in (50, 60):
+            self.assertNotIn(pid, self.kills(p))
+            self.assertIn(f"ccwho kill {pid} if you mean it", self.spared(p)[pid])
+
+    def test_the_chosen_sessions_work_has_no_live_session_note(self):
+        # the person chose that session: "the work of a live session" says nothing
+        w = self.world(marks={11: ("claude", self.LIVE)})
+        self.assertNotIn("live session", self.note(procs.kill_plan("session", self.LIVE, w), 11))
+        self.assertIn("live session", self.note(                              # control
+            procs.kill_plan("pid", {"pid": 11, "start": self.T}, w), 11))
+
+    def test_a_session_kill_takes_no_other_sessions_work(self):
+        other = "eeee5555-0000-4000-8000-000000000005"
+        extra = {12: (11, self.T, "esbuild --service")}
+        p = self.plan("session", self.LIVE, extra=extra, marks={12: ("claude", other)})
+        self.assertEqual(self.kills(p), [])
+        self.assertIn("another session's mark", self.spared(p)[11])
+
+    def test_a_session_kill_names_a_host_and_what_an_unlisted_agent_runs(self):
+        extra = {12: (10, self.T, "python3 -m jupyter lab --port 8888"),
+                 13: (10, self.T, "claude -p fix"), 14: (13, self.T, "node build.js")}
+        marks = {12: ("claude", self.LIVE), 14: ("claude", self.LIVE)}
+        p = self.plan("session", self.LIVE, extra=extra, marks=marks)
+        self.assertEqual(self.kills(p), [11])
+        for pid in (12, 14):
+            self.assertIn(f"ccwho kill {pid} if you mean it", self.spared(p)[pid])
+
+    def test_another_live_sessions_work_is_never_this_ones(self):
+        # the tree outranks the mark: B, started from A's shell, passes A's mark on
+        b = "bbbb2222-0000-4000-8000-000000000002"
+        extra = {13: (1, self.T, "/Users/x/.local/bin/claude"), 14: (13, self.T, "node b.js")}
+        w = self.world(extra=extra, marks={14: ("claude", self.LIVE)})
+        w["sessions"] = w["sessions"] + [{"sessionId": b, "pid": 13}]
+        w["att"] = procs.attribute(w["table"], w["marks"], w["ports"], w["sessions"], own=99)
+        self.assertEqual([q["pid"] for q in w["att"]["sessions"][b]], [14])
+        self.assertEqual(self.kills(procs.kill_plan("session", self.LIVE, w)), [11])
+        self.assertEqual(self.kills(procs.kill_plan("pid", {"pid": 14, "start": self.T}, w)), [14])
+
+    def test_a_session_kill_names_a_shell(self):
+        extra = {12: (10, self.T, "-zsh"), 13: (12, self.T, "vim notes")}
+        p = self.plan("session", self.LIVE, extra=extra,
+                      marks={12: ("claude", self.LIVE), 13: ("claude", self.LIVE)})
+        self.assertEqual(self.kills(p), [11])
+        self.assertIn("ccwho kill 12 if you mean it", self.spared(p)[12])
+
+    def test_a_doubt_anywhere_in_the_tree_names_the_tree(self):
+        extra = {12: (10, self.T, "sh -c run-tools"), 13: (12, self.T, "npm exec chrome-devtools-mcp@latest")}
+        p = self.plan("session", self.LIVE, extra=extra,
+                      marks={12: ("claude", self.LIVE), 13: ("claude", self.LIVE)})
+        self.assertEqual(self.kills(p), [11])
+        self.assertIn("ccwho kill 12 if you mean it", self.spared(p)[12])
+
+    def test_the_terminal_app_above_claude_is_no_doubt(self):
+        # every claude runs under a terminal app: only what is below it counts
+        extra = {5: (1, self.T, "/Applications/iTerm.app/Contents/MacOS/iTerm2"),
+                 10: (5, self.T, "/Users/x/.local/bin/claude")}
+        self.assertEqual(self.kills(self.plan("session", self.LIVE, extra=extra)), [11])
+
+    def test_an_agents_doubted_tree_is_a_refusal(self):
+        # as clean --mine refuses it: the agent's kill did not take all it asked for
+        extra = {12: (10, self.T, "npm exec chrome-devtools-mcp@latest")}
+        w = self.world(extra=extra, marks={12: ("claude", self.LIVE)})
+        w["mine"] = self.LIVE
+        for mode in ("session", "mine"):
+            with self.subTest(mode=mode):
+                p = procs.kill_plan(mode, self.LIVE, w)
+                self.assertEqual(self.kills(p), [11])
+                self.assertFalse(next(e for e in p["spare"] if e["pid"] == 12).get("outside"))
+
+    def test_mine_still_lists_what_runs_under_another_session(self):
+        b = "bbbb2222-0000-4000-8000-000000000002"
+        extra = {13: (1, self.T, "/Users/x/.local/bin/claude"), 14: (13, self.T, "node b.js")}
+        w = self.world(extra=extra, marks={14: ("claude", self.LIVE)})
+        w["sessions"] = w["sessions"] + [{"sessionId": b, "pid": 13}]
+        w["att"] = procs.attribute(w["table"], w["marks"], w["ports"], w["sessions"], own=99)
+        w["mine"] = self.LIVE
+        p = procs.kill_plan("mine", self.LIVE, w)
+        self.assertEqual(self.kills(p), [11])
+        self.assertIn(14, self.spared(p))
+
+    def test_an_agent_takes_only_its_own_session(self):
+        w = self.world()
+        w["mine"] = self.LIVE
+        self.assertEqual(self.kills(procs.kill_plan("session", self.LIVE, w)), [11])
+        p = procs.kill_plan("session", DEAD_SID, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("only its own", p["why"])
+
+    def test_a_session_kill_needs_a_session_and_its_marks(self):
+        for target in (None, "", "aaaa", 11, "../x"):
+            with self.subTest(target=target):
+                p = self.plan("session", target)
+                self.assertEqual(p["kill"], [])
+                self.assertIn("no session", p["why"])
+        w = self.world()
+        w["marks"] = None
+        p = procs.kill_plan("session", self.LIVE, w)
+        self.assertEqual(p["kill"], [])
+        self.assertIn("environments were not read", p["why"])
+        p = self.plan("session", "ffff6666-0000-4000-8000-000000000006")
+        self.assertEqual((p["kill"], p["why"]), ([], "that session left nothing running"))
 
     def test_a_computed_kill_never_takes_ccwho_or_a_session_whatever_it_is_given(self):
         # attribute() leaves them out; kill_plan does not rely on its caller
@@ -1829,7 +1938,10 @@ class TestKillPlan(unittest.TestCase):
 
     def test_a_live_sessions_daemons_and_tmux_are_never_its_work_to_kill(self):
         w = self.live_world()
-        self.assertEqual(procs.kill_plan("session", self.LIVE, w)["kill"], [])
+        p = procs.kill_plan("session", self.LIVE, w)
+        self.assertEqual(self.kills(p), [11])
+        for pid in (60, 70, 80, 90, 91):                  # the tops: each named
+            self.assertIn(f"ccwho kill {pid}", self.spared(p).get(pid, ""), pid)
         for pid in (60, 70, 71, 80, 81, 82, 90, 91):      # named, each says what it is
             k = procs.kill_plan("pid", {"pid": pid, "start": self.T}, w)["kill"]
             self.assertRegex(k[0].get("note", "") if k else "spared", r"daemon|ssh|tmux|spared", pid)
@@ -2338,10 +2450,11 @@ class TestKillPlanV1(unittest.TestCase):
     def note(self, plan, pid):
         return next(k.get("note", "") for k in plan["kill"] if k["pid"] == pid)
 
-    def test_session_mode_is_not_built(self):
+    def test_session_mode_takes_what_the_session_started(self):
+        # was "not built" (v1); the owner's D12 (2026-09-27) builds it
         p = procs.kill_plan("session", LIVE_SID, self.world())
-        self.assertEqual(p["kill"], [])
-        self.assertIn("ccwho kill <pid>", p["why"])
+        self.assertEqual(self.kills(p), [11])
+        self.assertNotIn("live session", self.note(p, 11))
 
     def test_clean_takes_an_orphan_and_what_runs_under_it(self):
         # review 9: the tree is the unit - the orphan alone left the rest running

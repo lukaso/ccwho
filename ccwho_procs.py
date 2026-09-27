@@ -1729,6 +1729,7 @@ def _kill_plan(mode, target, world):
             over_agent.setdefault(a, kind)
     session_pid = {s["sessionId"]: s["pid"] for s in sessions if s.get("sessionId")}
     codex_note = "ccwho cannot tell whether the Codex session that started it is still running"
+    chosen = None           # mode "mine" or "session": the session whose work it is
 
     def nothing(why):
         return {"kill": [], "spare": [], "why": why}
@@ -1884,11 +1885,30 @@ def _kill_plan(mode, target, world):
     def name_of(pid):
         return program_name(cmd_of(pid))
 
+    def doubt(q):
+        """Why a session's computed kill leaves `q`'s tree to be named, or None."""
+        cmd, kind = cmd_of(q), group.get(q)
+        if kind and kind[0] == "unsure":
+            return f"not sure: {printable(str(kind[2].get('why', '?')))}"
+        if is_helper(cmd):
+            return "it looks like a session's helper - that session may break"
+        if reason := _doubt(table, q, cmd, session_pid.get(chosen)):
+            return reason
+        if _person_shell(cmd):
+            return "it is a shell someone may be working in"
+        if _session_host(cmd):
+            return f"{_name(cmd)} is a session host - someone may be using it"
+        return None
+
     def notes_of(q, root, taking):
         """What ccwho doubts about `q`: said with the kill, never a refusal."""
         cmd, kind, out = cmd_of(q), group.get(q), []
         live_mark = mark_sid(q) in session_pid
-        if ((kind and kind[0] == "session") or live_mark) and not (
+        # the session the person chose: that it is live says nothing new
+        # (not what runs under ANOTHER live session: the tree outranks its mark)
+        picked = chosen is not None and mark_sid(q) == chosen and not (
+            kind and kind[0] == "session" and kind[1] != chosen)
+        if ((kind and kind[0] == "session") or live_mark) and not picked and not (
                 agent and is_mine(q) and (not kind or kind[0] != "session" or kind[1] == mine)):
             out.append("it is the work of a live session")
         elif kind and kind[0] == "codex":
@@ -2045,26 +2065,32 @@ def _kill_plan(mode, target, world):
                    for p in att["left_behind"] if p["pid"] not in inside]
         if not roots and not spared:
             return nothing("nothing was left behind")
-    elif mode == "mine":
-        if not agent:
+    elif mode in ("mine", "session"):
+        if mode == "mine" and not agent:
             return nothing("--mine is for an agent: run it from the session whose"
                            " processes to kill")
-        if target != mine:
+        if mode == "session" and not (isinstance(target, str) and _UUID.match(target)):
+            return nothing("that is no session id - nothing killed")
+        if target != mine and (agent or mode == "mine"):
             return nothing("an agent kills only its own session's processes")
+        if not marks_read:
+            return nothing("the environments were not read - ccwho cannot tell what the"
+                           " session started; nothing killed")
+        chosen = target
         # the tops of what the session started: never a session, an agent or
         # ccwho's own chain - what runs under those is a top of its own
         barred = live | {own} | above_ccwho | set(over_agent) | {
             q for q in table if _agent_kind(cmd_of(q)) or _ANY_AGENT.search(cmd_of(q))}
-        ours = {q for q in table if q > 1 and is_mine(q) and q not in barred
-                and not (own in table and own in _ancestors(table, q))}
+        # the tree outranks the mark: what runs under another live session is its
+        # work, whatever mark it inherited
+        ours = {q for q in table if q > 1 and mark_sid(q) == chosen and q not in barred
+                and not (own in table and own in _ancestors(table, q))
+                and not (mode == "session" and group.get(q, ("",))[0] == "session"
+                         and group[q][1] != chosen)}
         roots = sorted(q for q in ours if table[q][0] not in ours)
         if not roots:
-            return nothing("your session left nothing running")
-    elif mode == "session":
-        # v1 (after 8 review rounds): which processes a LIVE session owns has too
-        # long a tail of shapes to kill them unnamed
-        return nothing("ccwho does not kill a live session's work yet - name each"
-                       " process: ccwho kill <pid>")
+            return nothing("your session left nothing running" if mode == "mine"
+                           else "that session left nothing running")
     else:
         return nothing(f"unknown kind of kill: {printable(str(mode))[:20]}")
 
@@ -2085,6 +2111,17 @@ def _kill_plan(mode, target, world):
                        for m in members[1:]]
         else:
             trees[root] = members
+    # a session's work, computed: a tree ccwho doubts is named, as clean names
+    # what it is not sure of - its MCP helper, a daemon, tmux, an app, a shell
+    # (the owner's D12, 2026-09-27: the person confirms the rest, listed)
+    for root in list(trees) if mode == "session" else ():
+        why = next((d for q in trees[root] if (d := doubt(q))), None)
+        if why:
+            spared.append(dict(spare(root, f"{root} and what runs under it: {why}"
+                                           f" - ccwho kill {root} if you mean it"),
+                                # an agent asked for it: not taking it is a refusal
+                                **({} if agent else {"outside": True})))
+            del trees[root]
     while True:
         taking = {q for m in trees.values() for q in m}
         notes = {q: notes_of(q, root, taking) for root, m in trees.items() for q in m}

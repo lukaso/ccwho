@@ -19,7 +19,7 @@ import unittest
 import ccwho as runner
 import ccwho_engine as engine
 import ccwho_procs as procs
-from test_signal import DEAD, OTHER, T, Machine, _end_own, _settled, live_at, world
+from test_signal import DEAD, LIVE, OTHER, T, Machine, _end_own, _settled, live_at, world
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,8 +27,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 class Cli:
     """One ccwho kill/clean run on a fake machine."""
 
-    def __init__(self, w=None, tty=True, answer="y", env=None, ends=None, trouble=None):
+    ROWS = [{"sessionId": LIVE, "name": "liveapp-b2", "title": "fix the gate", "pid": 10}]
+
+    def __init__(self, w=None, tty=True, answer="y", env=None, ends=None, trouble=None,
+                 rows=None):
         self.m = Machine([w or world()], ends=ends)
+        self.rows = self.ROWS if rows is None else rows
+        self.rows_read = 0
         self.tty, self.answer, self.env = tty, answer, dict(env or {})
         self.trouble, self.asked, self.builds, self.carried = trouble, [], [], []
 
@@ -38,6 +43,12 @@ class Cli:
             status["trouble"] = self.trouble
         w = self.m.worlds[0]
         return dict(w, mine=mine) if mine is not None else w
+
+    def read_rows(self):
+        self.rows_read += 1
+        if isinstance(self.rows, BaseException):
+            raise self.rows
+        return self.rows
 
     def ask(self, prompt):
         self.asked.append(prompt)
@@ -52,7 +63,7 @@ class Cli:
     def run(self, *argv, clean=False):
         out = io.StringIO()
         seams = {"build": self.build, "ask": self.ask, "tty": lambda: self.tty,
-                 "env": self.env, "carry": self.carry}
+                 "env": self.env, "carry": self.carry, "rows": self.read_rows}
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             rc = runner.kill_cli(list(argv), clean=clean, seams=seams)
         return rc, out.getvalue()
@@ -63,9 +74,9 @@ class Cli:
 
 class TestUsage(unittest.TestCase):
     def test_what_is_no_target(self):
-        for argv in ([], ["abc"], ["20", "21"], [":99999"], [":"], ["-5"], ["--yes"],
+        for argv in ([], ["20", "21"], ["a b"], ["-x-"], [".."], [":99999"], [":"], ["-5"], ["--yes"],
                      ["20", "--bogus"], ["1.5"], ["20", "--mine"], ["²"], ["0"], [":0"],
-                     ["99999999"], ["٣"], [":000080"], [":0003000"], ["0020"]):
+                     ["99999999"], ["٣"], [":000080"], [":0003000"], ["00"], ["020"]):
             c = Cli()
             rc, out = c.run(*argv)
             self.assertEqual(rc, 2, argv)
@@ -426,6 +437,178 @@ class TestTargets(unittest.TestCase):
         c = Cli()
         c.run("22")
         self.assertEqual(c.carried[0][1], {"pid": 22, "start": T})
+
+
+class TestASession(unittest.TestCase):
+    """`ccwho kill <session>`: what a live session started (the owner's D12),
+    named as `ccwho jump` names it - a short id or a name."""
+
+    def test_by_short_id_and_by_name(self):
+        for word in ("aaaa", "liveapp", "AAAA1111"):
+            with self.subTest(word=word):
+                c = Cli()
+                rc, out = c.run(word)
+                self.assertEqual(c.carried[0][0:2], ("session", LIVE))
+                self.assertEqual(c.sent(), [11])
+                self.assertIn("node server.js", out)
+                self.assertEqual(rc, 0)
+
+    def test_it_asks_first(self):
+        c = Cli(answer="n")
+        rc, out = c.run("liveapp")
+        self.assertEqual((rc, c.sent()), (1, []))
+        self.assertEqual(len(c.asked), 1)
+
+    def test_two_sessions_match_lists_them_and_does_nothing(self):
+        rows = Cli.ROWS + [{"sessionId": OTHER, "name": "liveapp-c3", "title": "t", "pid": 12}]
+        c = Cli(rows=rows)
+        rc, out = c.run("liveapp")
+        self.assertEqual(rc, 2)
+        self.assertIn("matches 2 sessions", out)
+        self.assertIn("liveapp-c3", out)
+        self.assertEqual((c.builds, c.sent()), ([], []))
+
+    def test_no_session_matches(self):
+        c = Cli()
+        rc, out = c.run("nosuch")
+        self.assertEqual(rc, 1)
+        self.assertIn("no live session matches 'nosuch'", out)
+        self.assertIn("ccwho clean", out)                  # what an ended one left
+        self.assertEqual(c.builds, [])
+
+    def test_the_sessions_not_read_kills_nothing(self):
+        c = Cli(rows=OSError("no feed"))
+        rc, out = c.run("liveapp")
+        self.assertEqual(rc, 1)
+        self.assertIn("nothing killed", out)
+        self.assertNotIn("no feed", out)
+        self.assertEqual(c.builds, [])
+
+    def test_the_list_names_the_session_the_word_found(self):
+        c = Cli(answer="n")
+        rc, out = c.run("liveapp")
+        self.assertIn(engine.pick_line(Cli.ROWS[0]), out)
+        self.assertLess(out.index(engine.pick_line(Cli.ROWS[0])), out.index("node server.js"))
+
+    DIGITS = "48210000-0000-4000-8000-000000000009"
+
+    def digits_world(self, sid):
+        w = world()
+        w["sessions"] = [{"sessionId": sid, "pid": 10}]
+        w["att"] = procs.attribute(w["table"], w["marks"], w["ports"], w["sessions"], own=99)
+        return w
+
+    def test_digits_that_are_also_a_short_id_ask_which(self):
+        # the check uses the sessions the world already read: never the feed
+        c = Cli(w=self.digits_world(self.DIGITS), rows=AssertionError("the feed was read"))
+        rc, out = c.run("4821", "--yes")
+        self.assertEqual((rc, c.carried), (2, []))
+        self.assertIn(f"ccwho kill {self.DIGITS}", out)
+        self.assertIn("ccwho kill 4821 --pid", out)
+        c = Cli(w=self.digits_world(self.DIGITS))           # --pid: the pid
+        rc, out = c.run("4821", "--pid", "--yes")
+        self.assertEqual(rc, 1)
+        self.assertIn("4821 already exited", out)
+        c = Cli(w=self.digits_world("00004821-0000-4000-8000-000000000009"))
+        rc, out = c.run("4821", "--yes")                    # control: in the id, not its start
+        self.assertIn("4821 already exited", out)
+        c = Cli(w=self.digits_world(self.DIGITS))           # control: a pid that is no id start
+        c.run("20", "--yes")
+        self.assertEqual(c.carried[0][0], "pid")
+
+    def test_a_pid_or_port_kill_reads_no_session_feed(self):
+        for argv in (("20", "--yes"), (":3000", "--yes"), ("20", "--dry-run")):
+            with self.subTest(argv=argv):
+                c = Cli()
+                c.run(*argv)
+                self.assertEqual((c.rows_read, len(c.builds)), (0, 1))
+
+    def test_a_full_id_and_a_zero_led_short_id_name_a_session(self):
+        for word in (self.DIGITS, "0123", "0020", "0123abcd-0000-4000-8000-000000000009"):
+            with self.subTest(word=word):
+                self.assertEqual(runner._kill_target([word], False), ("query", word))
+        rows = [{"sessionId": self.DIGITS, "name": "calc-a1", "title": "t", "pid": 13}]
+        c = Cli(rows=rows, answer="n")
+        c.run(self.DIGITS)
+        self.assertIn("calc-a1", c.run(self.DIGITS)[1])
+
+    def test_a_loose_word_with_yes_names_the_session_and_does_nothing(self):
+        # --yes: nobody reads the list, so the word must name the session exactly
+        for word in ("gate", "e", "liveapp"):
+            with self.subTest(word=word):
+                c = Cli()
+                rc, out = c.run(word, "--yes")
+                self.assertEqual((rc, c.carried), (2, []))
+                self.assertIn(engine.pick_line(Cli.ROWS[0]), out)
+                self.assertIn("name it exactly", out)
+        for word in ("liveapp-b2", "LIVEAPP-B2", "aaaa", LIVE):         # control: exact
+            with self.subTest(word=word):
+                c = Cli()
+                c.run(word, "--yes")
+                self.assertEqual(c.carried[0][0:2], ("session", LIVE))
+        c = Cli(env={"CLAUDE_CODE_SESSION_ID": LIVE}, answer=None)      # an agent: the same
+        rc, out = c.run("gate")
+        self.assertEqual((rc, c.carried), (2, []))
+
+    def test_a_tty_names_a_session_exactly(self):
+        rows = [dict(Cli.ROWS[0], tty="ttys032")]
+        for word in ("s032", "ttys032"):
+            with self.subTest(word=word):
+                c = Cli(rows=rows)
+                c.run(word, "--yes")
+                self.assertEqual(c.carried[0][0:2], ("session", LIVE))
+
+    def test_a_zero_led_short_id_is_at_most_eight_long(self):
+        self.assertEqual(runner._kill_target(["01234567"], False), ("query", "01234567"))
+        self.assertIsNone(runner._kill_target(["012345678"], False))
+
+    def test_pid_is_for_a_pid_only(self):
+        for argv in (["liveapp", "--pid"], [":3000", "--pid"], [self.DIGITS, "--pid"]):
+            with self.subTest(argv=argv):
+                c = Cli()
+                rc, out = c.run(*argv)
+                self.assertEqual((rc, c.builds), (2, []))
+                self.assertIn("usage", out)
+
+    def test_an_interrupt_while_the_sessions_are_read(self):
+        for word in ("liveapp",):
+            with self.subTest(word=word):
+                c = Cli(rows=KeyboardInterrupt())
+                try:
+                    rc, out = c.run(word)
+                except KeyboardInterrupt:       # unittest would stop the whole run
+                    self.fail("the interrupt escaped kill_cli")
+                self.assertEqual((rc, c.builds), (130, []))
+                self.assertIn("interrupted - nothing killed", out)
+
+    def test_a_feed_not_read_is_not_no_match(self):
+        real = engine.collect
+        def collect(cache=None, status=None):
+            status["source_ok"] = False
+            return [], []
+        engine.collect = collect
+        self.addCleanup(setattr, engine, "collect", real)
+        c = Cli()
+        c.read_rows = runner._live_rows
+        rc, out = c.run("liveapp")
+        self.assertEqual(rc, 1)
+        self.assertIn("could not be read", out)
+        self.assertNotIn("no live session matches", out)
+
+    def test_a_pid_is_never_a_session(self):                           # control
+        c = Cli(rows=[{"sessionId": LIVE, "name": "20", "pid": 10}])
+        c.run("20")
+        self.assertEqual(c.carried[0][0], "pid")
+
+    def test_an_agent_takes_only_its_own(self):
+        rows = Cli.ROWS + [{"sessionId": DEAD, "name": "other-d4", "title": "t", "pid": 13}]
+        c = Cli(env={"CLAUDE_CODE_SESSION_ID": LIVE}, answer=None, rows=rows)
+        c.run("liveapp-b2")
+        self.assertEqual(c.sent(), [11])
+        c = Cli(env={"CLAUDE_CODE_SESSION_ID": LIVE}, answer=None, rows=rows)
+        rc, out = c.run("other-d4")
+        self.assertEqual((rc, c.sent()), (1, []))
+        self.assertIn("only its own", out)
 
 
 class TestTheReport(unittest.TestCase):

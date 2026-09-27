@@ -1513,7 +1513,8 @@ def carry_out(mode, target, confirmed, force=False, mine=None, act=None):
     Returns {"killed" (seen gone), "survivors" (signalled, still running or
     not seen gone; "why" when SIGKILL was not sent), "spare" (never
     signalled, with "why"), "new" (taken by the fresh plan, never confirmed:
-    not signalled), "ports" (lines)} - each confirmed pid in exactly one of
+    not signalled), "ports" (lines), "held" (those ports not known free)} -
+    each confirmed pid in exactly one of
     the first three - and "why" when it stopped short: the world could not be
     read whole (nothing signalled), an interrupt, or an error after a signal.
     `act` replaces the machine (tests): build, plan, identity_of, env, send,
@@ -1522,7 +1523,7 @@ def carry_out(mode, target, confirmed, force=False, mine=None, act=None):
          "plan": procs.kill_plan, "identity_of": identity_of, "env": read_procargs,
          "send": os.kill, "sleep": time.sleep, "clock": time.monotonic, "ports": listen_ports}
     a.update(act or {})
-    out = {"killed": [], "survivors": [], "spare": [], "new": [], "ports": []}
+    out = {"killed": [], "survivors": [], "spare": [], "new": [], "ports": [], "held": []}
 
     def read(entries):
         """A world read now, and what of `entries` it still takes - or why not."""
@@ -1651,6 +1652,21 @@ def carry_out(mode, target, confirmed, force=False, mine=None, act=None):
                 state[pid] = ("held", dict(e, why=f"SIGKILL not sent: {why}"))
         wait(killing)
 
+    def stopped(err):
+        """Signals went out and `err` stopped the rest: say so; what got a
+        signal and was not seen gone is never "not killed"."""
+        stop = "interrupted" if isinstance(err, KeyboardInterrupt) else \
+            f"ccwho failed ({type(err).__name__}: {procs.safe_command(str(err), program=False)[:80]})"
+        out["why"] = f"{stop} - run ccwho ps to see what still runs"
+        for e in d["go"]:
+            k, entry = state.get(e["pid"], (None, e))
+            if k == "sent":
+                state[e["pid"]] = ("held", dict(entry, why=f"not seen gone - {stop}"))
+            elif k is None:
+                maybe = flight[0] is not None and flight[0]["pid"] == e["pid"]
+                state[e["pid"]] = (("held", dict(e, why=f"may have got SIGTERM - {stop}")) if maybe
+                                   else ("spare", dict(e, why=f"not signalled - {stop}")))
+
     try:
         for e in d["go"]:
             why = send(e, world, signal.SIGTERM)
@@ -1663,35 +1679,41 @@ def carry_out(mode, target, confirmed, force=False, mine=None, act=None):
         signalled = flight[0] is not None or any(k in ("sent", "gone", "held")
                                                  for k, _e in state.values())
         if not signalled:
-            raise                           # nothing was signalled: the crash says more
-        stop = "interrupted" if isinstance(err, KeyboardInterrupt) else \
-            f"ccwho failed ({type(err).__name__}: {procs._shown_line(str(err))[:80]})"
-        out["why"] = f"{stop} - run ccwho ps to see what still runs"
+            err.ccwho_nothing_signalled = True  # the caller may say "nothing killed"
+            raise
+        stopped(err)
+    base = list(out["spare"])
+
+    def tally():
+        by = {"gone": [], "sent": [], "held": [], "spare": []}
         for e in d["go"]:
-            k, entry = state.get(e["pid"], (None, e))
-            if k == "sent":
-                state[e["pid"]] = ("held", dict(entry, why=f"not seen gone - {stop}"))
-            elif k is None:
-                maybe = flight[0] is not None and flight[0]["pid"] == e["pid"]
-                state[e["pid"]] = (("held", dict(e, why=f"may have got SIGTERM - {stop}")) if maybe
-                                   else ("spare", dict(e, why=f"not signalled - {stop}")))
-    by = {"gone": [], "sent": [], "held": [], "spare": []}
-    for e in d["go"]:
-        k, entry = state[e["pid"]]
-        by[k].append(entry)
-    out["killed"], out["survivors"] = by["gone"], by["sent"] + by["held"]
-    out["spare"] += by["spare"]
-    if "why" in out:
-        return out
-    termed = by["gone"] + by["sent"] + by["held"]
+            k, entry = state[e["pid"]]
+            by[k].append(entry)
+        out["killed"], out["survivors"] = by["gone"], by["sent"] + by["held"]
+        out["spare"] = base + by["spare"]
+        return by["gone"] + by["sent"] + by["held"]
+
+    # whatever stops the rest from here, the report is returned
     try:
-        listen = a["ports"]()
+        termed = tally()
+        if "why" in out:
+            out["held"] = sorted({p for e in termed for p in e.get("ports") or []})
+            return out
+        try:
+            listen = a["ports"]()
+        except Exception as err:            # an interrupt is an interrupt: the outer handler
+            out["why"] = f"the ports could not be read again ({type(err).__name__})"
+            listen = None
+        wanted = sorted({p for e in termed for p in e.get("ports") or []})
+        # the ports not known to be free: still held, or not read again
+        out["held"] = [p for p in wanted if listen is None or any(p in v for v in listen.values())]
+        out["ports"] = procs.port_report([p for e in termed for p in e.get("ports") or []], listen,
+                                         world["table"], {e["pid"] for e in termed},
+                                         ended={e["pid"] for e in out["killed"]})
     except (Exception, KeyboardInterrupt) as err:
-        out["why"] = f"the ports could not be read again ({type(err).__name__})"
-        listen = None
-    out["ports"] = procs.port_report([p for e in termed for p in e.get("ports") or []], listen,
-                                     world["table"], {e["pid"] for e in termed},
-                                     ended={e["pid"] for e in out["killed"]})
+        stopped(err)
+        termed = tally()
+        out["held"] = sorted({p for e in termed for p in e.get("ports") or []})
     return out
 
 

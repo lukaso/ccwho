@@ -313,6 +313,38 @@ a tty or a pid, nothing else. The applet also swallows failures, because a non-z
 target shape: `https://evil/s032` is exactly as long as `ccwho://jump/`, so without
 that check it would slice to a valid-looking target.
 
+## ccwho kill and ccwho clean - you see the list, then you decide
+
+```sh
+ccwho kill :3000            # what holds the port, and what runs under it
+ccwho kill 4412             # that process and its whole tree
+ccwho clean                 # every process tree a session that ended left behind
+ccwho kill :3000 --dry-run  # the list only
+ccwho kill :3000 --yes      # no question (a script)
+ccwho kill 4412 --force     # SIGKILL what SIGTERM did not end
+```
+
+Every kill lists each process it takes - who started it and what ccwho doubts
+about it ("a claude runs under it", "Chrome is connected to :3000") - and asks.
+With no terminal and no `--yes` it prints the list and exits 3. Some things are
+never killed, for anyone: a live Claude session, an agent or what runs one,
+ccwho itself and the shell that runs it, a process piped to an agent, and a pid
+that is now a different process.
+
+Right before each signal ccwho reads the machine again: it signals only what you
+confirmed that is still the same process (start time, command, session), one pid
+at a time, children first. SIGTERM first; what survives 3 s is named, and
+`--force` sends it SIGKILL after the same check. Then it says whether the port
+came free.
+
+**Run by an agent** (a Claude Code or Codex session id in ccwho's environment),
+ccwho never asks and takes only what that agent's own session started, and
+nothing that carries a doubt: `ccwho clean --mine` cleans up after itself.
+
+Exit codes: 0 all killed, 1 not all (or nothing to kill), 2 usage, 3 needs `--yes`,
+130 interrupted before any signal (nothing killed). A `--dry-run` exits as the kill
+would: 1 when part of the target would be refused.
+
 ## ccwho reap - killing only the stale ones
 
 Leaked helper processes accumulate: liveapp's vitest PTY-guard tests spawn a
@@ -483,6 +515,8 @@ ccwho --prompt          # add the last thing you said, under each row
 ccwho --json            # machine-readable, for a status line or key binding
 ccwho save              # record the live fleet (before a reboot)
 ccwho restore [--open]  # list it back, or reopen the windows
+ccwho kill <pid>|:<port>  # kill a process tree or a port's holder - lists, then asks
+ccwho clean [--mine]    # kill what ended sessions left behind - lists, then asks
 ccwho reap              # leaked helper processes, dry run
 ccwho doctor            # is everything ccwho needs in place?
 ccwho setup             # install what it needs, once

@@ -1931,14 +1931,17 @@ def _kill_plan(mode, target, world):
         litter = {p["pid"] for p in att["left_behind"] if table.get(p["pid"], (0,))[0] == 1}
         roots = sorted(litter)
         inside = {q for r in roots for q in subtree(r)}
-        spared += [spare(p["pid"], f"{p['pid']} is not sure: {printable(str(p.get('why', '?')))}"
-                                   f" - ccwho kill {p['pid']} if you mean it")
+        spared += [dict(spare(p["pid"], f"{p['pid']} is not sure: {printable(str(p.get('why', '?')))}"
+                                   f" - ccwho kill {p['pid']} if you mean it"),
+                            outside=True)   # not clean's target: never a refusal
                    for p in att["unsure"] if p["pid"] not in inside]
-        spared += [spare(p["pid"], f"{p['pid']} was started by Codex - {codex_note};"
-                                   f" ccwho kill {p['pid']} if you mean it")
+        spared += [dict(spare(p["pid"], f"{p['pid']} was started by Codex - {codex_note};"
+                                   f" ccwho kill {p['pid']} if you mean it"),
+                            outside=True)
                    for p in att["codex"] if p["pid"] not in inside]
-        spared += [spare(p["pid"], f"{p['pid']} is not an orphan - ccwho kill {p['pid']} if"
-                                   f" you mean it")
+        spared += [dict(spare(p["pid"], f"{p['pid']} is not an orphan - ccwho kill {p['pid']} if"
+                                   f" you mean it"),
+                            outside=True)
                    for p in att["left_behind"] if p["pid"] not in inside]
         if not roots and not spared:
             return nothing("nothing was left behind")

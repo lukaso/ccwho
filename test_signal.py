@@ -382,6 +382,14 @@ class TestCarryOut(unittest.TestCase):
         self.assertEqual(r["ports"], [":3000 is free"])
         self.assertNotIn("why", r)
 
+    def test_held_says_which_ports_are_not_known_free(self):
+        m = Machine([world()], ends={(21, signal.SIGTERM), (20, signal.SIGTERM)})
+        self.assertEqual(self.run_(m)["held"], [3000])                # 22 survives
+        self.assertEqual(self.run_(Machine([world()]))["held"], [])     # control
+        m = Machine([world()])
+        m.ports = lambda: None
+        self.assertEqual(self.run_(m)["held"], [3000])                # not read: not free
+
     def test_nothing_but_the_confirmed_is_signalled(self):
         m = Machine([world(extra={23: (22, T, "esbuild worker")}, marks={23: ("claude", DEAD)})])
         r = self.run_(m)
@@ -833,6 +841,54 @@ class TestCarryOut(unittest.TestCase):
         r = self.run_(m, force=True)
         self.assertIn(22, self.pids(r["killed"]))
 
+    def test_a_stop_in_the_last_step_still_reports(self):
+        # after the signals, while the report is made: never lost, never "nothing"
+        for err in (KeyboardInterrupt, RuntimeError):
+            m = Machine([world()])
+            live = engine.procs                 # the module the engine calls (after any reload)
+            real = live.port_report
+
+            def boom(*a, **k):
+                raise err("late")
+            live.port_report = boom
+            try:
+                r = self.run_(m)
+            finally:
+                live.port_report = real
+            self.assertEqual(len(m.sent), 3, err)
+            self.assertTrue(r["why"].startswith("interrupted" if err is KeyboardInterrupt
+                                                else "ccwho failed"), r["why"])
+            self.assertEqual(r["held"], [3000])            # not known free
+
+    def test_an_interrupt_while_reading_the_ports_is_an_interrupt(self):
+        m = Machine([world()])
+        m.ports = lambda: (_ for _ in ()).throw(KeyboardInterrupt)
+        r = self.run_(m)
+        self.assertTrue(r["why"].startswith("interrupted"), r["why"])
+        self.assertEqual(r["held"], [3000])
+
+    def test_nothing_signalled_is_marked_on_what_is_raised(self):
+        m = Machine([world()])
+        m.env = lambda pid: (_ for _ in ()).throw(RuntimeError("bug"))
+        with self.assertRaises(RuntimeError) as cm:
+            engine.carry_out("pid", self.TARGET, plan()["kill"], act=m.act())
+        self.assertTrue(getattr(cm.exception, "ccwho_nothing_signalled", False))
+
+    def test_an_error_text_is_filtered(self):
+        m = Machine([world()])
+        secret = "sk-ant-" + "Q" * 30
+
+        real_env = m.env
+
+        def env(pid):                       # after 22's SIGTERM
+            if pid == 21:
+                raise RuntimeError(f"curl -H Authorization:Bearer {secret} failed")
+            return real_env(pid)
+        m.env = env
+        r = self.run_(m)
+        self.assertIn("RuntimeError", r["why"])                         # control: it is said
+        self.assertNotIn(secret, repr(r))
+
     def test_an_error_after_a_signal_still_reports(self):
         m = Machine([world()])
 
@@ -854,7 +910,20 @@ def _orphan(tmp, name):
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, env=env, check=True)
     with open(pidfile) as f:
-        return int(f.read())
+        return _settled(int(f.read()))
+
+
+def _settled(pid):
+    """`pid` once it runs python3, not the shell that is about to exec it: an
+    identity read before the exec would never match the process again, and
+    the cleanup would (rightly) not end it."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        ident = engine.identity_of(pid)
+        if ident is None or not ident[1].startswith("/bin/sh"):
+            return pid
+        time.sleep(0.02)
+    return pid
 
 
 def _end_own(pid, identity, kill=os.kill, identity_of=None):

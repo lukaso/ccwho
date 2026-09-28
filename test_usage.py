@@ -239,6 +239,200 @@ class TestRecord(unittest.TestCase):
             self.assertEqual(r["first_account"], r["account"])
 
 
+FP = hashlib.sha256(TOKEN.encode()).hexdigest()[:16]
+PID = 52715
+
+
+class TestTheClaudeProcessNamesTheAccount(unittest.TestCase):
+    """#28: Claude Code gives the statusLine no CLAUDE_CODE_OAUTH_TOKEN (measured
+    2026-09-28, 2.1.283). The claude that runs it has one, and says which account
+    the session spends; ccwho is handed that claude's pid and its auth facts."""
+
+    def setUp(self):
+        self.h = Home()
+
+    def rec(self, env=None, previous=None, now=NOW, pid=None, auth=None, five=5):
+        return usage.record(self.h.payload(limits(five)), env or {}, self.h.dir, now,
+                            previous, claude_pid=pid, claude_auth=auth)
+
+    def test_the_claudes_token_names_a_token_session(self):
+        r = self.rec(pid=PID, auth={"token_fp": FP})
+        self.assertEqual(r["account"], {"kind": "token", "id": "token:" + FP})
+        self.assertNotIn("a@example.com", json.dumps(r))
+
+    def test_without_the_claudes_auth_the_login_is_read_as_before(self):     # control
+        self.assertEqual(self.rec(pid=PID, auth={})["account"]["id"], "login:uuid-a")
+        self.assertEqual(self.rec()["account"]["id"], "login:uuid-a")
+
+    def test_a_token_in_the_own_env_still_wins(self):
+        r = self.rec(env={"CLAUDE_CODE_OAUTH_TOKEN": TOKEN}, pid=PID,
+                     auth={"token_fp": "0" * 16})
+        self.assertEqual(r["account"]["id"], "token:" + FP)
+
+    def test_the_claudes_config_dir_is_where_its_login_is_read(self):
+        other = tempfile.mkdtemp()
+        self.h.login("b@example.com", "uuid-b", config_dir=other)
+        r = self.rec(pid=PID, auth={"config_dir": other})
+        self.assertEqual(r["account"]["id"], "login:uuid-b")
+
+    def test_the_own_config_dir_still_wins(self):
+        other, third = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.h.login("b@example.com", "uuid-b", config_dir=other)
+        self.h.login("c@example.com", "uuid-c", config_dir=third)
+        r = self.rec(env={"CLAUDE_CONFIG_DIR": other}, pid=PID, auth={"config_dir": third})
+        self.assertEqual(r["account"]["id"], "login:uuid-b")
+
+    def test_the_claude_pid_is_recorded(self):
+        self.assertEqual(self.rec(pid=PID, auth={})["claude_pid"], PID)
+        self.assertIsNone(self.rec()["claude_pid"])
+
+    def test_the_same_claude_keeps_its_first_account(self):                  # control
+        first = self.rec(pid=PID, auth={})
+        self.h.login("b@example.com", "uuid-b")
+        again = self.rec(previous=first, now=NOW + 60, pid=PID, auth={})
+        self.assertTrue(again["unsure"])
+        self.assertEqual(again["first_account"]["id"], "login:uuid-a")
+
+    def test_a_new_claude_for_the_session_starts_its_account_again(self):
+        """--resume in a new process with a token: the credential is read afresh."""
+        first = self.rec(pid=PID, auth={})
+        again = self.rec(previous=first, now=NOW + 60, pid=PID + 1, auth={"token_fp": FP})
+        self.assertFalse(again["unsure"])
+        self.assertEqual(again["first_account"]["id"], "token:" + FP)
+        self.assertEqual(again["first_seen"], NOW + 60)
+
+    def test_a_reading_from_before_the_fix_takes_the_claudes_account(self):
+        """The readings on disk named a token session's first account from the
+        login: they carry no claude_pid, and must not keep that account."""
+        old = self.rec()
+        del old["claude_pid"]
+        again = self.rec(previous=old, now=NOW + 60, pid=PID, auth={"token_fp": FP})
+        self.assertFalse(again["unsure"])
+        self.assertEqual(again["first_account"]["id"], "token:" + FP)
+
+    def test_a_login_reading_from_before_the_fix_keeps_its_account(self):
+        """Only the token was missed before #28. A login session whose login was
+        changed under it stays unsure: its claude still spends the old login."""
+        old = self.rec()
+        del old["claude_pid"]
+        self.h.login("b@example.com", "uuid-b")
+        again = self.rec(previous=old, now=NOW + 60, pid=PID, auth={})
+        self.assertTrue(again["unsure"])
+        self.assertEqual(again["first_account"]["id"], "login:uuid-a")
+        self.assertEqual(again["claude_pid"], PID)
+        # and from now on its pid is known: a later new claude starts again
+        later = self.rec(previous=again, now=NOW + 120, pid=PID + 1, auth={})
+        self.assertFalse(later["unsure"])
+        self.assertEqual(later["first_account"]["id"], "login:uuid-b")
+
+    def test_no_claude_before_and_none_now_is_the_same_session(self):        # control
+        first = self.rec()
+        self.h.login("b@example.com", "uuid-b")
+        again = self.rec(previous=first, now=NOW + 60)
+        self.assertTrue(again["unsure"])
+
+    def test_a_claude_that_can_no_longer_be_confirmed_is_not_a_new_one(self):
+        """A reading without a pid (the parent could not be confirmed this time)
+        is no evidence of a new process, nor of a switch: the account is unknown
+        for that reading, which joins no account (review 3: a lasting gap would put
+        another account's numbers under this one). The first account is kept."""
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        again = self.rec(previous=first, now=NOW + 60)
+        self.assertEqual(again["first_account"]["id"], "token:" + FP)
+        self.assertEqual(again["claude_pid"], PID)
+        self.assertTrue(again["unsure"])
+        self.assertEqual(again["account"], {"kind": "unknown", "id": None})
+
+    def test_the_same_claude_read_without_its_auth_keeps_its_account(self):
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        again = self.rec(previous=first, now=NOW + 60, pid=PID, auth=None)
+        self.assertTrue(again["unsure"])
+        self.assertEqual(again["first_account"]["id"], "token:" + FP)
+        self.assertEqual(again["account"], {"kind": "unknown", "id": None})
+
+    def test_the_same_claude_read_with_no_token_is_a_switch(self):           # control
+        """A readable environment without the token is evidence, not a gap."""
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        again = self.rec(previous=first, now=NOW + 60, pid=PID, auth={})
+        self.assertTrue(again["unsure"])
+        self.assertEqual(again["account"]["id"], "login:uuid-a")
+
+    def test_a_claude_counts_only_when_its_environment_was_read(self):
+        """A pid whose environment could not be read confirms nothing: it is not
+        stored, not a new process, and not a switch."""
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        again = self.rec(previous=first, now=NOW + 60, pid=PID + 1, auth=None)
+        self.assertEqual(again["account"], {"kind": "unknown", "id": None})
+        self.assertEqual(again["first_account"]["id"], "token:" + FP)
+        self.assertEqual(again["claude_pid"], PID)
+        self.assertTrue(again["unsure"])
+
+    def test_a_first_read_that_fails_stores_no_pid(self):
+        """Else the login becomes the first account of a token session's claude,
+        and every later read that does see the token is unsure."""
+        a = self.rec(pid=PID, auth=None)
+        self.assertEqual(a["account"]["id"], "login:uuid-a")                # as before
+        self.assertIsNone(a["claude_pid"])
+        b = self.rec(previous=a, now=NOW + 60, pid=PID, auth={"token_fp": FP})
+        self.assertFalse(b["unsure"])
+        self.assertEqual(b["first_account"]["id"], "token:" + FP)
+
+    def test_a_pid_that_is_not_a_pid_is_no_claude(self):
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        for bad in (0, -1, 1, True, "52715", 10 ** 8):
+            again = self.rec(previous=first, now=NOW + 60, pid=bad, auth=None)
+            self.assertEqual(again["account"], {"kind": "unknown", "id": None}, repr(bad))
+            self.assertTrue(again["unsure"], repr(bad))
+            self.assertEqual(again["claude_pid"], PID, repr(bad))
+            fresh = self.rec(pid=bad, auth={"token_fp": FP})
+            self.assertIsNone(fresh["claude_pid"], repr(bad))
+            # the auth of an unconfirmed claude is never used
+            self.assertEqual(fresh["account"]["id"], "login:uuid-a", repr(bad))
+
+    def test_the_own_env_token_still_wins_in_a_gap(self):
+        first = self.rec(pid=PID, auth={"token_fp": "0" * 16})
+        again = self.rec(env={"CLAUDE_CODE_OAUTH_TOKEN": TOKEN}, previous=first,
+                         now=NOW + 60, pid=PID, auth=None)
+        self.assertEqual(again["account"]["id"], "token:" + FP)
+
+    def test_a_gap_joins_no_account_and_the_next_reading_joins_again(self):
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        gap = self.rec(previous=first, now=NOW + 60, pid=PID, auth=None, five=70)
+        self.assertEqual(usage.accounts([gap], NOW + 60), [])
+        self.assertEqual(usage.session_accounts([gap]), {})
+        back = self.rec(previous=gap, now=NOW + 120, pid=PID, auth={"token_fp": FP})  # control
+        self.assertFalse(back["unsure"])
+        self.assertEqual(back["first_account"]["id"], "token:" + FP)
+        self.assertEqual(back["first_seen"], NOW)
+        self.assertEqual([r["id"] for r in usage.accounts([back], NOW + 120)], ["token:" + FP])
+
+    def test_an_unsure_session_stays_out_through_a_gap(self):
+        first = self.rec(pid=PID, auth={"token_fp": FP})
+        mid = self.rec(previous=first, now=NOW + 60, pid=PID, auth={})
+        self.assertTrue(mid["unsure"])
+        gap = self.rec(previous=mid, now=NOW + 120, pid=PID, auth=None)
+        self.assertTrue(gap["unsure"])
+        self.assertEqual(usage.accounts([gap], NOW + 120), [])
+
+    def test_a_stored_pid_that_is_not_a_pid_is_no_claude(self):
+        for bad in ("52715", True, 0, -3, 10 ** 8, None):
+            old = self.rec()
+            old["claude_pid"] = bad
+            again = self.rec(previous=old, now=NOW + 60)
+            self.assertEqual(again["account"]["id"], "login:uuid-a", repr(bad))
+            self.assertIsNone(again["claude_pid"], repr(bad))
+            self.assertFalse(again["unsure"], repr(bad))
+
+    def test_a_token_session_never_confirmed_keeps_its_first_seen(self):
+        """The migration is for readings from before #28 only - those carry no
+        claude_pid key. A token read from the own env, never confirmed, is not one."""
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN}
+        a = self.rec(env=env)
+        b = self.rec(env=env, previous=a, now=NOW + 60)
+        self.assertEqual(b["first_seen"], NOW)
+        self.assertEqual(b["first_account"]["id"], "token:" + FP)
+
+
 def reading(account_id, five=None, week=None, measured=None, received=NOW, unsure=False,
             sid=SID, kind="login", email="a@example.com"):
     rl = {}

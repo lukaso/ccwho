@@ -3,16 +3,21 @@
 Claude Code gives a statusLine command `rate_limits` - the 5-hour and 7-day
 windows of the account THAT session spends (measured 2026-09-25, 2.1.282: a
 machine login and a CLAUDE_CODE_OAUTH_TOKEN session both get it, with different
-numbers). ccwho never logs in and never calls the usage endpoint, which needs the
-keychain token, 403s for setup-tokens and 429s when polled. It records what it is
-handed, one file per session, and the list reads them back.
+numbers). It does NOT give the statusLine the token itself (measured 2026-09-28,
+2.1.283, #28): the account is read from the claude that runs it. ccwho never
+logs in and never calls the usage endpoint, which needs the keychain token,
+403s for setup-tokens and 429s when polled. It records what it is handed, one
+file per session, and the list reads them back.
 
 Three things are easy to get wrong, and each has a rule here:
 
 - WHICH ACCOUNT. The harness spends an env token before the machine login, so a
   token session is the token's fingerprint (sha256, 16 hex - the token itself is
   never kept). A login session is the login in ITS config dir's .claude.json.
-  A new token is a new account; nothing is ever merged.
+  A new token is a new account; nothing is ever merged. The token and config
+  dir are the claude process's own: the statusLine's environment lacks the token.
+  A new claude process for a session (--resume) reads its credential afresh, so
+  its first account starts again.
 - WHICH READING. Every session reports the numbers from its OWN last reply, so an
   idle session hands over an old 5% long after a busy one saw 60%. Receipt time
   orders nothing: the reading's measured time is its session's last reply in the
@@ -26,12 +31,12 @@ is pointed at. The runner owns stdin, the environment and every write.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import os
 import re
 import time
 
+import ccwho_procs
 import ccwho_text
 
 VERSION = 1
@@ -49,15 +54,25 @@ _LOGIN_OK = "<local-command-stdout>Login successful"
 
 
 def fingerprint(token):
-    return hashlib.sha256(token.encode()).hexdigest()[:16]
+    return ccwho_procs.token_fingerprint(token)
 
 
-def account_of(env, home):
-    """The account a session spends, named without its credential."""
+def account_of(env, home, claude_auth=None):
+    """The account a session spends, named without its credential.
+
+    claude_auth is what the claude running the statusLine holds (procs.parse_auth):
+    its token fingerprint and config dir. The statusLine's own environment wins
+    where it has them - it is the same process tree, only scrubbed."""
+    auth = claude_auth if isinstance(claude_auth, dict) else {}
     token = env.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
     if token:
         return {"kind": "token", "id": "token:" + fingerprint(token)}
-    base = env.get("CLAUDE_CONFIG_DIR") or home
+    token_fp = auth.get("token_fp")
+    if isinstance(token_fp, str) and token_fp:
+        return {"kind": "token", "id": "token:" + token_fp}
+    config_dir = auth.get("config_dir")
+    base = env.get("CLAUDE_CONFIG_DIR") or (
+        config_dir if isinstance(config_dir, str) and config_dir else home)
     try:
         with open(os.path.join(os.path.expanduser(base), ".claude.json")) as fh:
             acct = json.load(fh).get("oauthAccount") or {}
@@ -118,6 +133,10 @@ def _number(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _pid(v):
+    return isinstance(v, int) and not isinstance(v, bool) and 1 < v < 10 ** 7
+
+
 def clean_limits(rate_limits):
     """Only the known windows and their two numbers. None if nothing usable."""
     if not isinstance(rate_limits, dict):
@@ -134,8 +153,19 @@ def clean_limits(rate_limits):
     return out or None
 
 
-def record(payload, env, home, now, previous=None):
-    """What to store for one statusLine call, or None to store nothing."""
+def record(payload, env, home, now, previous=None, claude_pid=None, claude_auth=None):
+    """What to store for one statusLine call, or None to store nothing.
+
+    claude_pid is the claude running the statusLine, when ccwho could confirm it
+    (its parent); claude_auth is what that claude holds (see account_of), None
+    when its environment could not be read. A claude counts only when it was
+    read: an unread pid is neither stored nor a new process.
+
+    Known limits: a new claude that gets its predecessor's pid counts as the same
+    process - a changed credential then reads as unsure, never as the wrong
+    account (a claude that cannot be read is unsure too). Two claudes serving one
+    session at once each re-base it, so its reading follows whichever replied
+    last - numbers and account stay together."""
     if not isinstance(payload, dict):
         return None
     sid = payload.get("session_id")
@@ -144,9 +174,31 @@ def record(payload, env, home, now, previous=None):
     limits = clean_limits(payload.get("rate_limits"))
     if limits is None:
         return None
-    acct = account_of(env, home)
     measured, login = transcript_facts(payload.get("transcript_path"))
     prev = previous if isinstance(previous, dict) else {}
+    old_pid = prev.get("claude_pid") if _pid(prev.get("claude_pid")) else None
+    if claude_auth is None or not _pid(claude_pid):
+        claude_pid = None
+    gap = claude_pid is None and old_pid is not None \
+        and not env.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if gap:
+        # This session's claude was read before and cannot be now: the login
+        # file says nothing about which account it spends. Not a switch - the
+        # first account stays - but these numbers join no account: unlike a
+        # login file read mid-write, a parent that cannot be read can last.
+        acct = {"kind": "unknown", "id": None}
+    else:
+        acct = account_of(env, home, claude_auth if claude_pid is not None else None)
+    if claude_pid is None:
+        # an unread claude is no evidence of a new process
+        claude_pid = old_pid
+    elif old_pid is not None and claude_pid != old_pid:
+        # A new claude for this session (--resume): its credential is read afresh.
+        prev = {}
+    elif old_pid is None and acct.get("kind") == "token":
+        # A reading from before #28 named a token session's account from the
+        # login. Only the token was missed: a login reading keeps its account.
+        prev = {}
     first = prev.get("first_account")
     first_seen = prev.get("first_seen")
     # An unknown account is never kept as the first one: .claude.json read
@@ -165,9 +217,11 @@ def record(payload, env, home, now, previous=None):
             first, first_seen = acct, now
         else:
             unsure = True
+    unsure = unsure or gap
     return {"v": VERSION, "session_id": sid, "received_at": now, "measured_at": measured,
             "rate_limits": limits, "account": acct, "first_account": first,
-            "first_seen": first_seen, "login_at": login, "unsure": unsure}
+            "first_seen": first_seen, "login_at": login, "unsure": unsure,
+            "claude_pid": claude_pid}
 
 
 def load_readings(directory, now):

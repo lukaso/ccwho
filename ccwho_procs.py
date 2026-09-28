@@ -10,6 +10,7 @@ machine runs today.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 import shlex
@@ -34,26 +35,85 @@ def parse_procargs(buf):
     mentions a key is an argument. Never raises, and never puts buffer contents
     into anything it returns: the rest of the buffer may be secrets.
     """
+    parts = _procargs_strings(buf)
+    if parts is None:
+        return None
+    chunks, argc = parts
+    wanted = tuple(k.encode() + b"=" for k in ENV_KEYS)
+    out = {}
+    for chunk in chunks:
+        for prefix in wanted:
+            if chunk.startswith(prefix):
+                out[prefix[:-1].decode()] = chunk[len(prefix):].decode("utf-8", "replace")
+    return out if out else _nothing_found(chunks, argc)
+
+
+def _procargs_strings(buf):
+    """(every string after the exec path, argc), or None for a buffer that is
+    not a KERN_PROCARGS2 answer."""
     if not isinstance(buf, (bytes, bytearray)) or len(buf) < 4:
         return None
     (argc,) = struct.unpack_from("i", buf, 0)
     end = buf.find(b"\0", 4)
     if argc < 0 or end < 0:
         return None
-    wanted = tuple(k.encode() + b"=" for k in ENV_KEYS)
+    return buf[end:].split(b"\0"), argc
+
+
+def _nothing_found(chunks, argc):
+    """{} when the environment is there and holds no key; None when it is hidden.
+
+    macOS hands back nothing after argv for its own binaries (/bin/zsh,
+    /bin/cat): that environment is unknown, not empty. Only here is argv
+    walked by argc: where a rewritten title makes the walk eat the
+    environment, the answer is "unknown" - never a key lost."""
+    return {} if any(_after_argv(chunks, argc)) else None
+
+
+def _after_argv(chunks, argc):
+    """The strings past argc arguments: the environment, unless a rewritten
+    title moved it (then this lands past it, and is empty)."""
+    first = next((i for i, c in enumerate(chunks) if c), len(chunks))
+    return chunks[first + argc:]
+
+
+def token_fingerprint(token):
+    """How ccwho names a token account: sha256, 16 hex. The token is never kept."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+_TOKEN_KEY = b"CLAUDE_CODE_OAUTH_TOKEN="
+_CONFIG_KEY = b"CLAUDE_CONFIG_DIR="
+
+
+def parse_auth(buf):
+    """Which account a claude process spends, from its KERN_PROCARGS2 buffer:
+    {"token_fp": ..., "config_dir": ...}, each only when set; None if unreadable.
+
+    Claude Code gives its statusLine no CLAUDE_CODE_OAUTH_TOKEN (#28), so the
+    token is read from the claude itself. It is hashed here and nothing else of
+    it leaves: the result holds the fingerprint, never the token. The first
+    entry of a key wins, as getenv sees it. Keys are looked for past argv, so an
+    argument that looks like one is not taken; only when a rewritten title moved
+    the environment out of that walk (nothing is past argv) is every string read.
+    Never raises.
+    """
+    parts = _procargs_strings(buf)
+    if parts is None:
+        return None
+    chunks, argc = parts
     out = {}
-    for chunk in buf[end:].split(b"\0"):
-        for prefix in wanted:
-            if chunk.startswith(prefix):
-                out[prefix[:-1].decode()] = chunk[len(prefix):].decode("utf-8", "replace")
-    if out:
+    env = _after_argv(chunks, argc)
+    for chunk in env if any(env) else chunks:
+        if chunk.startswith(_TOKEN_KEY) and "token_fp" not in out:
+            token = chunk[len(_TOKEN_KEY):].decode("utf-8", "replace")
+            out["token_fp"] = token_fingerprint(token) if token else None
+        elif chunk.startswith(_CONFIG_KEY) and "config_dir" not in out:
+            out["config_dir"] = chunk[len(_CONFIG_KEY):].decode("utf-8", "replace") or None
+    out = {k: v for k, v in out.items() if v}
+    if out or any(chunk.startswith((_TOKEN_KEY, _CONFIG_KEY)) for chunk in chunks):
         return out
-    # macOS hands back nothing after argv for its own binaries (/bin/zsh,
-    # /bin/cat): that environment is unknown, not empty. Only here is argv
-    # walked by argc: where a rewritten title makes the walk eat the
-    # environment, the answer is "unknown" - never a key lost
-    rest = buf[end:].lstrip(b"\0").split(b"\0")[argc:]
-    return {} if any(rest) else None
+    return _nothing_found(chunks, argc)
 
 
 # Control characters (C0, DEL, C1): escape sequences that retitle a window or

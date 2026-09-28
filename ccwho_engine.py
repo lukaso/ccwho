@@ -1365,6 +1365,20 @@ def read_procargs(pid):
     straight into procs.parse_procargs, which keeps the named keys and nothing
     else. Nothing else here looks at the buffer.
     """
+    return procs.parse_procargs(procargs_buffer(pid))
+
+
+def read_auth(pid):
+    """Which account a claude process spends (procs.parse_auth), or None.
+
+    The same buffer as read_procargs, handed straight to procs.parse_auth, which
+    keeps the token's fingerprint and the config dir and nothing else (#28)."""
+    return procs.parse_auth(procargs_buffer(pid))
+
+
+def procargs_buffer(pid):
+    """The raw KERN_PROCARGS2 answer for a pid, or None. It holds every secret in
+    that environment: only procs.parse_procargs and procs.parse_auth read it."""
     import ctypes
     import ctypes.util
     try:
@@ -1384,8 +1398,8 @@ def read_procargs(pid):
         buf = ctypes.create_string_buffer(size.value)
         if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
             return None
-        return procs.parse_procargs(buf.raw[:size.value])
-    except (OSError, ValueError, AttributeError):
+        return buf.raw[:size.value]
+    except (OSError, ValueError, AttributeError, TypeError):
         return None
 
 

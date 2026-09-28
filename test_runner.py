@@ -3245,6 +3245,101 @@ class TestStatusline(unittest.TestCase):
         self.assertTrue(rec["unsure"])
         self.assertEqual(rec["first_account"]["id"], "login:uuid-a")
 
+    # #28: Claude Code gives the statusLine no CLAUDE_CODE_OAUTH_TOKEN; the claude
+    # that runs it - its parent, named by CLAUDE_PID - still has it
+    def claude_parent(self, env, pid=None):
+        """Make this process's parent a claude whose environment is `env`."""
+        import ccwho_procs
+        import struct
+        pid = os.getppid() if pid is None else pid
+        buf = struct.pack("i", 1) + b"/usr/local/bin/claude\0\0\0claude\0" + \
+            b"".join(e.encode() + b"\0" for e in env) + b"\0"
+        asked = []
+        real = runner.engine.procargs_buffer
+        runner.engine.procargs_buffer = lambda p: asked.append(p) or buf
+        self.addCleanup(setattr, runner.engine, "procargs_buffer", real)
+        old = os.environ.get("CLAUDE_PID")
+        os.environ["CLAUDE_PID"] = str(pid)
+        self.addCleanup(lambda: os.environ.pop("CLAUDE_PID", None) if old is None
+                        else os.environ.__setitem__("CLAUDE_PID", old))
+        return asked, ccwho_procs
+
+    def test_the_parent_claudes_token_names_the_account_and_is_kept_nowhere(self):
+        import hashlib
+        asked, _ = self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}", "HOME=/x"])
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(asked, [os.getppid()])
+        with open(self.usage_file()) as fh:
+            rec = json.load(fh)
+        fp = hashlib.sha256(self.TOKEN.encode()).hexdigest()[:16]
+        self.assertEqual(rec["account"], {"kind": "token", "id": "token:" + fp})
+        self.assertEqual(rec["claude_pid"], os.getppid())
+        for root, _, files in os.walk(self.tmp):
+            for name in files:
+                with open(os.path.join(root, name), errors="replace") as fh:
+                    self.assertNotIn(self.TOKEN, fh.read(), name)
+        self.assertNotIn(self.TOKEN, out + err)
+
+    def test_a_claude_pid_that_is_not_the_parent_is_not_read(self):          # control
+        asked, _ = self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"],
+                                      pid=os.getppid() + 100000)
+        self.run_with(self.payload())
+        self.assertEqual(asked, [])
+        with open(self.usage_file()) as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["account"]["id"], "login:uuid-a")
+        self.assertIsNone(rec["claude_pid"])
+
+    def test_a_claude_pid_that_is_not_a_pid_is_not_read(self):
+        for junk in ("", "abc", "1", "0", "-5", "٣", " 12", "9" * 12):
+            asked, _ = self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+            os.environ["CLAUDE_PID"] = junk
+            self.run_with(self.payload())
+            self.assertEqual(asked, [], repr(junk))
+
+    def test_a_parent_whose_environment_cannot_be_read_falls_back_to_the_login(self):
+        asked, _ = self.claude_parent([])
+        runner.engine.procargs_buffer = lambda p: asked.append(p) or None
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(asked, [os.getppid()])                             # control
+        with open(self.usage_file()) as fh:
+            self.assertEqual(json.load(fh)["account"]["id"], "login:uuid-a")
+
+    def test_a_parent_that_cannot_be_read_again_keeps_the_sessions_account(self):
+        import hashlib
+        fp = hashlib.sha256(self.TOKEN.encode()).hexdigest()[:16]
+        tok = {"kind": "token", "id": "token:" + fp}
+        os.makedirs(os.path.dirname(self.usage_file()))
+        with open(self.usage_file(), "w") as fh:
+            json.dump({"v": 1, "session_id": self.SID, "received_at": time.time() - 60,
+                       "measured_at": None, "rate_limits": {}, "account": tok,
+                       "first_account": tok, "first_seen": time.time() - 600,
+                       "login_at": None, "unsure": False, "claude_pid": os.getppid()}, fh)
+        asked, _ = self.claude_parent([])
+        runner.engine.procargs_buffer = lambda p: asked.append(p) or None
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(asked, [os.getppid()])
+        with open(self.usage_file()) as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["account"], {"kind": "unknown", "id": None})
+        self.assertEqual(rec["first_account"], tok)
+        self.assertTrue(rec["unsure"])              # a gap joins no account
+        self.assertEqual(rec["claude_pid"], os.getppid())
+
+    def test_a_parent_read_that_raises_still_records_and_exits_zero(self):
+        asked, _ = self.claude_parent([])
+
+        def boom(p):
+            raise RuntimeError("sysctl went away")
+        runner.engine.procargs_buffer = boom
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, err), (0, ""))
+        with open(self.usage_file()) as fh:
+            self.assertEqual(json.load(fh)["account"]["id"], "login:uuid-a")
+
     def test_a_write_that_fails_still_prints_and_exits_zero(self):
         os.makedirs(os.path.join(self.tmp, "ccwho"))
         with open(os.path.join(self.tmp, "ccwho", "usage"), "w") as fh:

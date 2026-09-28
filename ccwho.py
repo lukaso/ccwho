@@ -1601,6 +1601,27 @@ def prune_usage():
             pass
 
 
+def statusline_claude(env):
+    """(pid, auth) of the claude running this statusLine; (None, None) unless
+    CLAUDE_PID names this process's own parent.
+
+    Claude Code gives the statusLine no CLAUDE_CODE_OAUTH_TOKEN (#28): which
+    account a token session spends is known only to its claude. The parent check
+    is what makes the pid that claude, and not a stale or borrowed number. A
+    statusLine wrapped in a script of its own is not confirmed, and is read as
+    before. Never raises."""
+    try:
+        text = env.get("CLAUDE_PID", "")
+        if not (text.isascii() and text.isdigit() and len(text) < 8):
+            return None, None
+        pid = int(text)
+        if pid != os.getppid():
+            return None, None
+        return pid, engine.read_auth(pid)
+    except Exception:             # noqa: BLE001 - the reading is still recorded
+        return None, None
+
+
 def statusline(argv):
     """Claude Code runs this in every session, on every status update, with the
     session's JSON on stdin. It records the usage it is handed and prints
@@ -1618,7 +1639,9 @@ def statusline(argv):
                     previous = json.load(fh)
             except (OSError, ValueError):
                 previous = None
-        rec = usage.record(payload, os.environ, setup_home(), time.time(), previous)
+        claude_pid, claude_auth = statusline_claude(os.environ)
+        rec = usage.record(payload, os.environ, setup_home(), time.time(), previous,
+                           claude_pid=claude_pid, claude_auth=claude_auth)
         if rec is None:
             return 0
         try:

@@ -133,6 +133,81 @@ class TestParseProcargs(unittest.TestCase):
             procs.parse_procargs(buf, keys=("ANTHROPIC_API_KEY",))
 
 
+class TestParseAuth(unittest.TestCase):
+    """Which account the claude that runs a statusLine spends (#28).
+
+    Claude Code gives the statusLine no CLAUDE_CODE_OAUTH_TOKEN, so ccwho reads
+    it from the claude process itself. Only the fingerprint may come back: the
+    token is hashed inside the parse and goes nowhere else."""
+
+    FP = __import__("hashlib").sha256(TOKEN.encode()).hexdigest()[:16]
+
+    def test_the_token_comes_back_as_its_fingerprint_only(self):
+        got = procs.parse_auth(procargs(["claude", "--resume", SID],
+                                        [f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}", "HOME=/x"]))
+        self.assertEqual(got, {"token_fp": self.FP})
+        self.assertNotIn(TOKEN, repr(got))
+        self.assertNotIn(TOKEN[8:24], repr(got))
+
+    def test_the_fingerprint_is_the_one_usage_names_accounts_by(self):
+        import ccwho_usage
+        self.assertEqual(procs.token_fingerprint(TOKEN), ccwho_usage.fingerprint(TOKEN))
+        self.assertEqual(procs.token_fingerprint(TOKEN), self.FP)
+
+    def test_the_config_dir_comes_back(self):
+        got = procs.parse_auth(procargs(["claude"], ["CLAUDE_CONFIG_DIR=/Users/x/.cw"]))
+        self.assertEqual(got, {"config_dir": "/Users/x/.cw"})
+
+    def test_no_token_and_no_config_dir_is_empty_not_none(self):       # control
+        self.assertEqual(procs.parse_auth(procargs(["claude"], ["HOME=/x"])), {})
+
+    def test_an_empty_token_is_no_token(self):
+        got = procs.parse_auth(procargs(["claude"], ["CLAUDE_CODE_OAUTH_TOKEN=", "HOME=/x"]))
+        self.assertEqual(got, {})
+
+    def test_other_secrets_are_not_a_token(self):
+        got = procs.parse_auth(procargs(["claude"], [f"ANTHROPIC_API_KEY={TOKEN}",
+                                                     f"XCLAUDE_CODE_OAUTH_TOKEN={TOKEN}"]))
+        self.assertEqual(got, {})
+
+    def test_the_first_of_two_entries_is_the_one_getenv_sees(self):
+        other = "sk-ant-oat01-OTHER-FAKE"
+        got = procs.parse_auth(procargs(["claude"], [f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}",
+                                                     f"CLAUDE_CODE_OAUTH_TOKEN={other}"]))
+        self.assertEqual(got, {"token_fp": self.FP})
+
+    def test_an_argument_does_not_hide_the_environment(self):
+        got = procs.parse_auth(procargs(["claude", "CLAUDE_CONFIG_DIR=/argv",
+                                         f"CLAUDE_CODE_OAUTH_TOKEN=x"],
+                                        ["CLAUDE_CONFIG_DIR=/env",
+                                         f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}"]))
+        self.assertEqual(got, {"config_dir": "/env", "token_fp": self.FP})
+
+    def test_an_argument_is_no_key_when_the_environment_was_found(self):
+        got = procs.parse_auth(procargs(["claude", "CLAUDE_CODE_OAUTH_TOKEN=hello",
+                                         "CLAUDE_CONFIG_DIR=/tmp/x is wrong"], ["HOME=/x"]))
+        self.assertEqual(got, {})
+
+    def test_an_argument_counts_when_a_rewritten_title_ate_the_environment(self):
+        # the kernel keeps the old argc: walking it lands past the environment,
+        # so a key is taken wherever it is - as parse_procargs does
+        buf = struct.pack("i", 9) + b"/usr/local/bin/node\0\0\0claude\0" + \
+            f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}\0".encode() + b"\0"
+        self.assertEqual(procs.parse_auth(buf), {"token_fp": self.FP})
+
+    def test_an_empty_token_where_the_walk_ate_the_environment_is_empty(self):
+        buf = struct.pack("i", 9) + b"/usr/local/bin/node\0\0\0claude\0" + \
+            b"CLAUDE_CODE_OAUTH_TOKEN=\0\0"
+        self.assertEqual(procs.parse_auth(buf), {})
+
+    def test_an_unreadable_or_hidden_environment_is_none(self):
+        self.assertIsNone(procs.parse_auth(b"\xff\xff\xff\xff" +
+                                           f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}\0".encode()))
+        self.assertIsNone(procs.parse_auth(TestParseProcargs.HIDDEN_SLEEP))
+        for junk in (None, b"", b"ab", "text"):
+            self.assertIsNone(procs.parse_auth(junk), repr(junk))
+
+
 class TestConfigDirs(unittest.TestCase):
     def test_running_sessions_add_their_own_config_dirs(self):
         got = procs.config_dirs(["/Users/x/.claude-work", "/Users/x/.claude"],

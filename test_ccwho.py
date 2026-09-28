@@ -4870,9 +4870,9 @@ class TestReadProcargsOnARealProcess(unittest.TestCase):
                                       "ANTHROPIC_API_KEY": self.TOKEN, "PATH": "/bin"})
         try:
             got = {}
-            for _ in range(50):             # until it has exec'd
-                got = ccwho.read_procargs(child.pid) or {}
-                if got:
+            for _ in range(50):             # until it has exec'd: before that the
+                got = ccwho.read_procargs(child.pid) or {}   # fork holds OUR env
+                if got.get("CLAUDE_CONFIG_DIR") == "/fake/dir":
                     break
                 time.sleep(0.05)
         finally:
@@ -4883,6 +4883,34 @@ class TestReadProcargsOnARealProcess(unittest.TestCase):
 
     def test_a_pid_that_does_not_exist_is_none(self):                # control
         self.assertIsNone(ccwho.read_procargs(99999999))
+
+    def test_the_auth_of_a_real_process_is_its_token_fingerprint_only(self):
+        # #28: the statusLine reads its claude's token this way - on the real
+        # kernel, the fingerprint comes back and the token does not
+        import hashlib
+        import sys
+        import time
+        if sys.executable.startswith(("/usr/bin/", "/bin/", "/System/")):
+            self.skipTest("the test's own Python is a system binary: its env is hidden")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"],
+                                 env={"CLAUDE_CODE_OAUTH_TOKEN": self.TOKEN,
+                                      "CLAUDE_CONFIG_DIR": "/fake/dir", "PATH": "/bin"})
+        try:
+            got = {}
+            for _ in range(50):             # until it has exec'd: before that the
+                got = ccwho.read_auth(child.pid) or {}       # fork holds OUR env
+                if got.get("config_dir") == "/fake/dir":
+                    break
+                time.sleep(0.05)
+        finally:
+            child.kill()
+            child.wait()
+        self.assertEqual(got, {"token_fp": hashlib.sha256(self.TOKEN.encode()).hexdigest()[:16],
+                               "config_dir": "/fake/dir"})
+        self.assertNotIn(self.TOKEN, repr(got))
+
+    def test_the_auth_of_a_pid_that_does_not_exist_is_none(self):     # control
+        self.assertIsNone(ccwho.read_auth(99999999))
 
     def test_a_system_binary_is_unread_not_unmarked(self):
         # the environment macOS hides is unknown: "no session started it" would

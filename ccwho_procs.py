@@ -1568,6 +1568,11 @@ def _shown_line(text):
                    for c in text)
 
 
+# kill_plan's answer when a session started nothing that still runs: the one
+# empty plan that is known, not "not known" (ccwho stop tells them apart)
+SESSION_LEFT_NOTHING = "that session left nothing running"
+
+
 def kill_plan(mode, target, world):
     # every result leaves through here, one line per text: printable() keeps
     # \t and \n for recaps, and a session id is whatever a process set
@@ -2090,7 +2095,7 @@ def _kill_plan(mode, target, world):
         roots = sorted(q for q in ours if table[q][0] not in ours)
         if not roots:
             return nothing("your session left nothing running" if mode == "mine"
-                           else "that session left nothing running")
+                           else SESSION_LEFT_NOTHING)
     else:
         return nothing(f"unknown kind of kill: {printable(str(mode))[:20]}")
 

@@ -1173,6 +1173,38 @@ def _names_exactly(row, word):
                         or w in (tty.lower(), engine.short_tty(tty).lower()))
 
 
+def _one_session(word, rows, exact, nothing):
+    """(the one live session `word` names, None), or (None, exit code) after
+    saying why: none (1), several (2), a loose word when `exact` - nobody
+    reads the list, so a word found in a title is no one's choice (2) - or the
+    sessions not read (1; interrupted 130). `nothing` ends each refusal."""
+    try:
+        hits = engine.match_rows(rows(), word)
+    except KeyboardInterrupt:
+        print(f"ccwho: interrupted - {nothing}", file=sys.stderr)
+        return None, 130
+    except Exception as err:
+        print(f"ccwho: the sessions could not be read ({type(err).__name__})"
+              f" - {nothing}", file=sys.stderr)
+        return None, 1
+    if not hits:
+        print(f"ccwho: no live session matches {word!r} - what an ended session"
+              f" left: ccwho clean", file=sys.stderr)
+        return None, 1
+    if len(hits) > 1:
+        print(f"ccwho: {word!r} matches {len(hits)} sessions - be more specific:",
+              file=sys.stderr)
+        for line in engine.pick_lines(hits):
+            print(f"  {line}", file=sys.stderr)
+        return None, 2
+    if exact and not _names_exactly(hits[0], word):
+        print(f"ccwho: {word!r} found {engine.pick_line(hits[0])} - with no one to"
+              f" confirm, name it exactly: its id, name or tty", file=sys.stderr)
+        return None, 2
+    print(f"session {engine.pick_line(hits[0])}")
+    return hits[0], None
+
+
 def _live_rows():
     """The live sessions, or an error: an unread feed is no "no match"."""
     status = {}
@@ -1207,33 +1239,12 @@ def kill_cli(argv, clean=False, seams=None):
     env = s["env"]
     mine = engine.agent_id(env)             # an agent: its own session's work only
     if mode == "query":
-        # a live session: what it started (the owner's D12). One match, or none
-        try:
-            hits = engine.match_rows(s["rows"](), target)
-        except KeyboardInterrupt:
-            print("ccwho: interrupted - nothing killed", file=sys.stderr)
-            return 130
-        except Exception as err:
-            print(f"ccwho: the sessions could not be read ({type(err).__name__})"
-                  f" - nothing killed", file=sys.stderr)
-            return 1
-        if not hits:
-            print(f"ccwho: no live session matches {target!r} - what an ended session"
-                  f" left: ccwho clean", file=sys.stderr)
-            return 1
-        if len(hits) > 1:
-            print(f"ccwho: {target!r} matches {len(hits)} sessions - be more specific:",
-                  file=sys.stderr)
-            for line in engine.pick_lines(hits):
-                print(f"  {line}", file=sys.stderr)
-            return 2
-        if ("--yes" in argv or mine is not None) and not _names_exactly(hits[0], target):
-            # nobody reads the list: a word found in a title is no one's choice
-            print(f"ccwho: {target!r} found {engine.pick_line(hits[0])} - with no one to"
-                  f" confirm, name it exactly: its id, name or tty", file=sys.stderr)
-            return 2
-        print(f"session {engine.pick_line(hits[0])}")
-        mode, target = "session", hits[0].get("sessionId") or ""
+        # a live session: what it started (the owner's D12)
+        row, rc = _one_session(target, s["rows"], "--yes" in argv or mine is not None,
+                               "nothing killed")
+        if row is None:
+            return rc
+        mode, target = "session", row.get("sessionId") or ""
     if mode == "mine":
         target = mine
     status = {}
@@ -1308,6 +1319,204 @@ def kill_cli(argv, clean=False, seams=None):
         print("\nccwho: stopped while reporting - run ccwho ps to see what still runs",
               file=sys.stderr)
         return 1
+
+
+STOP_USAGE = "usage: ccwho stop <session> [--and-procs] [--dry-run] [--yes]"
+STOP_FLAGS = ("--and-procs", "--dry-run", "--yes")
+
+
+def _claude_stop(sid, config_dir=None):
+    """`claude stop <job>`: (exit code, its text). The job is the session id's
+    first eight (the full id is "No job matching"), in the session's own config
+    dir, as `claude attach` needs it (engine.attach_command)."""
+    # a default-dir session has none - whatever dir ccwho's own shell names
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    done = subprocess.run(["claude", "stop", engine.daemon_short(sid)], capture_output=True,
+                          text=True, timeout=30, env=env)
+    return done.returncode, (done.stderr or done.stdout or "")
+
+
+def _not_known(plan):
+    """kill_plan took nothing and cannot say what runs: a "why" (it comes only
+    with an empty plan) that is not "nothing left"."""
+    return bool(plan.get("why")) and plan["why"] != engine.procs.SESSION_LEFT_NOTHING
+
+
+STOP_WAIT = 10         # seconds for a stopped session to leave the list and the table
+
+
+def _session_gone(row):
+    """True: the session is no longer listed and its claude process has ended
+    (ps: no signal). False: it still runs. None: not known (the feed or ps
+    could not be read)."""
+    try:
+        if any(r.get("sessionId") == row.get("sessionId") for r in _live_rows()):
+            return False
+        pid = row.get("pid")
+        if isinstance(pid, int) and pid > 1:
+            done = subprocess.run(["ps", "-p", str(pid), "-o", "pid="], capture_output=True,
+                                  text=True, timeout=5)
+            if done.returncode == 0 or done.stdout.strip():
+                return False                # its claude runs
+            # ps says nothing, and no error: the pid is gone. An error: not known
+            return None if done.stderr.strip() else True
+        return True
+    except Exception:
+        return None
+
+
+def stop_cli(argv, seams=None):
+    """`ccwho stop <session> [--and-procs]` (the owner's D11, 2026-09-27).
+
+    A background session is stopped with `claude stop <id>`, which keeps its
+    conversation (`claude attach` brings it back). An interactive one is never
+    signalled: it runs in a window, and that is where to end it. The session is
+    named as `ccwho kill` names one. --and-procs also kills what it started
+    (kill_plan's "session" list, shown first; one question covers both) -
+    after the stop, and only when the stop worked. Without it, what the session
+    left running is said. An agent stops no session. Exit 0 done, 1 not (or
+    not all), 2 usage, 3 needs --yes, 130 interrupted."""
+    s = {"build": lambda mine=None, status=None: engine.build_world(mine, status=status),
+         "ask": lambda prompt: _ask(prompt), "tty": lambda: _can_ask(sys.stdin, sys.stdout),
+         "env": os.environ, "carry": engine.carry_out, "rows": _live_rows,
+         "stop": _claude_stop, "gone": _session_gone, "sleep": time.sleep,
+         "clock": time.monotonic}
+    s.update(seams or {})
+    flags = [a for a in argv if a.startswith("-")]
+    words = [a for a in argv if not a.startswith("-")]
+    parsed = _kill_target(words, False) if len(words) == 1 else None
+    if any(f not in STOP_FLAGS for f in flags) or parsed is None or parsed[0] != "query":
+        print(STOP_USAGE, file=sys.stderr)
+        return 2
+    word = words[0]
+    if engine.agent_id(s["env"]) is not None:
+        print("ccwho: an agent does not stop sessions - nothing stopped", file=sys.stderr)
+        return 1
+    row, rc = _one_session(word, s["rows"], "--yes" in argv, "nothing stopped")
+    if row is None:
+        return rc
+    sid, conf = row.get("sessionId") or "", row.get("configDir") or None
+    job = f"claude stop {engine.daemon_short(sid)}"
+    # `claude attach` keeps it "background": someone may be using it in a window
+    tty = engine.short_tty(row.get("tty") or "")
+    seen = f" - it is open in a window ({tty})" if tty and row.get("windowed") else ""
+    if row.get("kind") != "background":
+        print(f"ccwho: it runs in a window{f' ({tty})' if tty else ''} - ccwho does not"
+              f" stop it; end it there (/exit). To find it: ccwho jump {word}", file=sys.stderr)
+        return 1
+    procs_ = "--and-procs" in argv
+    plan, kill, refused = None, [], False
+    if procs_:
+        status = {}
+        try:
+            world = s["build"](mine=None, status=status)
+            if status.get("trouble"):
+                print(f"ccwho: {status['trouble']} - nothing stopped", file=sys.stderr)
+                return 1
+            plan = engine.procs.kill_plan("session", sid, world)
+        except KeyboardInterrupt:
+            print("ccwho: interrupted - nothing stopped", file=sys.stderr)
+            return 130
+        except Exception as err:
+            print(f"ccwho: failed ({type(err).__name__}) - nothing stopped", file=sys.stderr)
+            return 1
+        for line in engine.kill_list_lines(plan):
+            print(line)
+        kill = plan["kill"]
+        # a tree refused, or what it started not known: not all of it can go
+        refused = (any(not e.get("outside") for e in plan["spare"])
+                   or _not_known(plan))
+    print(f"and stop the session: {job} - its conversation is kept{seen}"
+          if kill else f"stop the session: {job} - its conversation is kept{seen}")
+    if "--dry-run" in argv:
+        print("dry run - nothing stopped")
+        return 1 if refused else 0
+    if "--yes" not in argv:
+        what = (f"stop it and kill these {len(kill)}" if kill else "stop it") + (
+            f" - it is open in a window ({tty})" if seen else "")
+        if not s["tty"]():
+            print(f"would {what} (listed above) - add --yes to do it")
+            return 3
+        try:
+            answer = s["ask"](f"{what}? [y/N] ")
+        except EOFError:
+            answer = ""
+        except KeyboardInterrupt:
+            print("\nccwho: interrupted - nothing stopped", file=sys.stderr)
+            return 130
+        if answer.strip().lower() not in ("y", "yes"):
+            print("nothing stopped")
+            return 1
+    try:
+        code, _text = s["stop"](sid, conf)  # its text may name paths: not shown
+    except KeyboardInterrupt:
+        print("ccwho: interrupted - the session may have been stopped; run ccwho ls",
+              file=sys.stderr)
+        return 130
+    except Exception as err:
+        print(f"ccwho: could not stop it ({type(err).__name__}) - nothing killed",
+              file=sys.stderr)
+        return 1
+    if code:
+        print(f"ccwho: could not stop it (claude stop exited {code}) - nothing killed",
+              file=sys.stderr)
+        return 1
+    # claude's word is not enough: what it started is killed only once the
+    # session is gone - listed no more, its claude ended
+    # a deadline by the clock: one read of the feed takes a second or more
+    deadline = s["clock"]() + STOP_WAIT
+    try:
+        while not (gone := s["gone"](row)):
+            if s["clock"]() >= deadline:
+                what = ("its end could not be confirmed" if gone is None
+                        else "the session still runs")
+                print(f"ccwho: claude stop said done, but {what} - nothing killed;"
+                      f" run ccwho ls", file=sys.stderr)
+                return 1
+            s["sleep"](0.5)
+    except KeyboardInterrupt:
+        print("ccwho: interrupted - the session may have been stopped; nothing killed;"
+              " run ccwho ls", file=sys.stderr)
+        return 130
+    print(f"stopped - its conversation is kept: {engine.attach_command(sid, conf)}")
+    if kill:
+        try:
+            r = s["carry"]("session", sid, kill, force=False, mine=None)
+            lines, rc = engine.kill_report_lines(r, refused)
+        except (Exception, KeyboardInterrupt) as err:
+            stopped = isinstance(err, KeyboardInterrupt)
+            what = "interrupted" if stopped else f"failed ({type(err).__name__})"
+            said = ("nothing killed" if getattr(err, "ccwho_nothing_signalled", False)
+                    else "some of its processes may have been signalled; run ccwho ps")
+            print(f"ccwho: {what} - {said}", file=sys.stderr)
+            return 130 if stopped else 1
+        for line in lines:
+            print(line)
+        return rc
+    # `claude stop` leaves what a session started with nohup running (S3)
+    try:
+        status = {}
+        world = s["build"](mine=None, status=status)
+        if status.get("trouble"):
+            raise LookupError
+        plan = engine.procs.kill_plan("session", sid, world)
+    except KeyboardInterrupt:
+        print("ccwho: interrupted - what it left running: run ccwho ps", file=sys.stderr)
+        return 130
+    except Exception:
+        print("what it left running: run ccwho ps")
+        return 1 if refused else 0
+    # what it takes, and what it names apart (a helper, a shell, ...): all still run
+    for e in plan["kill"] + [e for e in plan["spare"] if e.get("outside")]:
+        print(f"still running: {e['pid']} {e.get('command') or ''} - ccwho kill {e['pid']}")
+    for e in (e for e in plan["spare"] if not e.get("outside")):
+        print(f"not killed: {e['pid']} {e.get('command') or ''} - {e.get('why') or ''}")
+    if _not_known(plan):
+        print("what it left running: not known - run ccwho ps")
+    # --and-procs with a tree refused: as its dry run said, not all of it went
+    return 1 if refused else 0
 
 
 def reap(argv):
@@ -2164,6 +2373,8 @@ def main(argv=None):
         return kill_cli(argv[1:])
     if argv and argv[0] == "clean":
         return kill_cli(argv[1:], clean=True)
+    if argv and argv[0] == "stop":
+        return stop_cli(argv[1:])
     if argv and argv[0] == "save":
         rc = save(argv[1:])
         maybe_trim_log()          # after, so the save's own output is in what we bound
@@ -2203,6 +2414,7 @@ def main(argv=None):
         print("       ccwho show <anything>                      what that session was working on")
         print("       ccwho ps [--port N] [--all] [--json] [--full]  what agents started, and their ports")
         print("       ccwho kill <pid>|:<port>|<session> [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
+        print("       ccwho stop <session> [--and-procs] [--dry-run] [--yes]  stop a background session (its conversation is kept) - asks")
         print("       ccwho clean [--mine] [--dry-run] [--yes] [--force]      kill what ended sessions left - lists, then asks")
         print("       ccwho reap [pattern] [--older-than 1h] [--kill]  leaked helpers, dry run unless --kill")
         print("       ccwho accounts [--json]                    subscription usage, per account")

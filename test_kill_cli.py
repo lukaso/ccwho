@@ -34,6 +34,8 @@ class Cli:
         self.m = Machine([w or world()], ends=ends)
         self.rows = self.ROWS if rows is None else rows
         self.rows_read = 0
+        self.log, self.stop_answer, self.stop_ends, self.slept = [], (0, ""), True, []
+        self.t = 5000.0                     # a monotonic clock starts anywhere
         self.tty, self.answer, self.env = tty, answer, dict(env or {})
         self.trouble, self.asked, self.builds, self.carried = trouble, [], [], []
 
@@ -42,7 +44,11 @@ class Cli:
         if self.trouble:
             status["trouble"] = self.trouble
         w = self.m.worlds[0]
-        return dict(w, mine=mine) if mine is not None else w
+        if len(self.builds) == 1 and not self.stopped():    # the list: the world as given
+            return dict(w, mine=mine) if mine is not None else w
+        # after `claude stop`, or a later read: the machine as it is now
+        self.m.builds = max(self.m.builds, 1)
+        return self.m.build(mine=mine, status=status if status is not None else {})
 
     def read_rows(self):
         self.rows_read += 1
@@ -57,6 +63,7 @@ class Cli:
         return self.answer
 
     def carry(self, mode, target, confirmed, force=False, mine=None):
+        self.log.append(("carry", mode))
         self.carried.append((mode, target, [e["pid"] for e in confirmed], force, mine))
         return engine.carry_out(mode, target, confirmed, force=force, mine=mine, act=self.m.act())
 
@@ -67,6 +74,38 @@ class Cli:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             rc = runner.kill_cli(list(argv), clean=clean, seams=seams)
         return rc, out.getvalue()
+
+    def claude_stop(self, sid, config_dir=None):
+        self.log.append(("stop", sid))
+        self.config_dirs = getattr(self, "config_dirs", []) + [config_dir]
+        if isinstance(self.stop_answer, BaseException):
+            raise self.stop_answer
+        if self.stop_ends and self.stop_answer[0] == 0:
+            self.m.alive.pop(10, None)          # the session's claude ends; 11 is launchd's
+            self.m.builds = max(self.m.builds, 1)   # every read from here on sees it
+        return self.stop_answer
+
+    def gone(self, row):
+        return row.get("pid") not in self.m.alive
+
+    def sleep(self, secs):
+        self.slept.append(secs)
+        self.t += secs
+        if sum(self.slept) > 100:               # a wait that never ends fails, not hangs
+            raise AssertionError("the wait does not end")
+
+    def stop(self, *argv):
+        out = io.StringIO()
+        seams = {"build": self.build, "ask": self.ask, "tty": lambda: self.tty,
+                 "env": self.env, "carry": self.carry, "rows": self.read_rows,
+                 "stop": self.claude_stop, "gone": self.gone,
+                 "sleep": self.sleep, "clock": lambda: self.t}
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = runner.stop_cli(list(argv), seams=seams)
+        return rc, out.getvalue()
+
+    def stopped(self):
+        return [x[1] for x in self.log if x[0] == "stop"]
 
     def sent(self):
         return [p for p, _s in self.m.sent]
@@ -609,6 +648,384 @@ class TestASession(unittest.TestCase):
         rc, out = c.run("other-d4")
         self.assertEqual((rc, c.sent()), (1, []))
         self.assertIn("only its own", out)
+
+
+BG = [dict(Cli.ROWS[0], kind="background")]
+
+
+class TestStop(unittest.TestCase):
+    """`ccwho stop <session> [--and-procs]` (the owner's D11, 2026-09-27): a
+    background session is stopped with `claude stop <id>`, which keeps its
+    conversation; an interactive one is never signalled."""
+
+    def test_a_background_session_is_stopped_after_the_question(self):
+        c = Cli(rows=BG)
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual((rc, c.stopped(), len(c.asked)), (0, [LIVE], 1))
+        self.assertIn("stopped", out)
+        self.assertIn("claude attach", out)                 # how to get it back
+        self.assertEqual(c.sent(), [])                      # its processes: not without --and-procs
+
+    def test_no_means_nothing(self):
+        c = Cli(rows=BG, answer="n")
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual((rc, c.stopped()), (1, []))
+        self.assertIn("nothing stopped", out)
+
+    def test_no_terminal_needs_yes(self):
+        c = Cli(rows=BG, tty=False)
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual((rc, c.stopped()), (3, []))
+        self.assertIn("add --yes", out)
+        c = Cli(rows=BG, tty=False, answer=None)            # control: --yes, never asked
+        rc, out = c.stop("liveapp-b2", "--yes")
+        self.assertEqual((rc, c.stopped()), (0, [LIVE]))
+
+    def test_dry_run_stops_nothing(self):
+        c = Cli(rows=BG)
+        rc, out = c.stop("liveapp-b2", "--dry-run", "--and-procs")
+        self.assertEqual((rc, c.stopped(), c.sent(), c.asked), (0, [], [], []))
+        self.assertIn("dry run", out)
+        self.assertIn("node server.js", out)                # what --and-procs would take
+
+    def test_an_interactive_session_is_never_signalled(self):
+        for rows in (Cli.ROWS, [dict(Cli.ROWS[0], kind="interactive", tty="ttys012")]):
+            with self.subTest(kind=rows[0].get("kind")):
+                c = Cli(rows=rows)
+                rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+                self.assertEqual((rc, c.stopped(), c.sent(), c.builds), (1, [], [], []))
+                self.assertIn("runs in a window", out)
+                self.assertIn("ccwho jump", out)
+
+    def test_an_agent_stops_no_session(self):
+        c = Cli(rows=BG, env={"CLAUDE_CODE_SESSION_ID": LIVE}, answer=None)
+        rc, out = c.stop(LIVE, "--yes")
+        self.assertEqual((rc, c.stopped()), (1, []))
+        self.assertIn("an agent does not stop", out)
+
+    def test_and_procs_asks_once_stops_then_kills(self):
+        c = Cli(rows=BG)
+        rc, out = c.stop("liveapp-b2", "--and-procs")
+        self.assertEqual(len(c.asked), 1)
+        self.assertIn("node server.js", out)
+        self.assertLess(out.index("node server.js"), out.index("stopped"))
+        self.assertEqual(c.log[:2], [("stop", LIVE), ("carry", "session")])
+        self.assertEqual(c.sent(), [11])
+        self.assertEqual(rc, 0)
+
+    def test_a_failed_stop_kills_nothing(self):
+        for answer in ((1, "no such session"), OSError("no claude"),
+                       subprocess.TimeoutExpired("claude", 30)):
+            with self.subTest(answer=type(answer).__name__):
+                c = Cli(rows=BG)
+                c.stop_answer = answer
+                rc, out = c.stop("liveapp-b2", "--and-procs")
+                self.assertEqual((rc, c.sent()), (1, []))
+                self.assertIn("could not stop", out)
+                self.assertNotIn("no claude", out)
+
+    def test_what_it_left_running_is_said(self):
+        # S3: `claude stop` leaves a nohup server running - say so, with the kill
+        c = Cli(rows=BG)
+        rc, out = c.stop("liveapp-b2")
+        self.assertIn("still running: 11 node server.js - ccwho kill 11", out)
+
+    def test_the_word_rules_are_kills(self):
+        c = Cli(rows=BG)
+        rc, out = c.stop("gate", "--yes")                   # loose, no one reads
+        self.assertEqual((rc, c.stopped()), (2, []))
+        c = Cli(rows=BG + [dict(BG[0], sessionId=OTHER, name="liveapp-c3")])
+        rc, out = c.stop("liveapp")
+        self.assertEqual((rc, c.stopped()), (2, []))
+
+    def test_usage(self):
+        for argv in ([], ["20"], [":3000"], ["a", "b"], ["liveapp-b2", "--force"],
+                     ["liveapp-b2", "--pid"]):
+            with self.subTest(argv=argv):
+                c = Cli(rows=BG)
+                rc, out = c.stop(*argv)
+                self.assertEqual((rc, c.stopped(), c.rows_read), (2, [], 0))
+                self.assertIn("usage: ccwho stop", out)
+
+    def test_an_interrupt_at_the_question_stops_nothing(self):
+        c = Cli(rows=BG)
+        def ask(prompt):
+            raise KeyboardInterrupt
+        c.ask = ask
+        try:
+            rc, out = c.stop("liveapp-b2")
+        except KeyboardInterrupt:
+            self.fail("the interrupt escaped stop_cli")
+        self.assertEqual((rc, c.stopped()), (130, []))
+
+    def test_the_job_is_named_as_claude_knows_it(self):
+        # measured 2026-09-27: `claude stop <full id>` says "No job matching";
+        # the job id is the session id's first eight, in the session's config dir
+        c = Cli(rows=[dict(BG[0], configDir="/Users/x/.claude-work")])
+        rc, out = c.stop("liveapp-b2", "--yes")
+        self.assertEqual(c.config_dirs, ["/Users/x/.claude-work"])
+        self.assertIn("claude stop aaaa1111", out)
+        self.assertIn("CLAUDE_CONFIG_DIR=/Users/x/.claude-work claude attach aaaa1111", out)
+        seen = []
+        real = subprocess.run
+        def run(argv, **kw):
+            seen.append((argv, dict(kw["env"])))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        subprocess.run = run
+        self.addCleanup(setattr, subprocess, "run", real)
+        # ccwho's own shell may name another dir: a default-dir session has none
+        os.environ["CLAUDE_CONFIG_DIR"] = "/Users/x/.claude-other"
+        self.addCleanup(os.environ.pop, "CLAUDE_CONFIG_DIR", None)
+        for conf in ("/Users/x/.claude-work", None, ""):
+            runner._claude_stop(LIVE, conf)
+        self.assertEqual([a for a, _ in seen], [["claude", "stop", "aaaa1111"]] * 3)
+        self.assertEqual(seen[0][1]["CLAUDE_CONFIG_DIR"], "/Users/x/.claude-work")
+        for _argv, env in seen[1:]:
+            self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+            self.assertIn("PATH", env)
+
+    def test_a_stop_that_leaves_the_session_running_kills_nothing(self):
+        c = Cli(rows=BG)
+        c.stop_ends = False                     # claude said 0, the session runs on
+        rc, out = c.stop("liveapp-b2", "--and-procs")
+        self.assertEqual((rc, c.sent()), (1, []))
+        self.assertIn("still runs", out)
+        self.assertNotIn("stopped - its conversation", out)
+        self.assertGreater(len(c.slept), 0)
+        self.assertLessEqual(sum(c.slept), 10)              # bounded
+
+    def test_what_it_left_includes_what_is_named_apart(self):
+        extra = {12: (10, T, "npm exec chrome-devtools-mcp@latest")}
+        c = Cli(rows=BG, w=world(extra=extra, marks={12: ("claude", LIVE)}))
+        rc, out = c.stop("liveapp-b2")
+        self.assertIn("still running: 11 node server.js - ccwho kill 11", out)
+        self.assertIn("still running: 12 ", out)
+        self.assertIn("ccwho kill 12", out)
+
+    def test_what_it_left_not_read_is_said(self):
+        c = Cli(rows=BG)
+        c.m.trouble = ("the sessions were not all read", 2)
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual(rc, 0)
+        self.assertIn("what it left running: run ccwho ps", out)
+        self.assertNotIn("still running:", out)
+        c = Cli(rows=BG)                            # any error: its type at most, never its text
+        real = c.m.build
+        def build(mine=None, status=None):
+            if c.stopped():
+                raise RuntimeError("secret-path")
+            return real(mine=mine, status=status)
+        c.m.build = build
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual(rc, 0)
+        self.assertIn("run ccwho ps", out)
+        self.assertNotIn("secret-path", out)
+
+    def test_a_window_on_it_is_named_in_the_question(self):
+        c = Cli(rows=[dict(BG[0], tty="ttys012", windowed=True)], answer="n")
+        rc, out = c.stop("liveapp-b2")
+        self.assertIn("open in a window (s012)", c.asked[0])
+        for row in (BG[0], dict(BG[0], tty="ttys012", windowed=False)):   # control: no window
+            c = Cli(rows=[row], answer="n")
+            c.stop("liveapp-b2")
+            self.assertNotIn("window", c.asked[0])
+
+    def test_an_interrupt_during_the_stop_or_the_kill(self):
+        c = Cli(rows=BG)
+        c.stop_answer = KeyboardInterrupt()
+        try:
+            rc, out = c.stop("liveapp-b2", "--and-procs")
+        except KeyboardInterrupt:
+            self.fail("the interrupt escaped stop_cli")
+        self.assertEqual((rc, c.sent()), (130, []))
+        self.assertIn("may have been stopped", out)
+        c = Cli(rows=BG)
+        def carry(*a, **k):
+            raise KeyboardInterrupt
+        c.carry = carry
+        try:
+            rc, out = c.stop("liveapp-b2", "--and-procs")
+        except KeyboardInterrupt:
+            self.fail("the interrupt escaped stop_cli")
+        self.assertEqual(rc, 130)
+        self.assertIn("interrupted", out)
+        self.assertIn("may have been signalled", out)
+        c = Cli(rows=BG)                            # during the read of what it left
+        real = c.m.build
+        def build(mine=None, status=None):
+            if c.stopped():
+                raise KeyboardInterrupt
+            return real(mine=mine, status=status)
+        c.m.build = build
+        try:
+            rc, out = c.stop("liveapp-b2")
+        except KeyboardInterrupt:
+            self.fail("the interrupt escaped stop_cli")
+        self.assertEqual(rc, 130)
+        self.assertIn("interrupted", out)
+        self.assertIn("run ccwho ps", out)
+
+    def test_a_refused_tree_exits_1_after_the_stop_as_in_the_dry_run(self):
+        # 11 is piped to the session's claude: refused in the list, kill empty
+        w = world()
+        w["pipes"][11], w["pipes"][10] = {10}, {11}
+        rc_dry, out = Cli(rows=BG, w=w).stop("liveapp-b2", "--and-procs", "--dry-run")
+        c = Cli(rows=BG, w=w)
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+        self.assertEqual((rc_dry, rc), (1, 1))
+        self.assertEqual(c.stopped(), [LIVE])
+        self.assertIn("ccwho kill 11", out[out.index("stopped - "):])     # still named
+        c = Cli(rows=BG)                                                    # control
+        self.assertEqual(c.stop("liveapp-b2", "--yes")[0], 0)
+
+    def test_processes_not_known_are_no_success(self):
+        # the environments not read: nobody can tell what the session started
+        c = Cli(rows=BG)
+        c.m.worlds[0]["marks"] = None           # the list's read; later reads fail
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--dry-run")
+        self.assertEqual(rc, 1)
+        c = Cli(rows=BG)
+        c.m.worlds[0]["marks"] = None
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+        self.assertEqual((rc, c.stopped()), (1, [LIVE]))
+        self.assertIn("run ccwho ps", out[out.index("stopped - "):])
+        c = Cli(rows=BG, w=world(drop=(11,)))   # control: it left nothing
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+        self.assertEqual(rc, 0)
+
+    def test_what_it_left_not_known_after_the_stop_is_said(self):
+        c = Cli(rows=BG)
+        real = c.m.build
+        def build(mine=None, status=None):
+            w = real(mine=mine, status=status)
+            return dict(w, marks=None) if c.stopped() else w
+        c.m.build = build
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual(rc, 0)                 # the stop worked; it asked for nothing more
+        self.assertIn("what it left running: not known - run ccwho ps", out)
+
+    def test_one_tree_killed_and_one_refused_exits_1(self):
+        extra = {13: (10, T, "python3 worker.py"), 14: (13, T, "esbuild --service")}
+        w = world(extra=extra, marks={13: ("claude", LIVE), 14: ("claude", OTHER)})
+        c = Cli(rows=BG, w=w)
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+        self.assertEqual((rc, c.sent()), (1, [11]))
+
+    def test_a_kill_that_signalled_nothing_says_so(self):
+        for exc, code in ((KeyboardInterrupt(), 130), (RuntimeError("x"), 1)):
+            with self.subTest(exc=type(exc).__name__):
+                c = Cli(rows=BG)
+                def carry(*a, exc=exc, **k):
+                    exc.ccwho_nothing_signalled = True
+                    raise exc
+                c.carry = carry
+                try:
+                    rc, out = c.stop("liveapp-b2", "--and-procs")
+                except KeyboardInterrupt:
+                    self.fail("the interrupt escaped stop_cli")
+                self.assertEqual(rc, code)
+                self.assertIn("nothing killed", out)
+                self.assertNotIn("may have been signalled", out)
+
+    def test_a_tree_still_refused_after_the_stop_is_named(self):
+        # a child of 11 carries another session's mark: refused before the stop
+        # and after it
+        w = world(extra={12: (11, T, "esbuild --service")}, marks={12: ("claude", OTHER)})
+        c = Cli(rows=BG, w=w)
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+        self.assertEqual((rc, c.sent()), (1, []))
+        after = out[out.index("stopped - "):]
+        self.assertIn("not killed: 11 node server.js", after)
+        self.assertIn("another session's mark", after)
+
+    def test_gone_means_unlisted_and_its_claude_ended(self):
+        row = dict(BG[0], pid=4242)
+        real_rows, real_run = runner._live_rows, subprocess.run
+        self.addCleanup(setattr, runner, "_live_rows", real_rows)
+        self.addCleanup(setattr, subprocess, "run", real_run)
+        asked = []
+        def ps(rc, out, err=""):
+            def run(argv, **kw):
+                asked.append(argv)
+                if isinstance(rc, BaseException):
+                    raise rc
+                return subprocess.CompletedProcess(argv, rc, out, err)
+            return run
+        for listed, rc, out, err, gone in (
+                (True, 1, "", "", False),                        # still listed
+                (False, 0, " 4242\n", "", False),                # its claude runs
+                (False, 1, " 4242\n", "", False),                # a line: it runs
+                (False, 1, "", "", True),                        # both ended
+                (False, 1, "", "ps: illegal option", None),      # ps failed: not known
+                (False, OSError("no ps"), "", "", None)):
+            with self.subTest(listed=listed, rc=rc, err=err):
+                runner._live_rows = lambda: [row] if listed else []
+                subprocess.run = ps(rc, out, err)
+                self.assertIs(runner._session_gone(row), gone)
+        self.assertIn(["ps", "-p", "4242", "-o", "pid="], asked)
+        def broken():
+            raise LookupError("feed")
+        runner._live_rows = broken                              # not known: None
+        self.assertIsNone(runner._session_gone(row))
+
+    def test_the_kill_reads_the_machine_after_the_stop(self):
+        c = Cli(rows=BG)
+        seen = []
+        real = c.m.build
+        def build(mine=None, status=None):
+            w = real(mine=mine, status=status)
+            seen.append([x["pid"] for x in w["sessions"]])
+            return w
+        c.m.build = build
+        c.stop("liveapp-b2", "--and-procs")
+        self.assertEqual(c.sent(), [11])
+        self.assertTrue(seen)
+        self.assertNotIn([10], seen[-1:])              # carry_out saw the session gone
+
+    def test_an_interrupt_during_the_wait(self):
+        for where in ("gone", "sleep"):
+            with self.subTest(where=where):
+                c = Cli(rows=BG)
+                c.stop_ends = False
+                def boom(*a):
+                    raise KeyboardInterrupt
+                setattr(c, where, boom)
+                try:
+                    rc, out = c.stop("liveapp-b2", "--and-procs")
+                except KeyboardInterrupt:
+                    self.fail("the interrupt escaped stop_cli")
+                self.assertEqual((rc, c.sent()), (130, []))
+                self.assertIn("may have been stopped", out)
+
+    def test_the_wait_is_bounded_by_the_clock(self):
+        c = Cli(rows=BG)
+        c.stop_ends = False
+        start = c.t
+        def slow(row):
+            c.t += 1.0                          # each read of the feed takes a second
+            if c.t - start > 100:
+                raise AssertionError("the wait does not end")
+            return False
+        c.gone = slow
+        rc, out = c.stop("liveapp-b2")
+        self.assertEqual(rc, 1)
+        self.assertLessEqual(c.t - start, runner.STOP_WAIT + 1.5)
+
+    def test_an_end_that_cannot_be_read_is_not_still_runs(self):
+        c = Cli(rows=BG)
+        c.gone = lambda row: None               # the feed could not be read
+        rc, out = c.stop("liveapp-b2", "--and-procs")
+        self.assertEqual((rc, c.sent()), (1, []))
+        self.assertIn("could not be confirmed", out)
+        self.assertNotIn("still runs", out)
+
+    def test_main_routes_stop(self):
+        seen = []
+        real = runner.stop_cli
+        runner.stop_cli = lambda argv, seams=None: seen.append(argv) or 0
+        self.addCleanup(setattr, runner, "stop_cli", real)
+        runner.main(["stop", "x", "--yes"])
+        self.assertEqual(seen, [["x", "--yes"]])
 
 
 class TestTheReport(unittest.TestCase):

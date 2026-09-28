@@ -523,6 +523,7 @@ ccwho save              # record the live fleet (before a reboot)
 ccwho restore [--open]  # list it back, or reopen the windows
 ccwho kill <pid>|:<port>|<session>  # a process tree, a port's holder, or what a session started - lists, then asks
 ccwho clean [--mine]    # kill what ended sessions left behind - lists, then asks
+ccwho stop <session> [--and-procs]  # stop a background session, keep its conversation - asks
 ccwho reap              # leaked helper processes, dry run
 ccwho doctor            # is everything ccwho needs in place?
 ccwho setup             # install what it needs, once

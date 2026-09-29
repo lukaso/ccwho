@@ -3284,7 +3284,11 @@ def ui_groups(rows):
         else:
             members.sort(key=lambda r: _RANK.get(r.get("attention", ""), _UNKNOWN_RANK))
         if members:
-            out.append({"heading": heading, "rows": members})
+            # a group needs you when its marks are amber: a heading drawn like
+            # NEEDS YOU over rows that do not is read, at a glance, as a question
+            # waiting (STOPPED was)
+            needs = any(UI_STATE_STYLE.get(s) in ("needs", "review") for s in states)
+            out.append({"heading": heading, "rows": members, "needs_you": needs})
     return out
 
 

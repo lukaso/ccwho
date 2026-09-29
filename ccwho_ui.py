@@ -66,7 +66,9 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
 USAGE_STYLE = {"dim": "dim", "plain": "", "green": "bold green", "red": "bold red",
                "yellow": "yellow", "byellow": "bold yellow"}
 
-# Three states, three colours, used on one glyph per row and on its heading.
+# Each state's colour, used on one glyph per row. A heading is not drawn from
+# this table: it is amber when its group needs you and green when it does not
+# (.heading in CcwhoUi.CSS).
 STATE_STYLE = {"needs": "bold #e5a50a",    # amber: it is waiting on you
                "review": "#e5a50a",        # the same amber, unbold: it finished
                "busy": "#33d17a",          # green: it is working
@@ -729,6 +731,9 @@ class CcwhoUi(App):
     .row.acting { background: $warning 30%; border-left: thick $warning; }
     .row.acting.pulse { background: $warning 70%; }
     .heading { color: $accent; text-style: bold; padding: 1 1 0 1; }
+    /* A group that does not need you: the green of a busy mark. In the amber
+       of NEEDS YOU, STOPPED was read at a glance as a question waiting. */
+    .heading.calm { color: #33d17a; }
     #closebar { dock: top; height: 1; align: right top; }
     #close { width: 3; height: 1; color: $text-muted; }
     #close:hover { background: $accent; color: $text; }
@@ -926,6 +931,17 @@ class CcwhoUi(App):
                               tuple(r.get("sessionId") for r in g["rows"]))
                              for g in groups))
 
+    @staticmethod
+    def heading(group):
+        """A group's heading: amber when it needs you, green when it does not.
+
+        An engine older than the screen (it is read from disk on each refresh)
+        does not say: its headings are drawn as they were, all amber.
+        """
+        return Static(group["heading"], markup=False,
+                      classes="heading" if group.get("needs_you", True)
+                      else "heading calm")
+
     def hide_search(self):
         """Out of sight AND out of the focus chain.
 
@@ -988,8 +1004,7 @@ class CcwhoUi(App):
             listing.remove_children()
             fresh = []
             for group in groups:
-                fresh.append(Static(group["heading"], classes="heading",
-                                    markup=False))
+                fresh.append(self.heading(group))
                 fresh.extend(Row(row, width) for row in group["rows"])
             if not fresh:
                 fresh.append(Static(self.empty_text(), markup=False))
@@ -1024,8 +1039,7 @@ class CcwhoUi(App):
                 if head is None:
                     # a group that was empty a moment ago: the heading is a
                     # one-line Static, the rows are what must not be remade
-                    head = Static(group["heading"], classes="heading",
-                                  markup=False)
+                    head = self.heading(group)
                     listing.mount(head)
                 wanted.append(head)
                 wanted += [on_screen[r.get("sessionId")] for r in group["rows"]]

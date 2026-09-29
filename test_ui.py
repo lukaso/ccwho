@@ -729,6 +729,117 @@ class TestColourCarriesOneMeaning(UiTest):
         for name in set(engine.UI_STATE_STYLE.values()):
             self.assertIn(name, ui.STATE_STYLE, name)
 
+    def headings(self, app):
+        return {str(w.content): w.styles.color for w in app.query(".heading")}
+
+    def assert_warm(self, colour, heading):
+        self.assertGreater(colour.r, colour.g, f"{heading} is not amber: {colour}")
+
+    def assert_green(self, colour, heading):
+        self.assertGreater(colour.g, max(colour.r, colour.b),
+                           f"{heading} is not green: {colour}")
+
+    async def test_only_a_group_that_needs_you_has_its_colour(self):
+        # reported: STOPPED in the colour of NEEDS YOU read, at a glance, as a
+        # question waiting. What needs you keeps the colour; the rest are green.
+        states = ("asks", "stuck", "stopped", "busy", "program")
+        rows = [row(f"{i}{i}{i}{i}0000-0000-4000-8000-00000000000{i}", s)
+                for i, s in enumerate(states, 1)]
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00")))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            seen = self.headings(app)
+            self.assertEqual(set(seen), {"NEEDS YOU", "STUCK", "STOPPED", "BUSY",
+                                         "PROGRAMS"})
+            for heading in ("NEEDS YOU", "STUCK"):
+                self.assert_warm(seen[heading], heading)
+            for heading in ("STOPPED", "BUSY", "PROGRAMS"):
+                self.assert_green(seen[heading], heading)
+
+    async def refresh(self, app, pilot, collector, rows):
+        collector.fleet_value = ui.Fleet(rows, True, "12:01:00")
+        app.collect()
+        await pilot.pause()
+        await pilot.pause()
+
+    def row_ids(self, app):
+        """The row widgets, in any order: moved rows are the same widgets."""
+        return {id(w) for w in app.query(ui.Row)}
+
+    async def test_a_group_that_appears_on_a_refresh_has_its_colour_too(self):
+        # a session that changes group moves rows that are there and makes only
+        # the new heading: that path builds a heading of its own
+        collector = FakeCollector()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = self.row_ids(app)
+            await self.refresh(app, pilot, collector,
+                               [LIVE, dict(BUSY, attention="stopped")])
+            self.assertEqual(before, self.row_ids(app),
+                             "the rows moved, not rebuilt: this is the other path")
+            seen = self.headings(app)
+            self.assertEqual(set(seen), {"NEEDS YOU", "STOPPED"})
+            self.assert_warm(seen["NEEDS YOU"], "NEEDS YOU")
+            self.assert_green(seen["STOPPED"], "STOPPED")
+
+    async def test_needs_you_that_appears_on_a_refresh_has_its_colour(self):
+        # the common case on that path: a stopped session asks you something
+        collector = FakeCollector(fleet=ui.Fleet(
+            [dict(LIVE, attention="stopped"), BUSY], True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = self.row_ids(app)
+            await self.refresh(app, pilot, collector, [LIVE, BUSY])
+            self.assertEqual(before, self.row_ids(app),
+                             "the rows moved, not rebuilt: this is the other path")
+            self.assert_warm(self.headings(app)["NEEDS YOU"], "NEEDS YOU")
+
+    async def test_the_screen_draws_what_the_engine_decided(self):
+        # not a list of its own of which headings need you
+        real = ui.engine.ui_groups
+
+        def inverted(rows):
+            return [dict(g, needs_you=not g["needs_you"]) for g in real(rows)]
+        with mock.patch.object(ui.engine, "ui_groups", inverted):
+            app = self.app()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                seen = self.headings(app)
+                self.assert_green(seen["NEEDS YOU"], "NEEDS YOU")
+                self.assert_warm(seen["BUSY"], "BUSY")
+
+    async def test_an_older_engine_on_disk_leaves_the_headings_as_they_were(self):
+        # the engine is read from disk again on each refresh, the screen only at
+        # start: an older engine checked out under a running list must not
+        # close it. Its headings are drawn as they were before: all amber.
+        real = ui.engine.ui_groups
+
+        def older(rows):
+            return [{k: v for k, v in g.items() if k != "needs_you"}
+                    for g in real(rows)]
+        other = row("cccc3333-0000-4000-8000-000000000003", "program")
+        collector = FakeCollector()
+        with mock.patch.object(ui.engine, "ui_groups", older):
+            app = self.app(collector=collector)
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                # a session arrives: a full build
+                await self.refresh(app, pilot, collector, [LIVE, BUSY, other])
+                self.assertNotIn("STOPPED", self.headings(app))
+                before = self.row_ids(app)
+                # one changes group: the rows move, and STOPPED is made there
+                await self.refresh(app, pilot, collector,
+                                   [LIVE, dict(BUSY, attention="stopped"), other])
+                self.assertTrue(app.is_running)
+                self.assertEqual(before, self.row_ids(app),
+                                 "the rows moved: the other path was taken too")
+                seen = self.headings(app)
+                self.assertEqual(set(seen), {"NEEDS YOU", "STOPPED", "PROGRAMS"})
+                for heading, colour in seen.items():
+                    self.assert_warm(colour, heading)
+
 
 class TestTheBriefIsNotAWallOfWhite(UiTest):
     """render_brief already marks its labels dim and its title bold. The screen

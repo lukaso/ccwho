@@ -1197,42 +1197,61 @@ def match_rows(rows, query):
 ITERM_STATE_DIR = os.path.expanduser("~/.cache/ccwho")
 OSASCRIPT = "osascript"
 ASK_WAIT_AFTER_ERROR = 30.0
-_AE_TIMED_OUT = "(-1712)"
+_AE_TIMED_OUT = "-1712"
+_AE_ERROR = re.compile(r"\((-\d+)\)")
 # $0 is osascript, $1 the state dir. Output goes to files: a pipe nobody reads
 # any more fills at 64 KB, and the child - holding the lock - never exits. The
-# status is written last, so it exists only for an ask that ran to its end.
-_ASK_SH = ('d="$1"; shift; "$0" "$@" >"$d/iterm-ae.out" 2>"$d/iterm-ae.err"; '
+# status is written last, so it exists only for an ask that ran to its end. The
+# answers hold tab names - paths, commands, hosts - so they are ours alone.
+_ASK_SH = ('umask 077; d="$1"; shift; "$0" "$@" >"$d/iterm-ae.out" 2>"$d/iterm-ae.err"; '
            'echo $? >"$d/iterm-ae.status"')
 
 
 def parse_procs(procs_output):
-    """pid -> (tty, uid, executable) from `ps -eo pid,tty,uid,comm`. The
-    executable is the program that runs, not a command line anyone can type:
-    `tail -f .../MacOS/iTerm2` is tail."""
+    """pid -> (tty, uid, executable name) from `ps -eo pid,tty,uid,ucomm`, or
+    from the cheap `ps -eo pid,uid,ucomm` (tty ""). ucomm is the kernel's name
+    for the program that runs: argv[0] - and so `comm` - a process sets itself
+    (`exec -a iTerm2 sleep 9` is sleep)."""
+    lines = (procs_output or "").splitlines()
+    header = lines[0].split() if lines else []
+    has_tty = len(header) > 1 and header[1].startswith("TT")
     out = {}
-    for line in (procs_output or "").splitlines():
-        f = line.split(None, 3)
-        if len(f) < 4 or not f[0].isdigit() or not f[2].isdigit():
+    for line in lines:
+        f = line.split(None, 3 if has_tty else 2)
+        if len(f) < (4 if has_tty else 3) or not f[0].isdigit():
             continue
-        out[int(f[0])] = ("" if f[1] in ("??", "?", "-") else f[1], int(f[2]), f[3].strip())
+        tty, uid, name = (f[1], f[2], f[3]) if has_tty else ("", f[1], f[2])
+        if not uid.isdigit():
+            continue
+        out[int(f[0])] = ("" if tty in ("??", "?", "-") else tty, int(uid), name.strip())
     return out
 
 
-def _is_iterm_app(exe):
-    return os.path.basename(exe) == "iTerm2"          # whatever the bundle is called
+def _is_iterm_app(name):
+    return name == "iTerm2"                   # whatever the bundle is called
 
 
-def _is_iterm_daemon(exe):
-    return os.path.basename(exe).startswith("iTermServer-")
+def _is_iterm_daemon(name):
+    return name.startswith("iTermServer-")    # ucomm keeps 16 characters
 
 
 def iterm_app_pid(procs_output):
     """Our running iTerm2 app, or None. Another user's iTerm2 is not ours to ask."""
     me = os.getuid()
-    for pid, (_tty, uid, exe) in sorted(parse_procs(procs_output).items()):
-        if uid == me and _is_iterm_app(exe):
+    for pid, (_tty, uid, name) in sorted(parse_procs(procs_output).items()):
+        if uid == me and _is_iterm_app(name):
             return pid
     return None
+
+
+def app_snapshot():
+    """The cheap process table: no tty column (0.03 s of ps, where the tty
+    column costs 0.2 s) - enough to find iTerm2 outside a scan."""
+    try:
+        return subprocess.run(["ps", "-eo", "pid,uid,ucomm"], capture_output=True,
+                              text=True, errors="replace", timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def _gate_path(name):
@@ -1261,9 +1280,14 @@ def _read_gate(now):
     for key in ("quarantine", "asked_pid"):
         if type(state.get(key)) is int:
             clean[key] = state[key]
+    for key in ("pending", "slow"):
+        if state.get(key) is True:
+            clean[key] = True
     wait = state.get("wait_until")
     if type(wait) in (int, float) and wait <= now + ASK_WAIT_AFTER_ERROR:
         clean["wait_until"] = wait
+    if isinstance(state.get("last_error"), str) and re.fullmatch(r"-?\w{1,12}", state["last_error"]):
+        clean["last_error"] = state["last_error"]
     return clean
 
 
@@ -1271,7 +1295,8 @@ def _write_gate(state):
     """True when the state is on disk."""
     tmp = _gate_path("json.tmp")
     try:
-        with open(tmp, "w") as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(state, f)
         os.replace(tmp, _gate_path("json"))
     except OSError:
@@ -1282,18 +1307,29 @@ def _write_gate(state):
 def _settle(state, now):
     """Fold in how the last ask ended, and save it. Returns (state, its output
     if it answered, ok). The evidence is removed only once the state that
-    records it is saved: a quarantine that cannot be written must not vanish."""
+    records it is saved: a quarantine that cannot be written must not vanish.
+
+    An ask marked pending with no status had its wrapper killed: its osascript
+    may still have written why it failed, and that counts."""
     status = _gate_text("status")
-    if status is None:
+    pending = state.pop("pending", False)
+    if status is None and not pending:
         return state, None, True
     out, err = _gate_text("out") or "", _gate_text("err") or ""
-    answered = status.strip() == "0"
+    answered = status is not None and status.strip() == "0"
+    slow = state.pop("slow", False)
     if answered:
-        state.pop("quarantine", None)       # a wait set by a timeout still runs out
-    elif _AE_TIMED_OUT in err:
-        state["quarantine"] = state.get("asked_pid")
+        state.pop("quarantine", None)
+        state.pop("last_error", None)
+        if slow:        # a late answer: the pause runs from when it was seen
+            state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     else:
-        state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
+        code = _AE_ERROR.search(err)
+        state["last_error"] = code.group(1) if code else "failed"
+        if state["last_error"] == _AE_TIMED_OUT:
+            state["quarantine"] = state.get("asked_pid")
+        else:
+            state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     if not _write_gate(state):
         return state, None, False
     for name in ("status", "out", "err"):
@@ -1321,33 +1357,51 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     None when it was not asked or did not answer in `timeout` - the list is
     still worth showing without what iTerm2 would have said.
 
-    `procs` is the `ps -eo pid,tty,uid,comm` table the caller already has.
-    `wait` is how long to wait for an ask in flight to finish; a scan waits for
-    nothing. `why`, a dict, gets "asked": whether an Apple Event was sent.
+    `procs` is a process table the caller already has (collect()'s); without
+    one, the cheap one is taken - after the lock, like the clock: a wait set
+    while this caller queued for the lock is a wait for it too. `wait` is how
+    long to queue behind an ask in flight; a scan queues for nothing.
+
+    `why`, a dict, is told what happened: "asked" (an event was sent),
+    "refused" (no-iterm, io, busy, stuck, waiting) and "error" (the last Apple
+    Event error code, or "timeout").
     """
-    if why is not None:
-        why["asked"] = False
-    now = time.time() if now is None else now
-    pid = iterm_app_pid(tty_snapshot() if procs is None else procs)
-    if pid is None:
-        return None             # `tell application "iTerm2"` would launch it
+    if why is None:
+        why = {}
+    why.update({"asked": False, "refused": None, "error": None})
+    fixed_now = now
     try:
-        os.makedirs(ITERM_STATE_DIR, exist_ok=True)
+        os.makedirs(ITERM_STATE_DIR, mode=0o700, exist_ok=True)
+        os.chmod(ITERM_STATE_DIR, 0o700)
         fd = os.open(_gate_path("lock"), os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
+        why["refused"] = "io"
         return None
     try:
         if not _take_lock(fd, wait):
-            return None         # an ask is in flight, maybe in another process
+            why["refused"] = "busy"         # an ask in flight, maybe in another process
+            return None
+        now = time.time() if fixed_now is None else fixed_now
+        pid = iterm_app_pid(app_snapshot() if procs is None else procs)
+        if pid is None:
+            why["refused"] = "no-iterm"     # `tell application "iTerm2"` would launch it
+            return None
         state, _, saved = _settle(_read_gate(now), now)
         if not saved:
-            return None         # cannot record what happens next: do not send
+            why["refused"] = "io"           # cannot record what happens next: do not send
+            return None
         if state.get("quarantine") not in (None, pid):
             state.pop("quarantine")         # a restarted iTerm2
-        elif state.get("quarantine") == pid or now < state.get("wait_until", 0):
+            state.pop("last_error", None)
+        elif state.get("quarantine") == pid:
+            why.update(refused="stuck", error=state.get("last_error"))
             return None
-        state["asked_pid"] = pid
+        elif now < state.get("wait_until", 0):
+            why.update(refused="waiting", error=state.get("last_error"))
+            return None
+        state.update(asked_pid=pid, pending=True)
         if not _write_gate(state):
+            why["refused"] = "io"
             return None
         try:
             child = subprocess.Popen(
@@ -1355,18 +1409,23 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, pass_fds=(fd,), start_new_session=True)
         except OSError:
+            state.pop("pending", None)
+            _write_gate(state)
+            why["refused"] = "io"
             return None
-        if why is not None:
-            why["asked"] = True
+        why["asked"] = True
         try:
             child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             # it keeps the lock until it exits; the next ask reads how. Until
             # then and a while after, leave a slow iTerm2 alone
-            state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
+            state.update(wait_until=now + ASK_WAIT_AFTER_ERROR, slow=True)
             _write_gate(state)
+            why["error"] = "timeout"
             return None
-        _state, out, _saved = _settle(state, now)
+        state, out, _saved = _settle(state, now)
+        if out is None:
+            why["error"] = state.get("last_error")
         return out
     finally:
         os.close(fd)
@@ -1424,11 +1483,11 @@ def short_tty_full(tty):
 
 
 def titles_snapshot(timeout=5.0, procs=None):
-    """Ask iTerm2 once. Empty when it is not running, not scriptable, or slow -
-    the list is still worth showing without the names on the tabs. A scan never
-    waits for the gate."""
+    """Ask iTerm2 once: tty -> name, {} when it answered with no tabs, None when
+    it was not asked or did not answer - the list is still worth showing
+    without the names on the tabs. A scan never waits for the gate."""
     out = iterm_ask(["-e", iterm_titles_script()], timeout=timeout, procs=procs)
-    return parse_titles(out) if out is not None else {}
+    return parse_titles(out) if out is not None else None
 
 
 def iterm_panes_script():
@@ -1476,11 +1535,20 @@ def parse_panes(dump):
 PANES_WAIT = 10.0      # a save every 15 minutes may wait out the list's ask
 
 
-def panes_snapshot(timeout=5.0):
-    """Ask iTerm2 for its panes. Empty when it cannot be asked: a save then
-    records no panes, and a restore opens windows, as it always did."""
+def panes_snapshot(timeout=5.0, direct=False):
+    """Ask iTerm2 for its panes. In the background (a save) through the gate:
+    None when it was not asked, and the save keeps the panes it knew. `direct`
+    is for a restore - something you do, which asks iTerm2 itself and gets {}
+    when it cannot, and then opens windows, as it always did."""
+    if direct:
+        try:
+            done = subprocess.run(["osascript", "-e", iterm_panes_script()], capture_output=True,
+                                  text=True, errors="replace", timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        return parse_panes(done.stdout) if done.returncode == 0 else {}
     out = iterm_ask(["-e", iterm_panes_script()], timeout=timeout, wait=PANES_WAIT)
-    return parse_panes(out) if out is not None else {}
+    return parse_panes(out) if out is not None else None
 
 
 _SHELLS = {"sh", "bash", "zsh", "fish", "ksh", "tcsh", "csh", "dash", "nu", "xonsh"}
@@ -1539,24 +1607,27 @@ def titles_cached(cache, now=None, procs=None):
     """The tab names, at most once per TITLES_TTL. `cache` is the runner's dict,
     the same idiom as the transcript window cache; None means always ask.
 
-    An empty answer is never cached: iTerm2 starting up would otherwise show "~"
-    fallbacks for the next minute. Asking again costs nothing when iTerm2 is not
-    answering - iterm_ask refuses without sending anything.
+    An answer - even "no tabs" - is kept for the minute. No answer is not: the
+    names it had stay up and the next tick asks again, which costs nothing
+    while iTerm2 is not answering - iterm_ask refuses without sending anything.
 
     A tty that another session took over since the ask loses its name - it shows
     its "~" fallback, never the old session's - with no new ask.
     """
     now = time.time() if now is None else now
     if cache is None:
-        return titles_snapshot(procs=procs)
+        return titles_snapshot(procs=procs) or {}
     owners = tty_owners(procs)
     entry = cache.get("_titles")
     # any other shape was written by the engine before a hot reload: a miss
     ts, titles, seen = (entry if isinstance(entry, tuple) and len(entry) == 3
-                        and isinstance(entry[2], dict) else (0.0, {}, {}))
-    if titles and now - ts < TITLES_TTL:
-        return {t: name for t, name in titles.items() if seen.get(t) == owners.get(t)}
+                        and isinstance(entry[2], dict) else (None, {}, {}))
+    kept = {t: name for t, name in titles.items() if seen.get(t) == owners.get(t)}
+    if ts is not None and now - ts < TITLES_TTL:
+        return kept
     fresh = titles_snapshot(procs=procs)
+    if fresh is None:
+        return kept     # not asked: the names it had, and ask again next tick
     cache["_titles"] = (now, fresh, owners)
     return fresh
 
@@ -1564,7 +1635,7 @@ def titles_cached(cache, now=None, procs=None):
 def tty_snapshot():
     try:
         # the executable last: it may hold spaces ("Application Support")
-        return subprocess.run(["ps", "-eo", "pid,tty,uid,comm"], capture_output=True,
+        return subprocess.run(["ps", "-eo", "pid,tty,uid,ucomm"], capture_output=True,
                               text=True, errors="replace", timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -2227,7 +2298,7 @@ def in_temp_dir(path, temp_roots):
     return False
 
 
-def manifest_from_rows(rows, now=None, why_not=None, panes=None):
+def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None):
     """Capture the live fleet. Pure: the caller supplies the rows and the clock.
 
     Order is the caller's (collect() sorts needs-you first), so the restore list
@@ -2255,6 +2326,12 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None):
         tty = short_tty_full(r.get("tty", ""))
         kept[-1]["pane"] = ((panes or {}).get(tty) or {}).get("pane", "") if tty else ""
         kept[-1]["tabTitle"] = r.get("tab_title", "") or ""
+        if panes is None and known:
+            # iTerm2 was not asked: what the last save knew beats knowing nothing
+            # - five hours of such saves would push every good one out
+            was = known.get(r.get("sessionId")) or {}
+            kept[-1]["pane"] = was.get("pane", "") or ""
+            kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or was.get("tabTitle", "") or ""
     return {"version": MANIFEST_VERSION, "savedAt": now, "count": len(kept),
             "skipped": sum(why_count.values()), "skippedWhy": why_count,
             "sessions": kept}

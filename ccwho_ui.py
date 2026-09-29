@@ -833,7 +833,9 @@ class CcwhoUi(App):
 
     # ------------------------------------------------------------- collecting
 
-    @work(exclusive=True, thread=True)
+    # its own group: `exclusive` cancels every worker in the group, and in the
+    # default one that included a kill worker asking for the list after it
+    @work(exclusive=True, thread=True, group="collect")
     def collect(self):
         """Off the UI thread: `claude agents` can take 30s, and a list that
         freezes at the moment you reach for it is the problem this tool is about.
@@ -857,7 +859,10 @@ class CcwhoUi(App):
                 # numbered on the UI thread: two workers adding at once can share
                 # a number, and then the older picture can win
                 mine = self.call_from_thread(self.next_seq)
-                fleet = self.collector.fleet()
+                try:
+                    fleet = self.collector.fleet()
+                except Exception:
+                    continue    # a read that fails leaves the last list up
                 fleet.seq = mine
                 self.call_from_thread(self.show, fleet)
             finally:
@@ -1526,13 +1531,8 @@ class CcwhoUi(App):
         self.call_from_thread(box.show_result, lines)
         # the list after the kill: what it took is gone from it. A read that
         # fails leaves the last list up - the next tick tries again
-        try:
-            mine = self.call_from_thread(self.next_seq)
-            fleet = self.collector.fleet()
-            fleet.seq = mine
-            self.call_from_thread(self.show, fleet)
-        except Exception:
-            pass
+        # through collect(): one at a time, never beside a tick's
+        self.call_from_thread(self.collect)
 
     def ask_stop(self, row):
         """A background session: `ccwho stop`, after a box that says what it does."""
@@ -1554,13 +1554,8 @@ class CcwhoUi(App):
     def stopping(self, box, row):
         lines = self.collector.stop_session(row)
         self.call_from_thread(box.show_result, lines)
-        try:
-            mine = self.call_from_thread(self.next_seq)
-            fleet = self.collector.fleet()
-            fleet.seq = mine
-            self.call_from_thread(self.show, fleet)
-        except Exception:
-            pass
+        # through collect(): one at a time, never beside a tick's
+        self.call_from_thread(self.collect)
 
     @staticmethod
     def _stuck_items(row):
@@ -1695,13 +1690,8 @@ class CcwhoUi(App):
         self.call_from_thread(box.show_result, lines)
         # the list after the kill: what it took is gone from it. A read that
         # fails leaves the last list up - the next tick tries again
-        try:
-            mine = self.call_from_thread(self.next_seq)
-            fleet = self.collector.fleet()
-            fleet.seq = mine
-            self.call_from_thread(self.show, fleet)
-        except Exception:
-            pass
+        # through collect(): one at a time, never beside a tick's
+        self.call_from_thread(self.collect)
 
     @on(events.Click, "#procline")
     def clicked_left_behind(self, event):

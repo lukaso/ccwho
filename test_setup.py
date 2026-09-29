@@ -270,11 +270,16 @@ class TestFactGatherersSurviveTheMachine(unittest.TestCase):
         self.assertNotIn("System Events", seen["script"])
 
     def test_a_refused_automation_prompt_is_not_scriptable(self):
-        # the gate answers None for a refusal, a timeout, or a stuck iTerm2
+        # an ask that was made, and refused: -1743 is errAEEventNotPermitted
         real = setup.engine.iterm_ask
-        setup.engine.iterm_ask = lambda *a, **k: None
+
+        def refused(args, timeout=5.0, why=None, **k):
+            if why is not None:
+                why.update({"asked": True, "refused": None, "error": "-1743"})
+            return None
+        setup.engine.iterm_ask = refused
         try:
-            self.assertFalse(setup.iterm_scriptable())
+            self.assertIs(setup.iterm_scriptable(), False)
         finally:
             setup.engine.iterm_ask = real
 
@@ -1304,32 +1309,51 @@ class TestDoctorSaysWhereUsageComesFrom(unittest.TestCase):
 
 class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
     """The check asks through the background gate. A gate that said no - an ask
-    in flight, or an iTerm2 that stopped answering - is not an Automation
-    refusal, and must not send you to System Settings."""
+    in flight, an iTerm2 that stopped answering - is not an Automation refusal,
+    and must not send you to System Settings. An Automation refusal still does."""
 
     def setUp(self):
         self.addCleanup(setattr, setup.engine, "iterm_ask", setup.engine.iterm_ask)
 
-    def fake(self, out, asked):
+    def fake(self, out, **why):
         def ask(args, timeout=5.0, why=None, **k):
             if why is not None:
-                why["asked"] = asked
+                why.update({"asked": False, "refused": None, "error": None})
+                why.update(self.why)
             self.kw = k
             return out
+        self.why = why
         setup.engine.iterm_ask = ask
 
-    def test_a_refused_ask_is_not_knowing(self):
-        self.fake(None, asked=False)
+    def test_a_stuck_iterm2_is_not_knowing(self):
+        self.fake(None, refused="stuck", error="-1712")
         self.assertIsNone(setup.iterm_scriptable())
+
+    def test_a_busy_gate_is_not_knowing(self):
+        self.fake(None, refused="busy")
+        self.assertIsNone(setup.iterm_scriptable())
+
+    def test_its_own_ask_timing_out_is_not_knowing(self):
+        # a wedged iTerm2 answers nothing: that is not a missing permission
+        self.fake(None, asked=True, error="timeout")
+        self.assertIsNone(setup.iterm_scriptable())
+
+    def test_a_wait_after_an_automation_refusal_is_a_no(self):
+        self.fake(None, refused="waiting", error="-1743")
+        self.assertIs(setup.iterm_scriptable(), False)
+
+    def test_an_automation_refusal_is_a_no(self):                       # control
+        self.fake(None, asked=True, error="-1743")
+        self.assertIs(setup.iterm_scriptable(), False)
+
+    def test_no_iterm2_is_a_no(self):                                   # control
+        self.fake(None, refused="no-iterm")
+        self.assertIs(setup.iterm_scriptable(), False)
 
     def test_it_waits_a_moment_for_a_busy_gate(self):
         self.fake("3\n", asked=True)
-        setup.iterm_scriptable()
+        self.assertIs(setup.iterm_scriptable(), True)
         self.assertGreater(self.kw.get("wait", 0), 0)
-
-    def test_an_ask_that_failed_is_a_no(self):                          # control
-        self.fake(None, asked=True)
-        self.assertIs(setup.iterm_scriptable(), False)
 
     def test_doctor_says_restart_not_automation_when_it_could_not_ask(self):
         check = next(c for c in setup.doctor_checks({"iterm_ok": None}) if c["name"] == "iterm2")
@@ -1340,3 +1364,24 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
     def test_doctor_still_names_automation_when_iterm2_refused(self):   # control
         check = next(c for c in setup.doctor_checks({"iterm_ok": False}) if c["name"] == "iterm2")
         self.assertIn("Automation", " ".join(str(v) for v in check.values()))
+
+
+class TheStartTimeOfITerm2IsOurs(unittest.TestCase):
+    """iterm_started_at found iTerm2 with `pgrep -x iTerm2`: argv[0], any user."""
+
+    def test_it_finds_iterm2_the_way_the_gate_does(self):
+        self.addCleanup(setattr, setup.engine, "app_snapshot", setup.engine.app_snapshot)
+        self.addCleanup(setattr, setup.subprocess, "run", setup.subprocess.run)
+        setup.engine.app_snapshot = lambda: f"  PID UID UCOMM\n4242 {os.getuid()} iTerm2\n"
+        asked = []
+
+        def run(cmd, **k):
+            asked.append(cmd)
+
+            class R:
+                returncode, stdout, stderr = 0, "Tue Sep 29 12:00:00 2026", ""
+            return R()
+        setup.subprocess.run = run
+        setup.iterm_started_at()
+        self.assertNotIn("pgrep", " ".join(" ".join(c) for c in asked))
+        self.assertIn("4242", " ".join(" ".join(c) for c in asked))

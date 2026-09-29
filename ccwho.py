@@ -120,6 +120,27 @@ def unknown_flags(argv):
 ITERM_ACTION_DEADLINE = 20.0
 
 
+def launch_in_iterm(script, deadline, sids):
+    """Run an osascript that starts sessions: (result, "") or (None, why).
+
+    A timeout, or -1712 from inside iTerm2, leaves the event queued there - a
+    killed osascript does not cancel it - so every claim in `sids` stays
+    claimed (claim_unresolved): a retry now would start them twice."""
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
+                           timeout=deadline)
+    except subprocess.TimeoutExpired:
+        for sid in sids:
+            claim_unresolved(sid)
+        return None, f"iTerm2 did not answer in {deadline:g}s"
+    except OSError as ex:
+        return None, f"could not drive iTerm2: {ex}"
+    if r.returncode != 0 and "(-1712)" in (r.stderr or ""):
+        for sid in sids:
+            claim_unresolved(sid)
+    return r, ""
+
+
 def restore_deadline(windows):
     """A window per session, dozens of them: time for each, not one for all."""
     return 30.0 + 5.0 * max(1, windows)
@@ -630,7 +651,10 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0):
         write(plain)
         print(f"hotkey {key['label']} installed"
               f" ({key['label']} no longer types {key['instead_of']})")
-        if not iterm_ok:
+        if iterm_ok is None:
+            print("iTerm2 is not answering Apple Events - restart iTerm2, then press "
+                  + key['label'])
+        elif not iterm_ok:
             print("start iTerm2, then press " + key['label'])
         return 0
 
@@ -886,6 +910,7 @@ def known_entries():
 
 
 LAUNCH_CLAIM_SECONDS = 90.0       # long enough for a session to appear in the feed
+CLAIM_WRITE_GRACE = 5.0           # an empty claim younger than this is being written
 
 
 def _pid_alive(pid):
@@ -896,14 +921,23 @@ def _pid_alive(pid):
     return True
 
 
-def claim_unresolved(session_id, now=None):
-    """Keep a claim after its launcher gives up: the launch may still happen."""
+def claim_unresolved(session_id, now=None, iterm_pid=False):
+    """Keep a claim after its launcher gave up: the killed osascript's event may
+    still run inside iTerm2. Held while THAT iTerm2 lives - its queue goes with
+    it - or, if it cannot be named, for the usual claim time. Written whole
+    (temp file, then rename): a reader never sees it half written."""
     now = time.time() if now is None else now
-    path = os.path.join(ccwho_dir(), "launching", f"{session_id}.json")
+    if iterm_pid is False:
+        iterm_pid = engine.iterm_app_pid(engine.app_snapshot())
+    d = os.path.join(ccwho_dir(), "launching")
+    path = os.path.join(d, f"{session_id}.json")
     try:
-        with open(path, "w") as fh:
+        os.makedirs(d, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
             json.dump({"pid": os.getpid(), "since": now, "sessionId": session_id,
-                       "unresolved": True}, fh)
+                       "unresolved": True, "iterm_pid": iterm_pid}, fh)
+        os.replace(tmp, path)
     except OSError:
         pass
 
@@ -933,11 +967,23 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
         try:
             with open(path) as fh:
                 rec = json.load(fh)
-            # an unresolved launch - its osascript timed out, and a killed
-            # osascript does not cancel the event - holds after its launcher exits
-            held = ((alive(rec.get("pid")) or rec.get("unresolved") is True)
-                    and now - float(rec.get("since", 0)) < LAUNCH_CLAIM_SECONDS)
-        except (OSError, ValueError, TypeError):
+            young = now - float(rec.get("since", 0)) < LAUNCH_CLAIM_SECONDS
+            if rec.get("unresolved") is True and type(rec.get("iterm_pid")) is int:
+                # its event may still run: held while that iTerm2 lives
+                held = alive(rec["iterm_pid"])
+            elif rec.get("unresolved") is True:
+                held = young
+            else:
+                held = alive(rec.get("pid")) and young
+        except ValueError:
+            # O_EXCL makes it empty, json fills it: an empty claim is being
+            # written and held - unless a crash left it so. Garbage is no claim
+            try:
+                st = os.stat(path)
+                held = st.st_size == 0 and time.time() - st.st_mtime < CLAIM_WRITE_GRACE
+            except OSError:
+                held = False
+        except (OSError, TypeError):
             held = False          # unreadable claim is no claim
         if held:
             return False
@@ -1013,13 +1059,9 @@ def open_session(argv):
             print(f"ccwho open: {sid} is already starting in another window"
                   " - not launching it twice.", file=sys.stderr)
             return 1
-        try:
-            res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
-                                 capture_output=True, text=True, timeout=ITERM_ACTION_DEADLINE)
-        except subprocess.TimeoutExpired:
-            claim_unresolved(sid)
-            print(f"ccwho open: iTerm2 did not answer in {ITERM_ACTION_DEADLINE:g}s",
-                  file=sys.stderr)
+        res, why = launch_in_iterm(engine.iterm_run_script(value), ITERM_ACTION_DEADLINE, [sid])
+        if res is None:
+            print(f"ccwho open: {why}", file=sys.stderr)
             return 1
         if res.returncode != 0:
             print("ccwho open: could not open a window: %s"
@@ -2108,8 +2150,11 @@ def save(argv):
               file=sys.stderr)
         print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
         return 1
-    man = engine.manifest_from_rows(rows, why_not=save_problem,
-                                    panes=engine.panes_snapshot())
+    panes = engine.panes_snapshot()
+    # iTerm2 not asked (None): keep the panes the last save knew
+    known = ({e_.get("sessionId"): e_ for e_ in newest_manifest().get("sessions", [])
+              if isinstance(e_, dict)} if panes is None else None)
+    man = engine.manifest_from_rows(rows, why_not=save_problem, panes=panes, known=known)
     if man["count"] == 0:
         # Writing this would only push a manifest that HAS something out of the
         # keep-20 window. Nothing to restore is not something to record.
@@ -2296,7 +2341,7 @@ def restore(argv):
         saved = {e_.get("pane") for e_ in engine.manifest_entries(man) if e_.get("pane")}
         if saved:
             # asked only of a manifest that names panes: nothing else to count
-            live = {p["pane"] for p in engine.panes_snapshot().values()}
+            live = {p["pane"] for p in engine.panes_snapshot(direct=True).values()}
             print(f"iTerm2 has {len(saved & live)} of {len(saved)} saved panes open now.")
         if ok:
             print(f"restorable: {n} session(s) in {path}")
@@ -2361,7 +2406,7 @@ def restore(argv):
         fill = {}
         if openable and any(e_.get("pane") or e_.get("tabTitle") for e_ in openable):
             # the panes iTerm2 restored: resume each session where it was
-            fill = engine.match_panes(openable, engine.panes_snapshot(),
+            fill = engine.match_panes(openable, engine.panes_snapshot(direct=True),
                                       engine.idle_snapshot(), saved=entries)
         script = engine.iterm_open_script(openable, fill=fill)
         if not script and (running or starting) and not (unusable or gone):
@@ -2376,11 +2421,10 @@ def restore(argv):
             print(f"resuming {len(fill)} session(s) in the panes iTerm2 restored...")
         if n:
             print(f"opening {n} iTerm2 window(s)...")
-        try:
-            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
-                               timeout=restore_deadline(n + len(fill)))
-        except (OSError, subprocess.SubprocessError) as ex:
-            print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
+        r, why = launch_in_iterm(script, restore_deadline(n + len(fill)),
+                                 [e_.get("sessionId", "") for e_ in openable])
+        if r is None:
+            print(f"ccwho restore: {why}", file=sys.stderr)
             return 1
         if r.returncode != 0:
             print(f"ccwho restore: iTerm2 refused: {r.stderr.strip()}", file=sys.stderr)
@@ -2395,11 +2439,10 @@ def restore(argv):
                 print(f"{e_.get('project') or e_.get('sessionId')}: its pane closed before"
                       " ccwho could write to it - opening a new window")
             again = engine.iterm_open_script(missed)
-            try:
-                r2 = subprocess.run(["osascript", "-e", again], capture_output=True, text=True,
-                                    timeout=restore_deadline(len(missed)))
-            except (OSError, subprocess.SubprocessError) as ex:
-                print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
+            r2, why = launch_in_iterm(again, restore_deadline(len(missed)),
+                                      [e_.get("sessionId", "") for e_ in missed])
+            if r2 is None:
+                print(f"ccwho restore: {why}", file=sys.stderr)
                 return 1
             if r2.returncode != 0:
                 print(f"ccwho restore: iTerm2 refused: {r2.stderr.strip()}", file=sys.stderr)

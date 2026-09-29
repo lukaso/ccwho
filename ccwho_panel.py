@@ -21,7 +21,6 @@ Stdlib only (ctypes), like the engine: no dependency for one window.
 import ctypes
 import ctypes.util
 import os
-import subprocess
 import threading
 import time
 
@@ -99,7 +98,7 @@ _NOTES = ("AXFocusedWindowChanged", "AXApplicationActivated",
           "AXApplicationDeactivated")
 
 
-def panel_window_id(uuid, timeout=5.0):
+def panel_window_id(uuid, timeout=5.0, procs=None):
     """The window this session is in, by iTerm2's id - the same number macOS
     gives the window, so it can be matched against Accessibility's."""
     script = f'''tell application "iTerm2"
@@ -111,13 +110,13 @@ def panel_window_id(uuid, timeout=5.0):
     end repeat
   end repeat
 end tell'''
-    out = (setup.engine.iterm_ask(["-e", script], timeout=timeout) or "").strip()
+    out = (setup.engine.iterm_ask(["-e", script], timeout=timeout, procs=procs) or "").strip()
     return int(out) if out.isdigit() else None
 
 
-def iterm_pid(timeout=5.0):
+def iterm_pid(procs=None):
     """The running iTerm2, found the way the Apple Event gate finds it."""
-    return setup.engine.iterm_app_pid(setup.engine.tty_snapshot())
+    return setup.engine.iterm_app_pid(setup.engine.app_snapshot() if procs is None else procs)
 
 
 class _Ax:
@@ -302,8 +301,10 @@ def pid_alive(pid):
 
 
 def _resolve(env):
-    uuid, pid = session_uuid(env), iterm_pid()
-    panel = panel_window_id(uuid) if uuid and pid else None
+    # one cheap table per look: this runs every RETRY_EVERY until it finds one
+    table = setup.engine.app_snapshot()
+    uuid, pid = session_uuid(env), iterm_pid(table)
+    panel = panel_window_id(uuid, procs=table) if uuid and pid else None
     return (pid, panel) if pid and panel else None
 
 

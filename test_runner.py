@@ -259,7 +259,7 @@ class TestSaveAndRestore(unittest.TestCase):
 
     def test_save_records_the_pane_each_session_is_in(self):
         real = runner.engine.panes_snapshot
-        runner.engine.panes_snapshot = lambda: {"ttys032": {"pane": "G-1", "name": "t"}}
+        runner.engine.panes_snapshot = lambda **k: {"ttys032": {"pane": "G-1", "name": "t"}}
         try:
             self._save()
         finally:
@@ -1284,7 +1284,7 @@ class TestRestoreOpenFillsRestoredPanes(unittest.TestCase):
         self.idle = {"ttys050"}
         self.wrote = "G-B\n"
         real = (runner.engine.panes_snapshot, runner.engine.idle_snapshot)
-        runner.engine.panes_snapshot = lambda: self.panes
+        runner.engine.panes_snapshot = lambda **k: self.panes
         runner.engine.idle_snapshot = lambda: self.idle
         self.addCleanup(setattr, runner.engine, "panes_snapshot", real[0])
         self.addCleanup(setattr, runner.engine, "idle_snapshot", real[1])
@@ -1355,7 +1355,7 @@ class TestRestoreOpenFillsRestoredPanes(unittest.TestCase):
     def test_a_manifest_with_no_panes_does_not_ask_iterm(self):
         self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
         asked = []
-        runner.engine.panes_snapshot = lambda: asked.append(1) or {}
+        runner.engine.panes_snapshot = lambda **k: asked.append(1) or {}
         self._restore_open()
         self.assertEqual(asked, [])
 
@@ -1372,7 +1372,7 @@ class TestRestoreCheckCountsPanes(unittest.TestCase):
                     {"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef", "cwd": self.tmp,
                      "project": "b", "pane": "G-GONE"}])
         real = runner.engine.panes_snapshot
-        runner.engine.panes_snapshot = lambda: {"ttys050": {"pane": "G-A", "name": ""}}
+        runner.engine.panes_snapshot = lambda **k: {"ttys050": {"pane": "G-A", "name": ""}}
         try:
             _rc, out = self.run_check(["--check"])
         finally:
@@ -4227,3 +4227,119 @@ class TestARestoreHasTimeForEveryWindow(unittest.TestCase):
         self.assertGreaterEqual(runner.restore_deadline(1), 30)
         self.assertGreaterEqual(runner.restore_deadline(40), 40 * 5)
         self.assertGreater(runner.restore_deadline(40), runner.restore_deadline(1))
+
+
+class TestAClaimOutlivesALaunchThatMayStillHappen(unittest.TestCase):
+    """A claim is "I am opening this". After a timed-out launch the event may
+    still run inside iTerm2 - so the claim holds while THAT iTerm2 lives, and
+    goes when it does: its queue went with it."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_an_unresolved_claim_holds_while_its_iterm2_lives(self):
+        runner.claim_launch(self.SID, now=1000.0)
+        runner.claim_unresolved(self.SID, now=1000.0, iterm_pid=4242)
+        iterm_up = lambda pid: pid == 4242
+        self.assertFalse(runner.claim_launch(self.SID, now=1000.0 + 3600, alive=iterm_up))
+
+    def test_it_goes_when_that_iterm2_does(self):                      # control
+        runner.claim_launch(self.SID, now=1000.0)
+        runner.claim_unresolved(self.SID, now=1000.0, iterm_pid=4242)
+        self.assertTrue(runner.claim_launch(self.SID, now=1030.0, alive=lambda pid: False))
+
+    def test_without_an_iterm2_to_watch_it_expires(self):
+        runner.claim_launch(self.SID, now=1000.0)
+        runner.claim_unresolved(self.SID, now=1000.0, iterm_pid=None)
+        dead = lambda pid: False
+        self.assertFalse(runner.claim_launch(self.SID, now=1030.0, alive=dead))
+        self.assertTrue(runner.claim_launch(
+            self.SID, now=1000.0 + runner.LAUNCH_CLAIM_SECONDS + 1, alive=dead))
+
+    def test_a_claim_being_written_is_held(self):
+        # O_EXCL creates it empty and json fills it: a reader in between must
+        # not take the empty file for a dead claim
+        d = os.path.join(self.tmp, "launching")
+        os.makedirs(d)
+        open(os.path.join(d, self.SID + ".json"), "w").close()
+        self.assertFalse(runner.claim_launch(self.SID))
+        old = time.time() - 60                          # control: a crashed writer
+        os.utime(os.path.join(d, self.SID + ".json"), (old, old))
+        self.assertTrue(runner.claim_launch(self.SID))
+
+
+class TestARestoreThatTimedOutKeepsItsClaims(unittest.TestCase):
+    """The same as `ccwho open`: a restore killed at its deadline may still be
+    opening windows. Each session it claimed stays claimed."""
+
+    # the restore fixture, borrowed - not inherited, or its tests run here too
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    setUp, tearDown = _F.setUp, _F.tearDown
+    write_manifest, _restore_open = _F.write_manifest, _F._restore_open
+
+    def run_stuck(self, fail):
+        runner.subprocess.run = fail
+        rc, out = self._restore_open()
+        return rc, out
+
+    def held(self, sid):
+        return not runner.claim_launch(sid, alive=lambda pid: False)
+
+    def test_a_timeout_keeps_every_claim_and_says_so_plainly(self):
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        rc, out = self.run_stuck(stuck)
+        self.assertEqual(rc, 1)
+        self.assertIn("did not answer", out)
+        self.assertNotIn("create window", out, "the whole script was printed")
+        self.assertTrue(self.held(self.LIVE_SID) and self.held(self.DEAD_SID))
+
+    def test_a_timeout_inside_iterm2_keeps_them_too(self):
+        class TimedOut:
+            returncode, stdout = 1, ""
+            stderr = "execution error: AppleEvent timed out. (-1712)"
+        rc, _ = self.run_stuck(lambda cmd, **kw: TimedOut())
+        self.assertEqual(rc, 1)
+        self.assertTrue(self.held(self.LIVE_SID) and self.held(self.DEAD_SID))
+
+    def test_a_refusal_lets_them_go(self):                              # control
+        class Refused:
+            returncode, stdout, stderr = 1, "", "Not authorized (-1743)"
+        self.run_stuck(lambda cmd, **kw: Refused())
+        self.assertFalse(self.held(self.LIVE_SID) or self.held(self.DEAD_SID))
+
+    def test_the_deadline_passed_is_the_one_for_its_windows(self):
+        seen = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        self.run_stuck(lambda cmd, **kw: seen.append(kw.get("timeout")) or Done())
+        self.assertEqual(seen, [runner.restore_deadline(2)])
+
+
+
+class TestAHotkeySetupWhileITerm2IsNotAnswering(unittest.TestCase):
+    """`ccwho setup` with iTerm2 running but not answering Apple Events must not
+    say "start iTerm2"."""
+
+    def out(self, iterm_ok):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.install_hotkey(home, runner.setup.DEFAULT_HOTKEY, prove=False, iterm_ok=iterm_ok)
+        return buf.getvalue()
+
+    def test_not_answering_says_restart(self):
+        text = self.out(None)
+        self.assertNotIn("\nstart iTerm2", "\n" + text)   # "restart" contains it
+        self.assertIn("restart iTerm2", text)
+
+    def test_not_running_still_says_start(self):                          # control
+        self.assertIn("start iTerm2", self.out(False))

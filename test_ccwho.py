@@ -21,6 +21,8 @@ REAL = {name: getattr(ccwho, name) for name in ("live_file_sessions", "ps_table"
                                                 "listen_ports", "iterm_ask")}
 REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 REAL_TITLES_SNAPSHOT = ccwho.titles_snapshot
+REAL_APP_SNAPSHOT = ccwho.app_snapshot
+REAL_TTY_SNAPSHOT = ccwho.tty_snapshot
 
 
 def _guard(name):
@@ -3237,10 +3239,10 @@ class TestTitlesAreCachedBetweenTicks(unittest.TestCase):
         ccwho.titles_cached(cache, now=1000.0 + 61)
         self.assertEqual(len(self.calls), 2)
 
-    def test_an_empty_answer_is_not_cached_as_the_truth(self):
-        # iTerm2 starting up, or a timeout: retry on the next tick rather than
-        # showing "~" fallbacks for the next quarter minute
-        ccwho.titles_snapshot = lambda timeout=5.0, **k: self.calls.append(1) or {}
+    def test_no_answer_is_not_cached_as_the_truth(self):
+        # a timeout, or a gate that would not ask (None): retry on the next tick
+        # rather than showing "~" fallbacks for the next minute
+        ccwho.titles_snapshot = lambda timeout=5.0, **k: self.calls.append(1) or None
         cache = {}
         ccwho.titles_cached(cache, now=1000.0)
         ccwho.titles_cached(cache, now=1000.0 + 1)
@@ -6523,10 +6525,17 @@ class TestTheBriefInParts(unittest.TestCase):
         self.assertEqual({len(p) for line in with_fields for p in line}, {4})    # control
 
 
+
 def procs(*rows):
-    """`ps -eo pid,tty,uid,comm`: the executable, not the command line."""
-    return "  PID TTY        UID COMM\n" + "\n".join(
+    """`ps -eo pid,tty,uid,ucomm`: the kernel's name for the executable, which a
+    process cannot set for itself (argv[0], `comm`, it can)."""
+    return "  PID TTY        UID UCOMM\n" + "\n".join(
         f"{p} {t} {u} {c}" for p, t, u, c in rows) + "\n"
+
+
+def apps(*rows):
+    """`ps -eo pid,uid,ucomm`: the cheap table, no tty column (0.03 s, not 0.2)."""
+    return "  PID   UID UCOMM\n" + "\n".join(f"{p} {u} {c}" for p, u, c in rows) + "\n"
 
 
 def ps(*rows):
@@ -6536,8 +6545,10 @@ def ps(*rows):
 
 ME = os.getuid()
 APP = "/Applications/iTerm.app/Contents/MacOS/iTerm2"
-DAEMON = "/Users/x/Library/Application Support/iTerm2/iTermServer-3.7.2"
-DAEMON_CMD = DAEMON + " /Users/x/Library/Application Support/iTerm2/iterm2-daemon-1.socket"
+IT = "iTerm2"                          # its ucomm
+SERVER = "iTermServer-3.7."            # ucomm keeps 16 characters: iTermServer-3.7.2
+DAEMON_CMD = ("/Users/x/Library/Application Support/iTerm2/iTermServer-3.7.2 "
+              "/Users/x/Library/Application Support/iTerm2/iterm2-daemon-1.socket")
 LOGIN = "/usr/bin/login -fpl x /Applications/iTerm.app/Contents/MacOS/ShellLauncher --launch_shell"
 
 
@@ -6548,68 +6559,84 @@ class TestTheTerminalsITerm2ShowsComeFromPs(unittest.TestCase):
     already knows: every pane's first process is started by iTerm2's session
     daemon (iTermServer-*), or by iTerm2 itself without the daemon.
 
-    Identified by the EXECUTABLE (`comm`), never by a command line: `tail -f
-    .../MacOS/iTerm2` names the path and is not iTerm2."""
+    Identified by the kernel's name for the executable (`ucomm`), never by a
+    command line or argv[0]: `exec -a iTerm2 sleep` is sleep."""
 
     def test_a_pane_started_by_the_session_daemon_is_an_iterm2_terminal(self):
-        p = procs((100, "??", ME, APP), (200, "??", ME, DAEMON),
-                  (300, "ttys024", 0, "/usr/bin/login"), (301, "ttys024", ME, "-zsh"))
+        p = procs((100, "??", ME, IT), (200, "??", ME, SERVER),
+                  (300, "ttys024", 0, "login"), (301, "ttys024", ME, "zsh"))
         out = ps((100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN), (301, 300, "-zsh"))
         self.assertEqual(ccwho.iterm_ttys(out, p), {"ttys024"})
 
     def test_a_pane_started_by_iterm2_itself_counts_too(self):
         # no daemon ("restore sessions" off): iTerm2 is the parent
-        p = procs((100, "??", ME, APP), (300, "ttys007", 0, "/usr/bin/login"))
+        p = procs((100, "??", ME, IT), (300, "ttys007", 0, "login"))
         out = ps((100, 1, APP), (300, 100, "/usr/bin/login -fpq x /bin/bash -c make"))
         self.assertEqual(ccwho.iterm_ttys(out, p), {"ttys007"})
 
-    def test_a_renamed_bundle_is_still_iterm2(self):
-        app = "/Applications/iTerm2.app/Contents/MacOS/iTerm2"
-        p = procs((100, "??", ME, app), (300, "ttys007", 0, "/usr/bin/login"))
-        out = ps((100, 1, app), (300, 100, LOGIN))
+    def test_the_bundle_name_does_not_matter(self):
+        # iTerm2.app, iTerm.app: the executable is iTerm2 either way
+        p = procs((100, "??", ME, IT), (300, "ttys007", 0, "login"))
+        out = ps((100, 1, "/Applications/iTerm2.app/Contents/MacOS/iTerm2"), (300, 100, LOGIN))
         self.assertEqual(ccwho.iterm_ttys(out, p), {"ttys007"})
 
     def test_a_beta_daemon_is_still_the_daemon(self):
-        beta = "/Users/x/Library/Application Support/iTerm2/iTermServer-3.6.0beta2"
-        p = procs((100, "??", ME, APP), (200, "??", ME, beta),
-                  (300, "ttys024", 0, "/usr/bin/login"))
-        out = ps((100, 1, APP), (200, 1, beta + " /sock"), (300, 200, LOGIN))
+        p = procs((100, "??", ME, IT), (200, "??", ME, "iTermServer-3.6."),
+                  (300, "ttys024", 0, "login"))
+        out = ps((100, 1, APP), (200, 1, "/x/iTermServer-3.6.0beta2 /sock"), (300, 200, LOGIN))
         self.assertEqual(ccwho.iterm_ttys(out, p), {"ttys024"})
 
     def test_a_terminal_app_window_is_not_one(self):                    # control
-        term = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
-        p = procs((100, "??", ME, APP), (200, "??", ME, DAEMON),
-                  (300, "ttys024", 0, "/usr/bin/login"),
-                  (400, "??", ME, term), (401, "ttys050", 0, "/usr/bin/login"))
+        p = procs((100, "??", ME, IT), (200, "??", ME, SERVER),
+                  (300, "ttys024", 0, "login"),
+                  (400, "??", ME, "Terminal"), (401, "ttys050", 0, "login"))
         out = ps((100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN),
-                 (400, 1, term), (401, 400, "login -pf x"))
+                 (400, 1, "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
+                 (401, 400, "login -pf x"))
         self.assertEqual(ccwho.iterm_ttys(out, p), {"ttys024"})
 
-    def test_a_process_that_names_the_path_is_not_iterm2(self):
-        # `tail -f /Applications/iTerm.app/Contents/MacOS/iTerm2`: its
-        # executable is tail, so its children are not iTerm2 panes
-        p = procs((50, "ttys001", ME, "/usr/bin/tail"), (51, "ttys009", ME, "/bin/cat"),
-                  (100, "??", ME, APP))
-        out = ps((50, 1, "tail -f " + APP), (51, 50, "cat"), (100, 1, APP))
+    def test_a_process_calling_itself_iterm2_is_not_iterm2(self):
+        # `exec -a /x/MacOS/iTerm2 sleep 99`: argv[0] and comm say iTerm2, the
+        # kernel says sleep. It must not become the app, nor its children panes
+        p = procs((50, "??", ME, "sleep"), (51, "ttys009", ME, "cat"), (100, "??", ME, IT))
+        out = ps((50, 1, APP), (51, 50, "cat"), (100, 1, APP))
         self.assertEqual(ccwho.iterm_ttys(out, p), set())
         self.assertEqual(ccwho.iterm_app_pid(p), 100)
 
     def test_another_users_iterm2_is_not_ours(self):
-        self.assertIsNone(ccwho.iterm_app_pid(procs((100, "??", ME + 1, APP))))
+        self.assertIsNone(ccwho.iterm_app_pid(procs((100, "??", ME + 1, IT))))
+
+    def test_another_users_daemon_does_not_make_our_windows(self):
+        p = procs((100, "??", ME, IT), (200, "??", ME + 1, SERVER),
+                  (300, "ttys050", 0, "login"))
+        out = ps((100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN))
+        self.assertEqual(ccwho.iterm_ttys(out, p), set())
+        mine = procs((100, "??", ME, IT), (200, "??", ME, SERVER), (300, "ttys050", 0, "login"))
+        self.assertEqual(ccwho.iterm_ttys(out, mine), {"ttys050"})           # control
+
+    def test_a_process_newer_than_the_table_is_skipped(self):
+        # collect() takes the two ps snapshots one after the other: a pane
+        # started in between is in one and not the other
+        p = procs((100, "??", ME, IT), (200, "??", ME, SERVER), (300, "ttys024", 0, "login"))
+        out = ps((100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN), (305, 200, LOGIN))
+        self.assertEqual(ccwho.iterm_ttys(out, p), {"ttys024"})
+
+    def test_the_cheap_table_finds_the_app_too(self):
+        self.assertEqual(ccwho.iterm_app_pid(apps((1, 0, "launchd"), (100, ME, IT))), 100)
 
     def test_shells_kept_alive_after_iterm2_quit_are_not_windows(self):
         # measured 2026-09-29: after `kill -9` of iTerm2 the daemon kept all 28
         # shells, same parent - and not one window existed
-        p = procs((200, "??", ME, DAEMON), (300, "ttys024", 0, "/usr/bin/login"))
+        p = procs((200, "??", ME, SERVER), (300, "ttys024", 0, "login"))
         out = ps((200, 1, DAEMON_CMD), (300, 200, LOGIN))
         self.assertIsNone(ccwho.iterm_ttys(out, p))
 
     def test_no_iterm2_at_all_is_not_knowing(self):
         self.assertIsNone(ccwho.iterm_ttys(ps((1, 0, "/sbin/launchd")),
-                                           procs((1, "??", 0, "/sbin/launchd"))))
+                                           procs((1, "??", 0, "launchd"))))
 
     def test_iterm2_running_with_no_panes_is_an_empty_answer(self):     # control
-        self.assertEqual(ccwho.iterm_ttys(ps((100, 1, APP)), procs((100, "??", ME, APP))), set())
+        self.assertEqual(ccwho.iterm_ttys(ps((100, 1, APP)), procs((100, "??", ME, IT))), set())
 
 
 class TestCollectTakesWindowsFromPsNotFromTabNames(MachinelessCollect):
@@ -6632,14 +6659,14 @@ class TestCollectTakesWindowsFromPsNotFromTabNames(MachinelessCollect):
 
     def test_a_session_in_an_iterm2_pane_has_a_window_with_no_tab_names(self):
         row = self.row([(100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN), (301, 300, "claude")],
-                       [(100, "??", ME, APP), (200, "??", ME, DAEMON),
-                        (300, "ttys024", 0, "/usr/bin/login"), (301, "ttys024", ME, "claude")])
+                       [(100, "??", ME, IT), (200, "??", ME, SERVER),
+                        (300, "ttys024", 0, "login"), (301, "ttys024", ME, "claude")])
         self.assertIs(row["windowed"], True)
 
     def test_a_session_on_a_terminal_iterm2_does_not_show_has_none(self):  # control
         row = self.row([(100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN), (301, 1, "claude")],
-                       [(100, "??", ME, APP), (200, "??", ME, DAEMON),
-                        (300, "ttys024", 0, "/usr/bin/login"), (301, "ttys042", ME, "claude")])
+                       [(100, "??", ME, IT), (200, "??", ME, SERVER),
+                        (300, "ttys024", 0, "login"), (301, "ttys042", ME, "claude")])
         self.assertIs(row["windowed"], False)
 
     def test_without_iterm2_running_it_is_not_known(self):
@@ -6653,7 +6680,7 @@ class TestCollectTakesWindowsFromPsNotFromTabNames(MachinelessCollect):
         ccwho.iterm_ask = lambda args, timeout=5.0, **k: seen.append(k.get("procs")) or None
         self.addCleanup(setattr, ccwho, "iterm_ask", GUARDS["iterm_ask"])
         ccwho.titles_snapshot = REAL_TITLES_SNAPSHOT
-        table = [(100, "??", ME, APP), (301, "ttys024", ME, "claude")]
+        table = [(100, "??", ME, IT), (301, "ttys024", ME, "claude")]
         taken = []
         ccwho.tty_snapshot = lambda: taken.append(1) or procs(*table)
         ccwho.ps_snapshot = lambda: ps((100, 1, APP), (301, 1, "claude"))
@@ -6699,7 +6726,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
             return 0
 
     def table(self, pid=100):
-        return procs((pid, "??", ME, APP))
+        return apps((pid, ME, IT))
 
     def state(self, name):
         return os.path.join(ccwho.ITERM_STATE_DIR, "iterm-ae." + name)
@@ -6717,6 +6744,9 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
             time.sleep(0.05)
         return False
 
+    def ended(self):
+        return self.until(lambda: os.path.exists(self.state("status")))
+
     def test_an_answer_comes_back(self):                                # control
         self.stub('echo "ttys001\tmy tab"')
         self.assertEqual(self.ask(), "ttys001\tmy tab\n")
@@ -6726,42 +6756,90 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
     def test_no_iterm2_running_means_no_ask(self):
         # `tell application "iTerm2"` would LAUNCH it
         self.stub("echo hi")
+        why = {}
         self.assertIsNone(ccwho.iterm_ask(["-e", "x"], timeout=3,
-                                          procs=procs((1, "??", 0, "/sbin/launchd"))))
+                                          procs=apps((1, 0, "launchd")), why=why))
         self.assertEqual(self.launches(), 0)
+        self.assertEqual(why.get("refused"), "no-iterm")
 
     def test_while_one_ask_is_in_flight_no_second_is_sent(self):
         self.stub("sleep 1.5; echo late")
+        why = {}
         self.assertIsNone(self.ask(timeout=0.3))
-        self.assertIsNone(self.ask(timeout=0.3, now=time.time() + 60))
+        self.assertIsNone(self.ask(timeout=0.3, now=time.time() + 60, why=why))
         self.assertIsNone(self.ask(timeout=0.3, now=time.time() + 60))
         self.assertEqual(self.launches(), 1)
+        self.assertEqual(why.get("refused"), "busy")
 
     def test_an_ask_that_timed_out_runs_to_its_end(self):
         # killing it frees nothing inside iTerm2 - and would free the lock. The
         # wrapper writes the status last: it exists only if nothing was killed
         self.stub("sleep 1; echo late")
-        self.assertIsNone(self.ask(timeout=0.3))
-        self.assertTrue(self.until(lambda: os.path.exists(self.state("status"))),
-                        "the ask was killed before it could say how it ended")
+        why = {}
+        self.assertIsNone(self.ask(timeout=0.3, why=why))
+        self.assertTrue(self.ended(), "the ask was killed before it could say how it ended")
+        self.assertEqual((why.get("asked"), why.get("error")), (True, "timeout"))
 
     def test_after_a_timeout_it_waits_before_asking_again(self):
         # a slow iTerm2 would otherwise always have one event in flight
         self.stub("sleep 1; echo late")
         t = time.time()
         self.assertIsNone(self.ask(timeout=0.3, now=t))
-        self.assertTrue(self.until(lambda: os.path.exists(self.state("status"))))
+        self.assertTrue(self.ended())
         self.assertIsNone(self.ask(now=t + 5), "asked again 5 s after a timeout")
         self.assertEqual(self.launches(), 1)
-        self.assertEqual(self.ask(now=t + 31), "late\n")                # control
+
+    def test_the_wait_counts_from_when_the_late_answer_was_seen(self):
+        # an ask started at t, given up at t+5, answering at t+40 has used up a
+        # wait counted from t: the next ask would go straight out
+        self.stub("sleep 0.5; echo late")
+        t = time.time()
+        self.assertIsNone(self.ask(timeout=0.1, now=t))
+        self.assertTrue(self.ended())
+        self.assertIsNone(self.ask(now=t + 40), "the late answer was seen now")
+        self.assertIsNone(self.ask(now=t + 60))
+        self.assertEqual(self.launches(), 1)
+        self.assertEqual(self.ask(now=t + 71), "late\n")                # control
+
+    def test_the_time_is_read_after_the_lock_is_taken(self):
+        # a wait set while this caller queued for the lock is a wait for it too
+        self.stub("echo sent")
+        os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
+        fd = os.open(self.state("lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        def meanwhile():
+            time.sleep(0.6)
+            with open(self.state("json"), "w") as f:
+                json.dump({"wait_until": time.time() + ccwho.ASK_WAIT_AFTER_ERROR}, f)
+            os.close(fd)
+        import threading
+        threading.Thread(target=meanwhile).start()
+        self.assertIsNone(ccwho.iterm_ask(["-e", "x"], timeout=3, procs=self.table(), wait=5))
+        self.assertEqual(self.launches(), 0)
 
     def test_a_timeout_inside_iterm2_stops_asking_that_iterm2(self):
         self.stub('sleep 0.5; echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
         self.assertIsNone(self.ask(timeout=0.2))
-        self.assertTrue(self.until(lambda: os.path.exists(self.state("status"))))
-        self.assertIsNone(self.ask(now=time.time() + 3600))
+        self.assertTrue(self.ended())
+        why = {}
+        self.assertIsNone(self.ask(now=time.time() + 3600, why=why))
         self.assertIsNone(self.ask(now=time.time() + 86400))
         self.assertEqual(self.launches(), 1)
+        self.assertEqual(why.get("refused"), "stuck")
+
+    def test_an_ask_whose_wrapper_died_still_counts(self):
+        # the shell killed, osascript left to finish: no status, but the -1712
+        # it wrote is there, and the lock is free
+        self.stub("echo never")
+        os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
+        with open(self.state("json"), "w") as f:
+            json.dump({"asked_pid": 100, "pending": True}, f)
+        with open(self.state("err"), "w") as f:
+            f.write("execution error: AppleEvent timed out. (-1712)\n")
+        self.assertIsNone(self.ask(now=time.time() + 3600))
+        self.assertEqual(self.launches(), 0)
 
     def test_a_restarted_iterm2_is_asked_again(self):                   # control
         self.stub('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
@@ -6783,7 +6861,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
     def test_a_quarantine_that_cannot_be_saved_is_not_lost(self):
         self.stub('sleep 0.3; echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
         self.assertIsNone(self.ask(timeout=0.1))
-        self.assertTrue(self.until(lambda: os.path.exists(self.state("status"))))
+        self.assertTrue(self.ended())
         real = ccwho._write_gate
         ccwho._write_gate = lambda state: False             # a full disk, say
         try:
@@ -6794,12 +6872,15 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.assertIsNone(self.ask(now=time.time() + 3600), "the evidence of -1712 was thrown away")
         self.assertEqual(self.launches(), 1)
 
-    def test_any_other_error_waits_thirty_seconds(self):
-        self.stub('echo "not allowed (-1743)" >&2; exit 1')
+    def test_any_other_error_waits_thirty_seconds_and_says_which(self):
+        self.stub('echo "Not authorized to send Apple events to iTerm2. (-1743)" >&2; exit 1')
         t = time.time()
-        self.assertIsNone(self.ask(now=t))
-        self.assertIsNone(self.ask(now=t + 29))
+        first, second = {}, {}
+        self.assertIsNone(self.ask(now=t, why=first))
+        self.assertIsNone(self.ask(now=t + 29, why=second))
         self.assertEqual(self.launches(), 1)
+        self.assertEqual(first.get("error"), "-1743")
+        self.assertEqual((second.get("refused"), second.get("error")), ("waiting", "-1743"))
         self.stub('echo ok')
         self.assertEqual(self.ask(now=t + 31), "ok\n")
 
@@ -6808,16 +6889,17 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.stub("sleep 0.3; head -c 1000000 /dev/zero | tr '\\0' a")
         t = time.time()
         self.assertIsNone(self.ask(timeout=0.1, now=t))
-        self.assertTrue(self.until(lambda: os.path.exists(self.state("status"))))
+        self.assertTrue(self.ended())
         self.stub("echo small")
-        self.assertEqual(self.ask(now=t + 31), "small\n")
+        self.assertIsNone(self.ask(now=t + 100), "the late answer is seen: a wait starts")
+        self.assertEqual(self.ask(now=t + 131), "small\n", "the lock was held")
 
     def test_damaged_state_values_are_a_closed_gate(self):
         self.stub("echo fine")
         os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
         t = time.time()
         for bad in ("{not json", '{"wait_until": "x"}', '{"wait_until": null}',
-                    '{"wait_until": 1e308}', '{"quarantine": [1]}', "[]"):
+                    '{"wait_until": 1e308}', '{"quarantine": [1]}', "[]", '{"pending": "yes"}'):
             with open(self.state("json"), "w") as f:
                 f.write(bad)
             self.assertEqual(self.ask(now=t), "fine\n", bad)
@@ -6825,13 +6907,29 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
             f.write(json.dumps({"wait_until": t + 10}))
         self.assertIsNone(self.ask(now=t))
 
+    def test_its_files_are_private(self):
+        # the answers hold tab names: paths, commands, host names. The dir may
+        # already exist, made by an older ccwho with the default umask
+        os.makedirs(ccwho.ITERM_STATE_DIR, mode=0o755)
+        os.chmod(ccwho.ITERM_STATE_DIR, 0o755)
+        self.stub("echo 'a tab'")
+        self.assertEqual(self.ask(), "a tab\n")
+        self.stub("sleep 0.3; echo later")
+        self.assertIsNone(self.ask(timeout=0.1, now=time.time() + 100))
+        self.assertTrue(self.ended())
+        self.assertEqual(os.stat(ccwho.ITERM_STATE_DIR).st_mode & 0o077, 0)
+        for name in ("json", "out", "status"):
+            self.assertEqual(os.stat(self.state(name)).st_mode & 0o077, 0, name)
+
     def test_an_unwritable_state_dir_is_no_answer_not_a_crash(self):
         blocker = os.path.join(self.tmp, "file")
         open(blocker, "w").close()
         ccwho.ITERM_STATE_DIR = os.path.join(blocker, "state")
         self.stub("echo hi")
-        self.assertIsNone(self.ask())
+        why = {}
+        self.assertIsNone(self.ask(why=why))
         self.assertEqual(self.launches(), 0)
+        self.assertEqual(why.get("refused"), "io")
 
     def test_a_launch_that_fails_is_no_answer_not_a_crash(self):
         self.stub("echo hi")
@@ -6850,7 +6948,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         # its panes
         self.stub("sleep 0.8; echo ok")
         other = subprocess.Popen(
-            [sys.executable, "-c",
+            [sys.executable, "-B", "-c",
              "import ccwho_engine as e; "
              f"e.ITERM_STATE_DIR = {ccwho.ITERM_STATE_DIR!r}; e.OSASCRIPT = {ccwho.OSASCRIPT!r}; "
              f"print(e.iterm_ask(['-e','x'], timeout=5, procs={self.table()!r}))"],
@@ -6861,31 +6959,33 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.assertIsNone(self.ask(wait=0), "no wait: busy is no")          # control
         self.assertEqual(self.ask(wait=5), "ok\n")
 
-    def test_it_says_whether_it_asked(self):
-        self.stub("sleep 1.5; echo late")
-        first, second = {}, {}
-        self.ask(timeout=0.2, why=first)
-        self.ask(timeout=0.2, why=second)
-        self.assertTrue(first["asked"])
-        self.assertFalse(second["asked"])
-
     def test_the_lock_is_shared_between_processes(self):
-        self.stub("sleep 2; echo late")
+        self.stub("sleep 1.5; echo late")
         self.assertIsNone(self.ask(timeout=0.2))
-        other = subprocess.run(
-            [sys.executable, "-c",
-             "import ccwho_engine as e; "
-             f"e.ITERM_STATE_DIR = {ccwho.ITERM_STATE_DIR!r}; e.OSASCRIPT = {ccwho.OSASCRIPT!r}; "
-             f"print(e.iterm_ask(['-e','x'], timeout=0.3, procs={self.table()!r}))"],
-            capture_output=True, text=True, timeout=20, cwd=os.path.dirname(os.path.abspath(__file__)))
+        code = ("import ccwho_engine as e, time; "
+                f"e.ITERM_STATE_DIR = {ccwho.ITERM_STATE_DIR!r}; e.OSASCRIPT = {ccwho.OSASCRIPT!r}; "
+                # past any wait: only the lock can say no
+                f"print(e.iterm_ask(['-e','x'], timeout=0.3, procs={self.table()!r}, now=time.time() + 600))")
+        here = os.path.dirname(os.path.abspath(__file__))
+        other = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True,
+                               text=True, timeout=20, cwd=here)
         self.assertEqual(other.stdout.strip(), "None")
         self.assertEqual(self.launches(), 1)
+        self.assertTrue(self.ended())
+        # control: once the child is gone the lock is free (the first call sees
+        # the late answer and waits; one past that wait asks)
+        subprocess.run([sys.executable, "-B", "-c", code], capture_output=True,
+                       text=True, timeout=20, cwd=here)
+        later = code.replace("time.time() + 600", "time.time() + 700")
+        subprocess.run([sys.executable, "-B", "-c", later], capture_output=True,
+                       text=True, timeout=20, cwd=here)
+        self.assertEqual(self.launches(), 2)
 
 
 class TestTabNamesAndPanesAskThroughTheGate(unittest.TestCase):
     """titles_snapshot and panes_snapshot run in the background - every list
     scan, every autosave - so they must never reach osascript except through
-    iterm_ask."""
+    iterm_ask. None is "not asked"; {} is "iTerm2 answered: no tabs"."""
 
     def setUp(self):
         self.asked = []
@@ -6905,9 +7005,11 @@ class TestTabNamesAndPanesAskThroughTheGate(unittest.TestCase):
         self.assertEqual(ccwho.titles_snapshot(), {"ttys001": "my tab"})
         self.assertIn('tell application "iTerm2"', self.asked[0][0][-1])
 
-    def test_no_answer_is_no_names(self):                               # control
+    def test_not_asked_is_not_an_empty_answer(self):
         self.answer(None)
-        self.assertEqual(ccwho.titles_snapshot(), {})
+        self.assertIsNone(ccwho.titles_snapshot())
+        self.answer("")
+        self.assertEqual(ccwho.titles_snapshot(), {})                      # control
 
     def test_panes_come_through_the_gate(self):
         self.answer("/dev/ttys001\tG-1\tmy tab\n")
@@ -6920,9 +7022,22 @@ class TestTabNamesAndPanesAskThroughTheGate(unittest.TestCase):
         self.assertGreater(self.asked[0][1].get("wait", 0), 0, "save must not lose its panes")
         self.assertEqual(self.asked[1][1].get("wait", 0), 0, "a scan must never block on it")
 
-    def test_no_answer_is_no_panes(self):                               # control
+    def test_panes_not_asked_are_unknown(self):
         self.answer(None)
-        self.assertEqual(ccwho.panes_snapshot(), {})
+        self.assertIsNone(ccwho.panes_snapshot())
+
+    def test_a_restore_asks_for_its_panes_itself(self):
+        # restore is something you do: it does not queue behind the gate, nor
+        # wait out a pause some background ask set
+        ccwho.iterm_ask = lambda *a, **k: self.fail("restore went through the gate")
+        seen = {}
+
+        class Done:
+            returncode, stdout, stderr = 0, "/dev/ttys001\tG-1\tt\n", ""
+
+        ccwho.subprocess.run = lambda cmd, **k: seen.update(k) or Done()
+        self.assertEqual(ccwho.panes_snapshot(direct=True), {"ttys001": {"pane": "G-1", "name": "t"}})
+        self.assertGreater(seen.get("timeout", 0), 0)
 
 
 class TestNewTabsDoNotMakeCollectAskITerm2(MachinelessCollect):
@@ -6937,7 +7052,7 @@ class TestNewTabsDoNotMakeCollectAskITerm2(MachinelessCollect):
         ccwho.agents_json = lambda: "[]"
         cache = {}
         for n in range(1, 6):
-            ccwho.tty_snapshot = lambda n=n: procs(*[(100 + i, f"ttys{i:03d}", ME, "-zsh")
+            ccwho.tty_snapshot = lambda n=n: procs(*[(100 + i, f"ttys{i:03d}", ME, "zsh")
                                                       for i in range(n)])
             ccwho.collect(cache=cache)
         self.assertEqual(len(calls), 1)
@@ -6950,22 +7065,74 @@ class TestAReusedTerminalLosesItsOldName(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
+        self.reply = {"ttys022": "old tab", "ttys030": "other tab"}
         real = ccwho.titles_snapshot
         self.addCleanup(setattr, ccwho, "titles_snapshot", real)
-        ccwho.titles_snapshot = lambda timeout=5.0, **k: self.calls.append(1) or {
-            "ttys022": "old tab", "ttys030": "other tab"}
+        ccwho.titles_snapshot = lambda timeout=5.0, **k: self.calls.append(1) or self.reply
 
     def test_a_terminal_with_a_new_first_process_loses_its_name(self):
         cache = {}
         ccwho.titles_cached(cache, now=1000.0, procs=procs(
-            (300, "ttys022", 0, "/usr/bin/login"), (400, "ttys030", 0, "/usr/bin/login")))
+            (300, "ttys022", 0, "login"), (400, "ttys030", 0, "login")))
         names = ccwho.titles_cached(cache, now=1010.0, procs=procs(
-            (900, "ttys022", 0, "/usr/bin/login"), (400, "ttys030", 0, "/usr/bin/login")))
+            (900, "ttys022", 0, "login"), (400, "ttys030", 0, "login")))
         self.assertEqual(names, {"ttys030": "other tab"})
         self.assertEqual(len(self.calls), 1, "no new ask for it")
 
     def test_the_same_terminals_keep_their_names(self):                 # control
         cache = {}
-        table = procs((300, "ttys022", 0, "/usr/bin/login"), (301, "ttys022", ME, "-zsh"))
+        table = procs((300, "ttys022", 0, "login"), (301, "ttys022", ME, "zsh"))
         ccwho.titles_cached(cache, now=1000.0, procs=table)
         self.assertEqual(ccwho.titles_cached(cache, now=1010.0, procs=table)["ttys022"], "old tab")
+
+    def test_an_answer_with_no_tabs_is_kept_for_the_minute(self):
+        # iTerm2 open with no windows answers "" - asking on every tick for it
+        # broke the once-a-minute promise
+        self.reply = {}
+        cache = {}
+        for i in range(10):
+            ccwho.titles_cached(cache, now=1000.0 + i, procs="")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_refused_refresh_keeps_the_names_it_had(self):
+        cache = {}
+        table = procs((300, "ttys022", 0, "login"), (900, "ttys040", 0, "login"))
+        ccwho.titles_cached(cache, now=1000.0, procs=table)
+        self.reply = None                               # the gate would not ask
+        self.assertEqual(ccwho.titles_cached(cache, now=1061.0, procs=table).get("ttys022"),
+                         "old tab")
+        self.reply = {"ttys022": "new"}
+        self.assertEqual(ccwho.titles_cached(cache, now=1062.0, procs=table), {"ttys022": "new"},
+                         "a refusal must not count as the minute's ask")
+
+
+class TestASaveThatCannotAskKeepsThePanesItKnew(unittest.TestCase):
+    """A save every 15 minutes, keeping 20: five hours of saves while iTerm2 is
+    quarantined would push every manifest that knew its panes out."""
+
+    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": ""}
+
+    def test_unknown_panes_carry_over_from_the_last_save(self):
+        man = ccwho.manifest_from_rows([self.ROW], panes=None,
+                                       known={"s1": {"pane": "G-1", "tabTitle": "old tab"}})
+        self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]),
+                         ("G-1", "old tab"))
+
+    def test_asked_and_no_pane_is_no_pane(self):                         # control
+        man = ccwho.manifest_from_rows([self.ROW], panes={},
+                                       known={"s1": {"pane": "G-1", "tabTitle": "old tab"}})
+        self.assertEqual(man["sessions"][0]["pane"], "")
+
+
+class TestTheRealTablesNameTheProgramNotItsArgv0(unittest.TestCase):
+    """The tables come from ps on this machine: only the kernel's name for the
+    program can tell `exec -a .../MacOS/iTerm2 sleep` from iTerm2. Starts one
+    such process - no Apple Event, nothing iTerm2 sees."""
+
+    def test_a_process_calling_itself_iterm2_is_named_sleep(self):
+        fake = subprocess.Popen(["/bin/bash", "-c", "exec -a /x/iTerm.app/Contents/MacOS/iTerm2 sleep 5"])
+        self.addCleanup(fake.wait)
+        self.addCleanup(fake.kill)
+        time.sleep(0.2)
+        for table in (REAL_APP_SNAPSHOT(), REAL_TTY_SNAPSHOT()):
+            self.assertEqual(ccwho.parse_procs(table)[fake.pid][2], "sleep")

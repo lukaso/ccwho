@@ -318,21 +318,29 @@ SCRIPTABLE_WAIT = 3.0     # a background ask in flight takes about 0.6 s
 
 
 def iterm_scriptable(timeout=5.0):
-    """Can we ASK iTerm2 something? Not "is it running".
+    """Can we ASK iTerm2 something? Not "is it running". True, False, or None.
 
     Automation access is granted per application pair and can be refused; a
     process list says nothing about it, and refused automation is exactly when
     the tab names and `go` stop working. So ask iTerm2 itself, for the cheapest
-    thing it knows, and treat any failure as no.
+    thing it knows - through the background gate, waiting a moment for an ask
+    already in flight.
+
+    False: not running, or refused (-1743 errAEEventNotPermitted, now or in the
+    pause after it) - the Automation fix. None: running but not answering Apple
+    Events - stuck (-1712), its own ask timed out, or the gate is holding off.
+    Restarting iTerm2 is the fix for that, not System Settings.
     """
     why = {}
     out = engine.iterm_ask(["-e", 'tell application "iTerm2" to count windows'],
                            timeout=timeout, wait=SCRIPTABLE_WAIT, why=why)
-    if out is None and not why.get("asked") and engine.iterm_app_pid(engine.tty_snapshot()):
-        # iTerm2 runs, but the gate did not ask it: an ask stuck in flight, or an
-        # iTerm2 that stopped answering Apple Events. Not an Automation refusal
+    if out is not None:
+        return out.strip().isdigit()
+    if why.get("error") == "-1743" or why.get("refused") in ("no-iterm", "io"):
+        return False
+    if why.get("refused") in ("stuck", "busy", "waiting") or why.get("error") in ("-1712", "timeout"):
         return None
-    return bool(out) and out.strip().isdigit()
+    return False
 
 
 def handler_candidates(app_path=None):
@@ -513,15 +521,11 @@ def accessibility_granted_at(bundle_id=ITERM_BUNDLE, db=None, timeout=10.0):
 def iterm_started_at(pid=None, timeout=10.0):
     """When the running iTerm2 started, in epoch seconds. None if it is not."""
     if pid is None:
-        try:
-            found = subprocess.run(["pgrep", "-x", "iTerm2"],
-                                   capture_output=True, text=True, timeout=timeout)
-        except (OSError, subprocess.SubprocessError):
+        # the gate's way: the kernel's name for the program, and our uid - not
+        # `pgrep -x`, which matches argv[0] and any user
+        pid = engine.iterm_app_pid(engine.app_snapshot())
+        if pid is None:
             return None
-        pids = (found.stdout or "").split()
-        if not pids:
-            return None
-        pid = int(pids[0])
     try:
         done = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
                               capture_output=True, text=True, timeout=timeout)

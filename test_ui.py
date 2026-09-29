@@ -4643,3 +4643,29 @@ class TestOneCollectAtATime(UiTest):
             app.collect()
             await self.settle(pilot, collector, 2)
             self.assertEqual(collector.calls, 2)
+
+
+class TestARefreshAfterAKillWaitsItsTurn(UiTest):
+    """After a kill the list reads the world again - through collect(), so it
+    never runs beside a tick's collect on the same cache."""
+
+    class Box:
+        def show_result(self, lines):
+            self.lines = lines
+
+    async def test_a_refresh_after_a_kill_does_not_run_beside_a_collect(self):
+        collector = TestOneCollectAtATime.Blocking()
+        collector.kill_loops = lambda row: ["killed"]
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.1)
+            app.loop_killing(self.Box(), dict(LIVE))
+            await pilot.pause(0.2)
+            self.assertEqual(collector.most, 1)
+            collector.go.set()
+            for _ in range(100):
+                await pilot.pause(0.02)
+                if collector.calls >= 2 and collector.running == 0:
+                    break
+            self.assertEqual(collector.most, 1)
+            self.assertGreaterEqual(collector.calls, 2, "the refresh still happened")

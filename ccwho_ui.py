@@ -1648,6 +1648,14 @@ class CcwhoUi(App):
         self.call_from_thread(self.show_kill_box, prepared)
 
     def show_kill_box(self, prepared):
+        """The box - or, when it cannot be shown, why: the lock never stays."""
+        try:
+            self._show_kill_box(prepared)
+        except Exception as ex:         # its text may hold a command line: the type only
+            self.kill_busy = False
+            self.said(f"could not show the kill ({type(ex).__name__}) - nothing killed")
+
+    def _show_kill_box(self, prepared):
         if self.status == "reading the machine...":
             self.said("")
         plan = prepared["plan"]

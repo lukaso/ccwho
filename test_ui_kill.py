@@ -568,6 +568,29 @@ class TestOneKillAtATime(KillTest):
             self.assertEqual(len(c.prepared), 1)
             self.assertEqual(sum(isinstance(s, ui.KillBox) for s in app.screen_stack), 1)
 
+    async def test_a_box_that_cannot_open_frees_the_lock(self):
+        # the plan has a shape the list cannot print: said by its type, and the
+        # next x works - the lock is not kept until a restart
+        c = KillCollector()
+        real = ui.engine.kill_list_lines
+        def boom(plan):
+            raise KeyError("/secret/path")
+        ui.engine.kill_list_lines = boom
+        self.addCleanup(setattr, ui.engine, "kill_list_lines", real)
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_box(app, pilot)
+            self.assertTrue(app.is_running)
+            self.assertIsNone(self.box(app))
+            self.assertFalse(app.kill_busy)
+            self.assertIn("KeyError", app.status)
+            self.assertNotIn("/secret/path", app.status)
+            ui.engine.kill_list_lines = real            # the next x: one box, as usual
+            await pilot.press("x")
+            await self.settle(app, pilot)
+            self.assertEqual(sum(isinstance(s, ui.KillBox) for s in app.screen_stack), 1)
+            self.assertEqual(len(c.prepared), 2)
+
     async def test_a_refresh_that_fails_after_a_kill_keeps_the_app(self):
         c = KillCollector()
         real = c.fleet

@@ -73,7 +73,7 @@ ccwho                         # on a terminal
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
 | `p` | every process agents started, grouped: each session, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `x` | on a process (after `p`): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
-| `x` `x` | on a row with a loop or reader that can never end (a STUCK row, or one that also needs you): kill it (or click `[kill loop]` twice) |
+| `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
 | `o` | a menu of every save, newest first, with how many of its sessions run now; the last save before the restart is marked. Running sessions are left alone |
 | `r` | restart the list |
 | `q` | quit |
@@ -600,10 +600,12 @@ is found), is the same question. The answer
 is kept: a finished file does not change. Any other shape is unknown,
 because the process a loop runs in is the Bash tool's shell, and it runs the rest
 of the command too. That session is
-**STUCK**, its own group after NEEDS YOU, and the row names the loop. `x` twice,
-or `[kill loop]` clicked twice, kills it; the first only asks, for ten seconds, and
-moving away cancels it; the kill looks again first and signals only a pid that
-is still that session's dead loop. Killing it reports the task
+**STUCK**, its own group after NEEDS YOU, and the row names the loop. A click on
+`[kill stuck process…]`, or `x` then `l`, opens a box that lists it with why it can
+never end; `y` there kills it and Esc kills nothing. The kill looks again first and
+signals only a pid that is still that session's dead loop; what was not killed is
+named with why - it still runs but did not look stuck, the signal was not
+permitted, or the processes could not be read - never called "not stuck". Killing it reports the task
 as failed to the session, which wakes the agent. A file that cannot be read, or
 has no end line, is never called dead.
 
@@ -615,7 +617,7 @@ hours while the row said `running`. So a stdin reader (`cat`, `tr`, `cut`, `head
 `tail`, `wc`, `sort`, `uniq` with no file) in a Bash tool task, older than two
 minutes, whose fd 0 lsof shows is the claude's socket, makes the row STUCK: `cat N
 waits for input Claude Code never sends`. Never one under an MCP server (Claude Code
-does write to that socket) or under an agent. `x` twice stops the reader's whole
+does write to that socket) or under an agent. Its kill box stops the reader's whole
 task, parents first, so the tool shell cannot go on to its next command (a script
 that traps TERM is not reached); ccwho and any agent in the task are spared.
 

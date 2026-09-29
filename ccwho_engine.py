@@ -561,6 +561,13 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
     ptable = {pid: (ppid, "", cmd) for pid, ppid, cmd in rows}
     wanted = set(pids or ())
     send = kill or os.kill
+    begun = []
+
+    def table():
+        """The start table, read once for the whole kill: two reads can disagree."""
+        if not begun:
+            begun.append((starts or ps_table)())
+        return begun[0]
     killed, hit, failed = [], set(), []
     # both looked for on the one snapshot, before anything is signalled
     loops = [d["pid"] for d in find_dead_loops(session_pid, ptable, read, matches=matches)
@@ -569,7 +576,7 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
                if d["pid"] in wanted]
     if readers:
         killed = _stop_reader_tasks(session_pid, readers, rows, send, own, started,
-                                    starts, report, hit)
+                                    table, report, hit)
     # a reader's task first: a loop killed alone lets its shell run on, and a
     # loop in a task already stopped got its TERM there
     for pid in loops:
@@ -584,19 +591,26 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
             failed.append(pid)
             continue
         killed.append(pid)
+    # a listed pid that went with a reader's task got the signal too: said -
+    # if it is still the one listed (a reader has a start; a loop is not listed
+    # with one). One that got a new process is not "the one you stopped"
+    killed += [p for p in sorted(wanted & hit) if p not in killed
+               and (p not in (started or {}) or (table().get(p) or ("",))[0] == started[p])]
     if report is not None:
         report["unread"] = report.get("unread") or not rows
         report["failed"] = failed
+        # what was stopped with a reader's task is not "still runs"
         report["unconfirmed"] = _unconfirmed(
-            session_pid, wanted - set(loops) - {d["pid"] for d in readers}, ptable,
-            started, starts)
+            session_pid, wanted - set(loops) - {d["pid"] for d in readers} - hit, ptable,
+            started, table, report)
     return killed
 
 
-def _unconfirmed(session_pid, pids, ptable, started, starts):
+def _unconfirmed(session_pid, pids, ptable, started, table, report):
     """Of `pids` - asked for, not judged stuck now - the ones that still run as
     what was listed: in the session's tree, still a wait loop or a reader, and
-    a reader still with the start it was listed with. Not "not stuck"."""
+    a reader still with the start it was listed with. Not "not stuck". A start
+    table that said nothing leaves a listed reader unknown: report["unread"]."""
     tree, stack = set(), [session_pid]
     kids = {}
     for cpid, (ppid, _start, _cmd) in ptable.items():
@@ -610,7 +624,9 @@ def _unconfirmed(session_pid, pids, ptable, started, starts):
            and (procs.wait_loop(ptable[p][2]) or procs.stdin_reader(ptable[p][2]))]
     listed = {p: s for p, s in (started or {}).items() if p in out}
     if listed:
-        begun = (starts or ps_table)()
+        begun = table()
+        if not begun:
+            report["unread"] = True
         out = [p for p in out if p not in listed
                or (begun.get(p) or ("",))[0] == listed[p] != ""]
     return out
@@ -620,7 +636,7 @@ def _stop_reader_tasks(session_pid, readers, rows, send, own, started, starts, r
     """kill_dead_loops' part for readers: each listed reader's whole task,
     once, parents first. Every pid signalled goes into `hit`."""
     killed = []
-    begun = (starts or ps_table)()
+    begun = starts()
     if not begun and report is not None:
         report["unread"] = True         # no reader can be matched to the one listed
     ptable = {pid: (ppid, (begun.get(pid) or ("",))[0], cmd) for pid, ppid, cmd in rows}
@@ -3137,7 +3153,7 @@ UI_UNKNOWN_MARK = "·"
 # never names a colour: a terminal's palette is not its business.
 UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action",
             "detail")
-UI_KILL = "[kill loop]"
+UI_KILL = "[kill stuck process…]"
 # A click on a row goes to the session; this opens its detail instead: \ at the
 # right edge of line one over / on line two, one > the height of the row. ASCII:
 # a symbol of "ambiguous" width is two cells in some terminals, and pushes the
@@ -3258,7 +3274,8 @@ def ui_row_cells(row, width=100, tag=""):
     act = [("  ", "pad"), (UI_KILL, "action")] if loop_kill_offered(row) else []
     if loops:
         more = f" (+{len(loops) - 1} more)" if len(loops) > 1 else ""
-        mark = f"{dead_words(loops[0])}{more} · "
+        words, tail = dead_words(loops[0]), f"{more} · "
+        mark = words + tail
     # in screen cells, as _fit cuts the line: a CJK recap counted in characters
     # ran twice as wide, and the cut dropped the kill at the end of the line
     room = (width - _cells(pad) - sum(_cells(t) for t, _ in act)
@@ -3266,7 +3283,9 @@ def ui_row_cells(row, width=100, tag=""):
     if loops:
         # what to do about it comes first; the recap only where it can be read,
         # and the words about the loop give way - to nothing - before the kill
-        mark = _cut(mark, max(0, room))
+        # the count stays: cut, it hid a second stuck item behind the first
+        mark = (_cut(words, room - _cells(tail)) + tail if more and room - _cells(tail) >= 8
+                else _cut(mark, max(0, room)))
         body = body if room - _cells(mark) >= 20 else ""
     second = [(pad, "pad"), (mark, "age")] + (
         [(_cut(body, max(8, room - _cells(mark))), "recap")] if body else []) + act

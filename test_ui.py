@@ -97,7 +97,7 @@ class FakeCollector:
 
     def kill_loops(self, row):
         self.killed = (self.killed or []) + [row.get("sessionId")]
-        return "killed loop 86246"
+        return ["killed loop 86246"]
 
 
 class FakeAdapter:
@@ -1546,10 +1546,11 @@ class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
                 await pilot.press("enter")
                 await pilot.pause(0.1)
                 before = self.state(app)
-                await pilot.press("j", "x", "l")
+                await pilot.press("j", "x", "l", "y")
                 await pilot.pause(0.3)
                 self.assertIsNone(collector.killed)
-                self.assertIn("window is being opened", app.status)
+                self.assertIn("window is being opened",
+                              str(app.screen.query_one("#killbody").content))
                 self.assertEqual(app.acting, self.A["sessionId"])
                 self.assertEqual([s[:2] for s in self.state(app)],
                                  [s[:2] for s in before])
@@ -1558,11 +1559,14 @@ class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
             await pilot.pause(0.1)
             await pilot.pause()
             self.assertEqual(self.marks, [self.A["sessionId"]])
+            await pilot.press("escape")             # the refusal read, the box closed
+            await pilot.pause(0.1)
             await pilot.press("x")                  # and after it, the usual box:
             await pilot.pause(0.1)
             self.assertIsNone(collector.killed, "the refused kill is not kept for later")
             self.assertIsInstance(app.screen, ui.ChoiceBox)
-            await pilot.press("l")
+            await pilot.press("l", "y")
+            await app.workers.wait_for_complete()
             await pilot.pause(0.3)
             self.assertEqual(collector.killed, [STUCK["sessionId"]])
 
@@ -1858,8 +1862,9 @@ class TestClickableThingsLightUp(UiTest):
             self.assertEqual(self.roles_lit(rows[0]), set(), "the name is not a control")
 
     async def test_a_row_that_changes_under_a_still_mouse_is_lit_where_it_is(self):
-        # the loop's words got shorter: the kill moved left, the mouse did not
-        long = dict(STUCK, dead_loops=[{"pid": 86246, "tasks": ["bscl8fc6k"]},
+        # the loop's words got shorter: the kill moved left, the mouse did not -
+        # further than the button is wide, or the mouse is still on it
+        long = dict(STUCK, dead_loops=[{"pid": 86246, "tasks": ["bscl8fc6k", "b2", "b3", "b4"]},
                                        {"pid": 1, "tasks": ["x"]}])
         collector = FakeCollector(fleet=ui.Fleet([LIVE, long], True, "12:00:00"))
         app = self.app(collector=collector)
@@ -2944,10 +2949,11 @@ STUCK = row("cccc3333-0000-4000-8000-000000000003", "stuck", status="busy", pid=
 
 
 class TestKillingAStuckLoop(UiTest):
-    """A loop that can never end is killed from the list: `x` on its row, or a
-    click on [kill loop], opens the row's box (the owner's D10, 2026-09-27),
-    and `l` there kills it - a kill is not undone, so the box asks first. The
-    row's other clicks still go to the session."""
+    """A loop that can never end is killed from the list: a click on its
+    button, or `x` then `l`, opens the kill dialog about it alone (design review
+    2026-09-29, decisions 1, 2, 6), and `y` there kills it - a kill is not
+    undone, so the dialog asks first. The row's other clicks still go to the
+    session."""
 
     def setUp(self):
         self.collector = FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00"))
@@ -2957,14 +2963,20 @@ class TestKillingAStuckLoop(UiTest):
         return [w for w in app.query(ui.Row) if w.row["sessionId"] == STUCK["sessionId"]][0]
 
     def kill_offset(self, widget):
-        """Where [kill loop] is drawn, in the row's own coordinates."""
+        """Where the button is drawn, in the row's own coordinates."""
         text = "".join(t for t, _ in widget.spans())
         line = text.split("\n")[1]
         # the row's left border and padding come before its text; one column in
-        return (line.index("[kill loop]") + 2 + 1, 1)
+        return (line.index(ui.engine.UI_KILL) + 2 + 1, 1)
 
     def boxed(self, app):
         return isinstance(app.screen, ui.ChoiceBox)
+
+    def asked(self, app):
+        return isinstance(app.screen, ui.KillBox)
+
+    def said(self, app):
+        return str(app.screen.query_one("#killbody").content) if self.asked(app) else app.status
 
     async def test_the_stuck_row_has_its_own_heading(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -2972,7 +2984,7 @@ class TestKillingAStuckLoop(UiTest):
             await pilot.pause()
             text = self.screen_text(app)
             self.assertIn("STUCK", text)
-            self.assertIn("[kill loop]", text)
+            self.assertIn(ui.engine.UI_KILL, text)
 
     async def test_x_only_asks(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -2983,17 +2995,21 @@ class TestKillingAStuckLoop(UiTest):
             self.assertIsNone(self.collector.killed)
             self.assertTrue(self.boxed(app))
             text = "\n".join(str(w.content) for w in app.screen.query("Static"))
-            self.assertIn("l  kill the stuck loop 86246", text)
-            self.assertIn("the session continues", text)
+            self.assertIn("l  kill stuck loop 86246", text)
+            self.assertIn("the session keeps running", text)
 
-    async def test_l_in_the_box_kills_it(self):
+    async def test_l_in_the_box_asks_and_y_kills_it(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             await pilot.press("j", "x", "l")
             await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+            self.assertTrue(self.asked(app))
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
+            await pilot.pause(0.2)
             self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
-            self.assertFalse(self.boxed(app))
 
     async def test_escape_kills_nothing(self):                           # control
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -3008,7 +3024,7 @@ class TestKillingAStuckLoop(UiTest):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("x", "l")
+            await pilot.press("x", "l", "y")
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
 
@@ -3025,7 +3041,7 @@ class TestKillingAStuckLoop(UiTest):
                     await pilot.press("j", "x")
                     await pilot.pause()
                     self.assertFalse(self.boxed(app), "nothing to offer: no box")
-                    await pilot.press("l")
+                    await pilot.press("l", "y")
                     await pilot.pause(0.2)
                     self.assertIsNone(collector.killed)
 
@@ -3035,15 +3051,15 @@ class TestKillingAStuckLoop(UiTest):
         app = self.app(collector=collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x")
+            await pilot.press("j", "x", "l")
             await pilot.pause()
             for r in app.fleet.rows:
                 if r["sessionId"] == STUCK["sessionId"]:
                     r["attention"] = "program"
-            await pilot.press("l")
+            await pilot.press("y")
             await pilot.pause(0.2)
             self.assertIsNone(collector.killed)
-            self.assertIn("nothing killed", app.status)
+            self.assertIn("nothing killed", self.said(app))
 
     async def test_one_click_on_the_kill_only_asks_and_does_not_go(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -3054,16 +3070,17 @@ class TestKillingAStuckLoop(UiTest):
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
             self.assertEqual(self.adapter.asked, [])
-            self.assertTrue(self.boxed(app))
+            self.assertTrue(self.asked(app))
 
-    async def test_the_click_then_l_kills_it(self):
+    async def test_the_click_then_y_kills_it(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             w = self.stuck_row(app)
             await pilot.click(w, offset=self.kill_offset(w))
             await pilot.pause()
-            await pilot.press("l")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
             await pilot.pause(0.2)
             self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
             self.assertEqual(self.adapter.asked, [])
@@ -3073,10 +3090,11 @@ class TestKillingAStuckLoop(UiTest):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "p", "x", "l")
+            await pilot.press("j", "p", "x", "l", "y")
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
             self.assertFalse(self.boxed(app))
+            self.assertFalse(self.asked(app))
 
     async def test_a_click_on_the_kill_with_the_process_screen_open_says_why(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -3088,6 +3106,7 @@ class TestKillingAStuckLoop(UiTest):
             await pilot.click(w, offset=self.kill_offset(w))
             await pilot.pause(0.2)
             self.assertFalse(self.boxed(app))
+            self.assertFalse(self.asked(app))
             self.assertIsNone(self.collector.killed)
             self.assertIn("Esc for the list", app.status)
 
@@ -3095,11 +3114,12 @@ class TestKillingAStuckLoop(UiTest):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x")
+            await pilot.press("j", "x", "l")
             await pilot.pause()
             app.show(ui.Fleet([LIVE, STUCK], True, "12:00:05"))
             await pilot.pause()
-            await pilot.press("l")
+            await pilot.press("y")
+            await app.workers.wait_for_complete()
             await pilot.pause(0.2)
             self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
 
@@ -3107,23 +3127,25 @@ class TestKillingAStuckLoop(UiTest):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x")
+            await pilot.press("j", "x", "l")
             await pilot.pause()
             moved = dict(STUCK, dead_loops=[{"pid": 99999, "tasks": ["b9"]}])
             app.show(ui.Fleet([LIVE, moved], True, "12:00:05"))
             await pilot.pause()
-            await pilot.press("l")
+            await pilot.press("y")
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
-            self.assertIn("nothing killed", app.status)
+            self.assertIn("nothing killed", self.said(app))
 
-    async def test_what_the_kill_did_stays_said(self):
+    async def test_what_the_kill_did_stays_in_the_box(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x", "l")
+            await pilot.press("j", "x", "l", "y")
+            await app.workers.wait_for_complete()
             await pilot.pause(0.3)
-            self.assertIn("killed loop 86246", app.status)
+            self.assertTrue(self.asked(app), "the result waits for you to close it")
+            self.assertIn("killed loop 86246", self.said(app))
 
     async def test_a_click_on_the_name_still_goes(self):                 # control
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -3136,41 +3158,45 @@ class TestKillingAStuckLoop(UiTest):
 
 
 
+class TestTheButtonHasNoUnderline(unittest.TestCase):
+    """The owner decided against underlines (design review 2026-09-29, decision
+    4): brackets and bold say it is a button, the hover lights it."""
+
+    def test_bold_and_no_underline(self):
+        self.assertNotIn("underline", ui.ROLE_STYLE["action"])
+        self.assertIn("bold", ui.ROLE_STYLE["action"])
+
+
 class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
-    def kill(self, killed):
+    """What the kill did, one line per outcome, each pid named - and every
+    outcome that applies, not the first (review round 2 of 62a1169)."""
+
+    def kill(self, killed, report_says=None, row=STUCK):
         real = ui.engine.kill_dead_loops
         asked = []
 
-        def fake(session_pid, pids, **_):
+        def fake(session_pid, pids, started=None, report=None):
             asked.append((session_pid, pids))
+            report.update(report_says or {})
             return killed
         ui.engine.kill_dead_loops = fake
         try:
-            said = ui.Collector().kill_loops(STUCK)
+            said = ui.Collector().kill_loops(row)
         finally:
             ui.engine.kill_dead_loops = real
         return asked, said
 
+    def said_when(self, report_says, killed=()):
+        return "\n".join(self.kill(list(killed), report_says)[1])
+
     def test_the_session_and_its_loops_are_passed(self):
         asked, said = self.kill([86246])
         self.assertEqual(asked, [(73787, [86246])])
-        self.assertEqual(said, "killed loop 86246")
+        self.assertEqual(said, ["killed loop 86246"])
 
     def test_nothing_killed_says_so(self):                               # control
         _, said = self.kill([])
-        self.assertNotIn("killed loop", said)
-
-    def said_when(self, report_says):
-        real = ui.engine.kill_dead_loops
-
-        def fake(session_pid, pids, started=None, report=None):
-            report.update(report_says)
-            return []
-        ui.engine.kill_dead_loops = fake
-        try:
-            return ui.Collector().kill_loops(STUCK)
-        finally:
-            ui.engine.kill_dead_loops = real
+        self.assertNotIn("killed loop", "\n".join(said))
 
     def test_a_loop_that_still_runs_is_not_called_not_stuck(self):
         said = self.said_when({"unconfirmed": [86246]})
@@ -3187,8 +3213,19 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
         self.assertNotIn("no loop there is stuck", said)
         self.assertIn("could not signal 86246", said)
 
+    def test_a_mixed_result_names_what_was_not_killed(self):
+        said = self.said_when({"failed": [86247]}, killed=[86246])
+        self.assertIn("killed loop 86246", said)
+        self.assertIn("could not signal 86247", said)
+
+    def test_every_outcome_that_applies_is_said(self):
+        said = self.said_when({"failed": [86246], "unread": True, "unconfirmed": [86247]})
+        self.assertIn("could not signal 86246", said)
+        self.assertIn("could not read", said)
+        self.assertIn("86247 still runs", said)
+
     def test_a_loop_that_is_gone_is_still_not_stuck(self):             # control
-        self.assertEqual(self.said_when({}), "nothing killed: no loop there is stuck any more")
+        self.assertEqual(self.kill([], {})[1], ["nothing killed: no loop there is stuck any more"])
 
     def test_a_readers_task_says_it_was_stopped(self):
         row = dict(STUCK, dead_loops=[{"pid": 54329, "kind": "reader", "program": "cat",
@@ -3206,7 +3243,7 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
             ui.engine.kill_dead_loops = real
         # the start it was listed with: a new cat on that pid is not killed
         self.assertEqual(asked, [{54329: "Sat Sep 26 15:12:13 2026"}])
-        self.assertEqual(said, "stopped the task of cat 54329; spared the agent 54332")
+        self.assertEqual(said, ["stopped the task of cat 54329", "spared the agent 54332"])
 
 
 class TestTheProcessScreenVerify(UiTest):
@@ -3408,14 +3445,14 @@ class TestTheKillButtonOnAScrollingList(UiTest):
             # what is PAINTED is laid out at the width it is drawn in, whole
             painted = widget.painted.split("\n")[1]
             self.assertLessEqual(cell_len(painted), widget.content_region.width)
-            self.assertIn("[kill loop]", painted)
+            self.assertIn(ui.engine.UI_KILL, painted)
             col, width = self.button(widget)
-            self.assertEqual(width, len("[kill loop]"))
+            self.assertEqual(width, cell_len(ui.engine.UI_KILL))
             gutter = widget.content_region.x - widget.region.x
             async def screen_is(boxed, tries=40):
                 # a loaded machine can take more than one frame to push a screen
                 for _ in range(tries):
-                    if isinstance(app.screen, ui.ChoiceBox) == boxed:
+                    if isinstance(app.screen, ui.KillBox) == boxed:
                         return True
                     await pilot.pause(0.05)
                 return False

@@ -53,7 +53,7 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "project": "bold",
               "name": "",              # plain: this is the thing you are reading
               "meta": "dim",
-              "action": "bold underline",   # the one part of a row you click on its own
+              "action": "bold",        # the one part of a row you click on its own: no underline
               "detail": "bold",        # the › that opens the detail, not the jump
               "age": "bold",           # inside a dim line, the age stands out
               "recap": "dim",
@@ -353,7 +353,7 @@ class Row(Static):
     def text_width(self):
         """The cells the text is drawn in. Once laid out that is the row's own
         content width - which the list's scrollbar makes narrower: laid out any
-        wider, a full line lost its end, a [kill loop] button included."""
+        wider, a full line lost its end, a [kill stuck process…] button included."""
         try:
             drawn = self.content_region.width
         except Exception:       # the text is first built before the widget exists
@@ -573,10 +573,9 @@ class KillBox(ModalScreen):
 
 class ChoiceBox(ModalScreen):
     """What `x` can do to one session (the owner's D10, 2026-09-27): only the
-    choices that fit it, each a key and a line to click. A choice asks again on
-    its own before it acts - except the stuck loop's, whose line names what it
-    kills: this box is its question. Esc or ✕ closes; a key it does not offer
-    does nothing."""
+    choices that fit it, each a key and a line to click. Every choice asks again
+    on its own before it acts - the stuck items' `l` in the kill dialog about
+    them alone. Esc or ✕ closes; a key it does not offer does nothing."""
 
     DEFAULT_CSS = """
     ChoiceBox { align: center middle; }
@@ -1366,7 +1365,7 @@ class CcwhoUi(App):
         at = event.get_content_offset(widget)
         action = widget.action_at(at.x, at.y) if at is not None else None
         if action == "kill":
-            self.action_row_x()             # its box: the kill is asked about there
+            self.ask_loop_kill(self.selected_row())     # the dialog about it alone
             return
         if action == "detail":
             self.open_detail("brief")
@@ -1374,22 +1373,26 @@ class CcwhoUi(App):
         self._go()          # a click names its row, whatever the pane shows
 
     def row_choices(self, row):
-        """(choices, notes) for `x` on this row: its processes when it has some,
-        a stop when it runs in the background, its stuck loop when that is the
-        list's to kill."""
+        """(choices, notes) for `x` on this row, narrow to broad: its stuck
+        items first, with why (design review 2026-09-29), then its processes,
+        then a stop when it runs in the background."""
         row = row or {}
         choices, notes = [], []
+        stuck = engine.loop_kill_offered(row)
+        if stuck:
+            why = "".join(f"\n   {engine.dead_words(d)}" for d in row.get("dead_loops") or [])
+            choices.append(("l", f"{self.stuck_title(row)} - the session keeps running{why}"))
         if row.get("procs"):
             ports = " ".join(f":{p}" for p in row.get("ports") or [])
-            choices.append(("p", "kill its processes" + (f"  {ports}" if ports
-                                                          else f" ({row['procs']})")))
+            held = f"  {ports}" if ports else f" ({row['procs']})"
+            if stuck:       # beside the stuck item: all, and not all of it is stuck
+                choices.append(("p", f"kill all its processes{held} - some may not be stuck"))
+            else:
+                choices.append(("p", f"kill its processes{held}"))
         if row.get("kind") == "background":
             choices.append(("s", "stop the session - its conversation is kept"))
         else:
             notes.append("it runs in a window: to end it, end it there (/exit)")
-        if engine.loop_kill_offered(row):
-            pids = ", ".join(str(p) for p in self._pids(row))
-            choices.append(("l", f"kill the stuck loop {pids} - the session continues"))
         return choices, notes
 
     def check_action(self, action, parameters):
@@ -1435,27 +1438,85 @@ class CcwhoUi(App):
         elif key == "s":
             self.ask_stop(row)
         elif key == "l":
-            self.kill_loop_now(row)
+            now = self.still_stuck(row)
+            if now is None:
+                self.said("the session changed since the box opened - nothing killed; x again")
+                return
+            self.ask_loop_kill(now)
 
-    def kill_loop_now(self, row):
-        """The box named these loops: they go only while the row is the same -
-        the same session, the same loops, still the list's to kill."""
-        now = next((r for r in self.fleet.rows if r.get("sessionId") == row.get("sessionId")),
-                   None)
-        if (now is None or self._pids(now) != self._pids(row)
-                or not engine.loop_kill_offered(now)):
-            self.said("the session changed since the box opened - nothing killed; x again")
+    @staticmethod
+    def stuck_title(row):
+        """What a kill of the row's stuck items is called: one by its name,
+        more by their count."""
+        dead = row.get("dead_loops") or []
+        if len(dead) != 1:
+            return f"kill {len(dead)} stuck processes"
+        d = dead[0]
+        what = d.get("program") if d.get("kind") == "reader" else "loop"
+        return f"kill stuck {what} {d.get('pid')}"
+
+    def ask_loop_kill(self, row):
+        """The kill dialog about the row's stuck items alone: each with why it
+        can never end, and that the session keeps running - nothing else is
+        offered there (the owner, 2026-09-29). `y` kills them all."""
+        if self.detail_open and self.detail_mode == "procs":
+            self.action_row_nothing()   # that screen is not about the selected row
             return
-        if self.acting:
-            # a kill moves rows, and nothing moves while a window opens
-            self.said("a window is being opened - kill it after that")
+        if not row or not engine.loop_kill_offered(row):
             return
         if self.kill_busy:
             self.said("a kill is under way - finish that one first")
             return
-        self.kill_busy = True           # one kill at a time: killing() lets it go
-        self.said("killing...")
-        self.killing(now)
+        lines = []
+        for d in row.get("dead_loops") or []:
+            lines.append(f"{engine.dead_words(d)} - it will never end")
+            if d.get("kind") == "reader":
+                lines.append("  its whole task stops: the tool shell and what runs under it")
+        lines += ["", "the session keeps running"]
+        self.kill_busy = True
+        box = KillBox(self.stuck_title(row), lines, True)
+        box.on_kill = lambda: self.loop_kill_go(box, row)
+        self.push_screen(box, callback=self.kill_box_closed)
+
+    def still_stuck(self, row):
+        """The row as the list has it now, if it is the same - the same session,
+        the same stuck items (pid and start), still the list's to kill; else None."""
+        now = next((r for r in self.fleet.rows if r.get("sessionId") == row.get("sessionId")),
+                   None)
+        if (now is None or self._stuck_items(now) != self._stuck_items(row)
+                or not engine.loop_kill_offered(now)):
+            return None
+        return now
+
+    def loop_kill_go(self, box, row):
+        """`y` in the stuck dialog: its items go only while the row is the same."""
+        now = self.still_stuck(row)
+        if now is None:
+            box.show_result(["the session changed since the box opened - nothing killed;"
+                             " x again"])
+            return
+        if self.acting:
+            # a kill moves rows, and nothing moves while a window opens
+            box.show_result(["a window is being opened - nothing killed; kill it after that"])
+            return
+        self.loop_killing(box, now)
+
+    @work(thread=True)
+    def loop_killing(self, box, row):
+        try:
+            lines = self.collector.kill_loops(row)
+        except Exception as ex:         # its text may hold a path: the type only
+            lines = [f"could not kill ({type(ex).__name__}) - run ccwho ps"]
+        self.call_from_thread(box.show_result, lines)
+        # the list after the kill: what it took is gone from it. A read that
+        # fails leaves the last list up - the next tick tries again
+        try:
+            mine = self.call_from_thread(self.next_seq)
+            fleet = self.collector.fleet()
+            fleet.seq = mine
+            self.call_from_thread(self.show, fleet)
+        except Exception:
+            pass
 
     def ask_stop(self, row):
         """A background session: `ccwho stop`, after a box that says what it does."""
@@ -1486,30 +1547,10 @@ class CcwhoUi(App):
             pass
 
     @staticmethod
-    def _pids(row):
-        return tuple(d["pid"] for d in (row or {}).get("dead_loops") or [])
-
-    @work(thread=True)
-    def killing(self, row):
-        try:
-            said = self.collector.kill_loops(row)
-        except Exception as ex:         # its text may hold a path: the type only
-            said = f"could not kill ({type(ex).__name__}) - run ccwho ps"
-        # the list after the kill, and THEN what the kill did: the other order
-        # has the refresh wipe the answer before it can be read. A read that
-        # fails leaves the last list up - the next tick tries again
-        try:
-            mine = self.call_from_thread(self.next_seq)
-            fleet = self.collector.fleet()
-            fleet.seq = mine
-            self.call_from_thread(self.show, fleet)
-        except Exception:
-            pass
-        self.call_from_thread(self.loop_kill_done, said)    # the lock goes with it
-
-    def loop_kill_done(self, said):
-        self.kill_busy = False
-        self.said(said)
+    def _stuck_items(row):
+        """Each stuck item as the one you saw: its pid, and a reader's start - a
+        new reader on the same pid is not it."""
+        return tuple((d["pid"], d.get("start")) for d in (row or {}).get("dead_loops") or [])
 
     @on(events.DescendantFocus)
     def followed_focus(self, event):
@@ -2067,6 +2108,7 @@ class Collector:
                 (done.stdout + done.stderr).splitlines() if line.strip()]
 
     def kill_loops(self, row):
+        """What the kill did, one line per outcome, every outcome that applies."""
         pids = [d["pid"] for d in row.get("dead_loops") or []]
         readers = {d["pid"]: d for d in row.get("dead_loops") or []
                    if d.get("kind") == "reader"}
@@ -2076,25 +2118,29 @@ class Collector:
             killed = engine.kill_dead_loops(
                 row.get("pid"), pids, started={p: d.get("start") for p, d in readers.items()},
                 report=report)
-        except Exception as ex:
-            return f"could not kill: {ex}"
-        if not killed and report.get("unread"):
-            return "nothing killed: could not read the processes - try again"
-        if not killed and report.get("failed"):
-            return (f"nothing killed: could not signal {', '.join(str(p) for p in report['failed'])}"
-                    " - not permitted")
-        if not killed and report.get("unconfirmed"):
-            return (f"nothing killed: {', '.join(str(p) for p in report['unconfirmed'])}"
-                    " still runs, but did not look stuck just now - try again")
-        if not killed:
-            return "nothing killed: no loop there is stuck any more"
-        said = [f"stopped the task of {readers[p].get('program')} {p}"
-                for p in killed if p in readers]
+        except Exception as ex:         # its text may hold a path: the type only
+            return [f"could not kill ({type(ex).__name__}) - run ccwho ps"]
+        said = []
         loops = [str(p) for p in killed if p not in readers]
         if loops:
-            said.insert(0, "killed loop " + ", ".join(loops))
+            said.append("killed loop " + ", ".join(loops))
+        said += [f"stopped the task of {readers[p].get('program')} {p}"
+                 for p in killed if p in readers]
         said += [f"spared the agent {p}" for p in report.get("spared") or []]
-        return "; ".join(said)
+
+        def named(key):
+            return ", ".join(str(p) for p in report.get(key) or [])
+        if report.get("failed"):
+            said.append(f"could not signal {named('failed')} - not permitted")
+        if report.get("unconfirmed"):
+            said.append(f"{named('unconfirmed')} still runs, but did not look stuck"
+                        " just now - try again")
+        if report.get("unread"):
+            said.append("could not read the processes - try again")
+        if not killed:
+            said.insert(0, "nothing killed" if said else
+                        "nothing killed: no loop there is stuck any more")
+        return said
 
     def brief(self, row):
         head, tail, _ = engine.read_windows(row.get("sessionId", ""), cache=self.cache)

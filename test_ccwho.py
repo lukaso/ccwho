@@ -889,11 +889,33 @@ class TestStuckOnScreen(unittest.TestCase):
         text = "".join(t for t, _ in second)
         self.assertIn("loop 86246", text)
         self.assertIn("bscl8fc6k", text)
-        self.assertEqual([t for t, r in second if r == "action"], ["[kill loop]"])
+        self.assertEqual([t for t, r in second if r == "action"], [ccwho.UI_KILL])
+
+    def test_the_button_says_it_opens_a_dialog_about_the_stuck_process(self):
+        # the owner's words (design review 2026-09-29, decision 3): "…" - a box comes first
+        self.assertEqual(ccwho.UI_KILL, "[kill stuck process…]")
+
+    def test_the_count_of_more_survives_the_cut(self):
+        # the wider button left no room for "(+1 more)": you saw one stuck item
+        # of two until the box opened (review round 1, finding 1)
+        row = dict(self._row(), dead_loops=[
+            {"pid": 86246, "tasks": ["bscl8fc6k", "b2", "b3", "b4", "b5", "b6"]},
+            {"pid": 1, "tasks": ["x"]}])
+        for width in (60, 80, 100):
+            with self.subTest(width=width):
+                _, second = ccwho.ui_row_cells(row, width=width)
+                text = "".join(t for t, _ in second)
+                self.assertIn("(+1 more)", text)
+                self.assertIn(ccwho.UI_KILL, text)
+                self.assertEqual(sum(ccwho._cells(t) for t, _ in second), width)
+
+    def test_one_stuck_item_says_no_count(self):                        # control
+        _, second = ccwho.ui_row_cells(self._row(), width=80)
+        self.assertNotIn("more)", "".join(t for t, _ in second))
 
     def test_the_kill_survives_a_narrow_window(self):
         _, second = ccwho.ui_row_cells(self._row(), width=40)
-        self.assertEqual([t for t, r in second if r == "action"], ["[kill loop]"])
+        self.assertEqual([t for t, r in second if r == "action"], [ccwho.UI_KILL])
 
     def test_no_other_row_has_anything_to_click(self):                   # control
         for att in ("asks", "busy", "running", "stopped"):
@@ -1004,13 +1026,13 @@ class TestTheDetailIsOneClickAway(unittest.TestCase):
             with self.subTest(width=width):
                 _, second = ccwho.ui_row_cells(stuck, width=width)
                 roles = [r for _, r in second]
-                self.assertEqual([t for t, r in second if r == "action"], ["[kill loop]"])
+                self.assertEqual([t for t, r in second if r == "action"], [ccwho.UI_KILL])
                 self.assertLess(roles.index("action"), roles.index("detail"))
                 col, _ = self._col(second, "action")
                 self.assertEqual(ccwho.ui_action_at(stuck, width, 1, col), "kill")
 
     # pad, the gap before the kill, the kill, one cell, the arrow's half
-    KILL_FITS = 8 + 2 + len("[kill loop]") + 1 + 3
+    KILL_FITS = 8 + 2 + ccwho._cells(ccwho.UI_KILL) + 1 + 3
 
     def test_the_kill_stays_whole_down_to_its_own_width(self):
         # the loop's words give way, down to nothing - never the kill
@@ -1019,14 +1041,14 @@ class TestTheDetailIsOneClickAway(unittest.TestCase):
         for width in range(self.KILL_FITS, 41):
             with self.subTest(width=width):
                 _, second = ccwho.ui_row_cells(stuck, width=width)
-                self.assertIn(("[kill loop]", "action"), second)
+                self.assertIn((ccwho.UI_KILL, "action"), second)
                 self.assertEqual(second[-1], (ccwho.UI_DETAIL[1], "detail"))
                 self.assertEqual(sum(ccwho._cells(t) for t, _ in second), width)
 
     def test_below_that_there_is_no_room_for_it(self):                 # control
         stuck = self.rows()[-1]
         _, second = ccwho.ui_row_cells(stuck, width=self.KILL_FITS - 1)
-        self.assertNotIn(("[kill loop]", "action"), second)
+        self.assertNotIn((ccwho.UI_KILL, "action"), second)
 
     def test_the_zones_are_where_a_tagged_row_is_drawn(self):
         for row in self.rows():
@@ -1407,6 +1429,45 @@ class TestKillDeadReaders(unittest.TestCase):
         report = {}
         self._kill(peer="0x1", report=report, started={54329: "Sun Sep 27 09:00:00 2026"})
         self.assertEqual(report.get("unconfirmed"), [])
+
+    def _two(self, pids, extra=()):
+        """54329 proven and stopped with its task; the others asked for too."""
+        k, report, calls = self.machine(extra), {}, []
+
+        def starts():
+            calls.append(1)
+            return k.starts()
+        got = ccwho.kill_dead_loops(82755, list(pids), ps=k.ps, kill=k.kill, starts=starts,
+                                    unix=self.unix(), started={p: self.START for p in pids},
+                                    read=lambda path: None, matches=lambda a, f: False,
+                                    report=report)
+        return got, report, calls
+
+    def test_the_start_table_is_read_once_per_kill(self):
+        # a cat in another task, not proven: its start is checked on the same table
+        got, report, calls = self._two([54329, 90002], {90002: (90000, self.START, "cat")})
+        self.assertEqual(got, [54329])
+        self.assertEqual(report.get("unconfirmed"), [90002])
+        self.assertEqual(len(calls), 1)
+
+    def test_what_stopped_with_the_task_is_not_still_running(self):
+        # 54330 (tr) went with 54329's task: it is not "still runs" - it was
+        # signalled, and the kill says so (review round 1, finding 2)
+        got, report, _ = self._two([54329, 54330])
+        self.assertEqual(got, [54329, 54330])
+        self.assertEqual(report.get("unconfirmed"), [])
+
+    def test_a_listed_pid_not_in_the_task_is_not_said_killed(self):        # control
+        got, _, _ = self._two([54329, 90002], {90002: (90000, self.START, "cat")})
+        self.assertEqual(got, [54329])
+
+    def test_an_empty_start_table_for_an_unproven_reader_is_unread(self):
+        k, report = self.machine(), {}
+        ccwho.kill_dead_loops(82755, [54329], ps=k.ps, kill=k.kill, starts=lambda: {},
+                              unix=self.unix(peer="0x1"), started={54329: self.START},
+                              read=lambda path: None, matches=lambda a, f: False,
+                              report=report)
+        self.assertTrue(report.get("unread"))
 
     def test_a_start_table_that_said_nothing_is_unread(self):
         # every reader skipped for want of its start is not "no reader is stuck"

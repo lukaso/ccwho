@@ -840,15 +840,11 @@ class CcwhoUi(App):
         """Off the UI thread: `claude agents` can take 30s, and a list that
         freezes at the moment you reach for it is the problem this tool is about.
 
-        `exclusive` cancels the WORKER, not the thread already running inside it,
-        so a slow collection can still finish after a newer one - carrying a view
-        of the world that is already wrong. Each carries a number, and show()
-        keeps the highest.
-
-        And only one runs at a time. 2026-09-29: collections stuck on a slow
-        iTerm2 piled up, a new one every tick, each asking it again. A look
-        asked for while one runs sets `again`; the running one goes round once
-        more, so nothing asked for is lost.
+        Only one runs at a time (self.collecting). 2026-09-29: collections stuck
+        on a slow iTerm2 piled up, a new one every tick, each asking it again. A
+        look asked for while one runs sets `again`; the running one goes round
+        once more, so nothing asked for is lost. The numbers show() compares are
+        kept as a guard: they no longer race.
         """
         self.again = True           # set first: a runner finishing now sees it
         while self.again:
@@ -856,8 +852,7 @@ class CcwhoUi(App):
                 return
             try:
                 self.again = False
-                # numbered on the UI thread: two workers adding at once can share
-                # a number, and then the older picture can win
+                # numbered on the UI thread, where show() reads them
                 mine = self.call_from_thread(self.next_seq)
                 try:
                     fleet = self.collector.fleet()

@@ -24,6 +24,7 @@ import os
 import threading
 import time
 
+import ccwho_engine as engine
 import ccwho_setup as setup
 
 
@@ -110,13 +111,13 @@ def panel_window_id(uuid, timeout=5.0, procs=None):
     end repeat
   end repeat
 end tell'''
-    out = (setup.engine.iterm_ask(["-e", script], timeout=timeout, procs=procs) or "").strip()
+    out = (engine.iterm_ask(["-e", script], timeout=timeout, procs=procs) or "").strip()
     return int(out) if out.isdigit() else None
 
 
 def iterm_pid(procs=None):
     """The running iTerm2, found the way the Apple Event gate finds it."""
-    return setup.engine.iterm_app_pid(setup.engine.app_snapshot() if procs is None else procs)
+    return engine.iterm_app_pid(engine.app_snapshot() if procs is None else procs)
 
 
 class _Ax:
@@ -302,7 +303,7 @@ def pid_alive(pid):
 
 def _resolve(env):
     # one cheap table per look: this runs every RETRY_EVERY until it finds one
-    table = setup.engine.app_snapshot()
+    table = engine.app_snapshot()
     uuid, pid = session_uuid(env), iterm_pid(table)
     panel = panel_window_id(uuid, procs=table) if uuid and pid else None
     return (pid, panel) if pid and panel else None

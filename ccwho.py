@@ -123,21 +123,28 @@ ITERM_ACTION_DEADLINE = 20.0
 def launch_in_iterm(script, deadline, sids):
     """Run an osascript that starts sessions: (result, "") or (None, why).
 
-    A timeout, or -1712 from inside iTerm2, leaves the event queued there - a
-    killed osascript does not cancel it - so every claim in `sids` stays
-    claimed (claim_unresolved): a retry now would start them twice."""
+    Every claim in `sids` is marked unresolved BEFORE the event is sent, keyed
+    to the iTerm2 it goes to: a timeout, -1712 from inside iTerm2, Ctrl-C or a
+    closed terminal leaves the event queued there - a killed osascript does not
+    cancel it - and a retry would start the session twice. Only a definite
+    answer gives the claims back to their launcher. A launch that cannot be
+    recorded is not sent."""
+    iterm = engine.iterm_app_pid(engine.app_snapshot())
+    now = time.time()
+    if not all(claim_unresolved(sid, now=now, iterm_pid=iterm) for sid in sids):
+        return None, f"could not record the launch under {ccwho_dir()} - not sending it"
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
                            timeout=deadline)
     except subprocess.TimeoutExpired:
-        for sid in sids:
-            claim_unresolved(sid)
         return None, f"iTerm2 did not answer in {deadline:g}s"
     except OSError as ex:
-        return None, f"could not drive iTerm2: {ex}"
-    if r.returncode != 0 and "(-1712)" in (r.stderr or ""):
         for sid in sids:
-            claim_unresolved(sid)
+            claim_resolved(sid)            # nothing was sent
+        return None, f"could not drive iTerm2: {ex}"
+    if not (r.returncode != 0 and engine.ae_error_code(r.stderr) == engine.AE_TIMED_OUT):
+        for sid in sids:
+            claim_resolved(sid)
     return r, ""
 
 
@@ -921,25 +928,55 @@ def _pid_alive(pid):
     return True
 
 
-def claim_unresolved(session_id, now=None, iterm_pid=False):
-    """Keep a claim after its launcher gave up: the killed osascript's event may
-    still run inside iTerm2. Held while THAT iTerm2 lives - its queue goes with
-    it - or, if it cannot be named, for the usual claim time. Written whole
-    (temp file, then rename): a reader never sees it half written."""
-    now = time.time() if now is None else now
-    if iterm_pid is False:
-        iterm_pid = engine.iterm_app_pid(engine.app_snapshot())
+def _write_claim(session_id, record):
+    """Written whole (temp file, then rename): a reader never sees it half done."""
     d = os.path.join(ccwho_dir(), "launching")
     path = os.path.join(d, f"{session_id}.json")
     try:
         os.makedirs(d, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as fh:
-            json.dump({"pid": os.getpid(), "since": now, "sessionId": session_id,
-                       "unresolved": True, "iterm_pid": iterm_pid}, fh)
+            json.dump(record, fh)
         os.replace(tmp, path)
     except OSError:
-        pass
+        return False
+    return True
+
+
+def claim_unresolved(session_id, now=None, iterm_pid=False):
+    """Mark a claim as a launch that may still run inside iTerm2 - a killed
+    osascript does not cancel its event. Held while THAT iTerm2 lives and has
+    answered nothing since, or, if it cannot be named, for the usual claim time.
+    True when it is on disk."""
+    now = time.time() if now is None else now
+    if iterm_pid is False:
+        iterm_pid = engine.iterm_app_pid(engine.app_snapshot())
+    return _write_claim(session_id, {"pid": os.getpid(), "since": now, "sessionId": session_id,
+                                     "unresolved": True, "iterm_pid": iterm_pid})
+
+
+def claim_resolved(session_id, now=None):
+    """The launch was answered: back to an ordinary claim, held by its launcher."""
+    now = time.time() if now is None else now
+    return _write_claim(session_id, {"pid": os.getpid(), "since": now, "sessionId": session_id})
+
+
+def claim_is_unresolved(session_id):
+    try:
+        with open(os.path.join(ccwho_dir(), "launching", f"{session_id}.json")) as fh:
+            return json.load(fh).get("unresolved") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def release_claims(session_ids):
+    """Sessions seen running: whatever launched them is done - their claims go."""
+    for sid in session_ids:
+        if sid and engine._SESSION_ID.match(str(sid)):
+            try:
+                os.remove(os.path.join(ccwho_dir(), "launching", f"{sid}.json"))
+            except OSError:
+                pass
 
 
 def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
@@ -969,8 +1006,13 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
                 rec = json.load(fh)
             young = now - float(rec.get("since", 0)) < LAUNCH_CLAIM_SECONDS
             if rec.get("unresolved") is True and type(rec.get("iterm_pid")) is int:
-                # its event may still run: held while that iTerm2 lives
-                held = alive(rec["iterm_pid"])
+                # its event may still run: held while that iTerm2 lives and has
+                # answered nothing since - an answer means its queue was empty
+                ip = rec["iterm_pid"]
+                held = alive(ip) and not engine.iterm_answered_since(ip, float(rec.get("since", 0)))
+                if held and alive is _pid_alive:
+                    # and it IS that iTerm2, not a process that reused its pid
+                    held = engine.iterm_app_pid(engine.app_snapshot()) == ip
             elif rec.get("unresolved") is True:
                 held = young
             else:
@@ -1021,6 +1063,7 @@ def open_session(argv):
     sid = (argv[0] if argv else "").strip()
     status = {}
     rows, _ = engine.collect(cache={}, status=status)
+    release_claims(r.get("sessionId") for r in rows)     # running: their launch is done
     action, value = engine.resolve_open(sid, rows, known_entries(),
                                         source_ok=status.get("source_ok", False))
     if action == "jump":
@@ -1056,8 +1099,13 @@ def open_session(argv):
             print(f"ccwho open: not reopening {sid} - {why}", file=sys.stderr)
             return 1
         if not claim_launch(sid):
-            print(f"ccwho open: {sid} is already starting in another window"
-                  " - not launching it twice.", file=sys.stderr)
+            if claim_is_unresolved(sid):
+                print(f"ccwho open: not launching {sid} again - an earlier launch timed out"
+                      " inside iTerm2 and may still run. If it does not appear, restart"
+                      " iTerm2.", file=sys.stderr)
+            else:
+                print(f"ccwho open: {sid} is already starting in another window"
+                      " - not launching it twice.", file=sys.stderr)
             return 1
         res, why = launch_in_iterm(engine.iterm_run_script(value), ITERM_ACTION_DEADLINE, [sid])
         if res is None:
@@ -2152,8 +2200,8 @@ def save(argv):
         return 1
     panes = engine.panes_snapshot()
     # iTerm2 not asked (None): keep the panes the last save knew
-    known = ({e_.get("sessionId"): e_ for e_ in newest_manifest().get("sessions", [])
-              if isinstance(e_, dict)} if panes is None else None)
+    known = ({e_.get("sessionId"): e_ for e_ in engine.manifest_entries(newest_manifest())
+              if isinstance(e_.get("sessionId"), str)} if panes is None else None)
     man = engine.manifest_from_rows(rows, why_not=save_problem, panes=panes, known=known)
     if man["count"] == 0:
         # Writing this would only push a manifest that HAS something out of the
@@ -2361,6 +2409,7 @@ def restore(argv):
         entries = engine.manifest_entries(man)
         status = {}
         live, _ = engine.collect(cache={}, status=status)
+        release_claims(r.get("sessionId") for r in live)     # running: their launch is done
         source_ok = status.get("source_ok", False)
         if not source_ok:
             print("ccwho restore: cannot read the live session list - not reopening"

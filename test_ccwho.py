@@ -7072,18 +7072,16 @@ class TestAReusedTerminalLosesItsOldName(unittest.TestCase):
 
     def test_a_terminal_with_a_new_first_process_loses_its_name(self):
         cache = {}
-        ccwho.titles_cached(cache, now=1000.0, procs=procs(
-            (300, "ttys022", 0, "login"), (400, "ttys030", 0, "login")))
-        names = ccwho.titles_cached(cache, now=1010.0, procs=procs(
-            (900, "ttys022", 0, "login"), (400, "ttys030", 0, "login")))
+        ccwho.titles_cached(cache, now=1000.0, owners={"ttys022": 300, "ttys030": 400})
+        names = ccwho.titles_cached(cache, now=1010.0, owners={"ttys022": 900, "ttys030": 400})
         self.assertEqual(names, {"ttys030": "other tab"})
         self.assertEqual(len(self.calls), 1, "no new ask for it")
 
     def test_the_same_terminals_keep_their_names(self):                 # control
         cache = {}
-        table = procs((300, "ttys022", 0, "login"), (301, "ttys022", ME, "zsh"))
-        ccwho.titles_cached(cache, now=1000.0, procs=table)
-        self.assertEqual(ccwho.titles_cached(cache, now=1010.0, procs=table)["ttys022"], "old tab")
+        ccwho.titles_cached(cache, now=1000.0, owners={"ttys022": 300})
+        self.assertEqual(ccwho.titles_cached(cache, now=1010.0, owners={"ttys022": 300})["ttys022"],
+                         "old tab")
 
     def test_an_answer_with_no_tabs_is_kept_for_the_minute(self):
         # iTerm2 open with no windows answers "" - asking on every tick for it
@@ -7091,18 +7089,18 @@ class TestAReusedTerminalLosesItsOldName(unittest.TestCase):
         self.reply = {}
         cache = {}
         for i in range(10):
-            ccwho.titles_cached(cache, now=1000.0 + i, procs="")
+            ccwho.titles_cached(cache, now=1000.0 + i)
         self.assertEqual(len(self.calls), 1)
 
     def test_a_refused_refresh_keeps_the_names_it_had(self):
         cache = {}
-        table = procs((300, "ttys022", 0, "login"), (900, "ttys040", 0, "login"))
-        ccwho.titles_cached(cache, now=1000.0, procs=table)
+        owners = {"ttys022": 300, "ttys040": 900}
+        ccwho.titles_cached(cache, now=1000.0, owners=owners)
         self.reply = None                               # the gate would not ask
-        self.assertEqual(ccwho.titles_cached(cache, now=1061.0, procs=table).get("ttys022"),
+        self.assertEqual(ccwho.titles_cached(cache, now=1061.0, owners=owners).get("ttys022"),
                          "old tab")
         self.reply = {"ttys022": "new"}
-        self.assertEqual(ccwho.titles_cached(cache, now=1062.0, procs=table), {"ttys022": "new"},
+        self.assertEqual(ccwho.titles_cached(cache, now=1062.0, owners=owners), {"ttys022": "new"},
                          "a refusal must not count as the minute's ask")
 
 
@@ -7136,3 +7134,135 @@ class TestTheRealTablesNameTheProgramNotItsArgv0(unittest.TestCase):
         time.sleep(0.2)
         for table in (REAL_APP_SNAPSHOT(), REAL_TTY_SNAPSHOT()):
             self.assertEqual(ccwho.parse_procs(table)[fake.pid][2], "sleep")
+
+
+
+class TestATabIsItsPaneProcess(unittest.TestCase):
+    """A tab's identity, for keeping its name: the process iTerm2 (or its
+    daemon) started on that tty - not the lowest pid on it. pids wrap at 99999:
+    measured 2026-09-29, 8 of 26 panes had a command with a lower pid than the
+    pane, and each one that came and went dropped the tab's name."""
+
+    def owners(self, *extra):
+        p = procs((100, "??", ME, IT), (200, "??", ME, SERVER),
+                  (78437, "ttys045", 0, "login"), *extra)
+        out = ps((100, 1, APP), (200, 1, DAEMON_CMD), (78437, 200, LOGIN),
+                 *[(pid, 78437, "git status") for pid, _t, _u, _c in extra])
+        return ccwho.pane_owners(out, p)
+
+    def test_a_command_with_a_lower_pid_does_not_change_the_tab(self):
+        self.assertEqual(self.owners((38200, "ttys045", ME, "git")), {"ttys045": 78437})
+        self.assertEqual(self.owners(), {"ttys045": 78437})
+
+    def test_a_new_pane_on_the_same_tty_is_a_new_tab(self):              # control
+        p = procs((100, "??", ME, IT), (200, "??", ME, SERVER), (91000, "ttys045", 0, "login"))
+        out = ps((100, 1, APP), (200, 1, DAEMON_CMD), (91000, 200, LOGIN))
+        self.assertEqual(ccwho.pane_owners(out, p), {"ttys045": 91000})
+
+
+class TestTheLastErrorCodeIsTheError(unittest.TestCase):
+    """osascript's error message can quote data - a -1728 lists the session
+    names, and any program in a pane sets its own name. Only the code that ends
+    the message is the error."""
+
+    def test_a_quoted_code_is_not_the_error(self):
+        err = '32:38: execution error: Can’t get item 3 of {"build (-1712)", "b"}. (-1728)\n'
+        self.assertEqual(ccwho.ae_error_code(err), "-1728")
+
+    def test_the_code_at_the_end_is(self):                               # control
+        self.assertEqual(ccwho.ae_error_code("execution error: AppleEvent timed out. (-1712)\n"), "-1712")
+        self.assertIsNone(ccwho.ae_error_code(""))
+
+
+class TestTheGateRemembersWhoLastAnswered(unittest.TestCase):
+    """An answer from iTerm2 means its queue was drained: a launch left
+    unresolved before it is no longer waiting in there."""
+
+    # the gate fixture, borrowed - not inherited, or its tests run here twice
+    _F = TestBackgroundAsksNeverPileUpInITerm2
+    setUp, stub, launches, table, state, ask, until, ended = (
+        _F.setUp, _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+
+    def test_an_answer_is_recorded_with_its_pid_and_time(self):
+        self.stub("echo ok")
+        before = time.time()
+        self.assertEqual(self.ask(pid=4242), "ok\n")
+        self.assertTrue(ccwho.iterm_answered_since(4242, before - 1))
+        self.assertFalse(ccwho.iterm_answered_since(4242, time.time() + 10))
+        self.assertFalse(ccwho.iterm_answered_since(999, before - 1))           # control
+
+    def test_a_quoted_code_does_not_quarantine(self):
+        self.stub('echo \'execution error: Can’t get item 3 of {"x (-1712)"}. (-1728)\' >&2; exit 1')
+        why = {}
+        self.assertIsNone(self.ask(why=why))
+        self.assertEqual(why.get("error"), "-1728")
+        self.stub("echo ok")
+        self.assertEqual(self.ask(now=time.time() + 31), "ok\n", "quarantined on a quoted code")
+
+    def test_a_caller_that_may_wait_does_not_queue_behind_a_slow_ask(self):
+        # the ask in flight already timed out: waiting for it only freezes the
+        # caller - the answer after it is a refusal anyway
+        self.stub("sleep 3; echo late")
+        self.assertIsNone(self.ask(timeout=0.2))
+        start, why = time.time(), {}
+        self.assertIsNone(self.ask(wait=3, why=why))
+        self.assertLess(time.time() - start, 0.5)
+        self.assertFalse(why.get("asked"))
+
+    def test_an_error_pauses_from_when_it_came_back(self):
+        self.stub('sleep 0.5; echo "Not authorized (-1743)" >&2; exit 1')
+        start = time.time()
+        self.assertIsNone(self.ask())
+        with open(self.state("json")) as f:
+            wait = json.load(f)["wait_until"]
+        self.assertGreaterEqual(wait, start + ccwho.ASK_WAIT_AFTER_ERROR + 0.4)
+
+
+class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
+    """The pane-filling script catches errors so one closed pane does not stop
+    the rest. A write that timed out (-1712) is not a closed pane: caught, it
+    reads as "missed" and the session gets launched a second time."""
+
+    def test_a_timeout_inside_the_fill_is_raised(self):
+        sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+        script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+                                         fill={sid: "U-1"})
+        self.assertIn("on error errMsg number errNum", script)
+        self.assertIn("if errNum is -1712 then error errMsg number errNum", script)
+
+
+class TestASaveTakesTheTabNameFromThePanes(unittest.TestCase):
+    """A save's names ask can meet a busy gate while its panes ask, which waits,
+    is answered - with every tab's name in it."""
+
+    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": ""}
+
+    def test_a_row_without_a_name_takes_the_pane_s(self):
+        man = ccwho.manifest_from_rows([self.ROW], panes={"ttys022": {"pane": "U", "name": "my tab"}})
+        self.assertEqual(man["sessions"][0]["tabTitle"], "my tab")
+
+    def test_a_row_with_a_name_keeps_it(self):                           # control
+        row = dict(self.ROW, tab_title="its own")
+        man = ccwho.manifest_from_rows([row], panes={"ttys022": {"pane": "U", "name": "my tab"}})
+        self.assertEqual(man["sessions"][0]["tabTitle"], "its own")
+
+
+class TestCollectDropsTheNameOfAReplacedPane(MachinelessCollect):
+    """collect() gives the tab-name cache each tty's pane process."""
+
+    def test_a_new_pane_on_the_tty_loses_the_old_name(self):
+        ccwho.titles_snapshot = lambda timeout=5.0, **k: {"ttys045": "old tab"}
+        real = ccwho.agents_json
+        self.addCleanup(setattr, ccwho, "agents_json", real)
+        ccwho.agents_json = lambda: json.dumps([{"sessionId": "aaa", "pid": 501, "cwd": "/x", "status": "idle"}])
+        cache = {}
+
+        def world(pane):
+            ccwho.ps_snapshot = lambda: ps((100, 1, APP), (200, 1, DAEMON_CMD), (pane, 200, LOGIN),
+                                           (501, pane, "claude"))
+            ccwho.tty_snapshot = lambda: procs((100, "??", ME, IT), (200, "??", ME, SERVER),
+                                               (pane, "ttys045", 0, "login"), (501, "ttys045", ME, "claude"))
+            return ccwho.collect(cache=cache)[0][0]["tab_title"]
+        self.assertEqual(world(300), "old tab")
+        self.assertEqual(world(300), "old tab")                                  # control
+        self.assertEqual(world(900), "", "a new pane kept the old tab's name")

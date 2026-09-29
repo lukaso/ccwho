@@ -1346,6 +1346,15 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
         self.fake(None, asked=True, error="-1743")
         self.assertIs(setup.iterm_scriptable(), False)
 
+    def test_a_gate_that_cannot_write_its_state_is_not_knowing(self):
+        # ~/.cache/ccwho unwritable: Automation is not the fix for that
+        self.fake(None, refused="io")
+        self.assertIsNone(setup.iterm_scriptable())
+
+    def test_doctor_names_the_state_dir_when_it_could_not_ask(self):
+        check = next(c for c in setup.doctor_checks({"iterm_ok": None}) if c["name"] == "iterm2")
+        self.assertIn("~/.cache/ccwho", " ".join(str(v) for v in check.values()))
+
     def test_no_iterm2_is_a_no(self):                                   # control
         self.fake(None, refused="no-iterm")
         self.assertIs(setup.iterm_scriptable(), False)

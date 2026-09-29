@@ -84,7 +84,7 @@ def doctor_checks(facts):
         out.append(_check(
             "iterm2", False,
             "not answering Apple Events - ccwho has stopped asking it for tab names",
-            "restart iTerm2"))
+            "restart iTerm2; if that does not help, check ~/.cache/ccwho is yours and writable"))
     else:
         out.append(_check(
             "iterm2", bool(facts.get("iterm_ok")),
@@ -327,20 +327,19 @@ def iterm_scriptable(timeout=5.0):
     already in flight.
 
     False: not running, or refused (-1743 errAEEventNotPermitted, now or in the
-    pause after it) - the Automation fix. None: running but not answering Apple
-    Events - stuck (-1712), its own ask timed out, or the gate is holding off.
-    Restarting iTerm2 is the fix for that, not System Settings.
+    pause after it) - the Automation fix. None: running but not answered - stuck
+    (-1712), its own ask timed out, the gate is holding off, or ccwho cannot
+    write its gate state in ~/.cache/ccwho. Restarting iTerm2 (or fixing that
+    dir) is the fix, not System Settings.
     """
     why = {}
     out = engine.iterm_ask(["-e", 'tell application "iTerm2" to count windows'],
                            timeout=timeout, wait=SCRIPTABLE_WAIT, why=why)
     if out is not None:
         return out.strip().isdigit()
-    if why.get("error") == "-1743" or why.get("refused") in ("no-iterm", "io"):
+    if why.get("error") == engine.AE_NOT_PERMITTED or why.get("refused") == "no-iterm":
         return False
-    if why.get("refused") in ("stuck", "busy", "waiting") or why.get("error") in ("-1712", "timeout"):
-        return None
-    return False
+    return None         # stuck, silent, busy, waiting, or its state dir unwritable
 
 
 def handler_candidates(app_path=None):

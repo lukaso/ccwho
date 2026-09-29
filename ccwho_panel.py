@@ -116,13 +116,8 @@ end tell'''
 
 
 def iterm_pid(timeout=5.0):
-    try:
-        done = subprocess.run(["pgrep", "-x", "iTerm2"],
-                              capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    pids = (done.stdout or "").split()
-    return int(pids[0]) if pids else None
+    """The running iTerm2, found the way the Apple Event gate finds it."""
+    return setup.engine.iterm_app_pid(setup.engine.tty_snapshot())
 
 
 class _Ax:

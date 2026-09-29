@@ -79,11 +79,18 @@ def doctor_checks(facts):
         else "update ccwho (brew upgrade ccwho); if it persists, Claude Code changed the"
         " file format - report it"))
 
-    out.append(_check(
-        "iterm2", bool(facts.get("iterm_ok")),
-        "scriptable" if facts.get("iterm_ok") else
-        "not running or not scriptable - no tab names, and `go` cannot focus a window",
-        "start iTerm2, and allow it under System Settings > Privacy > Automation"))
+    if facts.get("iterm_ok", False) is None:
+        # the gate would not ask: iTerm2 is not answering Apple Events
+        out.append(_check(
+            "iterm2", False,
+            "not answering Apple Events - ccwho has stopped asking it for tab names",
+            "restart iTerm2"))
+    else:
+        out.append(_check(
+            "iterm2", bool(facts.get("iterm_ok")),
+            "scriptable" if facts.get("iterm_ok") else
+            "not running or not scriptable - no tab names, and `go` cannot focus a window",
+            "start iTerm2, and allow it under System Settings > Privacy > Automation"))
 
     out.append(_check(
         "ccwho:// handler", bool(facts.get("handler_registered")),
@@ -307,6 +314,9 @@ def _session_files_bad():
         return "error"
 
 
+SCRIPTABLE_WAIT = 3.0     # a background ask in flight takes about 0.6 s
+
+
 def iterm_scriptable(timeout=5.0):
     """Can we ASK iTerm2 something? Not "is it running".
 
@@ -315,8 +325,13 @@ def iterm_scriptable(timeout=5.0):
     the tab names and `go` stop working. So ask iTerm2 itself, for the cheapest
     thing it knows, and treat any failure as no.
     """
+    why = {}
     out = engine.iterm_ask(["-e", 'tell application "iTerm2" to count windows'],
-                           timeout=timeout)
+                           timeout=timeout, wait=SCRIPTABLE_WAIT, why=why)
+    if out is None and not why.get("asked") and engine.iterm_app_pid(engine.tty_snapshot()):
+        # iTerm2 runs, but the gate did not ask it: an ask stuck in flight, or an
+        # iTerm2 that stopped answering Apple Events. Not an Automation refusal
+        return None
     return bool(out) and out.strip().isdigit()
 
 

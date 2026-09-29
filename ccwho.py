@@ -115,8 +115,14 @@ def unknown_flags(argv):
 # at a time by nature, unlike the background asks behind engine.iterm_ask - but
 # never without a deadline: an osascript with none waits as long as a stuck
 # iTerm2 does, which is forever (2026-09-29).
+# 20 s, not the list's 5 (FOCUS_DEADLINE): a command waits where you typed it,
+# while the list must stay responsive and says so on the screen.
 ITERM_ACTION_DEADLINE = 20.0
-RESTORE_DEADLINE = 120.0        # a window per session, dozens of them
+
+
+def restore_deadline(windows):
+    """A window per session, dozens of them: time for each, not one for all."""
+    return 30.0 + 5.0 * max(1, windows)
 
 
 def jump(argv):
@@ -890,6 +896,18 @@ def _pid_alive(pid):
     return True
 
 
+def claim_unresolved(session_id, now=None):
+    """Keep a claim after its launcher gives up: the launch may still happen."""
+    now = time.time() if now is None else now
+    path = os.path.join(ccwho_dir(), "launching", f"{session_id}.json")
+    try:
+        with open(path, "w") as fh:
+            json.dump({"pid": os.getpid(), "since": now, "sessionId": session_id,
+                       "unresolved": True}, fh)
+    except OSError:
+        pass
+
+
 def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
     """Claim the right to start THIS session, across processes. True if we got it.
 
@@ -915,8 +933,10 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
         try:
             with open(path) as fh:
                 rec = json.load(fh)
-            held = alive(rec.get("pid")) and (now - float(rec.get("since", 0))
-                                              < LAUNCH_CLAIM_SECONDS)
+            # an unresolved launch - its osascript timed out, and a killed
+            # osascript does not cancel the event - holds after its launcher exits
+            held = ((alive(rec.get("pid")) or rec.get("unresolved") is True)
+                    and now - float(rec.get("since", 0)) < LAUNCH_CLAIM_SECONDS)
         except (OSError, ValueError, TypeError):
             held = False          # unreadable claim is no claim
         if held:
@@ -997,6 +1017,7 @@ def open_session(argv):
             res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
                                  capture_output=True, text=True, timeout=ITERM_ACTION_DEADLINE)
         except subprocess.TimeoutExpired:
+            claim_unresolved(sid)
             print(f"ccwho open: iTerm2 did not answer in {ITERM_ACTION_DEADLINE:g}s",
                   file=sys.stderr)
             return 1
@@ -2357,7 +2378,7 @@ def restore(argv):
             print(f"opening {n} iTerm2 window(s)...")
         try:
             r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
-                               timeout=RESTORE_DEADLINE)
+                               timeout=restore_deadline(n + len(fill)))
         except (OSError, subprocess.SubprocessError) as ex:
             print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
             return 1
@@ -2376,7 +2397,7 @@ def restore(argv):
             again = engine.iterm_open_script(missed)
             try:
                 r2 = subprocess.run(["osascript", "-e", again], capture_output=True, text=True,
-                                    timeout=RESTORE_DEADLINE)
+                                    timeout=restore_deadline(len(missed)))
             except (OSError, subprocess.SubprocessError) as ex:
                 print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
                 return 1

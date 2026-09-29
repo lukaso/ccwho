@@ -4164,6 +4164,27 @@ class TestAStuckITerm2IsSaidNotRaised(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("did not answer", out)
 
+    def test_attaching_says_iterm2_did_not_answer(self):
+        self.live = [{"sessionId": self.SID, "tty": "", "pid": 90266, "kind": "background"}]
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertIn("did not answer", out)
+
+    def test_a_reopen_that_timed_out_keeps_its_claim(self):
+        # the killed osascript's event can still run in iTerm2: a retry inside
+        # the claim window would start the session twice - a forked conversation
+        self._open(self.SID)
+        dead = lambda pid: False                        # this CLI has exited
+        self.assertFalse(runner.claim_launch(self.SID, alive=dead),
+                         "a retry could launch it a second time")
+
+    def test_a_reopen_that_worked_leaves_a_claim_that_ends_with_it(self):   # control
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        runner.subprocess.run = lambda *a, **k: Done()      # osascript answers
+        self._open(self.SID)
+        self.assertTrue(runner.claim_launch(self.SID, alive=lambda pid: False))
+
     def test_jumping_says_iterm2_did_not_answer(self):
         self.live = [{"sessionId": self.SID, "pid": 42, "tty": "ttys032",
                       "title": "t", "name": "n", "project": "liveapp"}]
@@ -4196,3 +4217,13 @@ class TestWhatYouAskForSkipsTheGate(unittest.TestCase):
         rc, out = self._open(self.SID)
         self.assertEqual(rc, 0, out)
         self.assertIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+
+class TestARestoreHasTimeForEveryWindow(unittest.TestCase):
+    """One deadline for one window or forty: forty at a few seconds each would
+    be killed half way, its output - which panes it filled - lost."""
+
+    def test_the_deadline_grows_with_the_windows(self):
+        self.assertGreaterEqual(runner.restore_deadline(1), 30)
+        self.assertGreaterEqual(runner.restore_deadline(40), 40 * 5)
+        self.assertGreater(runner.restore_deadline(40), runner.restore_deadline(1))

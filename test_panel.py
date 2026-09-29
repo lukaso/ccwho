@@ -8,6 +8,7 @@ The sequences below are the ones logged on a real machine (macOS 26.6, iTerm2
     FocusedWindow 21541  +0.22s    macOS finishes activating iTerm2 and
     Activated            +0.001s   hands focus back to the window it had
 """
+import os
 import unittest
 
 import ccwho_panel as panel
@@ -302,3 +303,20 @@ class ThePanelWindowIsABackgroundAsk(unittest.TestCase):
     def test_no_answer_is_no_window(self):                              # control
         panel.setup.engine.iterm_ask = lambda *a, **k: None
         self.assertIsNone(panel.panel_window_id("ABC-123"))
+
+
+class ThePanelFindsITerm2LikeTheGate(unittest.TestCase):
+    """One way to find the iTerm2 app: its executable, and ours."""
+
+    def test_the_pid_comes_from_the_executable_table(self):
+        real = (panel.setup.engine.tty_snapshot, panel.subprocess.run)
+        self.addCleanup(lambda: (setattr(panel.setup.engine, "tty_snapshot", real[0]),
+                                 setattr(panel.subprocess, "run", real[1])))
+
+        def direct(*a, **k):
+            raise AssertionError("pgrep run: the table was already there")
+        panel.subprocess.run = direct
+        panel.setup.engine.tty_snapshot = lambda: (
+            "  PID TTY UID COMM\n"
+            f"4242 ?? {os.getuid()} /Applications/iTerm.app/Contents/MacOS/iTerm2\n")
+        self.assertEqual(panel.iterm_pid(), 4242)

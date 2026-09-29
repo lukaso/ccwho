@@ -1300,3 +1300,43 @@ class TestDoctorSaysWhereUsageComesFrom(unittest.TestCase):
     def test_no_usage_facts_adds_no_check(self):
         names = by_name(setup.doctor_checks(facts()))
         self.assertFalse([n for n in names if n.startswith("usage")])
+
+
+class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
+    """The check asks through the background gate. A gate that said no - an ask
+    in flight, or an iTerm2 that stopped answering - is not an Automation
+    refusal, and must not send you to System Settings."""
+
+    def setUp(self):
+        self.addCleanup(setattr, setup.engine, "iterm_ask", setup.engine.iterm_ask)
+
+    def fake(self, out, asked):
+        def ask(args, timeout=5.0, why=None, **k):
+            if why is not None:
+                why["asked"] = asked
+            self.kw = k
+            return out
+        setup.engine.iterm_ask = ask
+
+    def test_a_refused_ask_is_not_knowing(self):
+        self.fake(None, asked=False)
+        self.assertIsNone(setup.iterm_scriptable())
+
+    def test_it_waits_a_moment_for_a_busy_gate(self):
+        self.fake("3\n", asked=True)
+        setup.iterm_scriptable()
+        self.assertGreater(self.kw.get("wait", 0), 0)
+
+    def test_an_ask_that_failed_is_a_no(self):                          # control
+        self.fake(None, asked=True)
+        self.assertIs(setup.iterm_scriptable(), False)
+
+    def test_doctor_says_restart_not_automation_when_it_could_not_ask(self):
+        check = next(c for c in setup.doctor_checks({"iterm_ok": None}) if c["name"] == "iterm2")
+        text = " ".join(str(v) for v in check.values())
+        self.assertNotIn("Automation", text)
+        self.assertIn("restart iTerm2", text)
+
+    def test_doctor_still_names_automation_when_iterm2_refused(self):   # control
+        check = next(c for c in setup.doctor_checks({"iterm_ok": False}) if c["name"] == "iterm2")
+        self.assertIn("Automation", " ".join(str(v) for v in check.values()))

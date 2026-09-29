@@ -1189,8 +1189,9 @@ def match_rows(rows, query):
 #     osascript child itself until it exits. It is never killed.
 #   - an event that timed out INSIDE iTerm2 (-1712) means that iTerm2 is stuck:
 #     no background ask reaches it again until it is a different process.
-#   - any other failure waits ASK_WAIT_AFTER_ERROR.
-# Things you do (jump, run, restore) are not background asks and do not come
+#   - a caller that gave up waiting, or any other failure, waits
+#     ASK_WAIT_AFTER_ERROR: a slow iTerm2 must not always have an event in flight.
+# Things you do (jump, open, restore) are not background asks and do not come
 # here: they are one at a time by nature.
 
 ITERM_STATE_DIR = os.path.expanduser("~/.cache/ccwho")
@@ -1198,16 +1199,39 @@ OSASCRIPT = "osascript"
 ASK_WAIT_AFTER_ERROR = 30.0
 _AE_TIMED_OUT = "(-1712)"
 # $0 is osascript, $1 the state dir. Output goes to files: a pipe nobody reads
-# any more fills at 64 KB, and the child - holding the lock - never exits.
+# any more fills at 64 KB, and the child - holding the lock - never exits. The
+# status is written last, so it exists only for an ask that ran to its end.
 _ASK_SH = ('d="$1"; shift; "$0" "$@" >"$d/iterm-ae.out" 2>"$d/iterm-ae.err"; '
            'echo $? >"$d/iterm-ae.status"')
 
 
-def iterm_app_pid(ps_output):
-    """The running iTerm2 app, from `ps -eo pid,ppid,command`, or None."""
-    for pid, _ppid, cmd in _ps_rows(ps_output):
-        if pid.isdigit() and _ITERM_APP.search(cmd):
-            return int(pid)
+def parse_procs(procs_output):
+    """pid -> (tty, uid, executable) from `ps -eo pid,tty,uid,comm`. The
+    executable is the program that runs, not a command line anyone can type:
+    `tail -f .../MacOS/iTerm2` is tail."""
+    out = {}
+    for line in (procs_output or "").splitlines():
+        f = line.split(None, 3)
+        if len(f) < 4 or not f[0].isdigit() or not f[2].isdigit():
+            continue
+        out[int(f[0])] = ("" if f[1] in ("??", "?", "-") else f[1], int(f[2]), f[3].strip())
+    return out
+
+
+def _is_iterm_app(exe):
+    return os.path.basename(exe) == "iTerm2"          # whatever the bundle is called
+
+
+def _is_iterm_daemon(exe):
+    return os.path.basename(exe).startswith("iTermServer-")
+
+
+def iterm_app_pid(procs_output):
+    """Our running iTerm2 app, or None. Another user's iTerm2 is not ours to ask."""
+    me = os.getuid()
+    for pid, (_tty, uid, exe) in sorted(parse_procs(procs_output).items()):
+        if uid == me and _is_iterm_app(exe):
+            return pid
     return None
 
 
@@ -1223,54 +1247,88 @@ def _gate_text(name):
         return None
 
 
-def _read_gate():
+def _read_gate(now):
     """A damaged or missing state file is a closed gate: asking once is cheap,
-    never asking again is not."""
+    never asking again is not. So is any field of the wrong type, and a wait
+    longer than any this code sets."""
     try:
         state = json.loads(_gate_text("json") or "{}")
     except ValueError:
         return {}
-    return state if isinstance(state, dict) else {}
+    if not isinstance(state, dict):
+        return {}
+    clean = {}
+    for key in ("quarantine", "asked_pid"):
+        if type(state.get(key)) is int:
+            clean[key] = state[key]
+    wait = state.get("wait_until")
+    if type(wait) in (int, float) and wait <= now + ASK_WAIT_AFTER_ERROR:
+        clean["wait_until"] = wait
+    return clean
 
 
 def _write_gate(state):
+    """True when the state is on disk."""
     tmp = _gate_path("json.tmp")
     try:
         with open(tmp, "w") as f:
             json.dump(state, f)
         os.replace(tmp, _gate_path("json"))
     except OSError:
-        pass
+        return False
+    return True
 
 
 def _settle(state, now):
-    """Fold in how the last ask ended. Returns (state, its output if it answered)."""
+    """Fold in how the last ask ended, and save it. Returns (state, its output
+    if it answered, ok). The evidence is removed only once the state that
+    records it is saved: a quarantine that cannot be written must not vanish."""
     status = _gate_text("status")
     if status is None:
-        return state, None
+        return state, None, True
     out, err = _gate_text("out") or "", _gate_text("err") or ""
+    answered = status.strip() == "0"
+    if answered:
+        state.pop("quarantine", None)       # a wait set by a timeout still runs out
+    elif _AE_TIMED_OUT in err:
+        state["quarantine"] = state.get("asked_pid")
+    else:
+        state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
+    if not _write_gate(state):
+        return state, None, False
     for name in ("status", "out", "err"):
         try:
             os.remove(_gate_path(name))
         except OSError:
             pass
-    if status.strip() == "0":
-        state.pop("quarantine", None)
-        state.pop("wait_until", None)
-        return state, out
-    if _AE_TIMED_OUT in err:
-        state["quarantine"] = state.get("asked_pid")
-    else:
-        state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
-    return state, None
+    return state, (out if answered else None), True
 
 
-def iterm_ask(args, timeout=5.0, ps_output=None, now=None):
+def _take_lock(fd, wait):
+    end = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+
+
+def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     """Run `osascript *args` against iTerm2 as a background ask. Its output, or
     None when it was not asked or did not answer in `timeout` - the list is
-    still worth showing without what iTerm2 would have said."""
+    still worth showing without what iTerm2 would have said.
+
+    `procs` is the `ps -eo pid,tty,uid,comm` table the caller already has.
+    `wait` is how long to wait for an ask in flight to finish; a scan waits for
+    nothing. `why`, a dict, gets "asked": whether an Apple Event was sent.
+    """
+    if why is not None:
+        why["asked"] = False
     now = time.time() if now is None else now
-    pid = iterm_app_pid(ps_snapshot() if ps_output is None else ps_output)
+    pid = iterm_app_pid(tty_snapshot() if procs is None else procs)
     if pid is None:
         return None             # `tell application "iTerm2"` would launch it
     try:
@@ -1279,19 +1337,18 @@ def iterm_ask(args, timeout=5.0, ps_output=None, now=None):
     except OSError:
         return None
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not _take_lock(fd, wait):
             return None         # an ask is in flight, maybe in another process
-        state, _ = _settle(_read_gate(), now)
-        stuck = state.get("quarantine")
-        if stuck is not None and stuck != pid:
+        state, _, saved = _settle(_read_gate(now), now)
+        if not saved:
+            return None         # cannot record what happens next: do not send
+        if state.get("quarantine") not in (None, pid):
             state.pop("quarantine")         # a restarted iTerm2
-        if state.get("quarantine") == pid or now < state.get("wait_until", 0):
-            _write_gate(state)
+        elif state.get("quarantine") == pid or now < state.get("wait_until", 0):
             return None
         state["asked_pid"] = pid
-        _write_gate(state)
+        if not _write_gate(state):
+            return None
         try:
             child = subprocess.Popen(
                 ["/bin/sh", "-c", _ASK_SH, OSASCRIPT, ITERM_STATE_DIR, *args],
@@ -1299,12 +1356,17 @@ def iterm_ask(args, timeout=5.0, ps_output=None, now=None):
                 stderr=subprocess.DEVNULL, pass_fds=(fd,), start_new_session=True)
         except OSError:
             return None
+        if why is not None:
+            why["asked"] = True
         try:
             child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return None         # it keeps the lock until it exits; the next ask reads how
-        state, out = _settle(state, now)
-        _write_gate(state)
+            # it keeps the lock until it exits; the next ask reads how. Until
+            # then and a while after, leave a slow iTerm2 alone
+            state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
+            _write_gate(state)
+            return None
+        _state, out, _saved = _settle(state, now)
         return out
     finally:
         os.close(fd)
@@ -1361,10 +1423,11 @@ def short_tty_full(tty):
     return (tty or "").rsplit("/", 1)[-1]
 
 
-def titles_snapshot(timeout=5.0):
+def titles_snapshot(timeout=5.0, procs=None):
     """Ask iTerm2 once. Empty when it is not running, not scriptable, or slow -
-    the list is still worth showing without the names on the tabs."""
-    out = iterm_ask(["-e", iterm_titles_script()], timeout=timeout)
+    the list is still worth showing without the names on the tabs. A scan never
+    waits for the gate."""
+    out = iterm_ask(["-e", iterm_titles_script()], timeout=timeout, procs=procs)
     return parse_titles(out) if out is not None else {}
 
 
@@ -1410,10 +1473,13 @@ def parse_panes(dump):
     return out
 
 
+PANES_WAIT = 10.0      # a save every 15 minutes may wait out the list's ask
+
+
 def panes_snapshot(timeout=5.0):
     """Ask iTerm2 for its panes. Empty when it cannot be asked: a save then
     records no panes, and a restore opens windows, as it always did."""
-    out = iterm_ask(["-e", iterm_panes_script()], timeout=timeout)
+    out = iterm_ask(["-e", iterm_panes_script()], timeout=timeout, wait=PANES_WAIT)
     return parse_panes(out) if out is not None else {}
 
 
@@ -1459,30 +1525,46 @@ def idle_snapshot():
 TITLES_TTL = 60.0
 
 
-def titles_cached(cache, now=None):
+def tty_owners(procs_output):
+    """tty -> its first process. A tab closed and another opened on the same tty
+    has a new one, even inside the minute the names are kept."""
+    out = {}
+    for pid, (tty, _uid, _exe) in parse_procs(procs_output).items():
+        if tty and (tty not in out or pid < out[tty]):
+            out[tty] = pid
+    return out
+
+
+def titles_cached(cache, now=None, procs=None):
     """The tab names, at most once per TITLES_TTL. `cache` is the runner's dict,
     the same idiom as the transcript window cache; None means always ask.
 
     An empty answer is never cached: iTerm2 starting up would otherwise show "~"
     fallbacks for the next minute. Asking again costs nothing when iTerm2 is not
     answering - iterm_ask refuses without sending anything.
+
+    A tty that another session took over since the ask loses its name - it shows
+    its "~" fallback, never the old session's - with no new ask.
     """
     now = time.time() if now is None else now
     if cache is None:
-        return titles_snapshot()
+        return titles_snapshot(procs=procs)
+    owners = tty_owners(procs)
     entry = cache.get("_titles")
     # any other shape was written by the engine before a hot reload: a miss
-    ts, titles = entry if isinstance(entry, tuple) and len(entry) == 2 else (0.0, {})
+    ts, titles, seen = (entry if isinstance(entry, tuple) and len(entry) == 3
+                        and isinstance(entry[2], dict) else (0.0, {}, {}))
     if titles and now - ts < TITLES_TTL:
-        return titles
-    fresh = titles_snapshot()
-    cache["_titles"] = (now, fresh)
+        return {t: name for t, name in titles.items() if seen.get(t) == owners.get(t)}
+    fresh = titles_snapshot(procs=procs)
+    cache["_titles"] = (now, fresh, owners)
     return fresh
 
 
 def tty_snapshot():
     try:
-        return subprocess.run(["ps", "-eo", "pid,tty"], capture_output=True,
+        # the executable last: it may hold spaces ("Application Support")
+        return subprocess.run(["ps", "-eo", "pid,tty,uid,comm"], capture_output=True,
                               text=True, errors="replace", timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -2542,30 +2624,28 @@ def parent_map(ps_output):
     return out
 
 
-_ITERM_APP = re.compile(r"iTerm\.app/Contents/MacOS/iTerm2(\s|\Z)")
-_ITERM_DAEMON = re.compile(r"/iTermServer-[0-9.]+(\s|\Z)")
-
-
-def iterm_ttys(ps_output, ttys):
+def iterm_ttys(ps_output, procs_output):
     """The terminals iTerm2 shows, from ps alone: a pane's first process is
     started by iTerm2's session daemon (iTermServer-*), or by iTerm2 itself
     when it runs without one. Measured 2026-09-29: 28 of 28 panes, the same set
-    the AppleScript answer gave.
+    the AppleScript answer gave. Parents are known by their executable, from
+    `procs_output` (`ps -eo pid,tty,uid,comm`), never by a command line.
 
     This used to come from asking iTerm2. Those asks, each leaving a handler
     thread stuck inside a wedged iTerm2, used up its 512 worker threads and
     froze it - so what a window IS no longer costs an Apple Event.
 
-    None when no iTerm2 app is running: the daemon keeps every shell alive after
-    iTerm2 quits, with the same parent, and not one of them has a window.
+    None when no iTerm2 app of ours is running: the daemon keeps every shell
+    alive after iTerm2 quits, with the same parent, and not one has a window.
     """
-    rows = list(_ps_rows(ps_output))
-    if not any(_ITERM_APP.search(cmd) for _pid, _ppid, cmd in rows):
+    table = parse_procs(procs_output)
+    if iterm_app_pid(procs_output) is None:
         return None
-    parents = {int(pid) for pid, _ppid, cmd in rows
-               if pid.isdigit() and (_ITERM_APP.search(cmd) or _ITERM_DAEMON.search(cmd))}
-    return {short_tty_full(ttys[int(pid)]) for pid, ppid, _cmd in rows
-            if pid.isdigit() and ppid in parents and int(pid) in ttys}
+    me = os.getuid()
+    parents = {pid for pid, (_tty, uid, exe) in table.items()
+               if uid == me and (_is_iterm_app(exe) or _is_iterm_daemon(exe))}
+    return {short_tty_full(table[int(pid)][0]) for pid, ppid, _cmd in _ps_rows(ps_output)
+            if pid.isdigit() and ppid in parents and table.get(int(pid), ("",))[0]}
 
 
 def command_map(ps_output):
@@ -2632,8 +2712,9 @@ def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
     session is plainly in front of you. Its ancestor is the terminal showing
     it, so walk up until a tty iTerm2 knows appears.
 
-    Without iTerm2 to ask, nothing is known about windows and the session's own
-    tty stands - never a guess dressed as an answer.
+    `titles` is the set of ttys iTerm2 shows - collect() passes iterm_ttys(),
+    from ps. Without iTerm2 running, nothing is known about windows and the
+    session's own tty stands - never a guess dressed as an answer.
     """
     shown = attached_tty(session_id, ttys, commands)
     if shown:
@@ -2948,10 +3029,11 @@ def collect(cache=None, status=None):
         cache["_extra_roots"] = extra
         cache.pop("_paths", None)           # a miss may now be a hit
     ps_out = ps_snapshot()
-    ttys = parse_tty_map(tty_snapshot())
-    titles = titles_cached(cache)
+    procs_out = tty_snapshot()
+    ttys = parse_tty_map(procs_out)
+    titles = titles_cached(cache, procs=procs_out)
     # what has a window comes from ps; the tab names are only the label
-    shown = iterm_ttys(ps_out, ttys) or set()
+    shown = iterm_ttys(ps_out, procs_out) or set()
     ids = [s.get("sessionId", "") for s in sessions]
     # who started what: the env mark, which survives the process being orphaned;
     # built from the ps snapshot and start times this scan already has

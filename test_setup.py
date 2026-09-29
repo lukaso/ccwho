@@ -252,34 +252,31 @@ class TestFactGatherersSurviveTheMachine(unittest.TestCase):
     def test_the_iterm_probe_asks_iterm_not_the_process_list(self):
         # "iTerm2 is running" is not "we may script it": Automation access can be
         # denied, which is exactly when the names and the jumps stop working
+        # a background ask: the doctor banner runs this on a timer, so it goes
+        # through the gate like every other one (2026-09-29, iTerm2 froze)
         seen = {}
 
-        def fake_run(cmd, **kw):
-            seen["script"] = cmd[-1]
+        def fake_ask(args, timeout=5.0, **k):
+            seen["script"] = args[-1]
+            return "3\n"
 
-            class R:
-                returncode, stdout, stderr = 0, "3", ""
-            return R()
-
-        real = setup.subprocess.run
-        setup.subprocess.run = fake_run
+        real = setup.engine.iterm_ask
+        setup.engine.iterm_ask = fake_ask
         try:
             self.assertTrue(setup.iterm_scriptable())
         finally:
-            setup.subprocess.run = real
+            setup.engine.iterm_ask = real
         self.assertIn('tell application "iTerm2"', seen["script"])
         self.assertNotIn("System Events", seen["script"])
 
     def test_a_refused_automation_prompt_is_not_scriptable(self):
-        class R:
-            returncode, stdout, stderr = 1, "", "Not authorized to send Apple events"
-
-        real = setup.subprocess.run
-        setup.subprocess.run = lambda *a, **k: R()
+        # the gate answers None for a refusal, a timeout, or a stuck iTerm2
+        real = setup.engine.iterm_ask
+        setup.engine.iterm_ask = lambda *a, **k: None
         try:
             self.assertFalse(setup.iterm_scriptable())
         finally:
-            setup.subprocess.run = real
+            setup.engine.iterm_ask = real
 
 
 class TestVerdict(unittest.TestCase):

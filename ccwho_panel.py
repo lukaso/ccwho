@@ -111,13 +111,8 @@ def panel_window_id(uuid, timeout=5.0):
     end repeat
   end repeat
 end tell'''
-    try:
-        done = subprocess.run(["osascript", "-e", script],
-                              capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    out = (done.stdout or "").strip()
-    return int(out) if done.returncode == 0 and out.isdigit() else None
+    out = (setup.engine.iterm_ask(["-e", script], timeout=timeout) or "").strip()
+    return int(out) if out.isdigit() else None
 
 
 def iterm_pid(timeout=5.0):

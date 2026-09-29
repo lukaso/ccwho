@@ -111,6 +111,14 @@ def unknown_flags(argv):
     return bad
 
 
+# Things you asked for (jump, open, restore) go straight to iTerm2 - they are one
+# at a time by nature, unlike the background asks behind engine.iterm_ask - but
+# never without a deadline: an osascript with none waits as long as a stuck
+# iTerm2 does, which is forever (2026-09-29).
+ITERM_ACTION_DEADLINE = 20.0
+RESTORE_DEADLINE = 120.0        # a window per session, dozens of them
+
+
 def jump(argv):
     """Focus the terminal window holding a session. Needs iTerm2."""
     query = " ".join(a for a in argv if not a.startswith("-"))
@@ -131,8 +139,12 @@ def jump(argv):
         print(f"ccwho: {row.get('title')} has no controlling terminal", file=sys.stderr)
         return 1
     script = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jump.applescript")
-    res = subprocess.run(["osascript", script, f"/dev/{tty}"],
-                         capture_output=True, text=True)
+    try:
+        res = subprocess.run(["osascript", script, f"/dev/{tty}"],
+                             capture_output=True, text=True, timeout=ITERM_ACTION_DEADLINE)
+    except subprocess.TimeoutExpired:
+        print(f"ccwho: iTerm2 did not answer in {ITERM_ACTION_DEADLINE:g}s", file=sys.stderr)
+        return 1
     out = (res.stdout or res.stderr).strip()
     print(out)
     return 0 if out.startswith("focused") else 1
@@ -950,8 +962,13 @@ def open_session(argv):
     if action == "attach":
         # Running, with no window: give it one. `claude attach` opens a session
         # that is already running; reopening it would fork the conversation.
-        res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
-                             capture_output=True, text=True)
+        try:
+            res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
+                                 capture_output=True, text=True, timeout=ITERM_ACTION_DEADLINE)
+        except subprocess.TimeoutExpired:
+            print(f"ccwho open: iTerm2 did not answer in {ITERM_ACTION_DEADLINE:g}s",
+                  file=sys.stderr)
+            return 1
         if res.returncode != 0:
             print("ccwho open: could not open a window: %s"
                   % (res.stderr or "").strip(), file=sys.stderr)
@@ -976,8 +993,13 @@ def open_session(argv):
             print(f"ccwho open: {sid} is already starting in another window"
                   " - not launching it twice.", file=sys.stderr)
             return 1
-        res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
-                             capture_output=True, text=True)
+        try:
+            res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
+                                 capture_output=True, text=True, timeout=ITERM_ACTION_DEADLINE)
+        except subprocess.TimeoutExpired:
+            print(f"ccwho open: iTerm2 did not answer in {ITERM_ACTION_DEADLINE:g}s",
+                  file=sys.stderr)
+            return 1
         if res.returncode != 0:
             print("ccwho open: could not open a window: %s"
                   % (res.stderr or "").strip(), file=sys.stderr)
@@ -2334,7 +2356,8 @@ def restore(argv):
         if n:
             print(f"opening {n} iTerm2 window(s)...")
         try:
-            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
+                               timeout=RESTORE_DEADLINE)
         except (OSError, subprocess.SubprocessError) as ex:
             print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
             return 1
@@ -2352,7 +2375,8 @@ def restore(argv):
                       " ccwho could write to it - opening a new window")
             again = engine.iterm_open_script(missed)
             try:
-                r2 = subprocess.run(["osascript", "-e", again], capture_output=True, text=True)
+                r2 = subprocess.run(["osascript", "-e", again], capture_output=True, text=True,
+                                    timeout=RESTORE_DEADLINE)
             except (OSError, subprocess.SubprocessError) as ex:
                 print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
                 return 1

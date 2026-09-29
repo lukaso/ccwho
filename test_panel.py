@@ -277,3 +277,28 @@ class WatchingOneIterm(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThePanelWindowIsABackgroundAsk(unittest.TestCase):
+    """supervise() looks the window up again every RETRY_EVERY until it is
+    found, for as long as the panel lives - a background loop, so it asks
+    iTerm2 through the gate like every other one."""
+
+    def setUp(self):
+        real = (panel.setup.engine.iterm_ask, panel.subprocess.run)
+        self.addCleanup(lambda: (setattr(panel.setup.engine, "iterm_ask", real[0]),
+                                 setattr(panel.subprocess, "run", real[1])))
+
+        def direct(*a, **k):
+            raise AssertionError("osascript run directly, not through the gate")
+        panel.subprocess.run = direct
+
+    def test_the_window_id_comes_through_the_gate(self):
+        seen = []
+        panel.setup.engine.iterm_ask = lambda args, timeout=5.0, **k: seen.append(args) or "4242\n"
+        self.assertEqual(panel.panel_window_id("ABC-123"), 4242)
+        self.assertIn('"ABC-123"', seen[0][-1])
+
+    def test_no_answer_is_no_window(self):                              # control
+        panel.setup.engine.iterm_ask = lambda *a, **k: None
+        self.assertIsNone(panel.panel_window_id("ABC-123"))

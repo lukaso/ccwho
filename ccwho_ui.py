@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -762,6 +763,8 @@ class CcwhoUi(App):
         self.detail_mode = "brief"      # or "procs": what the detail pane shows
         self.status = "collecting..."
         self.started = self.shown = 0
+        self.collecting = threading.Lock()     # one collect at a time: collect()
+        self.again = False
         self.painted_width = 0
         self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
@@ -839,13 +842,26 @@ class CcwhoUi(App):
         so a slow collection can still finish after a newer one - carrying a view
         of the world that is already wrong. Each carries a number, and show()
         keeps the highest.
+
+        And only one runs at a time. 2026-09-29: collections stuck on a slow
+        iTerm2 piled up, a new one every tick, each asking it again. A look
+        asked for while one runs sets `again`; the running one goes round once
+        more, so nothing asked for is lost.
         """
-        # numbered on the UI thread: two workers adding at once can share a
-        # number, and then the older picture can win
-        mine = self.call_from_thread(self.next_seq)
-        fleet = self.collector.fleet()
-        fleet.seq = mine
-        self.call_from_thread(self.show, fleet)
+        self.again = True           # set first: a runner finishing now sees it
+        while self.again:
+            if not self.collecting.acquire(blocking=False):
+                return
+            try:
+                self.again = False
+                # numbered on the UI thread: two workers adding at once can share
+                # a number, and then the older picture can win
+                mine = self.call_from_thread(self.next_seq)
+                fleet = self.collector.fleet()
+                fleet.seq = mine
+                self.call_from_thread(self.show, fleet)
+            finally:
+                self.collecting.release()
 
     def next_seq(self):
         self.started += 1

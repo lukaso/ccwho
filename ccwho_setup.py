@@ -315,13 +315,9 @@ def iterm_scriptable(timeout=5.0):
     the tab names and `go` stop working. So ask iTerm2 itself, for the cheapest
     thing it knows, and treat any failure as no.
     """
-    try:
-        done = subprocess.run(
-            ["osascript", "-e", 'tell application "iTerm2" to count windows'],
-            capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return done.returncode == 0 and done.stdout.strip().isdigit()
+    out = engine.iterm_ask(["-e", 'tell application "iTerm2" to count windows'],
+                           timeout=timeout)
+    return bool(out) and out.strip().isdigit()
 
 
 def handler_candidates(app_path=None):

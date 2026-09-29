@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
+import subprocess
 import unittest
 
 import ccwho as runner
@@ -20,7 +21,8 @@ import ccwho as runner
 # test_ccwho. Every test here runs with guards that fail loudly instead.
 REAL = {name: getattr(runner.engine, name) for name in ("live_file_sessions",
                                                        "ps_table", "listen_ports",
-                                                       "panes_snapshot", "idle_snapshot")}
+                                                       "panes_snapshot", "idle_snapshot",
+                                                       "iterm_ask")}
 REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 
 
@@ -35,6 +37,7 @@ GUARDS = {name: _guard(name) for name in REAL}
 # is an answer they handle - so the stand-in is that answer, not a failure
 GUARDS["panes_snapshot"] = lambda *a, **k: {}
 GUARDS["idle_snapshot"] = lambda *a, **k: set()
+GUARDS["iterm_ask"] = lambda *a, **k: None       # the same answer, one level down
 _unpinned_live_file_sessions = GUARDS["live_file_sessions"]
 
 
@@ -3928,6 +3931,11 @@ class TestUsageSnapshotLogsWhatItShows(unittest.TestCase):
 
 
 class TestReloadRebindsUsage(unittest.TestCase):
+    def tearDown(self):
+        # a reload re-executes the engine and rebinds the real functions; left
+        # unguarded, every later save test asked the real iTerm2 for its panes
+        install_guards()
+
     def test_the_runner_uses_the_reloaded_usage_module(self):
         state = {"engine_error": ""}
         runner.reload_engine(state)
@@ -4107,3 +4115,84 @@ class TestFilteredLsLeavesTheSharedFilesAlone(TestReviewRoundOneRunner):
             runner.engine.collect, runner.fresh_index, runner.usage_facts = real
         self.assertEqual(open(runner.names_path()).read(), names)
         self.assertEqual(open(os.path.join(self.tmp, "usage-shown.jsonl")).read(), shown)
+
+
+class TestEveryOsascriptCallHasADeadline(unittest.TestCase):
+    """An osascript with no deadline waits as long as iTerm2 does - forever,
+    when iTerm2 is stuck (2026-09-29). jump and restore had none. Checked over
+    the source, so a new call cannot slip in without one."""
+
+    def test_each_direct_osascript_call_passes_a_timeout(self):
+        import ast
+        here = os.path.dirname(os.path.abspath(__file__))
+        missing, seen = [], 0
+        for name in sorted(os.listdir(here)):
+            if not name.startswith("ccwho") or not name.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(here, name)).read())
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and node.args
+                        and isinstance(node.args[0], ast.List) and node.args[0].elts
+                        and isinstance(node.args[0].elts[0], ast.Constant)
+                        and node.args[0].elts[0].value == "osascript"):
+                    continue
+                seen += 1
+                if not any(k.arg == "timeout" for k in node.keywords):
+                    missing.append(f"{name}:{node.lineno}")
+        self.assertGreater(seen, 0, "the scan found no osascript call at all")   # control
+        self.assertEqual(missing, [])
+
+
+class TestAStuckITerm2IsSaidNotRaised(unittest.TestCase):
+    """With a deadline, an osascript that iTerm2 never answers ends in
+    TimeoutExpired. That must be a sentence, not a traceback."""
+
+    # the open fixture, borrowed - not inherited, or its tests run here too
+    SID, ENTRY = TestOpenNeverForksALiveSession.SID, TestOpenNeverForksALiveSession.ENTRY
+    tearDown = TestOpenNeverForksALiveSession.tearDown
+    _open = TestOpenNeverForksALiveSession._open
+
+    def setUp(self):
+        TestOpenNeverForksALiveSession.setUp(self)
+
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = stuck
+
+    def test_reopening_says_iterm2_did_not_answer(self):
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertIn("did not answer", out)
+
+    def test_jumping_says_iterm2_did_not_answer(self):
+        self.live = [{"sessionId": self.SID, "pid": 42, "tty": "ttys032",
+                      "title": "t", "name": "n", "project": "liveapp"}]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.jump(["ttys032"])
+        self.assertEqual(rc, 1)
+        self.assertIn("did not answer", out.getvalue() + err.getvalue())
+
+
+class TestWhatYouAskForSkipsTheGate(unittest.TestCase):
+    """Owner, 2026-09-29: the gate limits BACKGROUND asks so they cannot freeze
+    iTerm2; what you ask for goes ahead. A reopen while the gate would refuse
+    still runs its osascript."""
+
+    SID, ENTRY = TestOpenNeverForksALiveSession.SID, TestOpenNeverForksALiveSession.ENTRY
+    tearDown = TestOpenNeverForksALiveSession.tearDown
+    _open = TestOpenNeverForksALiveSession._open
+
+    def setUp(self):
+        TestOpenNeverForksALiveSession.setUp(self)
+        real = runner.engine.iterm_ask
+
+        def refuses(*a, **k):
+            raise AssertionError("a user action went through the background gate")
+        runner.engine.iterm_ask = refuses
+        self.addCleanup(setattr, runner.engine, "iterm_ask", real)
+
+    def test_a_reopen_runs_while_the_gate_refuses(self):
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume", " ".join(" ".join(c) for c in self.runs))

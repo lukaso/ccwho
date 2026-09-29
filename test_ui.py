@@ -9,6 +9,7 @@ test here depends on what is running on this machine.
 """
 import asyncio
 import subprocess
+import threading
 import unittest
 from unittest import mock
 
@@ -4588,3 +4589,57 @@ class TestTheDetailThatCoversTheWindow(UiTest):
             await pilot.press("down")
             await pilot.pause()
             self.assertEqual(app.selected, chosen)
+
+
+class TestOneCollectAtATime(UiTest):
+    """2026-09-29: a collect stuck on a slow iTerm2 did not stop the next tick
+    from starting another - `exclusive` cancels the worker, not its thread - and
+    each one sent iTerm2 another Apple Event. One collect runs at a time; a look
+    asked for meanwhile runs once when it finishes, so no change is lost."""
+
+    class Blocking(FakeCollector):
+        def __init__(self):
+            super().__init__()
+            self.go = threading.Event()
+            self.lock = threading.Lock()
+            self.running = self.most = 0
+
+        def fleet(self):
+            with self.lock:
+                self.running += 1
+                self.most = max(self.most, self.running)
+            self.go.wait(10)
+            with self.lock:
+                self.running -= 1
+            return super().fleet()
+
+    async def settle(self, pilot, collector, calls):
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if collector.calls >= calls and collector.running == 0:
+                return
+
+    async def test_ticks_during_a_slow_collect_start_no_second_one(self):
+        collector = self.Blocking()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.1)
+            for _ in range(3):
+                app.collect()
+            await pilot.pause(0.1)
+            self.assertEqual(collector.most, 1)
+            collector.go.set()
+            await self.settle(pilot, collector, 2)
+            await pilot.pause(0.2)
+            self.assertEqual(collector.most, 1)
+            self.assertEqual(collector.calls, 2, "the asks made meanwhile run once, after")
+
+    async def test_a_collect_after_the_last_one_ended_runs(self):        # control
+        collector = self.Blocking()
+        collector.go.set()
+        app = self.app(collector=collector)
+        async with app.run_test() as pilot:
+            await self.settle(pilot, collector, 1)
+            app.collect()
+            await self.settle(pilot, collector, 2)
+            self.assertEqual(collector.calls, 2)

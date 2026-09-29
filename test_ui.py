@@ -4669,3 +4669,72 @@ class TestARefreshAfterAKillWaitsItsTurn(UiTest):
                     break
             self.assertEqual(collector.most, 1)
             self.assertGreaterEqual(collector.calls, 2, "the refresh still happened")
+
+
+SECRET = "/Users/x/secret-project/.env"
+
+
+class TestAnErrorSaysItsTypeOnly(unittest.TestCase):
+    """An error's text can hold a path or a command line: a message says what
+    failed and the error's type, never its text (the rule of the kill path,
+    2026-09-29, for every message the list shows)."""
+
+    def check(self, said, words):
+        self.assertIn(words, said)
+        self.assertNotIn(SECRET, said)
+
+    def test_the_fleet_read(self):
+        # fleet() reloads the engine first: a reload would put the real collect back
+        with mock.patch.object(ui.engine, "reload_all"), \
+                mock.patch.object(ui.engine, "collect", side_effect=OSError(SECRET)):
+            fleet = ui.Collector().fleet()
+        self.check(fleet.error, "could not read the fleet (OSError)")
+
+    def test_the_engine_reload(self):
+        c = ui.Collector()
+        with mock.patch.object(ui.engine, "reload_all", side_effect=RuntimeError(SECRET)):
+            c.reload()
+        self.check(c.reload_error, "engine reload failed (RuntimeError)")
+
+    def test_a_reopen(self):
+        import ccwho as runner
+        with mock.patch.object(runner, "reopen_saved", side_effect=OSError(SECRET)):
+            said = ui.Collector().restore("/r/x.json")
+        self.check(said, "could not reopen (OSError)")
+
+    def test_iterm2_and_pbcopy(self):
+        a = ui.Adapter()
+        with mock.patch.object(subprocess, "run", side_effect=OSError(SECRET)):
+            self.check(a.attach("claude attach aaaa1111"), "could not reach iTerm2 (OSError)")
+            self.check(a.focus({"tty": "ttys022"}), "could not reach iTerm2 (OSError)")
+            self.check(a.copy("x"), "could not run pbcopy (OSError)")
+
+
+class TestAnErrorOnScreenSaysItsTypeOnly(UiTest):
+    async def test_a_copy_that_raised(self):
+        class Broken(FakeAdapter):
+            def copy(self, text):
+                raise OSError(SECRET)
+        app = self.app(adapter=Broken())
+        async with app.run_test(size=(300, 50)) as pilot:
+            await pilot.pause()
+            app.action_copy_value("x")
+            await pilot.pause()
+            self.assertIn("could not copy (OSError)", app.status)
+            self.assertNotIn(SECRET, app.status)
+
+    async def test_the_saves_read(self):
+        def broken(s, live_ids=()):
+            raise OSError(SECRET)
+        real = FakeCollector.save_points
+        FakeCollector.save_points = broken
+        self.addCleanup(setattr, FakeCollector, "save_points", real)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            header = str(app.query_one("#header").content)
+            self.assertIn("could not read the saves (OSError)", header)
+            self.assertNotIn(SECRET, header)

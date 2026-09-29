@@ -128,3 +128,21 @@ class TestNoNameIsDefinedTwice(unittest.TestCase):
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
             with self.subTest(module=os.path.basename(path)):
                 self.assertEqual({k: v for k, v in names.items() if v > 1}, {})
+
+
+class TestEveryTestFileRunsInTheScript(unittest.TestCase):
+    """`./test` is "every test, in one command": a test file it does not name
+    never runs there, and a regression in it passes green (test_codex was
+    missing, review 2026-09-29)."""
+
+    def test_every_test_module_is_named(self):
+        import os
+        import re
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = open(os.path.join(here, "test")).read()
+        core = re.search(r'^CORE="([^"]*)"', script, re.M).group(1).split()
+        ui = re.search(r"python -m unittest ([a-z_ ]+?)\s+\"\$@\"", script).group(1).split()
+        files = sorted(f[:-3] for f in os.listdir(here)
+                       if re.fullmatch(r"test_[a-z_]+\.py", f))
+        self.assertEqual(sorted(set(files) - set(core) - set(ui)), [])
+        self.assertIn("test_ui", ui)                                     # control: it parsed

@@ -11,6 +11,7 @@ machine runs today.
 from __future__ import annotations
 
 import hashlib
+import posixpath
 import re
 import unicodedata
 import shlex
@@ -349,6 +350,26 @@ def mark_of(env):
     if env.get("CODEX_THREAD_ID"):
         return ("codex", env["CODEX_THREAD_ID"])
     return None
+
+
+def parse_lsof_locks(text, lock_dir):
+    """{thread id: holder pid} from `lsof -Fpn +D <lock_dir>`: the Codex threads
+    whose lock file ($CODEX_HOME/thread-writer-locks/<thread id>.lock) a process
+    holds open. The holder is the thread's host - the ChatGPT app, a VS Code
+    window, the codex CLI (measured 2026-09-29: an idle thread keeps its lock,
+    so this is "open", not "busy"). Another folder, another file, or a name that
+    is no thread id is not a thread."""
+    out, pid = {}, None
+    for line in (text or "").splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            path = line[1:]
+            folder, name = posixpath.split(path)   # text only: no file is read
+            stem = name[:-len(".lock")] if name.endswith(".lock") else ""
+            if folder == lock_dir.rstrip("/") and _UUID.fullmatch(stem):
+                out.setdefault(stem, pid)
+    return out
 
 
 def parse_lsof_listen(text):

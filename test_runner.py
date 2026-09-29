@@ -373,6 +373,46 @@ class TestSaveAndRestore(unittest.TestCase):
         self.assertIn("new", out)
         self.assertNotIn("old", out)
 
+    # the list's `o` shows reopen_saved's answer: an error by its type, never its
+    # text - it can hold a path (the rule of 2026-09-29)
+    SECRET = "/Users/x/secret-project/.env"
+
+    def test_a_reopen_that_cannot_drive_iterm2_says_the_type_only(self):
+        self._save()
+        d = runner.restore_dir()
+        path = os.path.join(d, os.listdir(d)[0])
+        def no_rows(cache=None, status=None):
+            if status is not None:
+                status["source_ok"] = True
+            return ([], 0)
+        runner.engine.collect = no_rows                 # nothing live: it would reopen
+        real_rp, real_run = runner.resume_problem, runner.subprocess.run
+        runner.resume_problem = lambda row: ""
+        def run(argv, *a, **k):
+            if argv and argv[0] == "osascript":
+                raise OSError(self.SECRET)
+            return real_run(argv, *a, **k)
+        runner.subprocess.run = run
+        try:
+            said = runner.reopen_saved(path)
+        finally:
+            runner.subprocess.run, runner.resume_problem = real_run, real_rp
+        self.assertIn("could not drive iTerm2 (OSError)", said)
+        self.assertNotIn(self.SECRET, said)
+
+    def test_a_reopen_of_a_bad_manifest_says_the_type_only(self):
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        bad = os.path.join(d, "2026-01-01T0000.json")
+        with open(bad, "w") as fh:
+            fh.write("{not json")
+        said = runner.reopen_saved(bad)
+        self.assertIn("(JSONDecodeError)", said)
+        self.assertNotIn("Expecting", said)                 # json's own text
+        said = runner.reopen_saved(os.path.join(d, "gone.json"))
+        self.assertIn("(FileNotFoundError)", said)
+        self.assertNotIn("Errno", said)
+
     def test_restore_does_not_open_windows_unless_asked(self):
         self._save()
         calls = []

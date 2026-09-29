@@ -1885,7 +1885,7 @@ def proc_marks(table, cache=None):
     return out
 
 
-def _lsof(args):
+def _lsof(args, env=None):
     """lsof's text, or None when it could not be asked. lsof exits 1 with
     nothing on stderr when nothing matched; exit 1 with an error, any other
     exit, or a timeout is None. Another user's processes are simply not listed
@@ -1893,12 +1893,161 @@ def _lsof(args):
     exe = find_tool("lsof") or "/usr/sbin/lsof"
     try:
         done = subprocess.run([exe] + args, capture_output=True, text=True,
-                              errors="replace", timeout=20)
+                              errors="replace", timeout=20, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode == 0 or (done.returncode == 1 and not (done.stderr or "").strip()):
         return done.stdout
     return None
+
+
+CODEX_LOCK_TTL = 30.0  # seconds lsof's answer is kept while the lock files stay the same
+
+
+def codex_threads(home, lsof=None, cache=None, clock=None):
+    """The Codex threads open now, under the CODEX_HOME `home`: [{"thread",
+    "name", "cwd", "host_pid", "originator", "source"}] - or None when lsof
+    could not be asked ("not known" is never "none open"). A thread is open
+    while a process holds its lock file (procs.parse_lsof_locks); that process
+    serves it (measured: the ChatGPT app's codex serves the threads typed in VS
+    Code too - `source` says where it was typed). Its name is the newest in
+    session_index.jsonl; its folder, host and source come from its transcript's
+    FIRST line (session_meta) only - the rest is what was said, and is never
+    read. A lock with no transcript is no row: each thread came with such a
+    second lock, taken in the same second - Codex's own (measured 2026-09-29).
+    Only this CODEX_HOME is read: ccwho's own, else ~/.codex (codex_home)."""
+    # lsof escapes the bytes of a non-ASCII path in a C locale (and ccwho may
+    # start without a UTF-8 one): the paths it names must match those asked
+    lsof = lsof or (lambda args: _lsof(args, env=dict(os.environ, LC_ALL="en_US.UTF-8")))
+    cache = {} if cache is None else cache
+    clock = clock or time.monotonic
+    # lsof names files by their resolved path: a symlinked or relative home too
+    lock_dir = os.path.realpath(os.path.join(home, "thread-writer-locks"))
+
+    def listed():
+        try:
+            return sorted(f for f in os.listdir(lock_dir)
+                          if f.endswith(".lock") and procs._UUID.fullmatch(f[:-len(".lock")]))
+        except OSError:
+            return []
+    locks = listed()
+    if not locks:
+        return []
+    # lsof reads every process's files: 0.5 s here in any form (measured
+    # 2026-09-29). Its answer is kept for a TTL while the lock files are the
+    # same - a new thread's lock is a new file, so it shows at once; a thread
+    # closed shows open for up to the TTL, and nothing is killed on it (D17)
+    key, now = f"_codex_locks:{lock_dir}", clock()
+    kept = cache.get(key)
+    if kept and kept[0] == locks and now - kept[1] < CODEX_LOCK_TTL:
+        held = kept[2]
+    else:
+        text = lsof(["-nP", "-Fpn", "--"] + [os.path.join(lock_dir, f) for f in locks])
+        if text is None and listed() != locks:
+            # a thread closed between the listing and lsof ("status error"):
+            # list again and ask once more
+            locks = listed()
+            if not locks:
+                return []
+            text = lsof(["-nP", "-Fpn", "--"] + [os.path.join(lock_dir, f) for f in locks])
+        asked = {os.path.join(lock_dir, f) for f in locks}
+        if text is None or any(line.startswith("n") and line[1:] not in asked
+                               for line in text.splitlines()):
+            # failed, or it named a file another way than it was asked (lsof
+            # escapes bytes it cannot print): not known - never "none open"
+            cache.pop(key, None)        # not known is never kept
+            return None
+        held = procs.parse_lsof_locks(text, lock_dir)
+        cache[key] = (locks, now, held)
+    names = {}
+    try:
+        with open(os.path.join(home, "session_index.jsonl"), errors="replace") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and isinstance(e.get("id"), str) and e["id"] in held:
+                    names[e["id"]] = e.get("thread_name") if isinstance(
+                        e.get("thread_name"), str) else ""
+    except OSError:
+        pass
+    out = []
+    for thread in sorted(held):
+        meta = _codex_meta(home, thread, cache, now)
+        if meta is None:
+            continue                    # no transcript: not a thread you can see
+        def text(v):
+            # plain printable text, as every other row: a name can hold escapes,
+            # and Codex writes an object `source` for a subagent
+            return procs.printable(v) if isinstance(v, str) else ""
+        out.append({"thread": thread, "name": text(names.get(thread, "")),
+                    "cwd": text(meta.get("cwd")), "host_pid": held[thread],
+                    "originator": text(meta.get("originator")),
+                    "source": text(meta.get("source"))})
+    return out
+
+
+def codex_home(env=None):
+    """The CODEX_HOME whose threads the list shows: ccwho's own, else ~/.codex."""
+    env = os.environ if env is None else env
+    return env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def read_codex_threads(env=None, cache=None):
+    """codex_threads for this machine, or None when they could not be read: a
+    second source, whose failure never blanks the list."""
+    try:
+        return codex_threads(codex_home(env), cache=cache)
+    except Exception:
+        return None
+
+
+def codex_fleet(threads, att, ports_ok):
+    """Each open Codex thread with its work: the processes whose Codex mark names
+    it (helpers left out) and their ports - None when the ports were not read.
+    None when the threads are not known. A Codex process whose thread is not
+    open is in no thread: it stays in att["codex"], state unknown (D17)."""
+    if threads is None:
+        return None
+    out = []
+    for t in threads:
+        mine = [p for p in att.get("codex") or [] if p.get("session") == t["thread"]]
+        summary = procs.row_summary(mine)
+        out.append(dict(t, procs=summary["procs"],
+                        ports=summary["ports"] if ports_ok else None,
+                        pids=sorted(p["pid"] for p in mine if not p.get("helper"))))
+    return out
+
+
+def _codex_meta(home, thread, cache, now=0.0):
+    """A thread's session_meta payload - the first line of its rollout - {} when
+    that line is no session_meta, or None when it has no rollout."""
+    # a text key: collect() sweeps its cache by key.startswith("_"). Only a
+    # found path is kept, and looked for again once it is gone (moved)
+    key = f"_codex_rollout:{home}:{thread}"
+    path = cache.get(key)
+    if not path or not os.path.exists(path):
+        # every thread has a lock with no transcript: not looked for every scan
+        missed = cache.get(f"_codex_miss:{home}:{thread}")
+        if missed is not None and now - missed < CODEX_LOCK_TTL:
+            return None
+        found = glob.glob(os.path.join(home, "sessions", "*", "*", "*",
+                                       f"rollout-*-{thread}.jsonl"))
+        if not found:
+            cache.pop(key, None)
+            cache[f"_codex_miss:{home}:{thread}"] = now
+            return None
+        cache.pop(f"_codex_miss:{home}:{thread}", None)
+        path = cache[key] = sorted(found)[-1]
+    try:
+        with open(path, errors="replace") as fh:
+            first = json.loads(fh.readline())
+    except (OSError, ValueError):
+        return {}
+    payload = first.get("payload") if isinstance(first, dict) else None
+    return (payload if isinstance(first, dict) and first.get("type") == "session_meta"
+            and isinstance(payload, dict) else {})
 
 
 def established_connections():
@@ -3253,6 +3402,9 @@ def collect(cache=None, status=None):
                    sessions_ok=sessions_ok)
     fleet["unknown_ports"] = unknown_ports
     fleet["unknown_holders"] = unknown_holders
+    # Codex threads open now (Phase 3, D15): their own list, never session rows
+    fleet["codex_threads"] = codex_fleet(read_codex_threads(cache=cache), att,
+                                         ports_ok=ports is not None)
     return rows, fleet
 
 

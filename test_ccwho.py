@@ -18,7 +18,8 @@ import ccwho_engine as ccwho
 # test in this module runs with guards that fail loudly instead; a test that means
 # to exercise a real function takes it from REAL and puts the guard back.
 REAL = {name: getattr(ccwho, name) for name in ("live_file_sessions", "ps_table",
-                                                "listen_ports", "iterm_ask")}
+                                                "listen_ports", "iterm_ask",
+                                                "read_codex_threads")}
 REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 REAL_TITLES_SNAPSHOT = ccwho.titles_snapshot
 REAL_APP_SNAPSHOT = ccwho.app_snapshot
@@ -61,7 +62,7 @@ class MachinelessCollect(unittest.TestCase):
     def setUp(self):
         self._saved = (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
                        ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports,
-                       ccwho.stdin_sockets)
+                       ccwho.stdin_sockets, ccwho.read_codex_threads)
         ccwho.ps_snapshot = lambda: ""
         ccwho.tty_snapshot = lambda: ""
         ccwho.titles_snapshot = lambda timeout=5.0, **k: {}
@@ -71,11 +72,12 @@ class MachinelessCollect(unittest.TestCase):
         ccwho.ps_table = lambda: {}
         ccwho.listen_ports = lambda: {}
         ccwho.stdin_sockets = lambda pids: {}
+        ccwho.read_codex_threads = lambda env=None, cache=None: []  # Codex's locks: machine
 
     def tearDown(self):
         (ccwho.ps_snapshot, ccwho.tty_snapshot, ccwho.titles_snapshot,
          ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports,
-         ccwho.stdin_sockets) = self._saved
+         ccwho.stdin_sockets, ccwho.read_codex_threads) = self._saved
 
 
 class TestParseSessions(unittest.TestCase):
@@ -3209,6 +3211,8 @@ class TestTitlesAreCachedBetweenTicks(unittest.TestCase):
         ccwho.ps_table, ccwho.listen_ports = (lambda: {}), (lambda: {})
         self.addCleanup(setattr, ccwho, "ps_table", real_table)
         self.addCleanup(setattr, ccwho, "listen_ports", real_ports)
+        self.addCleanup(setattr, ccwho, "read_codex_threads", ccwho.read_codex_threads)
+        ccwho.read_codex_threads = lambda env=None, cache=None: []    # Codex's locks: machine
         try:
             cache = {}
             ccwho.collect(cache=cache)
@@ -3407,6 +3411,51 @@ class TestCollectReportsAnUnparseableSource(MachinelessCollect):
             ccwho.agents_json = real
         self.assertEqual(rows, [])
         self.assertIs(status["source_ok"], True)      # control
+
+
+class TestCollectCarriesTheCodexThreads(MachinelessCollect):
+    """Phase 3 (D15): the open Codex threads reach the fleet - their own list,
+    never session rows (jump, show and --json read the rows as Claude's)."""
+
+    T = {"thread": "01a0eca7-7b42-72f0-b19a-ff0ae32db6a3", "name": "fix the navbar",
+         "cwd": "/x", "host_pid": 4215, "originator": "Codex Desktop"}
+
+    def collect(self, threads):
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        ccwho.read_codex_threads = lambda env=None, cache=None: threads
+        try:
+            return ccwho.collect(cache={}, status={})
+        finally:
+            ccwho.agents_json = real
+
+    def test_they_are_in_the_fleet_and_not_in_the_rows(self):
+        rows, fleet = self.collect([dict(self.T)])
+        self.assertEqual([t["thread"] for t in fleet["codex_threads"]], [self.T["thread"]])
+        self.assertEqual(fleet["codex_threads"][0]["procs"], 0)
+        self.assertEqual(rows, [])
+
+    def test_not_known_is_none(self):
+        rows, fleet = self.collect(None)
+        self.assertIsNone(fleet["codex_threads"])
+
+    def test_the_read_gets_the_scans_own_cache(self):
+        # its lsof answer is kept in that cache: without it every tick pays 0.5 s
+        seen = []
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        ccwho.read_codex_threads = lambda env=None, cache=None: seen.append(cache) or []
+        try:
+            cache = {}
+            ccwho.collect(cache=cache, status={})
+        finally:
+            ccwho.agents_json = real
+        self.assertIs(seen[0], cache)
+
+    def test_ports_not_read_are_none(self):
+        ccwho.listen_ports = lambda: None
+        rows, fleet = self.collect([dict(self.T)])
+        self.assertIsNone(fleet["codex_threads"][0]["ports"])
 
 
 class TestCollectShowsNoDaemonRows(MachinelessCollect):
@@ -3981,6 +4030,8 @@ class TestTheCheapQuestion(unittest.TestCase):
         ccwho.ps_table, ccwho.listen_ports = (lambda: {}), (lambda: {})
         self.addCleanup(setattr, ccwho, "ps_table", real_table)
         self.addCleanup(setattr, ccwho, "listen_ports", real_ports)
+        self.addCleanup(setattr, ccwho, "read_codex_threads", ccwho.read_codex_threads)
+        ccwho.read_codex_threads = lambda env=None, cache=None: []    # Codex's locks: machine
         try:
             status = {}
             ccwho.collect(cache={}, status=status)
@@ -4233,6 +4284,8 @@ class TestWhatYouHaveLookedAtSurvives(unittest.TestCase):
         ccwho.ps_table, ccwho.listen_ports = (lambda: {}), (lambda: {})
         self.addCleanup(setattr, ccwho, "ps_table", real_table)
         self.addCleanup(setattr, ccwho, "listen_ports", real_ports)
+        self.addCleanup(setattr, ccwho, "read_codex_threads", ccwho.read_codex_threads)
+        ccwho.read_codex_threads = lambda env=None, cache=None: []    # Codex's locks: machine
         try:
             status = {}
             ccwho.collect(cache={}, status=status)

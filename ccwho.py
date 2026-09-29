@@ -132,7 +132,7 @@ def launch_in_iterm(script, deadline, sids):
     iterm = engine.iterm_app_pid(engine.app_snapshot())
     now = time.time()
     if not all(claim_unresolved(sid, now=now, iterm_pid=iterm) for sid in sids):
-        return None, f"could not record the launch under {ccwho_dir()} - not sending it"
+        return None, "could not record the launch in ccwho's own dir - not sending it"
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
                            timeout=deadline)
@@ -141,7 +141,9 @@ def launch_in_iterm(script, deadline, sids):
     except OSError as ex:
         for sid in sids:
             claim_resolved(sid)            # nothing was sent
-        return None, f"could not drive iTerm2: {ex}"
+        # the type only: the list's `o` shows this line, and an error's text
+        # can hold a path
+        return None, f"could not drive iTerm2 ({type(ex).__name__})"
     if not (r.returncode != 0 and engine.ae_error_code(r.stderr) == engine.AE_TIMED_OUT):
         for sid in sids:
             claim_resolved(sid)
@@ -2375,7 +2377,9 @@ def restore(argv):
         with open(path) as fh:
             man = json.load(fh)
     except (OSError, ValueError) as ex:
-        print(f"ccwho restore: cannot read {path}: {ex}", file=sys.stderr)
+        # the type only: the list's `o` shows this line, and an error's text can
+        # hold a path
+        print(f"ccwho restore: cannot read {path} ({type(ex).__name__})", file=sys.stderr)
         return 1
 
     if "--check" in argv:

@@ -4326,6 +4326,83 @@ class TestOneTableSaysWhatAStateIsCalled(unittest.TestCase):
         self.assertNotIn(" review ", out)
 
 
+class TestALabelLooksLikeNeedsYouOnlyWhenItDoes(unittest.TestCase):
+    """ccwho ls printed STOPPED in the yellow of FINISHED, one bold away from
+    NEEDS YOU, and at a glance it read as a question waiting. The list's
+    headings were fixed first; this table follows the same rule, and so does the
+    detail pane, which paints its label from it: a warm colour means it needs you.
+    """
+
+    # what each kind may be painted with, and nothing else: no bright, 256-colour
+    # or background form of a warm colour gets past a list of what is allowed
+    WARM = {"1", "31", "33", "35", "91", "93", "95"}     # bold; red, yellow, magenta
+    CALM = {"1", "2", "32", "92"}                        # bold, dim; green
+
+    def params(self, key):
+        """The parameters of each escape in a paint: "\\033[33;1m" is 33 and 1."""
+        # all of it is read: an escape this cannot parse (\033[38:5:214m, an
+        # orange) must fail here, not pass as a paint of nothing
+        self.assertRegex(ccwho._C[key], r"\A(?:\x1b\[[\d;]*m)*\Z")
+        return [p for code in re.findall(r"\x1b\[([\d;]*)m", ccwho._C[key])
+                for p in code.split(";")]
+
+    def split(self):
+        """Every grouped state, by whether its group needs you - the list's answer."""
+        states = [s for _, group in ccwho.UI_GROUPS for s in group]
+        groups = ccwho.ui_groups([{"sessionId": s, "attention": s, "ts": ""}
+                                  for s in states])
+        needs = {r["attention"] for g in groups if g["needs_you"] for r in g["rows"]}
+        return needs, set(states) - needs
+
+    def row(self, attention):
+        return {"sessionId": attention, "attention": attention, "status": "idle",
+                "project": "liveapp", "title": "x", "tab_title": "", "name": attention,
+                "doing": "", "ask": "", "since": "1m", "ts": "", "topic": "",
+                "first": "", "age": "", "orphans": 0, "work": 0, "tty": "",
+                "pid": 1, "cwd": "/x", "recap": "", "recap_ts": "",
+                "recap_age": "", "turns_since_recap": 0}
+
+    def test_what_needs_you_is_warm(self):                              # control
+        needs, _ = self.split()
+        self.assertEqual(needs, {"blocked", "waiting", "asks", "review", "stuck"})
+        for state in needs:
+            with self.subTest(state=state):
+                self.assertLessEqual(set(self.params(state)), self.WARM)
+                self.assertTrue(set(self.params(state)) - {"1"}, "a colour, not only bold")
+
+    def test_nothing_else_is_warm(self):
+        _, calm = self.split()
+        for state in calm:
+            with self.subTest(state=state):
+                self.assertLessEqual(set(self.params(state)), self.CALM,
+                                     f"{state} looks like it needs you")
+
+    def test_stopped_and_busy_are_green_as_in_the_list(self):
+        for state in ("stopped", "busy"):
+            self.assertEqual(self.params(state), ["32"], state)
+
+    def test_ls_and_the_detail_pane_paint_each_state_from_the_table(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "test_fixture_render_brief.json"),
+                  encoding="utf-8") as fh:
+            brief = json.load(fh)[0]["brief"]
+        reset = ccwho._C["reset"]
+        for _, states in ccwho.UI_GROUPS:
+            for state in states:
+                with self.subTest(state=state):
+                    label, paint = ccwho._LABEL[state], ccwho._C[state]
+                    out = ccwho.render([self.row(state)], 0, color=True, width=150)
+                    self.assertIn(f"{paint}{label:<10}{reset}", out)
+                    row = {"attention": state, "project": "liveapp"}
+                    # ccwho brief
+                    self.assertIn(f"{paint}{label}{reset}",
+                                  ccwho.render_brief(brief, row).splitlines()[0])
+                    # the list's detail pane, painted part by part as ccwho_ui does
+                    pane = "".join(ccwho.brief_ansi(text, style) for text, style, *_ in
+                                   ccwho.brief_parts(brief, row, fields=True)[0])
+                    self.assertIn(f"{paint}{label}{reset}", pane)
+
+
 class TestASessionWithNoWindowSaysSo(unittest.TestCase):
     """Clicking a session did nothing, and the reason was invisible: it runs in
     the background - `claude bg-spare` on a tty iTerm2 has never heard of - so

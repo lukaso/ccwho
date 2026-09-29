@@ -3141,11 +3141,13 @@ def reload_all(engine):
 
 # --------------------------------------------------------------------- display
 
-_C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[33m",
+# Warm (yellow, magenta, red) means it needs you; the rest are green or dim.
+# STOPPED in the yellow of FINISHED was read as a question waiting.
+_C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[32m",
       "review": "\033[33m", "stuck": "\033[31;1m",
-      "running": "\033[2m", "ready": "\033[33m", "waiting": "\033[33;1m",
-      "busy": "\033[36m", "idle": "\033[2m",
-      "shell": "\033[35m", "program": "\033[2m", "codex": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
+      "running": "\033[2m", "ready": "\033[32m", "waiting": "\033[33;1m",
+      "busy": "\033[32m", "idle": "\033[2m",
+      "shell": "\033[32m", "program": "\033[2m", "codex": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
 
 def _paint(text, key, color):

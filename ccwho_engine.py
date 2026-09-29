@@ -1253,6 +1253,13 @@ def iterm_app_pid(procs_output):
     return None
 
 
+def is_iterm_app(procs_output, pid):
+    """Is `pid` an iTerm2 app of ours, by its own entry in the table - not
+    whichever iTerm2 has the lowest pid, and not a process that reused it."""
+    _tty, uid, name = parse_procs(procs_output).get(pid, ("", -1, ""))
+    return uid == os.getuid() and _is_iterm_app(name)
+
+
 def app_snapshot():
     """The cheap process table: no tty column (0.03 s of ps, where the tty
     column costs 0.2 s) - enough to find iTerm2 outside a scan."""
@@ -1348,14 +1355,16 @@ def _settle(state, now):
     return state, (out if answered else None), True
 
 
-def _take_lock(fd, wait):
+def _take_lock(fd, wait, give_up=lambda: False):
+    """True with the lock; False after `wait` seconds, or as soon as
+    `give_up()` says the wait is for nothing."""
     end = time.monotonic() + wait
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
         except OSError:
-            if time.monotonic() >= end:
+            if time.monotonic() >= end or give_up():
                 return False
             time.sleep(0.05)
 
@@ -1389,15 +1398,20 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     try:
         if not _take_lock(fd, 0):
             # an ask in flight, maybe in another process. Queue behind it only
-            # if it is a healthy one: behind one that already timed out, or into
-            # a pause, the answer is a refusal anyway - waiting only freezes us
-            early = time.time() if fixed_now is None else fixed_now
-            ahead = _read_gate(early)
-            if not wait or ahead.get("slow") or early < ahead.get("wait_until", 0):
-                why.update(refused="busy" if not wait else "waiting", error=ahead.get("last_error"))
-                return None
-            if not _take_lock(fd, wait):
-                why["refused"] = "busy"
+            # while it is a healthy one: behind one that already timed out, or
+            # into a pause, the answer is a refusal anyway - waiting only
+            # freezes us. Looked at on every try: it can time out while we wait
+            ahead = {}
+
+            def hopeless():
+                early = time.time() if fixed_now is None else fixed_now
+                ahead.clear()
+                ahead.update(_read_gate(early))
+                ahead["hopeless"] = bool(ahead.get("slow") or early < ahead.get("wait_until", 0))
+                return ahead["hopeless"]
+            if hopeless() or not wait or not _take_lock(fd, wait, give_up=hopeless):
+                why.update(refused="waiting" if wait and ahead["hopeless"] else "busy",
+                           error=ahead.get("last_error"))
                 return None
         now = time.time() if fixed_now is None else fixed_now
         pid = iterm_app_pid(app_snapshot() if procs is None else procs)
@@ -1444,6 +1458,14 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         # it came back now: a pause after an error runs from here, not from
         # before the ask
         done = time.time() if fixed_now is None else fixed_now
+        if _gate_text("status") is None:
+            # its wrapper died, and its osascript may not have: that one still
+            # holds the lock and may yet write why it failed (-1712). Whoever
+            # takes the lock after it ends settles it - as a slow one till then
+            state.update(wait_until=done + ASK_WAIT_AFTER_ERROR, slow=True)
+            _write_gate(state)
+            why["error"] = "failed"
+            return None
         state, out, _saved = _settle(state, done)
         if out is None:
             why["error"] = state.get("last_error")
@@ -2804,8 +2826,8 @@ def iterm_run_script(cmd):
     if not cmd:
         return ""
     return ('tell application "iTerm2"\n  activate\n'
-            '  create window with default profile\n'
-            '  tell current session of current window\n'
+            '  set w to (create window with default profile)\n'
+            '  tell current session of w\n'
             '    write text %s\n  end tell\nend tell\n' % applescript_str(cmd))
 
 
@@ -2890,8 +2912,11 @@ def iterm_open_script(entries, fill=None):
         if uid:
             fills.append((uid, cmd))
             continue
-        lines.append("  create window with default profile")
-        lines.append("  tell current session of current window")
+        # the window by name: `current window` is asked for as an event of its
+        # own, and a click on another window in between - seconds, when iTerm2
+        # is slow - would put the resume line into that window's pane
+        lines.append("  set w to (create window with default profile)")
+        lines.append("  tell current session of w")
         lines.append("    write text %s" % applescript_str(cmd))
         lines.append("  end tell")
     if not lines and not fills:
@@ -2950,7 +2975,7 @@ def pane_owners(ps_output, procs_output):
     return out
 
 
-def iterm_ttys(ps_output, procs_output):
+def iterm_ttys(ps_output, procs_output, owners=None):
     """The terminals iTerm2 shows, from ps alone: a pane's first process is
     started by iTerm2's session daemon (iTermServer-*), or by iTerm2 itself
     when it runs without one. Measured 2026-09-29: 28 of 28 panes, the same set
@@ -2964,10 +2989,11 @@ def iterm_ttys(ps_output, procs_output):
 
     None when no iTerm2 app of ours is running: the daemon keeps every shell
     alive after iTerm2 quits, with the same parent, and not one has a window.
+    `owners` is pane_owners() of the same two tables, when the caller has it.
     """
     if iterm_app_pid(procs_output) is None:
         return None
-    return set(pane_owners(ps_output, procs_output))
+    return set(pane_owners(ps_output, procs_output) if owners is None else owners)
 
 
 def command_map(ps_output):
@@ -3355,9 +3381,8 @@ def collect(cache=None, status=None):
     ttys = parse_tty_map(procs_out)
     owners = pane_owners(ps_out, procs_out)
     titles = titles_cached(cache, procs=procs_out, owners=owners)
-    # what has a window comes from ps; the tab names are only the label - no
-    # iTerm2 app of ours: nothing is known about windows (see iterm_ttys)
-    shown = set(owners) if iterm_app_pid(procs_out) is not None else set()
+    # what has a window comes from ps; the tab names are only the label
+    shown = iterm_ttys(ps_out, procs_out, owners=owners) or set()
     ids = [s.get("sessionId", "") for s in sessions]
     # who started what: the env mark, which survives the process being orphaned;
     # built from the ps snapshot and start times this scan already has

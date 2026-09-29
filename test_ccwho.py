@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import tempfile
 import sys
+import threading
 import time
 import unittest
 
@@ -2521,6 +2522,18 @@ class ItermOpenScript(unittest.TestCase):
 
     def test_nothing_to_open_yields_no_script(self):
         self.assertEqual(ccwho.iterm_open_script([]), "")
+
+    def test_each_window_is_written_to_by_name_not_as_the_current_one(self):
+        # `current window` is asked for after `create window`, as its own
+        # event: a click on another iTerm2 window in between - seconds, when
+        # iTerm2 is slow - and the resume line goes into THAT window's pane
+        for s in (ccwho.iterm_open_script(self.entries),
+                  ccwho.iterm_run_script("cd /x && claude --resume y")):
+            self.assertNotIn("current window", s)
+            self.assertEqual(s.count("set w to (create window with default profile)"),
+                             s.count("create window with default profile"))
+            self.assertEqual(s.count("tell current session of w"),
+                             s.count("create window with default profile"))
 
 
 # A restore used to open one new window per session, and the person then moved
@@ -6742,6 +6755,13 @@ class TestCollectTakesWindowsFromPsNotFromTabNames(MachinelessCollect):
                         (300, "ttys024", 0, "login"), (301, "ttys042", ME, "claude")])
         self.assertIs(row["windowed"], False)
 
+    def test_shells_the_daemon_kept_after_iterm2_quit_have_no_window(self):
+        # the daemon keeps every shell, same parent, after iTerm2 quits
+        row = self.row([(200, 1, DAEMON_CMD), (300, 200, LOGIN), (301, 300, "claude")],
+                       [(200, "??", ME, SERVER), (300, "ttys024", 0, "login"),
+                        (301, "ttys024", ME, "claude")])
+        self.assertIsNot(row["windowed"], True)
+
     def test_without_iterm2_running_it_is_not_known(self):
         row = self.row([(301, 1, "claude")], [(301, "ttys042", ME, "claude")])
         self.assertIsNone(row["windowed"])
@@ -7286,6 +7306,44 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
         why = {}
         self.ask(now=time.time() + 100, wait=3, why=why)           # settles it: a pause starts
         self.assertEqual(self.ask(now=time.time() + 200, wait=3), "ok\n")
+
+    def test_past_the_pause_a_slow_ask_still_in_flight_turns_callers_away(self):
+        # iTerm2 wedged: the ask that timed out still holds the lock after the
+        # pause. A caller that may wait is refused at once, not after its wait
+        self.stub("sleep 3; echo late")
+        self.assertIsNone(self.ask(timeout=0.2))
+        start, why = time.time(), {}
+        self.assertIsNone(self.ask(now=time.time() + 60, wait=3, why=why))
+        self.assertLess(time.time() - start, 0.5)
+        self.assertEqual(why.get("refused"), "waiting")
+
+    def test_a_queued_caller_stops_waiting_when_the_ask_ahead_times_out(self):
+        # it queued behind a healthy ask, which then timed out: what it waits
+        # for now is a refusal, and a save would sit out all of its 10 s
+        self.stub("sleep 6; echo late")
+        first = threading.Thread(target=self.ask, kwargs={"timeout": 0.5})
+        first.start()
+        self.addCleanup(first.join)
+        self.assertTrue(self.until(lambda: self.launches() == 1))
+        start, why = time.time(), {}
+        self.assertIsNone(self.ask(wait=10, why=why))
+        self.assertLess(time.time() - start, 4, "waited for the slow ask to end")
+        self.assertEqual(why.get("refused"), "waiting")
+
+    def test_an_ask_whose_wrapper_died_first_is_settled_after_it_ends(self):
+        # the wrapper killed, its osascript still running and about to say
+        # -1712. Settled at once, that goes into files already removed, and
+        # the stuck iTerm2 is asked again
+        marker = os.path.join(self.tmp, "ended")
+        self.stub(f'kill -9 $PPID; sleep 0.5; echo "AppleEvent timed out. (-1712)" >&2; '
+                  f'touch {shlex.quote(marker)}; exit 1')
+        self.assertIsNone(self.ask())
+        self.assertTrue(self.until(lambda: os.path.exists(marker)))
+        why = {}
+        self.assertTrue(self.until(lambda: self.ask(now=time.time() + 60, why=why) is None
+                                   and why.get("refused") != "busy"))
+        self.assertEqual(why.get("refused"), "stuck")
+        self.assertEqual(self.launches(), 1)
 
     def test_an_error_pauses_from_when_it_came_back(self):
         self.stub('sleep 0.5; echo "Not authorized (-1743)" >&2; exit 1')

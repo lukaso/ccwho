@@ -2081,12 +2081,13 @@ class Collector:
     def fleet(self):
         import time
         self.reload()
-        status = {}
+        status, seen_at = {}, time.time()
         try:
             rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
             return Fleet([], False, "", f"could not read the fleet ({type(ex).__name__})",
                          secure=self.secure_input())
+        self.release(rows, seen_at)
         # The scan's own answer to the cheap question, so the next cheap check
         # does not see a changed world and scan all over again.
         if status.get("watch") is not None:
@@ -2097,6 +2098,16 @@ class Collector:
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble, procs=procs,
                      secure=self.secure_input(), usage=self.usage(rows))
+
+    def release(self, rows, seen_at):
+        """The sessions on the list let go of their launch claims (ccwho's
+        release_claims): the list sees a launch that timed out and then ran
+        all day, long before an `open` would. Never the reason it goes down."""
+        try:
+            import ccwho as runner
+            runner.release_claims(engine.live_ids(rows), seen_at)
+        except Exception:
+            pass
 
     def usage(self, rows):
         """The usage snapshot, on this collecting thread; "unknown" when it

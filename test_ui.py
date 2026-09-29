@@ -256,6 +256,43 @@ class TestTheCollectorLooksForSecureInput(unittest.TestCase):
         self.assertEqual(fleet.secure, "")
 
 
+class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
+    """The list scans all day: a launch that timed out and then ran is seen
+    here first. Its claim must go, or a reopen after the session ends says
+    "restart iTerm2" for a launch that worked."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def claim_after(self, rows):
+        import os, shutil, tempfile, time
+        import ccwho as runner
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.environ["CCWHO_DIR"] = tmp
+        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+        runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time() - 5,
+                                       "sessionId": self.SID, "unresolved": True,
+                                       "iterm_pid": 4_000_000, "until": 0})
+        collector = ui.Collector()
+        collector.reload = lambda: None
+        collector.secure_input = lambda: ""
+        collector.usage = lambda rows: {"state": "unknown"}
+        real = ui.engine.collect
+        ui.engine.collect = lambda cache=None, status=None: (
+            status.update(source_ok=True) or (list(rows), {}))
+        try:
+            collector.fleet()
+        finally:
+            ui.engine.collect = real
+        return os.path.exists(os.path.join(tmp, "launching", self.SID + ".json"))
+
+    def test_a_session_on_the_list_lets_go_of_its_claim(self):
+        self.assertFalse(self.claim_after([row(self.SID)]))
+
+    def test_one_not_on_it_keeps_it(self):                              # control
+        self.assertTrue(self.claim_after([row("99999999-9999-4999-8999-999999999999")]))
+
+
 class TestKeys(UiTest):
     async def test_enter_goes_to_the_selected_session(self):
         adapter = FakeAdapter()

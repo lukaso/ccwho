@@ -428,8 +428,11 @@ class TestALongList(KillTest):
             for _ in range(40):
                 if scroll.scroll_y >= scroll.max_scroll_y:
                     break
+                was = scroll.scroll_y
                 await pilot.press("pagedown")
                 await pilot.pause(ui.KillBox.REST + 0.2)            # a person reads the page
+                if scroll.scroll_y == was:
+                    break                   # PgDn did not move it: fail now, not in 18 s
             self.assertGreater(scroll.scroll_y, 0)
             await pilot.press("enter")
             await self.settle(app, pilot)
@@ -701,9 +704,9 @@ class TestTheFooterFollows(KillTest):
             await pilot.pause()
             self.assertNotIn("kill", shown())
 
-    async def test_x_in_a_session_brief_does_nothing(self):
-        # with no kill or clean there, `x` must not fall through to the list's
-        # two-press loop kill of the session the brief is about
+    async def test_x_in_a_session_brief_asks_about_that_session(self):
+        # no kill or clean there: `x` is the session's own box, which asks
+        # first - never a kill straight away
         from test_ui import LIVE, STUCK
         c = FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00"))
         app = self.app(collector=c)
@@ -717,10 +720,11 @@ class TestTheFooterFollows(KillTest):
             self.assertIs(app.focused, app.query_one("#brief"))
             await pilot.press("x")
             await pilot.pause()
+            self.assertIsInstance(app.screen, ui.ChoiceBox)
+            self.assertIn(STUCK["sessionId"][:4], app.screen.title_text)
             await pilot.press("x")
             await pilot.pause()
             self.assertIsNone(c.killed)
-            self.assertNotIn("kill loop", app.status)
 
     async def test_p_from_a_brief_lands_on_the_first_process(self):
         app = self.app(collector=KillCollector())
@@ -778,6 +782,363 @@ class TestTheCollectorKills(unittest.TestCase):
         finally:
             ui.engine.carry_out = real
         self.assertEqual(seen, ["dddd4444-0000-4000-8000-00000000dead"])
+
+    def test_a_stop_runs_ccwho_stop_and_says_what_it_said(self):
+        # `ccwho stop <id> --yes`: every rule of the CLI (the job, the wait, what it left)
+        import subprocess
+        import sys
+        seen, kwargs = [], []
+        real = subprocess.run
+        def run(argv, **kw):
+            seen.append(argv)
+            kwargs.append(kw)
+            return subprocess.CompletedProcess(argv, 0, "stopped - its conversation is kept\n",
+                                               "")
+        subprocess.run = run
+        try:
+            lines = ui.Collector().stop_session(BG_ROW)
+        finally:
+            subprocess.run = real
+        self.assertEqual(seen[0][0], sys.executable)
+        self.assertTrue(seen[0][1].endswith("ccwho.py"))
+        self.assertEqual(seen[0][2:], ["stop", BG_ROW["sessionId"], "--yes"])
+        self.assertIs(kwargs[0].get("stdin"), subprocess.DEVNULL)  # never the TUI's terminal
+        self.assertEqual(lines, ["stopped - its conversation is kept"])
+
+    def test_a_stop_that_cannot_run_says_its_type_only(self):
+        import subprocess
+        real = subprocess.run
+        def run(argv, **kw):
+            raise OSError("/secret/path")
+        subprocess.run = run
+        try:
+            lines = ui.Collector().stop_session(BG_ROW)
+        finally:
+            subprocess.run = real
+        self.assertEqual(len(lines), 1)
+        self.assertIn("could not run the stop (OSError)", lines[0])
+        self.assertNotIn("/secret/path", lines[0])
+
+    def test_a_stop_that_fails_says_its_type_only(self):
+        import subprocess
+        real = subprocess.run
+        def run(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 60)
+        subprocess.run = run
+        try:
+            lines = ui.Collector().stop_session(BG_ROW)
+        finally:
+            subprocess.run = real
+        self.assertEqual(len(lines), 1)
+        self.assertIn("TimeoutExpired", lines[0])
+        self.assertNotIn("could not run", lines[0])           # claude stop may have run
+        self.assertIn("may have been stopped", lines[0])
+        self.assertIn("run ccwho ls", lines[0])
+
+
+BG_ROW = dict(HOLDING, kind="background")
+
+
+class RowCollector(KillCollector):
+    def __init__(self, rows=(HOLDING, BUSY), **kw):
+        super().__init__(**kw)
+        self.fleet_value = ui.Fleet(list(rows), True, "12:00:00", procs=PROCS)
+        self.stopped = []
+
+    def kill_prepare(self, mode, target):
+        self.prepared.append((mode, target))
+        return dict(self.prep_value, mode=mode, target=target)
+
+    def stop_session(self, row):
+        self.stopped.append(row["sessionId"])
+        return ["stopped - its conversation is kept: claude attach aaaa1111"]
+
+
+class RowBoxTest(KillTest):
+    def choices(self, app):
+        return app.screen if isinstance(app.screen, ui.ChoiceBox) else None
+
+    def choice_text(self, app):
+        return "\n".join(str(w.content) for w in app.screen.query("Static"))
+
+    async def open_choices(self, app, pilot):
+        await pilot.pause()
+        await pilot.press("x")
+        await pilot.pause()
+
+
+class TestXOnARow(RowBoxTest):
+    """`x` on a session row: a box of what can be done to it (the owner's D10,
+    2026-09-27) - its processes, a stop for a background session, its stuck
+    loop - each then asked about on its own."""
+
+    async def test_x_offers_what_fits_the_row(self):
+        app = self.app(collector=RowCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            self.assertIsNotNone(self.choices(app))
+            text = self.choice_text(app)
+            self.assertIn("p  kill its processes  :3000", text)
+            self.assertNotIn("stop the session", text)          # interactive
+            self.assertIn("end it there", text)
+            self.assertNotIn("kill the stuck loop", text)
+
+    async def test_p_asks_about_the_sessions_processes(self):
+        c = RowCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            await pilot.press("p")
+            await self.settle(app, pilot)
+            self.assertEqual(c.prepared, [("session", HOLDING["sessionId"])])
+            self.assertIsNotNone(self.box(app))
+            self.assertIn("aaaa", str(app.screen.query_one("#killhead").content))
+            self.assertEqual(c.carried, [])
+
+    async def test_the_process_screen_offers_no_row_x(self):
+        # that screen is not about the selected row: no `x` in the footer, and
+        # an `x` that reaches the row says why
+        app = self.app(collector=RowCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.x_says(app), "kill or stop")          # control
+            await pilot.press("p")
+            await pilot.pause()
+            app.query(ui.Row).first().focus()
+            await pilot.pause()
+            self.assertIsNone(self.x_says(app))
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsNone(self.choices(app))
+            self.assertIn("Esc", app.status)
+
+    async def test_no_box_while_a_kill_is_under_way(self):
+        c = RowCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            app.kill_busy = True
+            await self.open_choices(app, pilot)
+            self.assertIsNone(self.choices(app))
+            self.assertIn("a kill is under way", app.status)
+
+    async def test_escape_closes_and_does_nothing(self):
+        c = RowCollector(rows=(BG_ROW, BUSY))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            await pilot.press("escape")
+            await self.settle(app, pilot)
+            self.assertIsNone(self.choices(app))
+            self.assertEqual((c.prepared, c.stopped), ([], []))
+
+    async def test_a_click_on_a_choice_picks_it(self):
+        c = RowCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            await pilot.click("#choice-p")
+            await self.settle(app, pilot)
+            self.assertEqual(c.prepared, [("session", HOLDING["sessionId"])])
+
+    async def test_a_key_the_box_does_not_offer_does_nothing(self):
+        c = RowCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            await pilot.press("s")                              # interactive: no stop
+            await self.settle(app, pilot)
+            self.assertIsNotNone(self.choices(app))
+            self.assertEqual((c.prepared, c.stopped), ([], []))
+
+    async def test_a_row_with_nothing_to_do_says_so(self):
+        c = RowCollector(rows=(BUSY,))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            self.assertIsNone(self.choices(app))
+            self.assertIn("end it in its window", app.status)
+
+    async def test_the_footer_follows_a_refresh_of_the_same_row(self):
+        # the keys stay on the row; a refresh gives it processes: now `x` acts
+        bare = dict(HOLDING, procs=0, ports=[])
+        c = RowCollector(rows=(bare, BUSY))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertIsNone(self.x_says(app))
+            app.show(ui.Fleet([HOLDING, BUSY], True, "12:00:05", procs=PROCS))
+            await pilot.pause()
+            self.assertEqual(self.x_says(app), "kill or stop")
+
+    async def test_the_footer_names_x_only_where_it_does_something(self):
+        app = self.app(collector=RowCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.x_says(app), "kill or stop")          # HOLDING: its processes
+            await pilot.press("j")                                      # BUSY: nothing
+            await pilot.pause()
+            self.assertIsNone(self.x_says(app))
+
+
+class TestStopFromARow(RowBoxTest):
+    """`s` in the row's box: a background session is stopped after a box that
+    asks, by `ccwho stop` (split from TestXOnARow for the 30 s kill)."""
+
+    async def test_a_background_session_can_be_stopped_after_its_box(self):
+        c = RowCollector(rows=(BG_ROW, BUSY))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            self.assertIn("s  stop the session", self.choice_text(app))
+            await pilot.press("s")
+            await pilot.pause()
+            self.assertIsNotNone(self.box(app))
+            self.assertIn("conversation is kept", self.box_text(app))
+            self.assertEqual(str(app.screen.query_one("#killgo").content).strip(), "stop")
+            self.assertIn("y or Enter stops", str(app.screen.query_one("#killhint").content))
+            self.assertEqual(c.stopped, [])                     # asked, not done
+            await pilot.press("y")
+            await self.settle(app, pilot)
+            self.assertEqual(c.stopped, [BG_ROW["sessionId"]])
+            self.assertIn("claude attach aaaa1111", self.box_text(app))
+
+    async def test_no_stop_while_a_kill_is_under_way(self):
+        c = RowCollector(rows=(BG_ROW, BUSY))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            app.kill_busy = True        # a kill began while the box was open
+            await pilot.press("s")
+            await pilot.pause()
+            self.assertIsNone(self.box(app))
+            self.assertIn("a kill is under way", app.status)
+            self.assertEqual(c.stopped, [])
+
+    async def test_the_stop_box_holds_the_one_kill_at_a_time(self):
+        c = RowCollector(rows=(BG_ROW, BUSY))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            self.assertTrue(app.kill_busy)
+            await pilot.press("y")
+            await self.settle(app, pilot)
+            self.assertTrue(app.kill_busy)                      # its answer is on screen
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertFalse(app.kill_busy)
+
+    async def test_n_on_the_stop_box_stops_nothing(self):
+        c = RowCollector(rows=(BG_ROW, BUSY))
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            await pilot.press("n")
+            await self.settle(app, pilot)
+            self.assertEqual(c.stopped, [])
+            self.assertIsNone(self.box(app))
+
+
+class GatedLoopCollector(FakeCollector):
+    """kill_loops waits for the test to let it go; fleet() may fail after it."""
+
+    def __init__(self, fleet, fail_fleet=False):
+        super().__init__(fleet=fleet)
+        import threading
+        self.gate, self.loop_calls, self.fail_fleet, self.done = threading.Event(), 0, fail_fleet, False
+
+    def kill_loops(self, row):
+        self.loop_calls += 1           # not `calls`: FakeCollector counts fleet() in it
+        self.gate.wait(10)
+        self.done = True
+        return "killed loop 86246"
+
+    def fleet(self):
+        if self.done and self.fail_fleet:
+            raise RuntimeError("ps failed")
+        return super().fleet()
+
+
+class TestOneLoopKillAtATime(RowBoxTest):
+    """A loop kill holds the one-kill-at-a-time lock (review round 2): pressed
+    again while it runs, the same pids are not killed twice."""
+
+    def fleet(self):
+        from test_ui import LIVE, STUCK
+        return ui.Fleet([LIVE, STUCK], True, "12:00:00")
+
+    async def test_x_while_a_loop_kill_runs_opens_no_box(self):
+        c = GatedLoopCollector(self.fleet())
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("j", "x", "l")
+                await pilot.pause(0.2)
+                self.assertTrue(app.kill_busy)
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertIsNone(self.choices(app))
+                self.assertIn("a kill is under way", app.status)
+            finally:
+                c.gate.set()
+            await self.settle(app, pilot)
+            self.assertEqual(c.loop_calls, 1)
+            self.assertFalse(app.kill_busy)
+            self.assertIn("killed loop 86246", app.status)
+
+    async def test_a_failed_list_read_after_the_kill_frees_the_lock(self):
+        c = GatedLoopCollector(self.fleet(), fail_fleet=True)
+        c.gate.set()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "l")
+            await self.settle(app, pilot)
+            self.assertFalse(app.kill_busy)
+            self.assertIn("killed loop 86246", app.status)       # what it did is still said
+            self.assertTrue(app.is_running)
+
+    async def test_l_after_a_kill_began_kills_nothing(self):
+        c = GatedLoopCollector(self.fleet())
+        c.gate.set()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            await pilot.pause()
+            app.kill_busy = True        # a kill began while the box was open
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            self.assertEqual(c.loop_calls, 0)
+            self.assertIn("a kill is under way", app.status)
+
+    async def test_a_kill_that_raises_frees_the_lock(self):
+        c = GatedLoopCollector(self.fleet())
+        def boom(row):
+            raise RuntimeError("/secret/path")
+        c.kill_loops = boom
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "l")
+            await self.settle(app, pilot)
+            self.assertFalse(app.kill_busy)
+            self.assertIn("could not kill", app.status)
+            self.assertNotIn("/secret/path", app.status)
+
+    async def test_a_direct_x_on_a_row_with_nothing_opens_no_box(self):
+        # the keys never reach it there (check_action), but the guard holds alone
+        app = self.app(collector=RowCollector(rows=(BUSY,)))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            app.action_row_x()
+            await pilot.pause()
+            self.assertIsNone(self.choices(app))
+            self.assertIn("end it in its window", app.status)
 
 
 if __name__ == "__main__":

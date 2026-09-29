@@ -1546,7 +1546,7 @@ class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
                 await pilot.press("enter")
                 await pilot.pause(0.1)
                 before = self.state(app)
-                await pilot.press("j", "x", "x")
+                await pilot.press("j", "x", "l")
                 await pilot.pause(0.3)
                 self.assertIsNone(collector.killed)
                 self.assertIn("window is being opened", app.status)
@@ -1558,28 +1558,26 @@ class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
             await pilot.pause(0.1)
             await pilot.pause()
             self.assertEqual(self.marks, [self.A["sessionId"]])
-            await pilot.press("x")                  # and after it, the usual two:
+            await pilot.press("x")                  # and after it, the usual box:
             await pilot.pause(0.1)
-            self.assertIsNone(collector.killed, "the refused x did not arm it")
-            self.assertTrue(app.status.startswith("x or click again"))
-            await pilot.press("x")
+            self.assertIsNone(collector.killed, "the refused kill is not kept for later")
+            self.assertIsInstance(app.screen, ui.ChoiceBox)
+            await pilot.press("l")
             await pilot.pause(0.3)
             self.assertEqual(collector.killed, [STUCK["sessionId"]])
 
-    async def test_a_jump_disarms_a_kill(self):
-        # armed, then Enter on the same row: the question left the screen with
-        # the jump, so one x afterwards only asks again
+    async def test_enter_in_the_kill_box_neither_jumps_nor_kills(self):
+        # the box asks about the kill: Enter there is no answer, and no jump
+        adapter = FakeAdapter()
         collector = FakeCollector(fleet=ui.Fleet([self.A, STUCK], True, "12:00:00"))
-        app = self.app(collector=collector)
+        app = self.app(adapter=adapter, collector=collector)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             await pilot.press("j", "x", "enter")
-            await pilot.pause(0.1)
-            await pilot.pause()
-            await pilot.press("x")
             await pilot.pause(0.3)
             self.assertIsNone(collector.killed)
-            self.assertTrue(app.status.startswith("x or click again"))
+            self.assertEqual(adapter.asked, [])
+            self.assertIsInstance(app.screen, ui.ChoiceBox)
 
     async def test_a_turn_that_came_during_the_jump_is_not_marked_seen(self):
         adapter = GatedAdapter()
@@ -1970,7 +1968,7 @@ class TestTheDetailWithTheMouse(UiTest):
             await pilot.click(w, offset=TestKillingAStuckLoop.kill_offset(None, w),
                               button=3)
             await pilot.pause()
-            self.assertIsNone(app.armed)
+            self.assertNotIsInstance(app.screen, ui.ChoiceBox)
             self.assertTrue(app.detail_open)
 
     async def test_it_works_from_the_process_screen_too(self):
@@ -2946,9 +2944,10 @@ STUCK = row("cccc3333-0000-4000-8000-000000000003", "stuck", status="busy", pid=
 
 
 class TestKillingAStuckLoop(UiTest):
-    """A loop that can never end is killed from the list: `x` twice, or the
-    [kill loop] part of the row clicked twice. Once only arms it - a kill is
-    not undone - and the row's other clicks still go to the session."""
+    """A loop that can never end is killed from the list: `x` on its row, or a
+    click on [kill loop], opens the row's box (the owner's D10, 2026-09-27),
+    and `l` there kills it - a kill is not undone, so the box asks first. The
+    row's other clicks still go to the session."""
 
     def setUp(self):
         self.collector = FakeCollector(fleet=ui.Fleet([LIVE, STUCK], True, "12:00:00"))
@@ -2964,6 +2963,9 @@ class TestKillingAStuckLoop(UiTest):
         # the row's left border and padding come before its text; one column in
         return (line.index("[kill loop]") + 2 + 1, 1)
 
+    def boxed(self, app):
+        return isinstance(app.screen, ui.ChoiceBox)
+
     async def test_the_stuck_row_has_its_own_heading(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
@@ -2972,76 +2974,76 @@ class TestKillingAStuckLoop(UiTest):
             self.assertIn("STUCK", text)
             self.assertIn("[kill loop]", text)
 
-    async def test_one_x_only_asks(self):
+    async def test_x_only_asks(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             await pilot.press("j", "x")
             await pilot.pause()
             self.assertIsNone(self.collector.killed)
-            self.assertIn("86246", app.status)
+            self.assertTrue(self.boxed(app))
+            text = "\n".join(str(w.content) for w in app.screen.query("Static"))
+            self.assertIn("l  kill the stuck loop 86246", text)
+            self.assertIn("the session continues", text)
 
-    async def test_two_x_kill_it(self):
+    async def test_l_in_the_box_kills_it(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x", "x")
+            await pilot.press("j", "x", "l")
             await pilot.pause(0.2)
             self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
+            self.assertFalse(self.boxed(app))
+
+    async def test_escape_kills_nothing(self):                           # control
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x", "escape")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+            self.assertFalse(self.boxed(app))
 
     async def test_x_on_a_row_with_no_dead_loop_does_nothing(self):      # control
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("x", "x")
+            await pilot.press("x", "l")
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
 
-    async def test_mid_turn_x_does_nothing(self):                        # control
-        # mid-turn the agent may be about to deal with the loop itself
-        busy = dict(STUCK, attention="busy")
-        collector = FakeCollector(fleet=ui.Fleet([LIVE, busy], True, "12:00:00"))
-        app = self.app(collector=collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            await pilot.press("j", "x", "x")
-            await pilot.pause(0.2)
-            self.assertIsNone(collector.killed)
+    async def test_mid_turn_or_a_program_offers_no_loop_kill(self):
+        # mid-turn the agent may be about to deal with the loop itself; a
+        # program's row is no more a kill than a busy one of yours
+        for attention in ("busy", "program"):
+            with self.subTest(attention=attention):
+                row = dict(STUCK, attention=attention)
+                collector = FakeCollector(fleet=ui.Fleet([LIVE, row], True, "12:00:00"))
+                app = self.app(collector=collector, adapter=self.adapter)
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("j", "x")
+                    await pilot.pause()
+                    self.assertFalse(self.boxed(app), "nothing to offer: no box")
+                    await pilot.press("l")
+                    await pilot.pause(0.2)
+                    self.assertIsNone(collector.killed)
 
-    async def test_x_on_a_program_mid_turn_does_nothing(self):
-        # its agent may be about to deal with the loop: a program's row is no
-        # more a kill than a busy one of yours
-        program = dict(STUCK, attention="program")
-        collector = FakeCollector(fleet=ui.Fleet([LIVE, program], True, "12:00:00"))
-        app = self.app(collector=collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            await pilot.press("j", "x")
-            await pilot.pause()
-            self.assertIsNone(app.armed, "one x must not even ask")
-            await pilot.press("x")
-            await pilot.pause(0.2)
-            self.assertIsNone(collector.killed)
-
-    async def test_an_arm_ends_when_the_row_becomes_a_program(self):
+    async def test_a_row_that_became_a_program_is_not_killed(self):
         # the row changes in place, so it is a copy: STUCK is shared by every test
         collector = FakeCollector(fleet=ui.Fleet([LIVE, dict(STUCK)], True, "12:00:00"))
         app = self.app(collector=collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             await pilot.press("j", "x")
+            await pilot.pause()
             for r in app.fleet.rows:
                 if r["sessionId"] == STUCK["sessionId"]:
                     r["attention"] = "program"
-            self.assertEqual(app.still_armed(), "")
-
-    async def test_moving_away_disarms_it(self):                         # control
-        app = self.app(collector=self.collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            await pilot.press("j", "x", "k", "j", "x")
+            await pilot.press("l")
             await pilot.pause(0.2)
-            self.assertIsNone(self.collector.killed)
+            self.assertIsNone(collector.killed)
+            self.assertIn("nothing killed", app.status)
 
     async def test_one_click_on_the_kill_only_asks_and_does_not_go(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
@@ -3052,101 +3054,74 @@ class TestKillingAStuckLoop(UiTest):
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
             self.assertEqual(self.adapter.asked, [])
-            self.assertIn("86246", app.status)
+            self.assertTrue(self.boxed(app))
 
-    async def test_two_clicks_on_the_kill_kill_it(self):
+    async def test_the_click_then_l_kills_it(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             w = self.stuck_row(app)
             await pilot.click(w, offset=self.kill_offset(w))
             await pilot.pause()
-            w = self.stuck_row(app)
-            await pilot.click(w, offset=self.kill_offset(w))
+            await pilot.press("l")
             await pilot.pause(0.2)
             self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
             self.assertEqual(self.adapter.asked, [])
-
-    # review round 1: the arm outlived what the screen said
-    async def test_an_arm_expires(self):
-        app = self.app(collector=self.collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            now = [1000.0]
-            app.clock = lambda: now[0]
-            await pilot.press("j", "x")
-            now[0] += ui.ARM_SECS + 1
-            await pilot.press("x")
-            await pilot.pause(0.2)
-            self.assertIsNone(self.collector.killed)
-            self.assertIn("86246", app.status, "it asks again")
-
-    async def test_the_question_goes_when_the_arm_does(self):
-        # review round 2: an expired arm must not leave its question on screen
-        was, ui.ARM_SECS = ui.ARM_SECS, 0.2
-        try:
-            app = self.app(collector=self.collector, adapter=self.adapter)
-            async with app.run_test(size=(120, 30)) as pilot:
-                await pilot.pause()
-                await pilot.press("j", "x")
-                self.assertIn("86246", app.status)
-                await pilot.pause(0.6)
-                self.assertNotIn("86246", app.status)
-        finally:
-            ui.ARM_SECS = was
 
     async def test_x_on_the_process_screen_does_nothing(self):
         # that screen is not about the selected row: you cannot see what x hits
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "p", "x", "x")
+            await pilot.press("j", "p", "x", "l")
             await pilot.pause(0.2)
             self.assertIsNone(self.collector.killed)
-            self.assertNotIn("86246", app.status)
+            self.assertFalse(self.boxed(app))
 
-    async def test_a_refresh_keeps_the_question_on_screen(self):        # control
+    async def test_a_click_on_the_kill_with_the_process_screen_open_says_why(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
+        async with app.run_test(size=(180, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x")
-            app.show(ui.Fleet([LIVE, STUCK], True, "12:00:05"))
-            await pilot.pause()
-            self.assertIn("86246", app.status)
-            await pilot.press("x")
-            await pilot.pause(0.2)
-            self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
-
-    async def test_a_refresh_with_other_loops_disarms(self):
-        app = self.app(collector=self.collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            await pilot.press("j", "x")
-            moved = dict(STUCK, dead_loops=[{"pid": 99999, "tasks": ["b9"]}])
-            app.show(ui.Fleet([LIVE, moved], True, "12:00:05"))
-            await pilot.pause()
-            await pilot.press("x")
-            await pilot.pause(0.2)
-            self.assertIsNone(self.collector.killed)
-
-    async def test_a_click_on_another_row_disarms(self):
-        app = self.app(collector=self.collector, adapter=self.adapter)
-        async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause()
-            await pilot.press("j", "x")
-            live = [w for w in app.query(ui.Row) if w.row["sessionId"] == LIVE["sessionId"]][0]
-            await pilot.click(live, offset=(20, 0))
+            await pilot.press("p")
             await pilot.pause()
             w = self.stuck_row(app)
             await pilot.click(w, offset=self.kill_offset(w))
             await pilot.pause(0.2)
+            self.assertFalse(self.boxed(app))
             self.assertIsNone(self.collector.killed)
+            self.assertIn("Esc for the list", app.status)
+
+    async def test_a_refresh_while_asked_keeps_the_kill(self):          # control
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            await pilot.pause()
+            app.show(ui.Fleet([LIVE, STUCK], True, "12:00:05"))
+            await pilot.pause()
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            self.assertEqual(self.collector.killed, [STUCK["sessionId"]])
+
+    async def test_a_refresh_with_other_loops_kills_nothing(self):
+        app = self.app(collector=self.collector, adapter=self.adapter)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "x")
+            await pilot.pause()
+            moved = dict(STUCK, dead_loops=[{"pid": 99999, "tasks": ["b9"]}])
+            app.show(ui.Fleet([LIVE, moved], True, "12:00:05"))
+            await pilot.pause()
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            self.assertIsNone(self.collector.killed)
+            self.assertIn("nothing killed", app.status)
 
     async def test_what_the_kill_did_stays_said(self):
         app = self.app(collector=self.collector, adapter=self.adapter)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("j", "x", "x")
+            await pilot.press("j", "x", "l")
             await pilot.pause(0.3)
             self.assertIn("killed loop 86246", app.status)
 
@@ -3407,15 +3382,25 @@ class TestTheKillButtonOnAScrollingList(UiTest):
             col, width = self.button(widget)
             self.assertEqual(width, len("[kill loop]"))
             gutter = widget.content_region.x - widget.region.x
+            async def screen_is(boxed, tries=40):
+                # a loaded machine can take more than one frame to push a screen
+                for _ in range(tries):
+                    if isinstance(app.screen, ui.ChoiceBox) == boxed:
+                        return True
+                    await pilot.pause(0.05)
+                return False
+            # every cell names the kill; the ends are clicked for real (a box
+            # each is slow: all of them ran close to the 30 s kill)
             for cell in range(width):
-                app.armed = None
+                self.assertEqual(widget.action_at(col + cell, 1), "kill", f"cell {cell}")
+            self.assertNotEqual(widget.action_at(col + width, 1), "kill")          # control
+            for cell in (0, width - 1):
                 await pilot.click(widget, offset=(gutter + col + cell, 1))
-                await pilot.pause()
-                self.assertTrue(app.armed, f"cell {cell} of the button arms it")
-            app.armed = None
+                self.assertTrue(await screen_is(True), f"cell {cell} of the button asks")
+                await pilot.press("escape")
+                self.assertTrue(await screen_is(False))
             await pilot.click(widget, offset=(gutter + col + width, 1))           # control
-            await pilot.pause()
-            self.assertFalse(app.armed)
+            self.assertFalse(await screen_is(True, tries=10), "past the button: no box")
 
     async def test_an_ascii_recap(self):
         await self.check("Goal was moving the durable files into STATE; " * 6)

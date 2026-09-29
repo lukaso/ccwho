@@ -98,7 +98,6 @@ PULSE_EVERY = 0.45             # the blink on a row that is being opened
 # fifteen changed four times a minute, and acting on every change is ~4% of a
 # core.
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
-ARM_SECS = 10.0                # a kill asked for once is confirmed within this
 
 
 class Fleet:
@@ -165,9 +164,8 @@ class Brief(Static):
         # the footer says what `x` does on the line the keys are on (check_action)
         Binding("x", "kill", "kill"),
         Binding("x", "clean", "clean all"),
-        # neither here (the session brief, or no line): `x` stops here, never
-        # reaching the list's two-press kill of the session's stuck loops
-        Binding("x", "nothing", "", show=False),
+        # neither (the session brief, or no line): `x` goes on to the list's -
+        # the session's box, which asks before it does anything
         Binding("left,escape", "leave", "back"),
     ]
 
@@ -300,9 +298,6 @@ class Brief(Static):
         it - after the box lists what that takes."""
         if self.fields.get(self.lit) == "proc":
             self.app.ask_kill("proc", self.values.get(self.lit))
-
-    def action_nothing(self):
-        pass
 
     def action_clean(self):
         """`x` on the left-behind heading cleans it all - after the box."""
@@ -457,9 +452,9 @@ class KillBox(ModalScreen):
 
     CHROME = 5      # the box's rows besides the list: border 2, title 1, bar and its margin 2
 
-    def __init__(self, title, lines, can_kill):
+    def __init__(self, title, lines, can_kill, verb="kill"):
         super().__init__()
-        self.title_text, self.lines = title, list(lines)
+        self.title_text, self.lines, self.verb = title, list(lines), verb
         self.state = "ask" if can_kill else "done"
         self.on_kill = None
         self.seen = set()       # the list's rows that have been on screen
@@ -472,7 +467,7 @@ class KillBox(ModalScreen):
             yield VerticalScroll(Static("\n".join(self.lines), id="killbody", markup=False),
                                  id="killscroll")
             with Horizontal(id="killbar"):
-                yield Static(" kill ", id="killgo", markup=False)
+                yield Static(f" {self.verb} ", id="killgo", markup=False)
                 yield Static(self.hint(), id="killhint", markup=False)
 
     def on_mount(self):
@@ -532,9 +527,13 @@ class KillBox(ModalScreen):
 
     def hint(self):
         if self.state == "ask" and self.unseen():
-            return "not all of the list was on screen yet - scroll through it (↓ PgDn) to kill"
-        return {"ask": "y or Enter kills · n or Esc closes", "killing": "killing...",
-                "done": "Enter or Esc closes"}[self.state]
+            return (f"not all of the list was on screen yet - scroll through it (↓ PgDn)"
+                    f" to {self.verb}")
+        return {"ask": f"y or Enter {self.verb}s · n or Esc closes",
+                "killing": self.doing(), "done": "Enter or Esc closes"}[self.state]
+
+    def doing(self):
+        return "stopping..." if self.verb == "stop" else "killing..."
 
     def paint(self, lines=None):
         if not self.query("#killbody"):
@@ -550,7 +549,7 @@ class KillBox(ModalScreen):
             return
         if self.state == "ask":
             self.state = "killing"
-            self.paint(["killing..."])
+            self.paint([self.doing()])
             if self.on_kill:
                 self.on_kill()
         elif self.state == "done":
@@ -570,6 +569,61 @@ class KillBox(ModalScreen):
             self.action_go()
         elif widget is not None and widget.id == "killclose":
             self.action_close()
+
+
+class ChoiceBox(ModalScreen):
+    """What `x` can do to one session (the owner's D10, 2026-09-27): only the
+    choices that fit it, each a key and a line to click. A choice asks again on
+    its own before it acts - except the stuck loop's, whose line names what it
+    kills: this box is its question. Esc or ✕ closes; a key it does not offer
+    does nothing."""
+
+    DEFAULT_CSS = """
+    ChoiceBox { align: center middle; }
+    #choicebox { width: auto; min-width: 50; max-width: 100; height: auto;
+                 border: round $warning; background: $surface; padding: 0 1; }
+    #choicetop { height: auto; }
+    #choicehead { width: 1fr; text-style: bold; }
+    #choiceclose { width: 3; color: $text-muted; }
+    #choiceclose:hover { background: $accent; color: $text; }
+    .choice { width: 100%; height: auto; }
+    .choice:hover { background: $accent; }
+    .choicenote { color: $text-muted; height: auto; }
+    """
+
+    BINDINGS = [Binding("escape", "close", "close")]
+
+    def __init__(self, title, choices, notes=()):
+        super().__init__()
+        self.title_text, self.choices, self.notes = title, list(choices), list(notes)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="choicebox"):
+            with Horizontal(id="choicetop"):
+                yield Static(self.title_text, id="choicehead", markup=False)
+                yield Static(" ✕ ", id="choiceclose", markup=False)
+            for key, label in self.choices:
+                yield Static(f"{key}  {label}", id=f"choice-{key}", classes="choice",
+                             markup=False)
+            for note in self.notes:
+                yield Static(note, classes="choicenote", markup=False)
+            yield Static("Esc closes", classes="choicenote", markup=False)
+
+    def on_key(self, event):
+        if event.key in {k for k, _ in self.choices}:
+            event.stop()
+            self.dismiss(event.key)
+
+    def on_click(self, event):
+        widget = getattr(event, "widget", None)
+        wid = getattr(widget, "id", None) or ""
+        if wid == "choiceclose":
+            self.dismiss(None)
+        elif wid.startswith("choice-"):
+            self.dismiss(wid[len("choice-"):])
+
+    def action_close(self):
+        self.dismiss(None)
 
 
 class SavesMenu(ModalScreen):
@@ -690,7 +744,10 @@ class CcwhoUi(App):
         Binding("j,down", "next", "down", show=False),
         Binding("k,up", "prev", "up", show=False),
         Binding("o", "reopen", "reopen"),
-        Binding("x", "kill_loop", "kill loop", show=False),
+        # the footer names it only on a row it can act on (check_action)
+        Binding("x", "row_x", "kill or stop"),
+        # no choice on this row: `x` says why, and the footer shows no `x`
+        Binding("x", "row_nothing", "", show=False),
         Binding("r", "restart", "restart", show=False),
         Binding("q", "quit", "quit"),
     ]
@@ -710,9 +767,6 @@ class CcwhoUi(App):
         self.painted_shape = None
         self.selected = ""      # by session id: widgets come and go, this does not
         self.acting = ""        # the session a window is being opened for
-        # (session, its loop pids, when): what the next x or click kills. Only
-        # while the question is on screen: a kill is not undone
-        self.armed = None
         self.kill_busy = False  # a kill is being read, asked or carried out
         self.clock = time.monotonic
         self.pulsing = False
@@ -842,7 +896,7 @@ class CcwhoUi(App):
             self.held = fleet           # shown when the jump is done: landed()
             return
         self.fleet = self.keep_seen(fleet)
-        self.status = self.still_armed() or ""
+        self.status = ""
         self.rebuild()
 
     def keep_seen(self, fleet):
@@ -1305,8 +1359,6 @@ class CcwhoUi(App):
         self.selected = widget.row.get("sessionId", "")
         self.mark_selected()
         widget.focus()
-        if self.armed and self.armed[0] != self.selected:
-            self.armed = None
         # a right click - or ctrl-click, the Mac's own - asks about the row
         if getattr(event, "button", 1) == 3 or getattr(event, "ctrl", False):
             self.open_detail("brief")
@@ -1314,69 +1366,150 @@ class CcwhoUi(App):
         at = event.get_content_offset(widget)
         action = widget.action_at(at.x, at.y) if at is not None else None
         if action == "kill":
-            self.action_kill_loop()
+            self.action_row_x()             # its box: the kill is asked about there
             return
         if action == "detail":
             self.open_detail("brief")
             return
         self._go()          # a click names its row, whatever the pane shows
 
-    def action_kill_loop(self):
-        """Kill the selected session's wait loops that cannot end - on the second
-        ask. The first only says what the second will do: a kill is not undone."""
+    def row_choices(self, row):
+        """(choices, notes) for `x` on this row: its processes when it has some,
+        a stop when it runs in the background, its stuck loop when that is the
+        list's to kill."""
+        row = row or {}
+        choices, notes = [], []
+        if row.get("procs"):
+            ports = " ".join(f":{p}" for p in row.get("ports") or [])
+            choices.append(("p", "kill its processes" + (f"  {ports}" if ports
+                                                          else f" ({row['procs']})")))
+        if row.get("kind") == "background":
+            choices.append(("s", "stop the session - its conversation is kept"))
+        else:
+            notes.append("it runs in a window: to end it, end it there (/exit)")
+        if engine.loop_kill_offered(row):
+            pids = ", ".join(str(p) for p in self._pids(row))
+            choices.append(("l", f"kill the stuck loop {pids} - the session continues"))
+        return choices, notes
+
+    def check_action(self, action, parameters):
+        if action == "row_x":
+            # only where it does something: the footer then says so. Not on the
+            # process screen - it is not about the selected row
+            return (not (self.detail_open and self.detail_mode == "procs")
+                    and bool(self.row_choices(self.selected_row())[0]))
+        return True
+
+    def action_row_x(self):
+        """`x` on a session: the box of what fits it. The process screen's `x`
+        is its own - that screen is not about the selected row."""
         if self.detail_open and self.detail_mode == "procs":
-            return      # that screen is not about the selected row
+            self.action_row_nothing()
+            return
         row = self.selected_row()
-        if not engine.loop_kill_offered(row or {}):
+        if not row:
+            return
+        if self.kill_busy:
+            self.said("a kill is under way - finish that one first")
+            return
+        choices, notes = self.row_choices(row)
+        if not choices:
+            self.action_row_nothing()
+            return
+        title = f"{engine.brief.short_id(row.get('sessionId', ''))}  {row.get('name') or ''}  " \
+                f"{row.get('title') or ''}".rstrip()
+        self.push_screen(ChoiceBox(title, choices, notes),
+                         callback=lambda key, row=row: self.row_chosen(row, key))
+
+    def action_row_nothing(self):
+        if self.detail_open and self.detail_mode == "procs":
+            self.said("the process screen is open - Esc for the list, then x on the session")
+            return
+        if self.selected_row():
+            self.said("nothing to kill or stop here - an interactive session: end it in its"
+                      " window (/exit)")
+
+    def row_chosen(self, row, key):
+        if key == "p":
+            self.ask_kill("session", row.get("sessionId"))
+        elif key == "s":
+            self.ask_stop(row)
+        elif key == "l":
+            self.kill_loop_now(row)
+
+    def kill_loop_now(self, row):
+        """The box named these loops: they go only while the row is the same -
+        the same session, the same loops, still the list's to kill."""
+        now = next((r for r in self.fleet.rows if r.get("sessionId") == row.get("sessionId")),
+                   None)
+        if (now is None or self._pids(now) != self._pids(row)
+                or not engine.loop_kill_offered(now)):
+            self.said("the session changed since the box opened - nothing killed; x again")
             return
         if self.acting:
             # a kill moves rows, and nothing moves while a window opens
-            self.status = "a window is being opened - kill it after that"
-            self.paint_header(self.fleet.groups(self.filter_text))
+            self.said("a window is being opened - kill it after that")
             return
-        if self.still_armed() and self.armed[0] == row.get("sessionId", ""):
-            self.armed = None
-            self.status = "killing..."
-            self.paint_header(self.fleet.groups(self.filter_text))
-            self.killing(row)
+        if self.kill_busy:
+            self.said("a kill is under way - finish that one first")
             return
-        self.armed = (row.get("sessionId", ""), self._pids(row), self.clock())
-        self.status = self.still_armed()
-        self.paint_header(self.fleet.groups(self.filter_text))
-        # the question goes when the arm does: one left on screen would be false
-        self.set_timer(ARM_SECS + 0.05, self.arm_expired)
+        self.kill_busy = True           # one kill at a time: killing() lets it go
+        self.said("killing...")
+        self.killing(now)
 
-    def arm_expired(self):
-        if self.status.startswith("x or click again") and not self.still_armed():
-            self.status = ""
-            self.paint_header(self.fleet.groups(self.filter_text))
+    def ask_stop(self, row):
+        """A background session: `ccwho stop`, after a box that says what it does."""
+        if self.kill_busy:
+            self.said("a kill is under way - finish that one first")
+            return
+        self.kill_busy = True
+        sid = row.get("sessionId") or ""
+        lines = [f"stop the session: claude stop {engine.daemon_short(sid)}"
+                 f" - its conversation is kept",
+                 f"to get it back: {engine.attach_command(sid, row.get('configDir') or None)}"]
+        if row.get("windowed") and row.get("tty"):
+            lines.append(f"it is open in a window ({engine.short_tty(row['tty'])})")
+        box = KillBox(f"stop session {engine.brief.short_id(sid)}", lines, True, verb="stop")
+        box.on_kill = lambda: self.stopping(box, row)
+        self.push_screen(box, callback=self.kill_box_closed)
+
+    @work(thread=True)
+    def stopping(self, box, row):
+        lines = self.collector.stop_session(row)
+        self.call_from_thread(box.show_result, lines)
+        try:
+            mine = self.call_from_thread(self.next_seq)
+            fleet = self.collector.fleet()
+            fleet.seq = mine
+            self.call_from_thread(self.show, fleet)
+        except Exception:
+            pass
 
     @staticmethod
     def _pids(row):
         return tuple(d["pid"] for d in (row or {}).get("dead_loops") or [])
 
-    def still_armed(self):
-        """The question, while the kill it asks about still stands; else ""."""
-        if not self.armed:
-            return ""
-        sid, pids, since = self.armed
-        row = next((r for r in self.fleet.rows if r.get("sessionId") == sid), None)
-        if (self.clock() - since > ARM_SECS or row is None or self._pids(row) != pids
-                or not engine.loop_kill_offered(row)):
-            self.armed = None
-            return ""
-        return f"x or click again to kill loop {', '.join(str(p) for p in pids)}"
-
     @work(thread=True)
     def killing(self, row):
-        said = self.collector.kill_loops(row)
+        try:
+            said = self.collector.kill_loops(row)
+        except Exception as ex:         # its text may hold a path: the type only
+            said = f"could not kill ({type(ex).__name__}) - run ccwho ps"
         # the list after the kill, and THEN what the kill did: the other order
-        # has the refresh wipe the answer before it can be read
-        mine = self.call_from_thread(self.next_seq)
-        fleet = self.collector.fleet()
-        fleet.seq = mine
-        self.call_from_thread(self.show, fleet)
-        self.call_from_thread(self.said, said)
+        # has the refresh wipe the answer before it can be read. A read that
+        # fails leaves the last list up - the next tick tries again
+        try:
+            mine = self.call_from_thread(self.next_seq)
+            fleet = self.collector.fleet()
+            fleet.seq = mine
+            self.call_from_thread(self.show, fleet)
+        except Exception:
+            pass
+        self.call_from_thread(self.loop_kill_done, said)    # the lock goes with it
+
+    def loop_kill_done(self, said):
+        self.kill_busy = False
+        self.said(said)
 
     @on(events.DescendantFocus)
     def followed_focus(self, event):
@@ -1396,7 +1529,6 @@ class CcwhoUi(App):
         self.move(-1)
 
     def move(self, step):
-        self.armed = None       # a kill is armed for the row you were on, only
         if self.detail_open and self.detail_mode == "procs":
             # the process screen is not about the selected session: these keys
             # scroll it, and never move a selection you cannot see
@@ -1456,6 +1588,8 @@ class CcwhoUi(App):
                 mode, target = "pid", int(value)
             except (TypeError, ValueError):
                 return
+        elif field == "session":
+            mode, target = "session", value
         else:
             mode, target = "clean", None
         self.kill_busy = True
@@ -1483,7 +1617,8 @@ class CcwhoUi(App):
         target = prepared["target"]
         pid = target.get("pid") if isinstance(target, dict) else target
         title = ("clean what ended sessions left behind" if prepared["mode"] == "clean"
-                 else f"kill {pid} and what runs under it")
+                 else f"kill what session {engine.brief.short_id(str(target))} started"
+                 if prepared["mode"] == "session" else f"kill {pid} and what runs under it")
         box = KillBox(title, lines or ["nothing to kill"], can)
         box.on_kill = lambda: self.carrying(box, prepared)
         self.push_screen(box, callback=self.kill_box_closed)
@@ -1590,7 +1725,6 @@ class CcwhoUi(App):
         row = self.selected_row()
         if not row:
             return
-        self.armed = None       # the question leaves the screen with the jump
         # Name it the way you picked it. "going to daf9..." is not something
         # you can check against the window that comes forward; the title is.
         name = (row.get("tab_title") or row.get("title") or row.get("name") or "")
@@ -1914,6 +2048,23 @@ class Collector:
     def kill_carry(self, prepared):
         return engine.carry_out(prepared["mode"], prepared["target"], prepared["plan"]["kill"],
                                 mine=prepared["mine"])
+
+    def stop_session(self, row):
+        """`ccwho stop <id> --yes`, run as its own process: the CLI's every rule
+        (the job, the wait for the session to go, what it left) - its lines."""
+        runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ccwho.py")
+        try:
+            done = subprocess.run([sys.executable, runner, "stop", row.get("sessionId") or "",
+                                   "--yes"], capture_output=True, text=True, timeout=90,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired as ex:
+            # claude stop may have run by now: its answer was not heard
+            return [f"ccwho: the stop did not answer ({type(ex).__name__}) - the session may"
+                    f" have been stopped; run ccwho ls"]
+        except Exception as ex:         # its text is not shown: the type only
+            return [f"ccwho: could not run the stop ({type(ex).__name__}) - run ccwho ls"]
+        return [engine.procs.printable(line) for line in
+                (done.stdout + done.stderr).splitlines() if line.strip()]
 
     def kill_loops(self, row):
         pids = [d["pid"] for d in row.get("dead_loops") or []]

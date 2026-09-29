@@ -1971,6 +1971,22 @@ def _kill_plan(mode, target, world):
     def name_of(pid):
         return program_name(cmd_of(pid))
 
+    def codex_host(q):
+        """(the Codex host above q, None) - or (None, why) when another agent
+        (a claude, a live session) is on the way up: what runs under it is its
+        work, whatever mark it inherited - or (None, None) with no agent above."""
+        thread = mark_sid(q)
+        for a in _ancestors(table, q):
+            kind = ("claude" if a in live else _agent_kind(cmd_of(a))
+                    or ("an agent" if _ANY_AGENT.search(cmd_of(a)) else None))
+            # the host serves the thread and carries no mark of it; a codex that
+            # carries this thread's own mark was started inside it - another agent
+            if kind == "Codex agent" and mark_sid(a) != thread:
+                return a, None
+            if kind:
+                return None, f"{_a(kind)} runs above it ({a}) - its work, not the thread's"
+        return None, None
+
     def doubt(q):
         """Why a session's computed kill leaves `q`'s tree to be named, or None."""
         cmd, kind = cmd_of(q), group.get(q)
@@ -1978,7 +1994,15 @@ def _kill_plan(mode, target, world):
             return f"not sure: {printable(str(kind[2].get('why', '?')))}"
         if is_helper(cmd):
             return "it looks like a session's helper - that session may break"
-        if reason := _doubt(table, q, cmd, session_pid.get(chosen)):
+        # what is between the session's own agent and q counts - a Claude
+        # session's claude, or a Codex thread's host (it has no listed pid; its
+        # host is the ChatGPT app, and every app's child "runs in an app")
+        below = session_pid.get(chosen)
+        if below is None and kind and kind[0] == "codex":
+            below, why = codex_host(q)
+            if why:
+                return why
+        if reason := _doubt(table, q, cmd, below):
             return reason
         if _person_shell(cmd):
             return "it is a shell someone may be working in"
@@ -1997,7 +2021,8 @@ def _kill_plan(mode, target, world):
         if ((kind and kind[0] == "session") or live_mark) and not picked and not (
                 agent and is_mine(q) and (not kind or kind[0] != "session" or kind[1] == mine)):
             out.append("it is the work of a live session")
-        elif kind and kind[0] == "codex":
+        elif kind and kind[0] == "codex" and not picked:
+            # the thread the person chose is open (its lock is held): no doubt
             out.append(codex_note)
         elif kind and kind[0] == "unsure":
             out.append(f"not sure: {printable(str(kind[2].get('why', '?')))}")
@@ -2010,7 +2035,13 @@ def _kill_plan(mode, target, world):
             out.append("it looks like a session's helper - that session may break")
         # a live session's work: only what is below its claude counts - the
         # terminal app above every claude is no reason to doubt what it started
+        # - and a Codex thread's work: below its Codex host; another agent on
+        # the way up is said
         below = session_pid.get(kind[1]) if kind and kind[0] == "session" else None
+        if kind and kind[0] == "codex":
+            below, why = codex_host(q)
+            if why:
+                out.append(why)
         if reason := _doubt(table, q, cmd, below):
             out.append(reason)
         if _person_shell(cmd):

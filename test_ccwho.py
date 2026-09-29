@@ -3614,6 +3614,26 @@ class TestTheViewModelBehindTheUi(unittest.TestCase):
     def test_no_sessions_at_all_is_no_groups(self):
         self.assertEqual(ccwho.ui_groups([]), [])
 
+    def test_a_group_says_whether_it_needs_you(self):
+        # STOPPED was drawn in the colour of NEEDS YOU, and a glance read it as
+        # a question waiting. The screen draws the two kinds apart; which kind a
+        # group is, is decided here.
+        states = ("blocked", "review", "stuck", "stopped", "busy", "program")
+        groups = ccwho.ui_groups([{"sessionId": s, "attention": s, "ts": ""}
+                                  for s in states])
+        self.assertEqual({g["heading"]: g["needs_you"] for g in groups},
+                         {"NEEDS YOU": True, "STUCK": True, "STOPPED": False,
+                          "BUSY": False, "PROGRAMS": False})
+
+    def test_a_group_needs_you_when_its_marks_say_so(self):
+        # the rule, not a list of headings: a heading is amber over amber marks
+        self.addCleanup(ccwho.UI_STATE_STYLE.update, dict(ccwho.UI_STATE_STYLE))
+        ccwho.UI_STATE_STYLE.update(stopped="needs", stuck="quiet")
+        groups = ccwho.ui_groups([{"sessionId": s, "attention": s, "ts": ""}
+                                  for s in ("stuck", "stopped")])
+        self.assertEqual({g["heading"]: g["needs_you"] for g in groups},
+                         {"STUCK": False, "STOPPED": True})
+
     def test_the_first_line_is_what_you_see_on_the_tab(self):
         line = ccwho.ui_row_lines(self.rows()[1], width=100)[0]
         self.assertIn("bbbb", line)              # short id

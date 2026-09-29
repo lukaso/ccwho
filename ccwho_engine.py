@@ -1977,6 +1977,63 @@ def codex_threads(home, lsof=None, cache=None, clock=None):
     return out
 
 
+def codex_where(thread):
+    """Where a Codex thread was typed, in words: its `source`, else its host."""
+    source = thread.get("source") or ""
+    named = {"vscode": "VS Code", "cli": "the codex CLI", "exec": "codex exec"}.get(source)
+    if named:
+        return named
+    return "the ChatGPT app" if thread.get("originator") == "Codex Desktop" else "Codex"
+
+
+def codex_rows(fleet):
+    """The list's rows for the open Codex threads (D16), from collect()'s fleet.
+    Never collect()'s own rows: those are Claude sessions to everything that
+    reads them (--json, jump, show)."""
+    threads = (fleet or {}).get("codex_threads") if isinstance(fleet, dict) else None
+    home = os.path.expanduser("~")
+    out = []
+    for t in threads or []:
+        cwd = t.get("cwd") or ""
+        # one line, and no mark that reorders what is read (U+202E): a name is text
+        name = procs._shown_line(_one_line(t.get("name") or "")) or "a new Codex thread"
+        folder = ("~" + cwd[len(home):]) if cwd == home or cwd.startswith(home + "/") else cwd
+        # what is drawn: one line, no mark that reorders it (U+202E) or hides in it
+        clean = (lambda text: procs._shown_line(_one_line(text)))
+        # a UUIDv7 starts with its time (the same four hex for weeks): the short
+        # id is its random end
+        out.append({"sessionId": t["thread"], "short": t["thread"][-4:],
+                    "kind": "codex", "attention": "codex",
+                    "project": clean(os.path.basename(cwd.rstrip("/"))) or "codex",
+                    "name": "", "title": name, "tab_title": name, "since": "",
+                    "where": codex_where(t), "folder": clean(folder), "cwd": cwd,
+                    "host_pid": t.get("host_pid"), "procs": t.get("procs") or 0,
+                    "ports": t.get("ports"), "pids": list(t.get("pids") or [])})
+    return out
+
+
+def codex_detail_parts(row, fleet, width=80):
+    """The detail of a Codex row: what it is, where it runs, and its processes -
+    each a part the keys can be on (`x` kills it, Enter copies its pid), as on
+    the process screen. [(line, value, field)]."""
+    fleet = fleet if isinstance(fleet, dict) else {}
+    one = (lambda text: truncate(procs._shown_line(_one_line(text)), width))
+    out = [(one(row.get("title") or "a Codex thread"), None, None),
+           (one(row.get("cwd") or "(no folder yet)"), None, None),
+           (one(f"Codex, open in {row.get('where') or 'Codex'} - open it there;"
+                f" ccwho cannot bring it forward"), None, None), ("", None, None)]
+    mine = [p for p in fleet.get("codex") or []
+            if p.get("session") == row.get("sessionId") and not p.get("helper")]
+    if not mine:
+        out.append(("no processes of its own", None, None))
+    for p in mine:
+        ports = " ".join(f":{n}" for n in p.get("ports") or []) or "-"
+        pid = p.get("pid")
+        line = f"{pid:<7} {ports:<12} {p.get('command') or ''}"
+        out.append((one(line), str(pid), "proc") if isinstance(pid, int) else (one(line), None, None))
+    return out
+
+
 def codex_home(env=None):
     """The CODEX_HOME whose threads the list shows: ccwho's own, else ~/.codex."""
     env = os.environ if env is None else env
@@ -3443,7 +3500,7 @@ _C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[33m",
       "review": "\033[33m", "stuck": "\033[31;1m",
       "running": "\033[2m", "ready": "\033[33m", "waiting": "\033[33;1m",
       "busy": "\033[36m", "idle": "\033[2m",
-      "shell": "\033[35m", "program": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
+      "shell": "\033[35m", "program": "\033[2m", "codex": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
 
 def _paint(text, key, color):
@@ -3460,7 +3517,8 @@ def now_iso(now=None):
 _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
           "review": "FINISHED", "ready": "stopped", "stuck": "STUCK",
           "stopped": "STOPPED", "busy": "busy", "running": "running",
-          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program"}
+          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program",
+          "codex": "codex"}
 
 
 # Every escape a session might have printed, as a terminal reads it: an OSC up
@@ -3607,7 +3665,10 @@ UI_GROUPS = (("NEEDS YOU", ("blocked", "waiting", "asks", "review")),
              ("STOPPED", ("stopped", "ready", "shell", "idle")),
              ("BUSY", ("busy", "running")),
              # started by a program, which answers it: last, and never a question
-             ("PROGRAMS", ("program",)))
+             ("PROGRAMS", ("program",)),
+             # Codex threads open in their app (D16): nothing to jump to - after
+             # every Claude session
+             ("CODEX", ("codex",)))
 
 UI_WIDE = 140            # below this, the detail replaces the list instead of
                          # sitting beside it
@@ -3639,7 +3700,11 @@ def ui_groups(rows):
         else:
             members.sort(key=lambda r: _RANK.get(r.get("attention", ""), _UNKNOWN_RANK))
         if members:
-            out.append({"heading": heading, "rows": members})
+            # a group needs you when its marks are amber: a heading drawn like
+            # NEEDS YOU over rows that do not is read, at a glance, as a question
+            # waiting (STOPPED was)
+            needs = any(UI_STATE_STYLE.get(s) in ("needs", "review") for s in states)
+            out.append({"heading": heading, "rows": members, "needs_you": needs})
     return out
 
 
@@ -3649,11 +3714,12 @@ def ui_groups(rows):
 # carries the state; the words stay plain.
 UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△", "stuck": "◆",
                  "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
-                 "busy": "●", "running": "●", "program": "·"}
+                 "busy": "●", "running": "●", "program": "·", "codex": "◇"}
 UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
                   "review": "review", "stuck": "needs",
                   "stopped": "quiet", "ready": "quiet", "shell": "quiet",
-                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet"}
+                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet",
+                  "codex": "quiet"}
 UI_UNKNOWN_MARK = "·"
 
 # What a part of a row IS, so the screen can decide how to draw it. The engine
@@ -3696,9 +3762,12 @@ def ui_row_cells(row, width=100, tag=""):
     written to answer "what was this about" - never without its age. No recap
     yet, and it says so and shows the last thing the session did instead.
     """
-    sid = brief.short_id(row.get("sessionId", ""))
+    sid = row.get("short") or brief.short_id(row.get("sessionId", ""))
     tail = f" · {row.get('since', '')}"
-    if row.get("kind") == "background" and row.get("windowed") is False:
+    if row.get("kind") == "codex":
+        # a Codex thread lives in its app: say which, never "no window"
+        tail = f" · Codex · {_printable(row.get('where') or 'Codex')}"
+    elif row.get("kind") == "background" and row.get("windowed") is False:
         # not "no window", which reads as broken: this is a session you can
         # open, with `claude attach`
         tail += " · background"
@@ -3767,7 +3836,9 @@ def ui_row_cells(row, width=100, tag=""):
     # The age goes FIRST. At the end of a long recap it is the first thing
     # truncation eats, and a recap whose age you cannot see reads as the current
     # state of the work - which is exactly the mistake the age exists to prevent.
-    if row.get("recap"):
+    if row.get("kind") == "codex":
+        mark, body = "", row.get("folder") or "(no folder yet)"
+    elif row.get("recap"):
         age = row.get("recap_age") or "?"
         turns = row.get("turns_since_recap") or 0
         mark = f"{age}" + (f", {turns} turns" if turns else "") + " · "
@@ -4000,6 +4071,11 @@ def bottom_lines(fleet, hint="ccwho ps", width=None):
     where to see them. None when there is nothing."""
     fleet = fleet if isinstance(fleet, dict) else {}
     left, codex = fleet.get("left_behind") or [], fleet.get("codex") or []
+    # an open thread's processes are on its row (D16): this line is the rest -
+    # the Codex processes whose thread is not open, state unknown (D17)
+    # by the thread its mark names - its helpers too: they are that open thread's
+    open_ = {t.get("thread") for t in fleet.get("codex_threads") or [] if isinstance(t, dict)}
+    codex = [p for p in codex if p.get("session") not in open_]
     sep = " · " if len(hint) <= 2 else " - "
     see = f"{sep}{hint} to see" if len(hint) <= 2 else f"{sep}{hint}"
     out = []

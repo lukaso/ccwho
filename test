@@ -22,4 +22,4 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "uv is not installed, so the UI tests cannot run: brew install uv" >&2
   exit 1
 fi
-exec uv run --quiet --with "textual>=8.0,<9" python -m unittest test_ui test_ui_kill "$@"
+exec uv run --quiet --with "textual>=8.0,<9" python -m unittest test_ui test_ui_kill test_ui_codex "$@"

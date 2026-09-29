@@ -110,7 +110,14 @@ class Fleet:
         self.source_ok, self.at, self.error = source_ok, at, error
         # subscription usage, as ccwho_usage.snapshot built it; None = not read
         self.usage = usage
-        self.rows = [self.tagged(r) for r in rows]
+        self.procs = procs if isinstance(procs, dict) else {"collected": False}
+        # the open Codex threads are rows too (D16) - the list's own: collect()'s
+        # rows stay Claude sessions for everything else that reads them
+        try:
+            codex = engine.codex_rows(self.procs)
+        except Exception:           # an engine from before, or an odd shape
+            codex = []
+        self.rows = [self.tagged(r) for r in rows] + codex
         # an app holding macOS Secure Input: no hotkey works until it lets go.
         # The list can still come forward (click iTerm2, run ccwho), so it is
         # where a dead hotkey gets explained
@@ -118,7 +125,7 @@ class Fleet:
         # collect()'s second answer: what agents started, the ports they hold,
         # what was left behind. None is "not collected": the list stays quiet
         # (a false alarm on every start is still an alarm) and `p` says unknown
-        self.procs = procs if isinstance(procs, dict) else {"collected": False}
+        # - set at the top, since the Codex rows are built from it
 
     def tagged(self, row):
         """The row, with the account it spends when 2+ accounts are seen. A copy:
@@ -1097,8 +1104,10 @@ class CcwhoUi(App):
         searching = (f"   search {self.filter_text!r}: {shown} of "
                      f"{len(self.fleet.rows)} · esc to clear"
                      if self.filter_text else "")
+        # sessions are Claude's; the Codex threads are counted by their group
+        sessions = sum(1 for r in self.fleet.rows if r.get("kind") != "codex")
         header.update(
-            f"{len(self.fleet.rows)} sessions" + (f": {counts}" if counts else "")
+            f"{sessions} sessions" + (f": {counts}" if counts else "")
             + when + searching + ("  " + self.status if self.status else ""))
         trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure)
                             if line)
@@ -1173,15 +1182,19 @@ class CcwhoUi(App):
         detail, brief_box = self.part("#detail"), self.part("#brief")
         if detail is None or brief_box is None or self.part("#list") is None:
             return
-        if self.detail_mode == "procs":
+        codex = self.detail_mode != "procs" and (row or {}).get("kind") == "codex"
+        if self.detail_mode == "procs" or codex:
             procs = self.fleet.procs
             # the pane's own width - wide, it is 38% of the screen - less its
             # border, padding and the scrollbar a long list brings
             wide = self.size.width >= engine.UI_WIDE
             width = (int(self.size.width * 0.38) - 5 if wide else self.size.width - 4)
             try:
-                parts = engine.ps_screen_parts(engine.ps_listing(self.fleet.rows, procs),
-                                               procs, width=max(20, width))
+                # a Codex thread's detail: what it is and its processes - it has
+                # no transcript ccwho reads, so no brief
+                parts = (engine.codex_detail_parts(row, procs, width=max(20, width)) if codex
+                         else engine.ps_screen_parts(engine.ps_listing(self.fleet.rows, procs),
+                                                     procs, width=max(20, width)))
             except Exception:           # an odd shape is "unknown", never a crash
                 parts = [("processes unknown", None, None)]
             # a process is a part the keys can be on (`x` kills it, Enter copies
@@ -1403,7 +1416,10 @@ class CcwhoUi(App):
                 choices.append(("p", f"kill all its processes{held} - some may not be stuck"))
             else:
                 choices.append(("p", f"kill its processes{held}"))
-        if row.get("kind") == "background":
+        if row.get("kind") == "codex":
+            # no stop: it lives in its app (D16)
+            notes.append(f"it runs in {row.get('where') or 'Codex'}: to end it, end it there")
+        elif row.get("kind") == "background":
             choices.append(("s", "stop the session - its conversation is kept"))
         else:
             notes.append("it runs in a window: to end it, end it there (/exit)")
@@ -1433,7 +1449,9 @@ class CcwhoUi(App):
         if not choices:
             self.action_row_nothing()
             return
-        title = f"{engine.brief.short_id(row.get('sessionId', ''))}  {row.get('name') or ''}  " \
+        # a Codex row's own short id (its random end); a Claude session's prefix
+        short = row.get("short") or engine.brief.short_id(row.get("sessionId", ""))
+        title = f"{short}  {row.get('name') or ''}  " \
                 f"{row.get('title') or ''}".rstrip()
         self.push_screen(ChoiceBox(title, choices, notes),
                          callback=lambda key, row=row: self.row_chosen(row, key))
@@ -1442,7 +1460,11 @@ class CcwhoUi(App):
         if self.detail_open and self.detail_mode == "procs":
             self.said("the process screen is open - Esc for the list, then x on the session")
             return
-        if self.selected_row():
+        row = self.selected_row()
+        if row and row.get("kind") == "codex":
+            self.said(f"nothing to kill here - it runs in {row.get('where') or 'Codex'}:"
+                      f" to end it, end it there")
+        elif row:
             self.said("nothing to kill or stop here - an interactive session: end it in its"
                       " window (/exit)")
 
@@ -1679,7 +1701,12 @@ class CcwhoUi(App):
         can = bool(plan.get("kill")) and not prepared.get("why")
         target = prepared["target"]
         pid = target.get("pid") if isinstance(target, dict) else target
+        thread = next((r for r in self.fleet.rows if r.get("kind") == "codex"
+                       and r.get("sessionId") == target), None)
         title = ("clean what ended sessions left behind" if prepared["mode"] == "clean"
+                 # which thread: its short id and its name - the one you confirm
+                 else f"kill what Codex thread {thread.get('short')} ({thread.get('title')})"
+                      f" started" if prepared["mode"] == "session" and thread
                  else f"kill what session {engine.brief.short_id(str(target))} started"
                  if prepared["mode"] == "session" else f"kill {pid} and what runs under it")
         box = KillBox(title, lines or ["nothing to kill"], can)
@@ -1787,6 +1814,10 @@ class CcwhoUi(App):
     def _go(self):
         row = self.selected_row()
         if not row:
+            return
+        if row.get("kind") == "codex":
+            # it lives in its app: nothing here can bring that forward
+            self.said(f"it runs in {row.get('where') or 'Codex'} - open it there")
             return
         # Name it the way you picked it. "going to daf9..." is not something
         # you can check against the window that comes forward; the title is.

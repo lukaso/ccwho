@@ -416,6 +416,256 @@ class TestCollectReadsTheThreads(unittest.TestCase):
             e.codex_threads = real
 
 
+class TestACodexThreadIsARow(unittest.TestCase):
+    """The owner's D16 (2026-09-29): a Codex thread is a row - its name, folder,
+    where it runs, its processes and ports - in its own group, CODEX, last.
+    Only the list's own rows: collect()'s rows stay Claude's (--json, jump,
+    show read them as sessions)."""
+
+    FLEET = {"codex_threads": [
+        {"thread": A, "name": "fix the navbar", "cwd": "/Users/x/projects/liveapp",
+         "host_pid": 4215, "originator": "Codex Desktop", "source": "vscode",
+         "procs": 2, "ports": [5173], "pids": [30, 31]},
+        {"thread": C, "name": "", "cwd": "", "host_pid": 4215, "originator": "Codex Desktop",
+         "source": "", "procs": 0, "ports": [], "pids": []}]}
+
+    def test_each_open_thread_is_a_codex_row(self):
+        rows = engine.codex_rows(self.FLEET)
+        self.assertEqual([(r["sessionId"], r["kind"], r["attention"]) for r in rows],
+                         [(A, "codex", "codex"), (C, "codex", "codex")])
+        r = rows[0]
+        self.assertEqual((r["project"], r["title"], r["procs"], r["ports"]),
+                         ("liveapp", "fix the navbar", 2, [5173]))
+        self.assertEqual(r["cwd"], "/Users/x/projects/liveapp")
+
+    def test_where_it_runs_is_said_by_where_it_was_typed(self):
+        where = lambda source, originator="Codex Desktop": engine.codex_where(
+            {"source": source, "originator": originator})
+        self.assertEqual(where("vscode"), "VS Code")
+        self.assertEqual(where("cli", "codex_cli_rs"), "the codex CLI")
+        self.assertEqual(where("exec", "codex_exec"), "codex exec")
+        self.assertEqual(where(""), "the ChatGPT app")
+        self.assertEqual(where("", "something else"), "Codex")
+
+    def test_threads_not_known_or_none_give_no_rows(self):
+        self.assertEqual(engine.codex_rows({"codex_threads": None}), [])
+        self.assertEqual(engine.codex_rows({}), [])
+        self.assertEqual(engine.codex_rows(None), [])
+
+    def test_two_threads_of_one_minute_have_different_short_ids(self):
+        # a UUIDv7 starts with its time: the first four hex are the same for
+        # weeks - the short id is its random end
+        a = "01a0ed5d-dc97-7333-8ff3-073a4c247d3e"
+        b = "01a0ed5d-dd24-7401-b67c-f314b56b67b7"
+        rows = engine.codex_rows({"codex_threads": [
+            dict(self.FLEET["codex_threads"][0], thread=a),
+            dict(self.FLEET["codex_threads"][0], thread=b)]})
+        self.assertNotEqual(rows[0]["short"], rows[1]["short"])
+        firsts = ["".join(t for t, _ in engine.ui_row_cells(r, width=140)[0]) for r in rows]
+        self.assertIn(rows[0]["short"], firsts[0])
+        self.assertNotIn(rows[1]["short"], firsts[0])
+
+    def test_a_row_with_no_name_or_folder_still_says_what_it_is(self):
+        r = engine.codex_rows(self.FLEET)[1]
+        self.assertEqual(r["project"], "codex")
+        self.assertTrue(r["title"])
+
+    def test_the_codex_group_is_last(self):
+        claude = {"sessionId": "b", "attention": "program"}
+        groups = engine.ui_groups([claude] + engine.codex_rows(self.FLEET))
+        self.assertEqual([g["heading"] for g in groups][-1], "CODEX")
+        self.assertEqual(len(groups[-1]["rows"]), 2)
+
+    def test_its_row_says_codex_and_where_not_a_window(self):
+        r = engine.codex_rows(self.FLEET)[0]
+        text = "".join(t for t, _ in engine.ui_row_cells(r, width=140)[0])
+        self.assertIn("Codex · VS Code", text)
+        self.assertIn(":5173", text)
+        self.assertNotIn("no window", text)
+        second = "".join(t for t, _ in engine.ui_row_cells(r, width=140)[1])
+        self.assertIn("~/projects/liveapp" if os.path.expanduser("~") == "/Users/x"
+                      else "/Users/x/projects/liveapp", second)
+        self.assertNotIn("no recap yet", second)
+
+    def test_a_name_with_a_break_or_a_bidi_mark_is_one_plain_line(self):
+        fleet = {"codex_threads": [dict(self.FLEET["codex_threads"][0],
+                                        name="line one\nline two \u202eevil")]}
+        r = engine.codex_rows(fleet)[0]
+        self.assertNotIn("\n", r["title"])
+        self.assertNotIn("\u202e", r["title"])
+
+
+class TestTheCodexLineIsWhatNoRowShows(unittest.TestCase):
+    """The bottom "codex:" line is the state-unknown processes (D17): a process
+    whose thread is open is on that thread's row, not counted again."""
+
+    def fleet(self, threads):
+        return {"left_behind": [], "codex_threads": threads,
+                "codex": [{"pid": 30, "ports": [], "session": A},
+                          {"pid": 40, "ports": [], "session": C}]}
+
+    def test_a_row_takes_its_processes_off_the_line(self):
+        lines = engine.bottom_lines(self.fleet([{"thread": A, "pids": [30]}]))
+        self.assertEqual(lines, ["codex: 1 process - ccwho ps"])
+
+    def test_every_process_on_a_row_is_no_line(self):
+        f = self.fleet([{"thread": A, "pids": [30]}, {"thread": C, "pids": [40]}])
+        self.assertEqual(engine.bottom_lines(f), [])
+
+    def test_threads_not_known_count_them_all(self):                     # control
+        self.assertEqual(engine.bottom_lines(self.fleet(None)), ["codex: 2 processes - ccwho ps"])
+
+
+class TestTheCodexDetail(unittest.TestCase):
+    def test_it_lists_its_own_work_only_each_a_process_part(self):
+        row = engine.codex_rows(TestACodexThreadIsARow.FLEET)[0]
+        fleet = {"codex": [{"pid": 30, "ports": [5173], "command": "vite", "session": A},
+                           {"pid": 32, "ports": [], "command": "npx mcp", "session": A,
+                            "helper": True},
+                           {"pid": 40, "ports": [8787], "command": "workerd", "session": C}]}
+        parts = engine.codex_detail_parts(row, fleet, width=100)
+        text = "\n".join(line for line, _, _ in parts)
+        self.assertIn("fix the navbar", text)
+        self.assertIn("VS Code", text)
+        self.assertEqual([(v, f) for _, v, f in parts if v], [("30", "proc")])
+        self.assertNotIn("workerd", text)
+        self.assertNotIn("npx mcp", text)
+
+
+class TestACodexRowIsPlainText(unittest.TestCase):
+    """Review 1 of the rows: the folder reached line two with bidi marks."""
+
+    def test_no_line_of_the_row_holds_a_control_or_format_character(self):
+        import unicodedata
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0],
+                 cwd="/tmp/ev\u202eil\u2066dir\u200b/x\ny\u202ez", name="n\u202eame")
+        row = engine.codex_rows({"codex_threads": [t]})[0]
+        for field in ("project", "folder", "title"):
+            self.assertFalse([c for c in row[field] if unicodedata.category(c)
+                              in ("Cc", "Cf", "Zl", "Zp")], field)
+        for width in (160, 80, 60):
+            for line in engine.ui_row_cells(row, width=width)[:2]:
+                text = "".join(t for t, _ in line)
+                self.assertFalse([c for c in text if unicodedata.category(c)
+                                  in ("Cc", "Cf", "Zl", "Zp")], (width, text))
+
+
+class TestTheCodexLineCountsHelpersOnTheirRow(unittest.TestCase):
+    def test_an_open_threads_helper_is_not_state_unknown(self):
+        fleet = {"left_behind": [], "codex_threads": [{"thread": A, "pids": [30]}],
+                 "codex": [{"pid": 30, "ports": [], "session": A},
+                           {"pid": 32, "ports": [], "session": A, "helper": True}]}
+        self.assertEqual(engine.bottom_lines(fleet), [])
+
+
+class TestKillingACodexThreadsWork(unittest.TestCase):
+    """x -> p on a Codex row is kill_plan's "session" mode with the thread id: its
+    processes, listed - with no "cannot tell whether it runs": it is open."""
+
+    T = "Tue Sep 29 11:13:00 2026"
+
+    def world(self):
+        table = {1: (0, self.T, "/sbin/launchd"),
+                 4215: (1, self.T, "/Applications/ChatGPT.app/Contents/Resources/codex"),
+                 30: (4215, self.T, "vite --port 5173"),
+                 99: (1, self.T, "python3 ccwho.py")}
+        marks = {1: None, 4215: None, 30: ("codex", A), 99: None}
+        ports = {30: [5173]}
+        att = procs.attribute(table, marks, ports, [], own=99)
+        return {"table": table, "att": att, "sessions": [], "own": 99, "ports": ports,
+                "pipes": {q: set() for q in table}, "marks": marks, "connections": []}
+
+    def test_its_processes_are_taken_without_the_unknown_note(self):
+        p = procs.kill_plan("session", A, self.world())
+        self.assertEqual([e["pid"] for e in p["kill"]], [30])
+        self.assertNotIn("cannot tell whether", p["kill"][0].get("note", ""))
+
+    def test_another_agents_work_inside_the_thread_is_not_taken(self):
+        # review 4: host -> zsh -> claude (a live session) -> node, still with
+        # the thread's mark. The stop is the thread's Codex host only: a claude
+        # between is its own work - named apart, never taken with no word
+        w = self.world()
+        # a codex CLI host, no app: only the rule about another agent can spare 53
+        w["table"][4215] = (1, self.T, "/opt/homebrew/bin/codex")
+        w["table"].update({50: (4215, self.T, "zsh -c claude"),
+                           51: (50, self.T, "/Users/x/.local/bin/claude"),
+                           53: (51, self.T, "node devserver.js")})
+        w["marks"].update({50: None, 51: None, 53: ("codex", A)})
+        w["pipes"].update({50: set(), 51: set(), 53: set()})
+        w["sessions"] = [{"sessionId": "aaaa1111-0000-4000-8000-000000000001", "pid": 51}]
+        w["att"] = procs.attribute(w["table"], w["marks"], w["ports"], w["sessions"], own=99)
+        p = procs.kill_plan("session", A, w)
+        self.assertNotIn(53, [e["pid"] for e in p["kill"]])
+        self.assertIn(30, [e["pid"] for e in p["kill"]])                 # control: its own
+        why = {e["pid"]: e["why"] for e in p["spare"]}
+        self.assertIn("runs above it (51)", why[53])
+        # and a pid kill of it says so
+        note = procs.kill_plan("pid", {"pid": 53, "start": self.T}, w)["kill"][0].get("note", "")
+        self.assertIn("runs above it (51)", note)
+
+    def cli_world(self, extra, marks, sessions=()):
+        w = self.world()
+        w["table"][4215] = (1, self.T, "/opt/homebrew/bin/codex")      # no app: only the rule
+        w["table"].update(extra)
+        w["marks"].update(marks)
+        w["pipes"].update({q: set() for q in extra})
+        w["sessions"] = list(sessions)
+        w["att"] = procs.attribute(w["table"], w["marks"], w["ports"], w["sessions"], own=99)
+        return w
+
+    def test_a_codex_started_inside_the_thread_is_not_its_host(self):
+        # review 5: host -> zsh (mark A) -> codex (a CLI with its own thread, A's
+        # mark inherited) -> node (mark A): the inner codex is not A's host
+        w = self.cli_world({13: (4215, self.T, "zsh -c codex"), 14: (13, self.T, "codex"),
+                            15: (14, self.T, "node devserver.js")},
+                           {13: ("codex", A), 14: ("codex", A), 15: ("codex", A)})
+        p = procs.kill_plan("session", A, w)
+        self.assertNotIn(15, [e["pid"] for e in p["kill"]])
+        self.assertIn("(14)", {e["pid"]: e["why"] for e in p["spare"]}[15])
+        self.assertIn(30, [e["pid"] for e in p["kill"]])                 # control
+        note = procs.kill_plan("pid", {"pid": 15, "start": self.T}, w)["kill"][0].get("note", "")
+        self.assertIn("(14)", note)
+
+    def test_a_live_session_ccwho_does_not_name_an_agent_is_one(self):
+        # a dev build of claude: its command says nothing, the session list does
+        w = self.cli_world({50: (4215, self.T, "zsh -c run"),
+                            51: (50, self.T, "/Users/x/dev/my-build"),
+                            53: (51, self.T, "node devserver.js")},
+                           {50: None, 51: None, 53: ("codex", A)},
+                           sessions=[{"sessionId": "aaaa1111-0000-4000-8000-000000000001",
+                                      "pid": 51}])
+        p = procs.kill_plan("session", A, w)
+        self.assertNotIn(53, [e["pid"] for e in p["kill"]])
+
+    def test_an_agent_only_its_command_names_is_one(self):
+        w = self.cli_world({50: (4215, self.T, "zsh -c run"),
+                            51: (50, self.T, "node /Users/x/src/claude-code/cli.js"),
+                            53: (51, self.T, "node devserver.js")},
+                           {50: None, 51: None, 53: ("codex", A)})
+        p = procs.kill_plan("session", A, w)
+        self.assertNotIn(53, [e["pid"] for e in p["kill"]])
+
+    def test_its_processes_get_no_app_note(self):
+        # review 2 of the rows: its host is the ChatGPT app's codex - what is
+        # under that agent does not "run in an app", as a Claude session's work
+        p = procs.kill_plan("session", A, self.world())
+        self.assertNotIn("note", p["kill"][0])
+
+    def test_a_process_right_under_an_app_keeps_the_app_note(self):      # control
+        w = self.world()
+        w["table"][31] = (1, self.T, "/Applications/Foo.app/Contents/MacOS/Foo")
+        w["table"][32] = (31, self.T, "node serve.js")
+        w["marks"][31], w["marks"][32] = None, ("codex", A)
+        w["pipes"][31], w["pipes"][32] = set(), set()
+        w["att"] = procs.attribute(w["table"], w["marks"], w["ports"], [], own=99)
+        p = procs.kill_plan("pid", {"pid": 32, "start": self.T}, w)
+        self.assertIn("runs in an app", p["kill"][0].get("note", ""))
+
+    def test_a_pid_kill_keeps_the_note(self):                             # control
+        p = procs.kill_plan("pid", {"pid": 30, "start": self.T}, self.world())
+        self.assertIn("cannot tell whether", p["kill"][0].get("note", ""))
+
+
 class TestTheRealLsof(unittest.TestCase):
     """The real lsof, on a lock file this test holds open itself: lsof escapes
     bytes it cannot print in a C locale, and ccwho may start without a UTF-8

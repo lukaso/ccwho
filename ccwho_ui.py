@@ -1889,7 +1889,9 @@ class CcwhoUi(App):
         try:
             answer = self.adapter.copy(value)
         except Exception as ex:         # a click must never end the list
-            answer = str(ex) or type(ex).__name__
+            # its text can hold a path: the type only
+            self.said(f"could not copy ({type(ex).__name__})")
+            return
         shown = engine.truncate(" ".join(value.split()), 40)
         self.said(f"could not copy: {answer}" if answer else f"copied {shown}")
 
@@ -1931,7 +1933,7 @@ class CcwhoUi(App):
         try:
             points = self.collector.save_points(live_ids)
         except Exception as ex:
-            points = f"could not read the saves: {ex}"
+            points = f"could not read the saves ({type(ex).__name__})"
         self.call_from_thread(self.offer_saves, points)
 
     def offer_saves(self, points):
@@ -2028,7 +2030,7 @@ class Collector:
             engine.reload_all(engine)
             self.reload_error = ""
         except Exception as ex:
-            self.reload_error = f"engine reload failed: {ex}"
+            self.reload_error = f"engine reload failed ({type(ex).__name__})"
 
     def fleet(self):
         import time
@@ -2037,7 +2039,7 @@ class Collector:
         try:
             rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
-            return Fleet([], False, "", f"could not read the fleet: {ex}",
+            return Fleet([], False, "", f"could not read the fleet ({type(ex).__name__})",
                          secure=self.secure_input())
         # The scan's own answer to the cheap question, so the next cheap check
         # does not see a changed world and scan all over again.
@@ -2089,7 +2091,7 @@ class Collector:
             import ccwho as runner
             return runner.reopen_saved(path)
         except Exception as ex:
-            return f"could not reopen: {ex}"
+            return f"could not reopen ({type(ex).__name__})"
 
     def kill_prepare(self, mode, target):
         return engine.kill_prepare(mode, target)
@@ -2168,7 +2170,7 @@ class Adapter:
         except subprocess.TimeoutExpired:
             return f"iTerm2 did not answer in {deadline:g}s"
         except OSError as ex:
-            return f"could not reach iTerm2: {ex}"
+            return f"could not reach iTerm2 ({type(ex).__name__})"
         if done.returncode:
             return f"could not open a window: {(done.stderr or '').strip()}"
         return "attached it in a new window"
@@ -2185,7 +2187,7 @@ class Adapter:
         except subprocess.TimeoutExpired:
             return f"pbcopy did not answer in {deadline:g}s"
         except OSError as ex:
-            return f"could not run pbcopy: {ex}"
+            return f"could not run pbcopy ({type(ex).__name__})"
         if done.returncode:
             return (done.stderr or "").strip() or f"pbcopy failed ({done.returncode})"
         return ""
@@ -2210,7 +2212,7 @@ class Adapter:
         except subprocess.TimeoutExpired:
             return f"iTerm2 did not answer in {deadline:g}s"
         except OSError as ex:
-            return f"could not reach iTerm2: {ex}"
+            return f"could not reach iTerm2 ({type(ex).__name__})"
         return (done.stdout or done.stderr).strip() or "done"
 
 

@@ -2190,6 +2190,11 @@ def save_points(live_ids=()):
     return points
 
 
+def _no_iterm2(ex):
+    """osascript could not run: said by the error's type - the list shows it."""
+    return f"ccwho restore: could not drive iTerm2 ({type(ex).__name__})"
+
+
 def reopen_saved(path=None):
     """What `o` in the list does: the same restore the command line runs, on
     the save chosen in its menu (the newest when none is named).
@@ -2239,7 +2244,9 @@ def restore(argv):
         with open(path) as fh:
             man = json.load(fh)
     except (OSError, ValueError) as ex:
-        print(f"ccwho restore: cannot read {path}: {ex}", file=sys.stderr)
+        # the type only: the list's `o` shows this line, and an error's text can
+        # hold a path
+        print(f"ccwho restore: cannot read {path} ({type(ex).__name__})", file=sys.stderr)
         return 1
 
     if "--check" in argv:
@@ -2336,7 +2343,7 @@ def restore(argv):
         try:
             r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
         except (OSError, subprocess.SubprocessError) as ex:
-            print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
+            print(_no_iterm2(ex), file=sys.stderr)
             return 1
         if r.returncode != 0:
             print(f"ccwho restore: iTerm2 refused: {r.stderr.strip()}", file=sys.stderr)
@@ -2354,7 +2361,7 @@ def restore(argv):
             try:
                 r2 = subprocess.run(["osascript", "-e", again], capture_output=True, text=True)
             except (OSError, subprocess.SubprocessError) as ex:
-                print(f"ccwho restore: could not drive iTerm2: {ex}", file=sys.stderr)
+                print(_no_iterm2(ex), file=sys.stderr)
                 return 1
             if r2.returncode != 0:
                 print(f"ccwho restore: iTerm2 refused: {r2.stderr.strip()}", file=sys.stderr)

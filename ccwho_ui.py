@@ -2078,6 +2078,14 @@ class Collector:
                 report=report)
         except Exception as ex:
             return f"could not kill: {ex}"
+        if not killed and report.get("unread"):
+            return "nothing killed: could not read the processes - try again"
+        if not killed and report.get("failed"):
+            return (f"nothing killed: could not signal {', '.join(str(p) for p in report['failed'])}"
+                    " - not permitted")
+        if not killed and report.get("unconfirmed"):
+            return (f"nothing killed: {', '.join(str(p) for p in report['unconfirmed'])}"
+                    " still runs, but did not look stuck just now - try again")
         if not killed:
             return "nothing killed: no loop there is stuck any more"
         said = [f"stopped the task of {readers[p].get('program')} {p}"

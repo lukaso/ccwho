@@ -457,8 +457,10 @@ def task_file(path, now=None):
 
 
 # what a wait loop runs while it waits: between looks nothing, or its sleep, and
-# during one its grep. Anything else under it means it is past the loop.
-_WAITING = re.compile(r"^(?:\S*/)?(?:sleep|grep)(?:\s|\Z)")
+# during one its grep. Anything else under it means it is past the loop. One
+# that just exited, not yet reaped, ps prints as "(sleep)": still waiting - a
+# kill that looked then found no stuck loop (2026-09-29, 2 of 226 scans)
+_WAITING = re.compile(r"^(?:(?:\S*/)?(?:sleep|grep)(?:\s|\Z)|\((?:sleep|grep)\)\Z)")
 
 
 # One grep, nothing from ccwho's own environment (GREP_OPTIONS, a gnubin PATH):
@@ -515,8 +517,10 @@ def find_dead_loops(pid, ptable, read=task_file, grace=DEAD_LOOP_GRACE,
             if cmd == parent_cmd:
                 continue                # a fork of the loop is the same loop
             loop = procs.wait_loop(cmd)
+            # a fork of it that exited, not yet reaped, is "(zsh)" to ps
+            fork = f"({(cmd.split(None, 1) or [''])[0].rsplit('/', 1)[-1]})"
             if not loop or not all(_WAITING.match(c) for _, c in kids.get(cpid, [])
-                                   if c != cmd):
+                                   if c not in (cmd, fork)):
                 continue
             # it has had its look: the file ended longer ago than it sleeps
             wait = max(grace, loop["sleep"] + 60)
@@ -546,14 +550,18 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
     Looked for again, not taken from the last scan: by the time you press the
     key the loop may have ended and its pid gone to something else. A reader
     must still have the start it was listed with (`started`, pid -> lstart).
-    Returns the pids of `pids` that got the signal, or whose task did.
+    Returns the pids of `pids` that got the signal, or whose task did. What
+    was not killed is not "not stuck": report["unconfirmed"] has each asked-for
+    loop or reader that still runs but did not look stuck, and report["unread"]
+    is True when ps, or the start table, said nothing; report["failed"] has
+    each stuck loop the signal was not permitted to reach.
     """
     rows = [(int(pid), ppid, cmd) for pid, ppid, cmd in _ps_rows((ps or ps_snapshot)())
             if pid.isdigit()]
     ptable = {pid: (ppid, "", cmd) for pid, ppid, cmd in rows}
     wanted = set(pids or ())
     send = kill or os.kill
-    killed, hit = [], set()
+    killed, hit, failed = [], set(), []
     # both looked for on the one snapshot, before anything is signalled
     loops = [d["pid"] for d in find_dead_loops(session_pid, ptable, read, matches=matches)
              if d["pid"] in wanted]
@@ -570,10 +578,42 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
             continue
         try:
             send(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            failed.append(pid)
             continue
         killed.append(pid)
+    if report is not None:
+        report["unread"] = report.get("unread") or not rows
+        report["failed"] = failed
+        report["unconfirmed"] = _unconfirmed(
+            session_pid, wanted - set(loops) - {d["pid"] for d in readers}, ptable,
+            started, starts)
     return killed
+
+
+def _unconfirmed(session_pid, pids, ptable, started, starts):
+    """Of `pids` - asked for, not judged stuck now - the ones that still run as
+    what was listed: in the session's tree, still a wait loop or a reader, and
+    a reader still with the start it was listed with. Not "not stuck"."""
+    tree, stack = set(), [session_pid]
+    kids = {}
+    for cpid, (ppid, _start, _cmd) in ptable.items():
+        kids.setdefault(ppid, []).append(cpid)
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            if c not in tree:
+                tree.add(c)
+                stack.append(c)
+    out = [p for p in sorted(pids) if p in tree
+           and (procs.wait_loop(ptable[p][2]) or procs.stdin_reader(ptable[p][2]))]
+    listed = {p: s for p, s in (started or {}).items() if p in out}
+    if listed:
+        begun = (starts or ps_table)()
+        out = [p for p in out if p not in listed
+               or (begun.get(p) or ("",))[0] == listed[p] != ""]
+    return out
 
 
 def _stop_reader_tasks(session_pid, readers, rows, send, own, started, starts, report, hit):
@@ -581,6 +621,8 @@ def _stop_reader_tasks(session_pid, readers, rows, send, own, started, starts, r
     once, parents first. Every pid signalled goes into `hit`."""
     killed = []
     begun = (starts or ps_table)()
+    if not begun and report is not None:
+        report["unread"] = True         # no reader can be matched to the one listed
     ptable = {pid: (ppid, (begun.get(pid) or ("",))[0], cmd) for pid, ppid, cmd in rows}
     own = os.getpid() if own is None else own
     spared = {own, *procs._ancestors(ptable, own)}

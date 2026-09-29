@@ -1125,6 +1125,69 @@ class TestKillDeadLoops(unittest.TestCase):
                                     matches=lambda argv, files: True)
         self.assertEqual((got, sent), ([], []))
 
+    def _report(self, ps, pids, matches=lambda argv, files: False):
+        report = {}
+        got = ccwho.kill_dead_loops(73787, pids, ps=lambda: ps, read=lambda path: self.ENDED,
+                                    matches=matches, kill=lambda pid, sig: None,
+                                    report=report)
+        return got, report
+
+    def test_a_loop_that_still_runs_but_did_not_look_stuck_is_named(self):
+        # its line came since: it runs on, and "no loop is stuck" would be a guess
+        got, report = self._report(f"73787 1 claude\n86246 73787 {self.LOOP}\n", [86246],
+                                   matches=lambda argv, files: True)
+        self.assertEqual(got, [])
+        self.assertEqual(report.get("unconfirmed"), [86246])
+
+    def test_a_killed_loop_is_not_unconfirmed(self):                   # control
+        got, report = self._report(f"73787 1 claude\n86246 73787 {self.LOOP}\n", [86246])
+        self.assertEqual(got, [86246])
+        self.assertEqual(report.get("unconfirmed", []), [])
+
+    def test_a_gone_or_reused_pid_is_not_unconfirmed(self):            # control
+        _, report = self._report("73787 1 claude\n86246 73787 vim notes.md\n", [86246, 86247])
+        self.assertEqual(report.get("unconfirmed", []), [])
+
+    def test_another_sessions_process_on_that_pid_is_not_unconfirmed(self):
+        # the pid went to a cat, or a loop, outside this session: "still runs"
+        # would send you to try again for ever (review 1, finding 1)
+        _, report = self._report("73787 1 claude\n86246 500 cat\n", [86246])
+        self.assertEqual(report.get("unconfirmed"), [])
+        _, report = self._report(f"73787 1 claude\n86246 555 {self.LOOP}\n", [86246],
+                                 matches=lambda argv, files: True)
+        self.assertEqual(report.get("unconfirmed"), [])
+
+    def test_a_stuck_loop_that_could_not_be_signalled_is_named(self):
+        report = {}
+
+        def kill(pid, sig):
+            raise PermissionError
+        got = ccwho.kill_dead_loops(73787, [86246],
+                                    ps=lambda: f"73787 1 claude\n86246 73787 {self.LOOP}\n",
+                                    read=lambda path: self.ENDED, kill=kill,
+                                    matches=lambda argv, files: False, report=report)
+        self.assertEqual((got, report.get("failed")), ([], [86246]))
+
+    def test_a_loop_that_is_gone_did_not_fail(self):                   # control
+        report = {}
+
+        def kill(pid, sig):
+            raise ProcessLookupError
+        ccwho.kill_dead_loops(73787, [86246],
+                              ps=lambda: f"73787 1 claude\n86246 73787 {self.LOOP}\n",
+                              read=lambda path: self.ENDED, kill=kill,
+                              matches=lambda argv, files: False, report=report)
+        self.assertEqual(report.get("failed"), [])
+
+    def test_a_ps_that_said_nothing_is_unread(self):
+        got, report = self._report("", [86246])
+        self.assertEqual(got, [])
+        self.assertTrue(report.get("unread"))
+
+    def test_a_ps_that_answered_is_not_unread(self):                   # control
+        _, report = self._report("73787 1 claude\n", [86246])
+        self.assertFalse(report.get("unread"))
+
     def test_a_loop_already_gone_is_not_an_error(self):
         sent = []
 
@@ -1333,6 +1396,26 @@ class TestKillDeadReaders(unittest.TestCase):
     def test_only_what_was_asked(self):                                     # control
         got, k = self._kill(pids=(90001,))
         self.assertEqual((got, k.sent), ([], []))
+
+    def test_a_reader_not_proven_now_is_unconfirmed(self):                # control
+        report = {}
+        self._kill(peer="0x1", report=report)
+        self.assertEqual(report.get("unconfirmed"), [54329])
+
+    def test_a_new_cat_on_that_pid_is_not_unconfirmed(self):
+        # lsof no longer proves it, and it is not the cat you saw (review 1, finding 1)
+        report = {}
+        self._kill(peer="0x1", report=report, started={54329: "Sun Sep 27 09:00:00 2026"})
+        self.assertEqual(report.get("unconfirmed"), [])
+
+    def test_a_start_table_that_said_nothing_is_unread(self):
+        # every reader skipped for want of its start is not "no reader is stuck"
+        k, report = self.machine(), {}
+        got = ccwho.kill_dead_loops(82755, [54329], ps=k.ps, kill=k.kill, starts=lambda: {},
+                                    unix=self.unix(), started={54329: self.START},
+                                    read=lambda path: None, matches=lambda a, f: False,
+                                    report=report)
+        self.assertEqual((got, report.get("unread")), ([], True))
 
     def test_a_reused_pid_is_left_alone(self):
         # the listed cat ended; a new cat got its pid: not the one you saw
@@ -1629,6 +1712,28 @@ class TestFindDeadLoops(unittest.TestCase):
     def test_a_loop_with_other_work_under_it_is_not(self):
         # the loop ended and the shell went on to the rest of its command
         self.assertEqual(self._tree((27737, "npm run e2e")), [])
+
+    def test_a_sleep_that_just_ended_is_still_waiting(self):
+        # macOS ps prints a child that has exited, not yet reaped, as "(sleep)":
+        # a kill that looked in that moment said "no loop there is stuck any
+        # more" about a loop that was (2026-09-29, 2 of 226 scans)
+        self.assertEqual(self._tree((27737, "(sleep)")), [27737])
+
+    def test_a_grep_that_just_ended_is_still_waiting(self):
+        self.assertEqual(self._tree((27737, "(grep)")), [27737])
+
+    def test_other_work_that_just_ended_is_not_waiting(self):         # control
+        self.assertEqual(self._tree((27737, "(npm)")), [])
+
+    ZLOOP = ("/bin/zsh -c 'until grep -q DONE /private/tmp/claude-501/p/s/tasks/b1.output;"
+             " do sleep 5; done'")
+
+    def test_the_loops_own_fork_that_just_ended_is_the_same_loop(self):
+        # a $(...) or pipeline fork of the shell, exited, not yet reaped
+        self.assertEqual(self._tree((27737, "(zsh)"), loop=self.ZLOOP), [27737])
+
+    def test_another_shell_that_just_ended_is_not_the_loop(self):        # control
+        self.assertEqual(self._tree((27737, "(bash)"), loop=self.ZLOOP), [])
 
     def test_a_forked_copy_is_the_same_loop(self):
         # zsh forks for a pipeline stage or $(...), with the same argv

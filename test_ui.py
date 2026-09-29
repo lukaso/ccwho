@@ -3160,6 +3160,36 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
         _, said = self.kill([])
         self.assertNotIn("killed loop", said)
 
+    def said_when(self, report_says):
+        real = ui.engine.kill_dead_loops
+
+        def fake(session_pid, pids, started=None, report=None):
+            report.update(report_says)
+            return []
+        ui.engine.kill_dead_loops = fake
+        try:
+            return ui.Collector().kill_loops(STUCK)
+        finally:
+            ui.engine.kill_dead_loops = real
+
+    def test_a_loop_that_still_runs_is_not_called_not_stuck(self):
+        said = self.said_when({"unconfirmed": [86246]})
+        self.assertNotIn("no loop there is stuck", said)
+        self.assertIn("86246 still runs", said)
+
+    def test_an_unread_ps_is_not_called_not_stuck(self):
+        said = self.said_when({"unread": True})
+        self.assertNotIn("no loop there is stuck", said)
+        self.assertIn("could not read", said)
+
+    def test_a_loop_that_could_not_be_signalled_says_so(self):
+        said = self.said_when({"failed": [86246]})
+        self.assertNotIn("no loop there is stuck", said)
+        self.assertIn("could not signal 86246", said)
+
+    def test_a_loop_that_is_gone_is_still_not_stuck(self):             # control
+        self.assertEqual(self.said_when({}), "nothing killed: no loop there is stuck any more")
+
     def test_a_readers_task_says_it_was_stopped(self):
         row = dict(STUCK, dead_loops=[{"pid": 54329, "kind": "reader", "program": "cat",
                                        "root": 86083, "start": "Sat Sep 26 15:12:13 2026"}])

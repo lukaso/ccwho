@@ -131,7 +131,9 @@ def launch_in_iterm(script, deadline, sids):
     recorded is not sent."""
     iterm = engine.iterm_app_pid(engine.app_snapshot())
     now = time.time()
-    if not all(claim_unresolved(sid, now=now, iterm_pid=iterm) for sid in sids):
+    if not all([claim_unresolved(sid, iterm, now=now) for sid in sids]):
+        for sid in sids:
+            claim_resolved(sid)            # nothing was sent: none of them may hold
         return None, "could not record the launch in ccwho's own dir - not sending it"
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
@@ -144,9 +146,14 @@ def launch_in_iterm(script, deadline, sids):
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
         return None, f"could not drive iTerm2 ({type(ex).__name__})"
-    if not (r.returncode != 0 and engine.ae_error_code(r.stderr) == engine.AE_TIMED_OUT):
+    code = engine.ae_error_code(r.stderr)
+    if r.returncode == 0 or (r.returncode > 0 and code and code != engine.AE_TIMED_OUT):
         for sid in sids:
-            claim_resolved(sid)
+            claim_resolved(sid)            # answered, or refused with a reason
+        return r, ""
+    if code == engine.AE_TIMED_OUT:
+        return None, "iTerm2 did not answer - the launch may still run"
+    # killed by a signal, or failed with no code: it may have sent its event
     return r, ""
 
 
@@ -945,14 +952,12 @@ def _write_claim(session_id, record):
     return True
 
 
-def claim_unresolved(session_id, now=None, iterm_pid=False):
+def claim_unresolved(session_id, iterm_pid, now=None):
     """Mark a claim as a launch that may still run inside iTerm2 - a killed
-    osascript does not cancel its event. Held while THAT iTerm2 lives and has
-    answered nothing since, or, if it cannot be named, for the usual claim time.
-    True when it is on disk."""
+    osascript does not cancel its event. Held while its launcher runs, then while
+    THAT iTerm2 runs (_iterm_holds), until the session is seen running. True
+    when it is on disk."""
     now = time.time() if now is None else now
-    if iterm_pid is False:
-        iterm_pid = engine.iterm_app_pid(engine.app_snapshot())
     return _write_claim(session_id, {"pid": os.getpid(), "since": now, "sessionId": session_id,
                                      "unresolved": True, "iterm_pid": iterm_pid})
 
@@ -963,25 +968,50 @@ def claim_resolved(session_id, now=None):
     return _write_claim(session_id, {"pid": os.getpid(), "since": now, "sessionId": session_id})
 
 
-def claim_is_unresolved(session_id):
+def claim_is_unresolved(session_id, alive=_pid_alive):
+    """A timed-out launch whose launcher is gone - not one still being sent."""
     try:
         with open(os.path.join(ccwho_dir(), "launching", f"{session_id}.json")) as fh:
-            return json.load(fh).get("unresolved") is True
+            rec = json.load(fh)
+        return rec.get("unresolved") is True and not alive(rec.get("pid"))
     except (OSError, ValueError, AttributeError):
         return False
 
 
-def release_claims(session_ids):
-    """Sessions seen running: whatever launched them is done - their claims go."""
+def release_claims(session_ids, seen_at):
+    """Sessions seen running: whatever launched them is done - their claims go.
+    Only claims older than the sighting: `claude agents` can take 30 s, and a
+    claim made since may be a new launch of a session that has ended."""
     for sid in session_ids:
-        if sid and engine._SESSION_ID.match(str(sid)):
-            try:
-                os.remove(os.path.join(ccwho_dir(), "launching", f"{sid}.json"))
-            except OSError:
-                pass
+        if not (sid and engine._SESSION_ID.match(str(sid))):
+            continue
+        path = os.path.join(ccwho_dir(), "launching", f"{sid}.json")
+        try:
+            with open(path) as fh:
+                since = float(json.load(fh).get("since", 0))
+            if since < seen_at:
+                os.remove(path)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
 
 
-def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
+def _iterm_holds(iterm_pid, alive, procs, young):
+    """An unresolved launch whose launcher is gone: its event may still be queued
+    in the iTerm2 it went to, so the claim holds while THAT iTerm2 runs. A ps
+    that could not be read is "could not tell", and holds. With no iTerm2 to
+    name, the usual claim time. (Owner, 2026-09-29: a fork is worse than a
+    block you can clear by restarting iTerm2 - no timing rule releases it.)"""
+    if type(iterm_pid) is not int:
+        return young
+    if not alive(iterm_pid):
+        return False
+    table = engine.app_snapshot() if procs is None else procs
+    if not engine.parse_procs(table):
+        return True
+    return engine.iterm_app_pid(table) == iterm_pid      # not a process that reused its pid
+
+
+def claim_launch(session_id, pid=None, now=None, alive=_pid_alive, procs=None):
     """Claim the right to start THIS session, across processes. True if we got it.
 
     resolve_open() reads the world and then the caller launches. Another ccwho -
@@ -1007,16 +1037,8 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
             with open(path) as fh:
                 rec = json.load(fh)
             young = now - float(rec.get("since", 0)) < LAUNCH_CLAIM_SECONDS
-            if rec.get("unresolved") is True and type(rec.get("iterm_pid")) is int:
-                # its event may still run: held while that iTerm2 lives and has
-                # answered nothing since - an answer means its queue was empty
-                ip = rec["iterm_pid"]
-                held = alive(ip) and not engine.iterm_answered_since(ip, float(rec.get("since", 0)))
-                if held and alive is _pid_alive:
-                    # and it IS that iTerm2, not a process that reused its pid
-                    held = engine.iterm_app_pid(engine.app_snapshot()) == ip
-            elif rec.get("unresolved") is True:
-                held = young
+            if rec.get("unresolved") is True:
+                held = alive(rec.get("pid")) or _iterm_holds(rec.get("iterm_pid"), alive, procs, young)
             else:
                 held = alive(rec.get("pid")) and young
         except ValueError:
@@ -1035,7 +1057,7 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive):
             os.unlink(path)
         except OSError:
             pass
-        return claim_launch(session_id, pid=pid, now=now, alive=alive)
+        return claim_launch(session_id, pid=pid, now=now, alive=alive, procs=procs)
     except OSError:
         return True               # cannot claim at all: do not block the user
     with os.fdopen(fd, "w") as fh:
@@ -1063,9 +1085,9 @@ def open_session(argv):
     just made.
     """
     sid = (argv[0] if argv else "").strip()
-    status = {}
+    status, seen_at = {}, time.time()
     rows, _ = engine.collect(cache={}, status=status)
-    release_claims(r.get("sessionId") for r in rows)     # running: their launch is done
+    release_claims((r.get("sessionId") for r in rows), seen_at)   # running: launched
     action, value = engine.resolve_open(sid, rows, known_entries(),
                                         source_ok=status.get("source_ok", False))
     if action == "jump":
@@ -2411,9 +2433,9 @@ def restore(argv):
         # each live transcript. Every entry goes through the same guard a single
         # click does, and an unreadable fleet opens nothing at all.
         entries = engine.manifest_entries(man)
-        status = {}
+        status, seen_at = {}, time.time()
         live, _ = engine.collect(cache={}, status=status)
-        release_claims(r.get("sessionId") for r in live)     # running: their launch is done
+        release_claims((r.get("sessionId") for r in live), seen_at)   # running: launched
         source_ok = status.get("source_ok", False)
         if not source_ok:
             print("ccwho restore: cannot read the live session list - not reopening"
@@ -2422,7 +2444,8 @@ def restore(argv):
                   " and here it would be every one of them.", file=sys.stderr)
             return 1
         openable, running, unusable, starting, seen = [], [], [], [], set()
-        gone = []
+        gone, stuck = [], []
+        table = engine.app_snapshot()        # one process table for every claim below
         for e_ in entries:
             sid = e_.get("sessionId", "")
             if sid in seen:
@@ -2435,8 +2458,10 @@ def restore(argv):
                 why = resume_problem(e_)
                 if why:
                     gone.append((e_, why))    # checked BEFORE the claim: not opening it
-                elif claim_launch(sid):
+                elif claim_launch(sid, procs=table):
                     openable.append(e_)
+                elif claim_is_unresolved(sid):
+                    stuck.append(e_)      # an earlier launch timed out: it may still run
                 else:
                     starting.append(e_)   # another ccwho is already opening this one
             else:
@@ -2456,16 +2481,22 @@ def restore(argv):
         for e_ in unusable:
             print(f"ccwho restore: {e_.get('project') or e_.get('sessionId') or '?'}"
                   " cannot be reopened from this manifest", file=sys.stderr)
+        for e_ in stuck:
+            print(f"ccwho restore: not reopening {e_.get('project') or e_.get('sessionId')}"
+                  " - an earlier launch timed out inside iTerm2 and may still run;"
+                  " if it does not appear, restart iTerm2", file=sys.stderr)
         fill = {}
         if openable and any(e_.get("pane") or e_.get("tabTitle") for e_ in openable):
             # the panes iTerm2 restored: resume each session where it was
             fill = engine.match_panes(openable, engine.panes_snapshot(direct=True),
                                       engine.idle_snapshot(), saved=entries)
         script = engine.iterm_open_script(openable, fill=fill)
-        if not script and (running or starting) and not (unusable or gone):
+        if not script and (running or starting) and not (unusable or gone or stuck):
             print(f"all {len(running) + len(starting)} session(s) in that manifest"
                   " are already running or starting.")
             return 0
+        if not script and stuck:
+            return 1                  # said above, last: the list's `o` shows that line
         if not script:
             print("ccwho restore: nothing in that manifest can be reopened", file=sys.stderr)
             return 1
@@ -2480,7 +2511,10 @@ def restore(argv):
             print(f"ccwho restore: {why}", file=sys.stderr)
             return 1
         if r.returncode != 0:
-            print(f"ccwho restore: iTerm2 refused: {r.stderr.strip()}", file=sys.stderr)
+            # its code, not its text: the list shows this line, and osascript's
+            # message quotes data (paths, tab names)
+            print(f"ccwho restore: iTerm2 refused"
+                  f" ({engine.ae_error_code(r.stderr) or f'exit {r.returncode}'})", file=sys.stderr)
             return r.returncode
         wrote = set((r.stdout or "").split())
         filled = [e_ for e_ in openable if fill.get(e_.get("sessionId", "")) in wrote]
@@ -2498,7 +2532,9 @@ def restore(argv):
                 print(f"ccwho restore: {why}", file=sys.stderr)
                 return 1
             if r2.returncode != 0:
-                print(f"ccwho restore: iTerm2 refused: {r2.stderr.strip()}", file=sys.stderr)
+                print(f"ccwho restore: iTerm2 refused"
+                      f" ({engine.ae_error_code(r2.stderr) or f'exit {r2.returncode}'})",
+                      file=sys.stderr)
                 return r2.returncode
             n += again.count("create window with default profile")
         if filled:

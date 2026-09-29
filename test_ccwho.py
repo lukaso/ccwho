@@ -6784,7 +6784,9 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
     def state(self, name):
         return os.path.join(ccwho.ITERM_STATE_DIR, "iterm-ae." + name)
 
-    def ask(self, pid=100, timeout=3.0, now=None, **kw):
+    def ask(self, pid=100, timeout=10.0, now=None, **kw):
+        # 10 s: an answer must come back even on a machine at load 20+ (seen
+        # 2026-09-29); the asks meant to time out pass their own small timeout
         return ccwho.iterm_ask(["-e", "whatever"], timeout=timeout,
                                procs=self.table(pid), now=now, **kw)
 
@@ -7227,22 +7229,13 @@ class TestTheLastErrorCodeIsTheError(unittest.TestCase):
         self.assertIsNone(ccwho.ae_error_code(""))
 
 
-class TestTheGateRemembersWhoLastAnswered(unittest.TestCase):
-    """An answer from iTerm2 means its queue was drained: a launch left
-    unresolved before it is no longer waiting in there."""
+class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
+    """What the gate does after an ask that was slow, or failed."""
 
     # the gate fixture, borrowed - not inherited, or its tests run here twice
     _F = TestBackgroundAsksNeverPileUpInITerm2
     setUp, stub, launches, table, state, ask, until, ended = (
         _F.setUp, _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
-
-    def test_an_answer_is_recorded_with_its_pid_and_time(self):
-        self.stub("echo ok")
-        before = time.time()
-        self.assertEqual(self.ask(pid=4242), "ok\n")
-        self.assertTrue(ccwho.iterm_answered_since(4242, before - 1))
-        self.assertFalse(ccwho.iterm_answered_since(4242, time.time() + 10))
-        self.assertFalse(ccwho.iterm_answered_since(999, before - 1))           # control
 
     def test_a_quoted_code_does_not_quarantine(self):
         self.stub('echo \'execution error: Can’t get item 3 of {"x (-1712)"}. (-1728)\' >&2; exit 1')
@@ -7261,6 +7254,17 @@ class TestTheGateRemembersWhoLastAnswered(unittest.TestCase):
         self.assertIsNone(self.ask(wait=3, why=why))
         self.assertLess(time.time() - start, 0.5)
         self.assertFalse(why.get("asked"))
+
+    def test_a_slow_ask_that_has_ended_does_not_refuse_waiting_callers_forever(self):
+        # only a caller holding the lock settles it: one that may wait must not
+        # turn away from a free lock because of a mark nobody cleared
+        self.stub("sleep 0.4; echo late")
+        self.assertIsNone(self.ask(timeout=0.1))
+        self.assertTrue(self.ended())
+        self.stub("echo ok")
+        why = {}
+        self.ask(now=time.time() + 100, wait=3, why=why)           # settles it: a pause starts
+        self.assertEqual(self.ask(now=time.time() + 200, wait=3), "ok\n")
 
     def test_an_error_pauses_from_when_it_came_back(self):
         self.stub('sleep 0.5; echo "Not authorized (-1743)" >&2; exit 1')
@@ -7319,3 +7323,25 @@ class TestCollectDropsTheNameOfAReplacedPane(MachinelessCollect):
         self.assertEqual(world(300), "old tab")
         self.assertEqual(world(300), "old tab")                                  # control
         self.assertEqual(world(900), "", "a new pane kept the old tab's name")
+
+
+class TestOneScanFindsThePanesOnce(MachinelessCollect):
+    def test_collect_works_out_the_panes_once(self):
+        calls, real = [], ccwho.pane_owners
+        self.addCleanup(setattr, ccwho, "pane_owners", real)
+        ccwho.pane_owners = lambda *a: calls.append(1) or real(*a)
+        ccwho.tty_snapshot = lambda: procs((100, "??", ME, IT))
+        ccwho.ps_snapshot = lambda: ps((100, 1, APP))
+        ccwho.collect(cache={})
+        self.assertEqual(len(calls), 1)
+
+
+class TestACarriedPaneIsText(unittest.TestCase):
+    """What the last save said is read off disk: a pane or title that is not a
+    string would be copied into every save and break the restore that reads it."""
+
+    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": ""}
+
+    def test_a_pane_that_is_not_text_is_not_carried(self):
+        man = ccwho.manifest_from_rows([self.ROW], panes=None, known={"s1": {"pane": ["G"], "tabTitle": 5}})
+        self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]), ("", ""))

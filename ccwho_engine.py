@@ -1286,11 +1286,9 @@ def _read_gate(now):
     if not isinstance(state, dict):
         return {}
     clean = {}
-    for key in ("quarantine", "asked_pid", "answered_pid"):
+    for key in ("quarantine", "asked_pid"):
         if type(state.get(key)) is int:
             clean[key] = state[key]
-    if type(state.get("answered_at")) in (int, float):
-        clean["answered_at"] = state["answered_at"]
     for key in ("pending", "slow"):
         if state.get(key) is True:
             clean[key] = True
@@ -1332,8 +1330,6 @@ def _settle(state, now):
     if answered:
         state.pop("quarantine", None)
         state.pop("last_error", None)
-        # iTerm2 drained its queue up to here: see iterm_answered_since
-        state.update(answered_pid=state.get("asked_pid"), answered_at=now)
         if slow:        # a late answer: the pause runs from when it was seen
             state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     else:
@@ -1383,14 +1379,6 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         why = {}
     why.update({"asked": False, "refused": None, "error": None})
     fixed_now = now
-    if wait:
-        # queueing behind an ask that already timed out only freezes the caller:
-        # the answer after it is a refusal anyway
-        early = time.time() if fixed_now is None else fixed_now
-        ahead = _read_gate(early)
-        if ahead.get("slow") or early < ahead.get("wait_until", 0):
-            why.update(refused="waiting", error=ahead.get("last_error"))
-            return None
     try:
         os.makedirs(ITERM_STATE_DIR, mode=0o700, exist_ok=True)
         os.chmod(ITERM_STATE_DIR, 0o700)
@@ -1399,9 +1387,18 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         why["refused"] = "io"
         return None
     try:
-        if not _take_lock(fd, wait):
-            why["refused"] = "busy"         # an ask in flight, maybe in another process
-            return None
+        if not _take_lock(fd, 0):
+            # an ask in flight, maybe in another process. Queue behind it only
+            # if it is a healthy one: behind one that already timed out, or into
+            # a pause, the answer is a refusal anyway - waiting only freezes us
+            early = time.time() if fixed_now is None else fixed_now
+            ahead = _read_gate(early)
+            if not wait or ahead.get("slow") or early < ahead.get("wait_until", 0):
+                why.update(refused="busy" if not wait else "waiting", error=ahead.get("last_error"))
+                return None
+            if not _take_lock(fd, wait):
+                why["refused"] = "busy"
+                return None
         now = time.time() if fixed_now is None else fixed_now
         pid = iterm_app_pid(app_snapshot() if procs is None else procs)
         if pid is None:
@@ -1453,14 +1450,6 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         return out
     finally:
         os.close(fd)
-
-
-def iterm_answered_since(pid, since):
-    """Has THIS iTerm2 answered a background ask after `since`? Then its event
-    queue was empty at that point: nothing older is still waiting to run."""
-    state = _read_gate(time.time())
-    return (state.get("answered_pid") == pid and pid is not None
-            and state.get("answered_at", 0) > since)
 
 
 def iterm_titles_script():
@@ -2509,8 +2498,11 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None):
             # iTerm2 was not asked: what the last save knew beats knowing nothing
             # - five hours of such saves would push every good one out
             was = known.get(r.get("sessionId")) or {}
-            kept[-1]["pane"] = was.get("pane", "") or ""
-            kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or was.get("tabTitle", "") or ""
+            # read off disk: only text is carried - anything else would ride
+            # into every save and break the restore that reads it
+            pane, title = was.get("pane"), was.get("tabTitle")
+            kept[-1]["pane"] = pane if isinstance(pane, str) else ""
+            kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or (title if isinstance(title, str) else "")
     return {"version": MANIFEST_VERSION, "savedAt": now, "count": len(kept),
             "skipped": sum(why_count.values()), "skippedWhy": why_count,
             "sessions": kept}
@@ -3304,9 +3296,11 @@ def collect(cache=None, status=None):
     ps_out = ps_snapshot()
     procs_out = tty_snapshot()
     ttys = parse_tty_map(procs_out)
-    titles = titles_cached(cache, procs=procs_out, owners=pane_owners(ps_out, procs_out))
-    # what has a window comes from ps; the tab names are only the label
-    shown = iterm_ttys(ps_out, procs_out) or set()
+    owners = pane_owners(ps_out, procs_out)
+    titles = titles_cached(cache, procs=procs_out, owners=owners)
+    # what has a window comes from ps; the tab names are only the label - no
+    # iTerm2 app of ours: nothing is known about windows (see iterm_ttys)
+    shown = set(owners) if iterm_app_pid(procs_out) is not None else set()
     ids = [s.get("sessionId", "") for s in sessions]
     # who started what: the env mark, which survives the process being orphaned;
     # built from the ps snapshot and start times this scan already has

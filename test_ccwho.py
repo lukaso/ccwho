@@ -6810,8 +6810,9 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         return ccwho.iterm_ask(["-e", "whatever"], timeout=timeout,
                                procs=self.table(pid), now=now, **kw)
 
-    def until(self, what, seconds=5.0):
-        """Poll rather than sleep a guessed time: loaded machines are slow."""
+    def until(self, what, seconds=20.0):
+        """Poll rather than sleep a guessed time: loaded machines are slow (a
+        5 s limit failed once at load 22, 2026-09-29)."""
         end = time.time() + seconds
         while time.time() < end:
             if what():

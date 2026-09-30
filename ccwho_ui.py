@@ -1597,9 +1597,11 @@ class CcwhoUi(App):
     @on(events.DescendantFocus)
     def followed_focus(self, event):
         """Clicking or tabbing to a row selects it - but only while the list is
-        the thing on screen. Focus moved by hiding a container is not a choice."""
+        the thing on screen. Focus moved by hiding a container is not a choice,
+        nor is one that comes as the app is torn down, the list already gone."""
         widget = getattr(event, "widget", None)
-        if isinstance(widget, Row) and self.query_one("#list").display:
+        lists = self.query("#list")
+        if isinstance(widget, Row) and lists and lists.first().display:
             self.selected = widget.row.get("sessionId", "")
             self.mark_selected()
             if self.detail_open:

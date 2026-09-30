@@ -153,18 +153,20 @@ def launch_in_iterm(script, deadline, sids):
     leaves it held while its osascript runs. Then, by outcome:
     - all of it ran (rc 0): launched (claim_launched), held until seen, or
       LAUNCH_CLAIM_SECONDS - and against any decision made before it;
-    - nothing was sent - an error raised while subprocess.run was still
-      making osascript's process (_while_starting: its pipes, fork, exec's
-      report, an argument refused) - or iTerm2 refused Apple Events (-1743)
-      at the script's first event (engine.AE_PROBE, which writes nothing):
-      the claims go (drop_claims);
+    - nothing was sent - an error raised in Popen's constructor before any
+      process was made (its pipes, fork, an argument refused), or after exec
+      reported the program could not run (_being_made) - or iTerm2 refused
+      Apple Events (-1743) at the script's first event (engine.AE_PROBE,
+      which writes nothing): the claims go (drop_claims);
     - iTerm2 quit during it (-600/-609): the event died with it, and what it
       opened may still start - held LAUNCH_CLAIM_SECONDS, cut off
       (claim_launched);
     - anything else - a timeout, -1712, a signal, -1743 after the first
       event, an error after a write (a window closing while the pane-fill
       script walks them), an error raised after osascript's process was made
-      (while its output was read), whatever its errno: unresolved, bound to
+      (before exec's report - the process is then ended and reaped, as
+      subprocess.run ends one it gives up on - or while its output was read),
+      whatever its errno, or one that cannot be placed: unresolved, bound to
       the iTerm2 a table taken after the send shows - to each of them, when
       it shows two of ours (_sent).
     A launch that cannot be recorded is not sent."""
@@ -174,8 +176,11 @@ def launch_in_iterm(script, deadline, sids):
         return None, _not_recorded(sids)
     send = None
     try:
-        with contextlib.suppress(OSError):
+        try:
             send = _hold_send()
+        except OSError as ex:
+            for sid in sids:
+                _unrecorded()[sid] = _said(ex)      # _not_recorded says why
         # the first mark that cannot be written ends it: all of them go
         marked = send is not None and all(claim_unresolved(sid, None, send=send[0]) for sid in sids)
     except BaseException:
@@ -197,22 +202,26 @@ def launch_in_iterm(script, deadline, sids):
         _let_go_send(send)
 
 
-def _while_starting(ex):
-    """Was `ex` raised while subprocess.run was still making osascript's
-    process - in Popen's constructor, before any child was made (its pipes,
-    fork, an argument refused), or after exec reported the program could not
-    run (the child has exited)? Then nothing ran. Told by where it was
-    raised, never by its errno (fork's EAGAIN is poll(2)'s too): anything
-    raised after - while its output was read, or it was waited for - or while
-    a child was made and exec not yet heard from, may come after its event
-    went out; so may anything this cannot place."""
+def _being_made(ex):
+    """The Popen whose constructor `ex` was raised in - while subprocess.run
+    was still making osascript's process - else None: raised after (while
+    its output was read, or it was waited for), or where this cannot tell.
+    Told by where it was raised, never by its errno: fork's EAGAIN is
+    poll(2)'s too."""
     tb = ex.__traceback__
     while tb is not None:
         if tb.tb_frame.f_code is subprocess.Popen.__init__.__code__:
-            p = tb.tb_frame.f_locals.get("self")
-            return not getattr(p, "_child_created", True) or getattr(p, "returncode", None) is not None
+            return tb.tb_frame.f_locals.get("self")
         tb = tb.tb_next
-    return False
+    return None
+
+
+def _never_ran(p):
+    """Did osascript never run, by the Popen an error was raised in the
+    making of (_being_made)? None was made (its pipes, fork, an argument
+    refused), or exec reported it could not run and it was reaped. False for
+    None: raised after, or where _being_made cannot tell."""
+    return p is not None and (not getattr(p, "_child_created", True) or p.returncode is not None)
 
 
 def _send(script, deadline, sids, lock):
@@ -228,9 +237,19 @@ def _send(script, deadline, sids, lock):
     except (OSError, ValueError, TypeError) as ex:
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
-        if _while_starting(ex):
-            drop_claims(sids)                   # nothing was sent: osascript never ran
+        p = _being_made(ex)
+        if _never_ran(p):
+            # no process was made, or exec reported it could not run (and it
+            # was reaped): osascript never ran, nothing was sent
+            drop_claims(sids)
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
+        if p is not None:
+            # made, and exec not heard from: it may be running osascript, and
+            # it holds the send lock. Ended and reaped, as subprocess.run ends
+            # one it gives up on - never left running past the record
+            with contextlib.suppress(Exception):
+                p.kill()
+                p.wait()
         _sent(sids)                             # it may have run: its event may be out
         return None, f"could not drive iTerm2 ({type(ex).__name__}) - {MAY_STILL_RUN}"
     except BaseException:
@@ -1340,9 +1359,14 @@ def _hold_send():
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        held, named = os.fstat(fd), os.lstat(path)
-        if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
-            raise OSError(errno.ENOENT, "the send lock was removed as it was made", path)
+        held = os.fstat(fd)
+        try:
+            named = os.lstat(path)
+        except FileNotFoundError:
+            named = None
+        if named is None or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            raise OSError(errno.EAGAIN, "its send lock was removed or replaced as it was made"
+                          " - try again", path)
     except OSError:
         os.close(fd)
         raise
@@ -1350,12 +1374,15 @@ def _hold_send():
 
 
 def _let_go_send(held):
-    """The send is recorded: its lock's file goes, then the lock."""
+    """The send is recorded: the lock is let go, and its file goes when no
+    one holds it then (_sweep_send) - a process that inherited it and still
+    runs keeps it named, and every claim naming it held; the sweep removes
+    it once free."""
     token, fd = held
     with contextlib.suppress(OSError):
-        os.unlink(_send_path(token))
-    with contextlib.suppress(OSError):
         os.close(fd)
+    with contextlib.suppress(OSError, ValueError):
+        _sweep_send(_send_path(token))
 
 
 def _open_in_claims(path):
@@ -1657,7 +1684,11 @@ def release_claims(session_ids, seen_at, seen_mono=None):
     than another's "not running". A sighting goes SIGHTING_SECONDS after its
     scan ended; a record no ccwho wrote goes at once. The sweep runs after:
     what this scan saw has its sighting by then. A claims lock that is busy
-    defers both to the next scan."""
+    defers both to the next scan. A start on the monotonic clock after now
+    is none a scan gives (scan() reads it first): nothing is released or
+    swept on it."""
+    if seen_mono is not None and seen_mono > _mono():
+        return
     d = os.path.join(ccwho_dir(), "launching")
     try:
         names = set(os.listdir(d))
@@ -1727,6 +1758,8 @@ def _sweep(d, now, now_mono=None):
     holds it. Only files ccwho writes (_CLAIM_FILE: a session id's claim and
     its temp files, a send lock's token), only regular ones - never through
     a symlink; one entry it cannot read does not stop the rest."""
+    if now_mono is not None and now_mono > _mono():
+        return                          # a start after now is none a scan gives
     mark = os.path.join(d, ".swept")
     try:
         if _recent(os.stat(mark).st_mtime, now):
@@ -1735,8 +1768,7 @@ def _sweep(d, now, now_mono=None):
         pass
     with contextlib.suppress(OSError), _claims_locked(wait=0):
         if now_mono is not None:
-            # the scan's start, on the clock now - never after now
-            now = min(now_mono, _mono()) + _skew()
+            now = now_mono + _skew()                    # the scan's start, on the clock now
         with contextlib.suppress(OSError):
             _mark_swept(d, mark, now)
         for e in os.scandir(d):

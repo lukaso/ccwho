@@ -89,15 +89,8 @@ def spawn_failing(ex):
     run - of a harmless program, never osascript - its fork failing with
     `ex`, raised where Popen makes the process."""
     def run(cmd, **kw):
-        real = subprocess._fork_exec
-
-        def fork_exec(*a, **k):
-            raise ex
-        subprocess._fork_exec = fork_exec
-        try:
+        with mock.patch.object(*testkit.FORK_POINT, side_effect=ex):
             return REAL_RUN(["/usr/bin/true"], **kw)
-        finally:
-            subprocess._fork_exec = real
     return run
 
 
@@ -107,23 +100,22 @@ def exec_failing():
     return lambda cmd, **kw: REAL_RUN(["/nonexistent/ccwho-test/osascript"], **kw)
 
 
-def failing_after_start(test, ex, where="communicate"):
-    """A subprocess.run for osascript whose process - a harmless program,
-    never osascript - is made, and then `ex` is raised: while its output is
-    read (communicate), or while Popen still waits for exec's report
-    (_close_pipe_fds). A child left unwaited is reaped when the test ends."""
-    def run(cmd, **kw):
-        real = getattr(subprocess.Popen, where)
+def failing_after_start(test, ex, where="communicate", argv=("/usr/bin/true",)):
+    """A subprocess.run for osascript whose process - `argv`, a harmless
+    program, never osascript - is made, and then `ex` is raised: while its
+    output is read (communicate), or while Popen still waits for exec's
+    report (_close_pipe_fds). Each child's Popen goes to test.children; one
+    left running is ended when the test ends."""
+    test.children = getattr(test, "children", [])
 
-        def failing(self, *a, **k):
-            if where != "communicate":
-                test.addCleanup(lambda p=self: (os.waitpid(p.pid, 0), setattr(p, "returncode", 0)))
-            raise ex
-        setattr(subprocess.Popen, where, failing)
-        try:
-            return REAL_RUN(["/usr/bin/true"], **kw)
-        finally:
-            setattr(subprocess.Popen, where, real)
+    def failing(self, *a, **k):
+        test.children.append(self)
+        test.addCleanup(lambda p=self: (p.kill(), p.wait()))      # a no-op once reaped
+        raise ex
+
+    def run(cmd, **kw):
+        with mock.patch.object(subprocess.Popen, where, failing):
+            return REAL_RUN(list(argv), **kw)
     return run
 
 
@@ -9692,12 +9684,13 @@ class TestScanHandsItsStartToTheRelease(TheClocks, unittest.TestCase):
 
 
 class TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack(unittest.TestCase):
-    """subprocess.run raises while Popen is still making osascript's process
-    - its pipes, fork, exec's report, an argument refused: nothing ran - or
-    after, while its output is read, when its event may already be in iTerm2
-    (a killed osascript does not cancel it). Only the first gives the claims
-    back. Told by where it was raised, never by its errno: fork's EAGAIN is
-    poll(2)'s too."""
+    """subprocess.run raises in Popen's constructor before any process was
+    made (its pipes, fork, an argument refused), or after exec reported the
+    program could not run: nothing ran, and the claims go. Raised after a
+    process was made and before exec's report, or while its output is read,
+    its event may already be in iTerm2 (a killed osascript does not cancel
+    it): the claims hold. Told by where it was raised, never by its errno:
+    fork's EAGAIN is poll(2)'s too."""
 
     _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
     SIDS, setUp, held_while_iterm2_lives = _F.SIDS, _F.setUp, _F.held_while_iterm2_lives
@@ -9739,6 +9732,16 @@ class TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack(unittest.TestCase):
                 # bound to the iTerm2 a table after it shows (_sent)
                 self.assertEqual(runner._read_claim(sid)["iterm_pid"], [4242])
                 self.assertTrue(self.held_while_iterm2_lives(sid))
+
+    def test_a_process_made_and_not_heard_from_is_ended(self):
+        # as subprocess.run ends one it gives up on: no osascript is left
+        # running on its own, holding the send lock after the send is recorded
+        sid = self.SIDS[30]
+        why = self.sent(sid, failing_after_start(self, OSError(errno.EBADF, "Bad file descriptor"),
+                                                 "_close_pipe_fds", ("/bin/sleep", "30")))
+        self.assertIn(runner.MAY_STILL_RUN, why)
+        self.assertIsNotNone(self.children[-1].returncode, "left running")
+        self.assertTrue(self.held_while_iterm2_lives(sid))
 
 
 class TestOnlyNoSuchProcessIsAProcessGone(unittest.TestCase):
@@ -10119,3 +10122,131 @@ class TestNoClaimStateCrossesTests(unittest.TestCase):
             first.run(r)
             TestAClaimsLockHeldForGoodStopsNoScan("test_a_launch_waits_a_while_then_refuses").run(r)
             self.assertEqual((r.failures, r.errors), ([], []), first)
+
+
+class TestASendLockStaysNamedWhileAnyoneHoldsIt(unittest.TestCase):
+    """_let_go_send removes the send lock's file only when no one holds the
+    lock then - as the sweep does: a process that inherited it and still runs
+    keeps it named, and every claim naming it held, until it ends."""
+
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_process_that_still_holds_it(self):
+        held = runner._hold_send()
+        child = subprocess.Popen(["/bin/sleep", "30"], pass_fds=(held[1],))
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        runner._let_go_send(held)
+        self.assertTrue(os.path.exists(runner._send_path(held[0])))
+        self.assertTrue(runner._sending({"send": held[0]}))
+        child.kill()
+        child.wait()
+        self.assertFalse(runner._sending({"send": held[0]}))       # free: the sweep's to remove
+
+    def test_no_one_else(self):                                                 # control
+        held = runner._hold_send()
+        runner._let_go_send(held)
+        self.assertFalse(os.path.exists(runner._send_path(held[0])))
+
+
+class TestALaunchWhoseSendLockWasRemovedAsItWasMadeSendsNothing(unittest.TestCase):
+    """_hold_send refuses a lock whose file was removed or replaced before its
+    flock: the launch is not sent, its claims go, and it says why - a race to
+    try again, not a dir that cannot be written."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS[:1], _F.setUp
+
+    def launch(self, between):
+        real = runner.fcntl
+
+        class Fcntl:
+            LOCK_EX, LOCK_NB, LOCK_SH = fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_SH
+
+            def flock(self, fd, op):
+                between()
+                return real.flock(fd, op)
+        sent = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        runner.subprocess.run = lambda cmd, **kw: sent.append(cmd) or Done()
+        runner.fcntl = Fcntl()
+        try:
+            res, why = runner.launch_in_iterm("script", 1.0, self.SIDS)
+        finally:
+            runner.fcntl = real
+        return sent, res, why
+
+    def sends(self):
+        d = os.path.join(self.tmp, "launching")
+        return [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".send")]
+
+    def replaced(self):
+        for p in self.sends():
+            os.unlink(p)
+            open(p, "w").close()
+
+    def test_removed_or_replaced_before_its_lock(self):
+        for between in (lambda: [os.unlink(p) for p in self.sends()], self.replaced):
+            with self.subTest(between=between):
+                if not os.path.exists(runner._claim_path(self.SIDS[0])):   # dropped by the last
+                    self.assertTrue(runner.claim_launch(self.SIDS[0]))
+                sent, res, why = self.launch(between)
+                self.assertEqual(sent, [])
+                self.assertIsNone(res)
+                self.assertIn("not sending it", why)
+                self.assertIn("try again", why)
+                self.assertNotIn("can be written", why)
+                self.assertFalse(os.path.exists(runner._claim_path(self.SIDS[0])))
+
+    def test_left_as_it_was_made(self):                                         # control
+        sent, res, why = self.launch(lambda: None)
+        self.assertEqual(len(sent), 1)
+        self.assertIsNotNone(res, why)
+
+
+class TestAScanStartAfterNowReleasesNothing(unittest.TestCase):
+    """A scan's start on the monotonic clock is never after now (scan() reads
+    it first): one that is was given by no scan - no claim becomes a sighting
+    on it, and no sweep runs on it."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def launched(self):
+        runner._write_claim(self.SID, {"pid": DEAD, "owner": "x", "since": time.time() - 5,
+                                       "sessionId": self.SID, "launched": True})
+
+    def test_a_start_ahead(self):
+        self.launched()
+        runner.release_claims([self.SID], time.time() + 3600, runner._mono() + 3600)
+        self.assertIs(runner._read_claim(self.SID).get("launched"), True)
+
+    def test_a_start_of_now(self):                                              # control
+        self.launched()
+        runner.release_claims([self.SID], time.time(), runner._mono())
+        self.assertIs(runner._read_claim(self.SID).get("seen"), True)
+
+
+class TestTheSpawnRuleOnEachPythonThatRunsCcwho(unittest.TestCase):
+    """_send sorts a spawn error by CPython's own frames and fields
+    (_being_made, _never_ran): checked on this Python and on the system's
+    (/usr/bin/python3 - `ccwho` runs on whichever python3 is first on PATH).
+    The list's (uv's) is checked by test_ui."""
+
+    def sorts(self, python):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        r = REAL_RUN([python, "-c", testkit.SPAWN_RULE_CHECK, os.path.dirname(os.path.abspath(runner.__file__))],
+                     capture_output=True, text=True, timeout=120,
+                     env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CCWHO_DIR=tmp))
+        return r.stdout.split(), r.stderr[-800:]
+
+    def test_this_python(self):
+        got, err = self.sorts(sys.executable)
+        self.assertEqual(got, testkit.SPAWN_RULE_SORTS, err)
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/python3"), "no system Python")
+    def test_the_systems(self):
+        got, err = self.sorts("/usr/bin/python3")
+        self.assertEqual(got, testkit.SPAWN_RULE_SORTS, err)

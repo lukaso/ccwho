@@ -4982,3 +4982,62 @@ class TestAnErrorOnScreenSaysItsTypeOnly(UiTest):
             header = str(app.query_one("#header").content)
             self.assertIn("could not read the saves (OSError)", header)
             self.assertNotIn(SECRET, header)
+
+
+class TestTheSpawnRuleOnTheListsPython(unittest.TestCase):
+    """The list sends launches (o) on its own Python: the spawn rule ccwho
+    reads from CPython's frames and fields sorts errors there too."""
+
+    def test_it_sorts(self):
+        import os
+        import shutil
+        import sys
+        import tempfile
+        import ccwho
+        import testkit
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        r = subprocess.run([sys.executable, "-c", testkit.SPAWN_RULE_CHECK,
+                            os.path.dirname(os.path.abspath(ccwho.__file__))],
+                           capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CCWHO_DIR=tmp))
+        self.assertEqual(r.stdout.split(), testkit.SPAWN_RULE_SORTS, r.stderr[-800:])
+
+
+class TestAFocusAfterTheListIsGone(UiTest):
+    """A row can take the focus while the app is torn down, after the list is
+    gone (a collect that ends as the list quits): not a choice, and no
+    error."""
+
+    async def test_it_selects_nothing(self):
+        import types
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            row = app.query(ui.Row).first()
+            before = app.selected
+            await app.query_one("#list").remove()
+            app.followed_focus(types.SimpleNamespace(widget=row))
+            self.assertEqual(app.selected, before)
+
+    async def test_while_it_is_hidden(self):
+        # focus moved by hiding a container is not a choice either
+        import types
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            row = list(app.query(ui.Row))[-1]
+            before = app.selected
+            app.query_one("#list").display = False
+            app.followed_focus(types.SimpleNamespace(widget=row))
+            self.assertEqual(app.selected, before)
+            self.assertNotEqual(before, row.row.get("sessionId", ""))
+
+    async def test_while_it_is_there(self):                                    # control
+        import types
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            row = list(app.query(ui.Row))[-1]
+            app.followed_focus(types.SimpleNamespace(widget=row))
+            self.assertEqual(app.selected, row.row.get("sessionId", ""))

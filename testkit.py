@@ -24,3 +24,47 @@ def pin_ccwho_dir(runner):
         if inherited is not None:
             os.environ["CCWHO_DIR"] = inherited
     return undo
+
+
+import subprocess
+
+# where Popen makes its process: subprocess._fork_exec from 3.11,
+# _posixsubprocess.fork_exec before
+FORK_POINT = ((subprocess, "_fork_exec") if hasattr(subprocess, "_fork_exec")
+              else (subprocess._posixsubprocess, "fork_exec"))
+
+# ccwho's spawn rule (_being_made, _never_ran) reads CPython's own frames and
+# fields: run this with each Python that runs ccwho. A fork that fails and an
+# exec that fails ran nothing; an error once the process is made - before
+# exec's report, or while its output is read - may have. argv[1]: the repo.
+# Only harmless programs are run.
+SPAWN_RULE_CHECK = """
+import contextlib, errno, os, subprocess, sys
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+import ccwho as r
+import testkit
+fd = os.open(os.devnull, os.O_RDONLY)       # a pass_fds, as the send lock is: the fork path
+
+
+def sort(argv, patch=None):
+    try:
+        with (mock.patch.object(*patch[0], side_effect=patch[1]) if patch else contextlib.nullcontext()):
+            subprocess.run(argv, capture_output=True, pass_fds=(fd,), timeout=30)
+    except (OSError, ValueError, TypeError) as ex:
+        p = r._being_made(ex)
+        if r._never_ran(p):
+            return "none-ran"
+        if p is not None:                   # made, not heard from: ended, as _send does
+            p.kill()
+            p.wait()
+        return "may-run"
+    return "ran"
+
+
+print(sort(["/usr/bin/true"], (testkit.FORK_POINT, BlockingIOError(errno.EAGAIN, "no process"))),
+      sort(["/nonexistent/ccwho-test/osascript"]),
+      sort(["/usr/bin/true"], ((subprocess.Popen, "_close_pipe_fds"), OSError(errno.EBADF, "x"))),
+      sort(["/usr/bin/true"], ((subprocess.Popen, "communicate"), OSError(errno.EIO, "x"))))
+"""
+SPAWN_RULE_SORTS = ["none-ran", "none-ran", "may-run", "may-run"]

@@ -298,7 +298,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
             collector.fleet()
         finally:
             ui.engine.collect = real
-        return runner.claim_is_unresolved(self.SID)
+        return (runner._refusals().pop(self.SID, None), runner.why_held(self.SID, None))[1][0] == "unresolved"
 
     def test_a_session_on_the_list_lets_go_of_its_claim(self):
         self.assertFalse(self.claim_after([row(self.SID)]))
@@ -333,7 +333,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
             collector.fleet()
         finally:
             ui.engine.collect = real
-        self.assertTrue(runner.claim_is_unresolved(self.SID))
+        self.assertTrue((runner._refusals().pop(self.SID, None), runner.why_held(self.SID, None))[1][0] == "unresolved")
 
 
 class TestKeys(UiTest):

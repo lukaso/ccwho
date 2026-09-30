@@ -7532,6 +7532,18 @@ class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
         script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
                                          fill={sid: "U-1"})
         self.assertIn("on error errMsg number errNum", script)
+        self.assertIn("if errNum is not in {-1728, -1719} then error errMsg number errNum", script)
+
+    def test_a_pane_it_cannot_even_read_is_passed_over(self):
+        # nothing was written to it: whatever its error, it is not a launch
+        sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+        script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+                                         fill={sid: "U-1"})
+        lines = [l.strip() for l in script.splitlines()]
+        read = lines.index("set u to unique id of s")
+        block = lines[read:lines.index("end try", read) + 1]
+        self.assertFalse(any(l.startswith("error ") or " error errMsg" in l for l in block), block)
+        self.assertLess(read, lines.index("if errNum is not in {-1728, -1719} then error errMsg number errNum"))
 
     @unittest.skipUnless(shutil.which("osascript"), "macOS only")
     def test_only_a_pane_that_is_gone_is_passed_over(self):

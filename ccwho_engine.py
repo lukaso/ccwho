@@ -2967,8 +2967,13 @@ def iterm_open_script(entries, fill=None):
     if fills:
         head += ["  repeat with w in windows", "    repeat with t in tabs of w",
                  "      repeat with s in sessions of t",
+                 # a pane it cannot even read had nothing written to it:
+                 # passed over, whatever the error
+                 "        set u to \"\"",
                  "        try",
                  "          set u to unique id of s",
+                 "        end try",
+                 "        try",
                  "          if done does not contain u then"]
         for i, (uid, cmd) in enumerate(fills):
             head.append("            %s u is %s then" % ("if" if i == 0 else "else if",

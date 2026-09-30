@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import sys
 import tempfile
@@ -9733,6 +9734,36 @@ class TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack(unittest.TestCase):
                 self.assertEqual(runner._read_claim(sid)["iterm_pid"], [4242])
                 self.assertTrue(self.held_while_iterm2_lives(sid))
 
+    def test_ctrl_c_as_its_process_is_made(self):
+        # Ctrl-C lands in Popen's constructor after the process was made: it
+        # is ended as on any other error, before the send is recorded as over
+        sid = self.SIDS[31]
+        run = failing_after_start(self, KeyboardInterrupt(), "_close_pipe_fds", ("/bin/sleep", "30"))
+        # _sent's table is taken only once it has ended
+        at_the_table = []
+        runner.engine.app_snapshot = lambda: at_the_table.append(self.children[-1].returncode) or ITERM_TABLE
+        with self.assertRaises(KeyboardInterrupt):
+            self.sent(sid, run)
+        self.assertEqual(self.children[-1].returncode, -signal.SIGKILL, "left running, or waited for")
+        self.assertEqual(at_the_table, [-signal.SIGKILL])
+        self.assertTrue(self.held_while_iterm2_lives(sid))
+
+    def test_one_that_cannot_be_ended_keeps_its_send_lock(self):
+        # it may still send: the claim stays on its send lock, which it holds
+        # - never bound to an iTerm2 that may quit while it still runs
+        sid = self.SIDS[32]
+        run = failing_after_start(self, OSError(errno.EBADF, "Bad file descriptor"), "_close_pipe_fds",
+                                  ("/bin/sleep", "30"))
+        with mock.patch.object(subprocess.Popen, "kill", side_effect=OSError(errno.EPERM, "no")):
+            why = self.sent(sid, run)
+        self.assertIn(runner.MAY_STILL_RUN, why)
+        self.assertIsNone(self.children[-1].returncode)
+        rec = runner._read_claim(sid)
+        self.assertIsNotNone(rec.get("send"))
+        self.assertTrue(runner._sending(rec))
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: False))
+        self.assertEqual(runner.why_held(sid), ("starting", 0))
+
     def test_a_process_made_and_not_heard_from_is_ended(self):
         # as subprocess.run ends one it gives up on: no osascript is left
         # running on its own, holding the send lock after the send is recorded
@@ -9740,7 +9771,7 @@ class TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack(unittest.TestCase):
         why = self.sent(sid, failing_after_start(self, OSError(errno.EBADF, "Bad file descriptor"),
                                                  "_close_pipe_fds", ("/bin/sleep", "30")))
         self.assertIn(runner.MAY_STILL_RUN, why)
-        self.assertIsNotNone(self.children[-1].returncode, "left running")
+        self.assertEqual(self.children[-1].returncode, -signal.SIGKILL, "left running, or waited for")
         self.assertTrue(self.held_while_iterm2_lives(sid))
 
 
@@ -10029,8 +10060,9 @@ class TestTheSweepNeverTakesAFileMadeAfterItsScan(unittest.TestCase):
     """A file is recent from SIGHTING_SECONDS before its scan's start to
     SIGHTING_SECONDS past the clock now: a scan that took longer than that
     (the Mac slept while `claude agents` ran) must not take a send lock made
-    since, before its launcher locks it. A start on the monotonic clock is
-    never after now - one given ahead is taken as now."""
+    since, before its launcher locks it. A start on the monotonic clock after
+    now is none a scan gives: no sweep runs on it (_sweep returns before its
+    lock)."""
 
     SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
     setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
@@ -10111,9 +10143,10 @@ class TestASendLockRemovedAsItIsMadeIsNone(unittest.TestCase):
 
 
 class TestNoClaimStateCrossesTests(unittest.TestCase):
-    """A claim_launch that failed leaves why in ccwho's thread-local store
-    (_LOCAL), and the next launch_in_iterm on the thread reads it: every
-    test here starts with none (setUpModule)."""
+    """A claim_launch that failed, or a send lock launch_in_iterm could not
+    have, leaves why in ccwho's thread-local store (_LOCAL), and the next
+    launch_in_iterm on the thread reads it: every test here starts with none
+    (setUpModule)."""
 
     def test_a_refused_dir_then_a_busy_lock(self):
         for first in (TestARefusalSaysItsReason("test_a_ccwho_dir_not_ours"),

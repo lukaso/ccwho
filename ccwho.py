@@ -133,8 +133,8 @@ AUTOMATION = "allow it under System Settings > Privacy > Automation"
 
 
 def _not_recorded(sids):
-    """Why a launch of these was not recorded: what the claim dir or its lock
-    said (_unrecorded), else where to look."""
+    """Why a launch of these was not recorded: what the claim dir, its lock or
+    the send lock said (_unrecorded), else where to look."""
     why = next((w for sid, w in _unrecorded().items() if sid in sids and w), None)
     return ("could not record the launch in ccwho's own dir - not sending it ("
             + (why or f"check that {os.path.join(ccwho_dir(), 'launching')} can be written") + ")")
@@ -224,6 +224,21 @@ def _never_ran(p):
     return p is not None and (not getattr(p, "_child_created", True) or p.returncode is not None)
 
 
+def _ended(p):
+    """Is the process Popen's constructor left (_being_made: made, exec not
+    heard from - it may be running osascript, holding the send lock) ended -
+    killed and reaped here, as subprocess.run ends one it gives up on? True
+    when there is none. False when it could not be ended: the send is then
+    not recorded as over (_sent) - the record made before it names the send
+    lock, which that process holds, and holds while it runs (_sending)."""
+    if p is None or not getattr(p, "_child_created", False):
+        return True
+    with contextlib.suppress(Exception):
+        p.kill()
+        p.wait()
+    return p.returncode is not None
+
+
 def _send(script, deadline, sids, lock):
     """launch_in_iterm's send, with its send lock held - by osascript too."""
     try:
@@ -243,19 +258,14 @@ def _send(script, deadline, sids, lock):
             # was reaped): osascript never ran, nothing was sent
             drop_claims(sids)
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
-        if p is not None:
-            # made, and exec not heard from: it may be running osascript, and
-            # it holds the send lock. Ended and reaped, as subprocess.run ends
-            # one it gives up on - never left running past the record
-            with contextlib.suppress(Exception):
-                p.kill()
-                p.wait()
-        _sent(sids)                             # it may have run: its event may be out
+        if _ended(p):
+            _sent(sids)                         # it may have run: its event may be out
         return None, f"could not drive iTerm2 ({type(ex).__name__}) - {MAY_STILL_RUN}"
-    except BaseException:
+    except BaseException as ex:
         # Ctrl-C: it may still run. (A closed terminal kills us without a
         # word: the record made before the send holds then.)
-        _sent(sids)
+        if _ended(_being_made(ex)):
+            _sent(sids)
         raise
     if r.returncode == 0:
         claim_launched(sids)
@@ -1211,11 +1221,13 @@ _LOCAL = threading.local()
 
 
 def _unrecorded():
-    """session id -> why this thread could not record a claim of it: what the
-    claim dir or its lock said, or None (a write that failed). Written by
-    claim_launch (its lock, or _take's write) and by _mark (its lock); a take
-    that succeeds removes it. launch_in_iterm refuses a launch of any of them
-    at once, and says why (_not_recorded)."""
+    """session id -> why this thread could not record a launch of it: what the
+    claim dir or its lock said, why its send lock could not be had (removed
+    or replaced as it was made: try again), or None (a write that failed).
+    Written by claim_launch (its lock, or _take's write), by _mark (its lock)
+    and by launch_in_iterm (_hold_send's refusal); a take that succeeds
+    removes it. launch_in_iterm refuses a launch of any of them at once, and
+    says why (_not_recorded)."""
     return _LOCAL.__dict__.setdefault("unrecorded", {})
 
 
@@ -1359,12 +1371,11 @@ def _hold_send():
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        held = os.fstat(fd)
         try:
-            named = os.lstat(path)
+            same = os.path.samestat(os.fstat(fd), os.lstat(path))
         except FileNotFoundError:
-            named = None
-        if named is None or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            same = False                        # removed before the lock was had
+        if not same:
             raise OSError(errno.EAGAIN, "its send lock was removed or replaced as it was made"
                           " - try again", path)
     except OSError:
@@ -1829,8 +1840,10 @@ def _mark_swept(d, mark, now):
 
 
 def _sweep_send(path):
-    """An old send lock's file goes when no one holds it - removed while the
-    sweep holds it. One held, or that cannot be read, stays."""
+    """A send lock's file goes when no one holds it - removed while THIS
+    caller holds its flock, whatever its age: the sweep's (an old one), and
+    _let_go_send's (the launch's own, right after it let go). One held, or
+    that cannot be opened as a regular file of ours, stays."""
     fd = _open_in_claims(path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

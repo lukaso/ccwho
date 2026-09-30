@@ -5014,8 +5014,9 @@ class TestAFocusAfterTheListIsGone(UiTest):
         app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            row = app.query(ui.Row).first()
+            row = list(app.query(ui.Row))[-1]
             before = app.selected
+            self.assertNotEqual(before, row.row.get("sessionId", ""))      # a choice it could make
             await app.query_one("#list").remove()
             app.followed_focus(types.SimpleNamespace(widget=row))
             self.assertEqual(app.selected, before)

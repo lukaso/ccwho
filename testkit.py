@@ -1,11 +1,16 @@
-"""No test writes to the real ~/.ccwho.
+"""What the test modules share.
 
-Tests set CCWHO_DIR and pop it again; a scan in a test that forgot to reached
-the user's own ~/.ccwho/launching - and swept it (2026-09-30). While CCWHO_DIR
-is unset, ccwho_dir() is a temp dir of the test module's own.
+No test writes to the real ~/.ccwho (pin_ccwho_dir): tests set CCWHO_DIR and
+pop it again; a scan in a test that forgot to reached the user's own
+~/.ccwho/launching - and swept it (2026-09-30). While CCWHO_DIR is unset,
+ccwho_dir() is a temp dir of the test module's own.
+
+The spawn rule is checked on each Python that runs ccwho (FORK_POINT,
+SPAWN_RULE_CHECK, SPAWN_RULE_SORTS): it reads CPython's own frames and fields.
 """
 import os
 import shutil
+import subprocess
 import tempfile
 
 
@@ -25,8 +30,6 @@ def pin_ccwho_dir(runner):
             os.environ["CCWHO_DIR"] = inherited
     return undo
 
-
-import subprocess
 
 # where Popen makes its process: subprocess._fork_exec from 3.11,
 # _posixsubprocess.fork_exec before

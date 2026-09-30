@@ -7541,6 +7541,9 @@ class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
                                          fill={sid: "U-1"})
         lines = [l.strip() for l in script.splitlines()]
         read = lines.index("set u to unique id of s")
+        # u is set before the read: a pane whose read failed leaves no u
+        # from an earlier pane, and none undefined (-2753, not passed over)
+        self.assertEqual(lines[read - 2:read], ['set u to ""', "try"])
         block = lines[read:lines.index("end try", read) + 1]
         self.assertFalse(any(l.startswith("error ") or " error errMsg" in l for l in block), block)
         self.assertLess(read, lines.index("if errNum is not in {-1728, -1719} then error errMsg number errNum"))

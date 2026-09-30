@@ -286,7 +286,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
         runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time() - 5,
                                        "sessionId": self.SID, "unresolved": True,
-                                       "iterm_pid": 4_000_000, "until": time.time()})
+                                       "iterm_pid": 4_000_000})
         collector = ui.Collector()
         collector.reload = lambda: None
         collector.secure_input = lambda: ""
@@ -298,7 +298,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
             collector.fleet()
         finally:
             ui.engine.collect = real
-        return (runner._refusals().pop(self.SID, None), runner.why_held(self.SID, None))[1][0] == "unresolved"
+        return runner._reason(runner._read_claim(self.SID), time.time(), None)[0] == "unresolved"
 
     def test_a_session_on_the_list_lets_go_of_its_claim(self):
         self.assertFalse(self.claim_after([row(self.SID)]))
@@ -319,7 +319,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         def collect(cache=None, status=None):
             time.sleep(0.02)
             runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time(), "sessionId": self.SID,
-                                           "unresolved": True, "iterm_pid": 4_000_000, "until": time.time()})
+                                           "unresolved": True, "iterm_pid": 4_000_000})
             time.sleep(0.02)
             status.update(source_ok=True)
             return [row(self.SID)], {}
@@ -333,7 +333,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
             collector.fleet()
         finally:
             ui.engine.collect = real
-        self.assertTrue((runner._refusals().pop(self.SID, None), runner.why_held(self.SID, None))[1][0] == "unresolved")
+        self.assertEqual(runner._reason(runner._read_claim(self.SID), time.time(), None)[0], "unresolved")
 
 
 class TestKeys(UiTest):

@@ -7373,8 +7373,14 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
 
     # the gate fixture, borrowed - not inherited, or its tests run here twice
     _F = TestBackgroundAsksNeverPileUpInITerm2
-    setUp, stub, launches, table, state, ask, until, ended = (
-        _F.setUp, _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+    stub, launches, table, state, ask, until, ended = (
+        _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+
+    def setUp(self):
+        self._F.setUp(self)
+        # a boot id of the test's own: not every host can read one
+        self.addCleanup(setattr, ccwho, "boot_id", ccwho.boot_id)
+        ccwho.boot_id = lambda: "THIS-BOOT"
     assert_launches = _F.assert_launches
 
     def test_a_quoted_code_does_not_quarantine(self):
@@ -7526,7 +7532,22 @@ class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
         script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
                                          fill={sid: "U-1"})
         self.assertIn("on error errMsg number errNum", script)
-        self.assertIn("if errNum is -1712 then error errMsg number errNum", script)
+
+    @unittest.skipUnless(shutil.which("osascript"), "macOS only")
+    def test_only_a_pane_that_is_gone_is_passed_over(self):
+        # the fill's own error handler, run as it is - outside any tell: it
+        # sends no event. -1712 and iTerm2 dying (-609, -600) may come after
+        # the resume line was written: raised, never read as a closed pane
+        sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+        script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+                                         fill={sid: "U-1"})
+        handler = next(l.strip() for l in script.splitlines() if l.strip().startswith("if errNum"))
+        for code, raised in ((-1712, True), (-609, True), (-600, True), (-10000, True),
+                             (-1728, False), (-1719, False)):
+            probe = (f'try\nerror "x" number {code}\non error errMsg number errNum\n'
+                     f"{handler}\nend try\nreturn \"passed over\"")
+            r = subprocess.run(["osascript", "-e", probe], capture_output=True, text=True, timeout=20)
+            self.assertEqual(r.returncode != 0, raised, (code, r.stdout, r.stderr))
 
 
 class TestASaveTakesTheTabNameFromThePanes(unittest.TestCase):

@@ -2977,11 +2977,13 @@ def iterm_open_script(entries, fill=None):
                         " ((ASCII character 5) & (ASCII character 21)) newline no")
             head.append("              tell s to write text %s" % applescript_str(cmd))
             head.append("              set done to done & u & linefeed")
-        # a write that timed out (-1712) may still run: raise it, or it reads as
-        # a closed pane and the session is launched a second time
+        # only a pane that is gone (-1728, -1719) is passed over: anything
+        # else - a write that timed out (-1712), iTerm2 dying under it (-609,
+        # -600) - may come after the resume line went in. Raised, or it reads
+        # as a closed pane and the session is launched a second time
         head += ["            end if", "          end if",
                  "        on error errMsg number errNum",
-                 "          if errNum is -1712 then error errMsg number errNum",
+                 "          if errNum is not in {-1728, -1719} then error errMsg number errNum",
                  "        end try",
                  "      end repeat", "    end repeat", "  end repeat"]
     body = "\n".join(head + lines + ["  return done"])

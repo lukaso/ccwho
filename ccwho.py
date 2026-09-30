@@ -132,6 +132,12 @@ CUT_OFF = "cut off when iTerm2 quit"     # in every line about such a launch: `o
 AUTOMATION = "allow it under System Settings > Privacy > Automation"
 
 
+def _not_recorded():
+    return ("could not record the launch in ccwho's own dir - not sending it (check that"
+            f" {os.path.join(ccwho_dir(), 'launching')} is a dir of yours, not a link, that it"
+            " and its .lock can be written, and that no stopped ccwho holds the lock)")
+
+
 def launch_in_iterm(script, deadline, sids):
     """Run an osascript that starts sessions: (result, "") when iTerm2 ran all
     of it, else (None, what to tell the user).
@@ -156,21 +162,29 @@ def launch_in_iterm(script, deadline, sids):
       script walks them): unresolved, bound to the iTerm2 a table taken after
       the send shows (_sent).
     A launch that cannot be recorded is not sent."""
+    if _unrecorded() & set(sids):
+        # its claim could not be written: nothing to mark, nothing to send
+        drop_claims(sids)
+        return None, _not_recorded()
+    send = None
     try:
-        send = _hold_send()
-    except OSError:
-        send = None
-    if send is None or not all([claim_unresolved(sid, None, send=send[0]) for sid in sids]):
+        with contextlib.suppress(OSError):
+            send = _hold_send()
+        # the first mark that cannot be written ends it: all of them go
+        marked = send is not None and all(claim_unresolved(sid, None, send=send[0]) for sid in sids)
+    except BaseException:
+        # Ctrl-C while marking: nothing was sent
+        if send:
+            _let_go_send(send)
+        drop_claims(sids)
+        raise
+    if not marked:
         elsewhere = not (_unrecorded() & set(sids)) and any(_theirs(sid) for sid in sids)
         if send:
             _let_go_send(send)
         drop_claims(sids)                  # nothing was sent: none of them may hold
         return None, ("a session in it is running now, or another ccwho is opening it"
-                      " - not sending it" if elsewhere else
-                      "could not record the launch in ccwho's own dir - not sending it (check"
-                      f" that {os.path.join(ccwho_dir(), 'launching')} is a dir of yours, not a link,"
-                      " that it and its .lock can be written, and that no stopped ccwho holds the"
-                      " lock)")
+                      " - not sending it" if elsewhere else _not_recorded())
     try:
         return _send(script, deadline, sids, send[1])
     finally:
@@ -222,7 +236,8 @@ def _send(script, deadline, sids, lock):
         # after the first event - or no telling where: what came before the
         # refusal may have been written (the pane fill walks on after its
         # write), so what may run holds
-        return None, f"iTerm2 refused ({code}) part way through - {AUTOMATION}; {MAY_STILL_RUN}"
+        where = " part way through" if engine.ae_error_start(r.stderr) is not None else ""
+        return None, f"iTerm2 refused ({code}){where} - {AUTOMATION}; {MAY_STILL_RUN}"
     # killed by a signal, failed with no code, or failed after a write
     how = code or ("stopped by a signal" if r.returncode < 0 else f"exit {r.returncode}")
     return None, f"iTerm2 did not finish ({how}) - {MAY_STILL_RUN}"
@@ -232,14 +247,15 @@ def _sent(sids):
     """The send is over and its launch may still run: the claims are bound to
     the iTerm2 a table taken now shows - the one that got the event, or its
     restart - and dated the end of the send, so that no table from before it
-    can bind or release them. When the table shows none, or cannot be read,
+    can bind or release them. When the table shows none, or two of ours (the
+    one `tell application "iTerm2"` picked is not known), or cannot be read,
     the record from before the send stays: it names its send lock, and is
     dated when that is first seen let go of (_dated); any iTerm2 of ours
     holds it."""
-    got = engine.iterm_app_pid(engine.app_snapshot())
-    if got is not None:
+    shown = engine.iterm_app_pids(engine.app_snapshot())
+    if len(shown) == 1:
         for sid in sids:
-            claim_unresolved(sid, got)
+            claim_unresolved(sid, shown[0])
 
 
 def scan(cache=None, status=None, eng=None):
@@ -1032,6 +1048,10 @@ def known_entries():
 LAUNCH_CLAIM_SECONDS = 90.0       # long enough for a session to appear in the feed
 CLOCK_STEP_SECONDS = 3600.0       # a wall clock set back by up to this voids no claim
 SIGHTING_SECONDS = 600.0          # longer than any caller takes from its scan to its claim
+# A decision stamped later than now by more than this was made before the
+# clock was set back. The same clock stamps both, so any is a step back; a
+# small step (a time sync's) is let pass - its misorder is under a second.
+CLOCK_SLACK_SECONDS = 1.0
 
 
 def _pid_alive(pid):
@@ -1078,45 +1098,69 @@ def _send_path(token):
 
 
 def _claims_dir():
-    """launching/, made if need be: a dir of this user's own, never through a
-    link (a root-run ccwho writes and removes files in it), and no one else's
-    to write in - another user could remove a send lock's file mid-send, and
-    the claim would read as not being sent. Writable by others: made
-    private."""
-    d = os.path.join(ccwho_dir(), "launching")
-    os.makedirs(d, mode=0o700, exist_ok=True)
-    st = os.lstat(d)
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
-        raise OSError(f"{d} is not a dir of this user's own")
-    if st.st_mode & 0o022:
-        os.chmod(d, stat.S_IMODE(st.st_mode) & 0o700)
+    """launching/, made if need be. It and the ccwho dir above it are this
+    user's own, and no one else's to write in: another user could remove a
+    send lock's file mid-send, or move launching/ away with every claim in
+    it. One writable by others is made private - through the dir opened,
+    never through a name that could have been swapped for a link since.
+    launching/ itself is never a link (a root-run ccwho writes and removes
+    files in it); the ccwho dir may be one of the user's own."""
+    top = ccwho_dir()
+    os.makedirs(top, mode=0o700, exist_ok=True)
+    _own_private_dir(top, os.O_RDONLY)
+    d = os.path.join(top, "launching")
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(d, 0o700)
+    _own_private_dir(d, os.O_RDONLY | os.O_NOFOLLOW)
     return d
 
 
-CLAIMS_LOCK_SECONDS = 5.0     # a launch waits this long for the claims lock
+def _own_private_dir(path, flags):
+    fd = os.open(path, flags | os.O_DIRECTORY)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise OSError(f"{path} is not a dir of this user's own")
+        if st.st_mode & 0o022:
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) & 0o700)
+    finally:
+        os.close(fd)
+
+
+CLAIMS_LOCK_SECONDS = 5.0     # a launch waits this long for the claims lock,
+GAVE_UP_SECONDS = 60.0        # and this long after one gave up, its thread tries once
 
 
 @contextlib.contextmanager
 def _claims_locked(wait=None):
     """One ccwho at a time reads, judges and rewrites claims: two that both
     judged a stale claim free both took it (a double click), and a sighting
-    could remove a claim made again since it was read. Every scan takes it,
-    so nothing slow - no ps, no send - runs under it. A holder can still be
-    stopped (Ctrl-Z) inside: a scan does not wait (wait=0 - it releases what
-    it saw next time), a launch waits CLAIMS_LOCK_SECONDS. Raises OSError
-    when the lock cannot be had."""
-    wait = CLAIMS_LOCK_SECONDS if wait is None else wait
-    fd = os.open(os.path.join(_claims_dir(), ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    could remove a claim made again since it was read. Every scan and every
+    launch takes it, so nothing slow - no ps, no send - runs under it. A
+    holder can still be stopped (Ctrl-Z) inside: a scan does not wait
+    (wait=0 - it releases what it saw next time); a launch waits
+    CLAIMS_LOCK_SECONDS, and for GAVE_UP_SECONDS after one of its thread gave
+    up, tries once - until one is had: the rest of a batch does not wait the
+    whole time again, and a click a minute on waits in full. The
+    lock file is this user's own, and its only name - not one another user
+    made, or links to, while the dir was open to them. Raises OSError when the
+    lock cannot be had."""
+    launch = wait is None
+    if launch:
+        gave_up = _LOCAL.__dict__.get("lock_gave_up")
+        wait = 0 if gave_up is not None and time.monotonic() - gave_up < GAVE_UP_SECONDS \
+            else CLAIMS_LOCK_SECONDS
+    path = os.path.join(_claims_dir(), ".lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        end = time.monotonic() + wait
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= end:
-                    raise
-                time.sleep(0.02)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
+            raise OSError(f"{path} is not a lock of this user's own - remove it")
+        if not engine._take_lock(fd, wait):
+            if launch and wait:
+                _LOCAL.lock_gave_up = time.monotonic()
+            raise BlockingIOError(errno.EWOULDBLOCK, "the claims lock is held by another ccwho")
+        _LOCAL.lock_gave_up = None
         yield
     finally:
         os.close(fd)
@@ -1161,7 +1205,9 @@ def _open_in_claims(path):
     """A file in the claim dir, opened for reading under the claims lock
     every scan and launch takes: never through a link, never blocking - a
     FIFO planted at the name does not hang ccwho. Raises ValueError when it
-    is no regular file, OSError when it cannot be opened."""
+    is no regular file of this user's own (another user's, planted while the
+    dir was open to them, is no claim ccwho wrote), OSError when it cannot be
+    opened."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as ex:
@@ -1169,8 +1215,11 @@ def _open_in_claims(path):
             raise ValueError("a link")
         raise
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise ValueError("not a file")
+        if st.st_uid != os.geteuid():
+            raise ValueError("not a file of this user's own")
     except BaseException:
         os.close(fd)
         raise
@@ -1262,23 +1311,57 @@ def _write_claim(session_id, record):
 
 
 def _dated(session_id, rec):
-    """An unresolved launch is judged as of the moment it is first seen to be
-    able to run no more than it already has: one dated ahead of the clock
-    (written while it ran fast), or one naming a send lock no one holds any
-    more (its launcher died before it could record what the send did) is
-    dated now, and saved so. Only a table taken after that can bind it or
-    call its iTerm2 gone - never one taken while it was being sent, before
-    its osascript had started iTerm2. The caller holds the lock."""
+    """A record is judged as of the moment it is first seen to be able to do
+    no more than it already has, and saved so. The caller holds the lock.
+    - A sighting or a launch dated later than now was written before the
+      clock was set back: it is dated now - not refusing, for up to an hour,
+      decisions made after it.
+    - An unresolved launch naming a send lock no one holds any more (its
+      launcher died before it could record what the send did) is dated now -
+      with every other claim of that send (_redate_send), so a batch of them
+      takes one table after it, not one each; so is one dated more than a
+      clock step ahead (written while the clock ran fast). Only a table taken
+      after that can bind it or call its iTerm2 gone - never one taken while
+      it was being sent, before its osascript had started iTerm2."""
+    at = time.time()
+    if rec.get("seen") is True or rec.get("launched") is True:
+        if float(rec["since"]) > at or float(rec.get("until", 0)) > at:
+            rec = dict(rec, since=min(float(rec["since"]), at))
+            if "until" in rec:
+                rec["until"] = min(float(rec["until"]), at)
+            _write_claim(session_id, rec)
+        return rec
     if rec.get("unresolved") is not True:
         return rec
-    ahead = float(rec["since"]) > time.time() + CLOCK_STEP_SECONDS
-    over = rec.get("send") is not None and not _sending(rec)
-    if ahead or over:
+    if rec.get("send") is not None and not _sending(rec):
+        _redate_send(rec["send"], at)
+        rec = dict({k: v for k, v in rec.items() if k not in ("until", "send")}, since=at)
+        _write_claim(session_id, rec)
+    elif float(rec["since"]) > at + CLOCK_STEP_SECONDS:
         # a send still under way keeps its lock named: it holds by that
-        rec = {k: v for k, v in rec.items() if k != "until" and (k != "send" or not over)}
-        rec["since"] = time.time()
+        rec = dict({k: v for k, v in rec.items() if k != "until"}, since=at)
         _write_claim(session_id, rec)
     return rec
+
+
+def _redate_send(token, at):
+    """Every unresolved claim naming this send lock, dated `at` - its send is
+    over. Under the lock."""
+    try:
+        entries = list(os.scandir(os.path.join(ccwho_dir(), "launching")))
+    except OSError:
+        return
+    for e in entries:
+        m = _CLAIM_FILE.fullmatch(e.name)
+        if not m or m.group(2) != "json" or not engine._SESSION_ID.match(m.group(1)):
+            continue
+        try:
+            rec = _read_claim(m.group(1))
+        except (OSError, ValueError):
+            continue
+        if rec.get("unresolved") is True and rec.get("send") == token:
+            _write_claim(m.group(1), dict({k: v for k, v in rec.items() if k not in ("until", "send")},
+                                          since=at))
 
 
 def _mine(session_id):
@@ -1390,7 +1473,8 @@ def release_claims(session_ids, seen_at):
     overlap, and one that started earlier may have read the session later
     than another's "not running". A sighting goes SIGHTING_SECONDS after its
     scan ended; a record no ccwho wrote goes at once. The sweep runs after:
-    what this scan saw has its sighting by then."""
+    what this scan saw has its sighting by then. A claims lock that is busy
+    defers both to the next scan."""
     d = os.path.join(ccwho_dir(), "launching")
     try:
         names = set(os.listdir(d))
@@ -1399,9 +1483,12 @@ def release_claims(session_ids, seen_at):
     sids = [sid for sid in session_ids
             if sid and engine._SESSION_ID.match(str(sid)) and f"{sid}.json" in names]
     if sids:
-        with contextlib.suppress(OSError), _claims_locked(wait=0):
-            for sid in sids:
-                _see(sid, seen_at)
+        try:
+            with _claims_locked(wait=0):
+                for sid in sids:
+                    _see(sid, seen_at)
+        except OSError:
+            return          # busy: no sightings, so no sweep either - next scan
     _sweep(d, seen_at)
 
 
@@ -1559,9 +1646,11 @@ def _iterm_holds(rec, alive, table, taken):
     # or call its iTerm2 gone - an older one may predate that iTerm2
     fresh = taken is not None and float(rec.get("since", 0)) < taken <= time.time()
     if type(iterm) is not int:
-        found = engine.iterm_app_pid(table)
-        if found is not None:
-            return True, (dict(rec, iterm_pid=found) if fresh else rec)
+        found = engine.iterm_app_pids(table)
+        if found:
+            # bound only to the one iTerm2 of ours a table shows: with two, the
+            # one the event went to is not known - either holds it
+            return True, (dict(rec, iterm_pid=found[0]) if fresh and len(found) == 1 else rec)
     elif engine.is_iterm_app(table, iterm):
         return True, rec
     return (False, rec) if fresh else None
@@ -1575,11 +1664,11 @@ def _take(session_id, pid, now, alive, table, taken, decided_at):
     does an error while judging one - the guard fails closed (the list
     reloads the engine, never this file). A decision older than
     SIGHTING_SECONDS is refused - judged here, by the clock after any wait
-    for the lock - and so is one from later than now: the clock was set back
-    since, and its order against what was written since is unknown. Why it
-    said no is kept for why_held."""
+    for the lock - and so is one more than CLOCK_SLACK_SECONDS later than
+    now: the clock was set back since, and its order against what was
+    written since is unknown. Why it said no is kept for why_held."""
     at = max(now, time.time())
-    if decided_at is not None and not (at - SIGHTING_SECONDS <= decided_at <= at + 1.0):
+    if decided_at is not None and not (at - SIGHTING_SECONDS <= decided_at <= at + CLOCK_SLACK_SECONDS):
         _refusals()[session_id] = ("old list", 0)
         return False
     try:
@@ -1624,13 +1713,16 @@ def _take(session_id, pid, now, alive, table, taken, decided_at):
 def _tables():
     """One process table for a batch of claims, taken when first needed:
     get(after) -> (table, when it was taken). One not taken after `after` - a
-    claim's since - is taken again: a claim is never judged on a table older
-    than it (_iterm_holds), nor on one stamped later than now (the clock was
-    set back since it was taken)."""
+    claim's since - is taken again, if one can be (`after` is not ahead of
+    now): a claim is never judged on a table older than it (_iterm_holds),
+    nor on one stamped later than now (the clock was set back since it was
+    taken)."""
     cached = []
 
     def get(after=None):
-        if not cached or (after is not None and cached[0][1] <= after) or cached[0][1] > time.time():
+        now = time.time()
+        # a claim dated ahead of now can have no table after it yet: none taken for it
+        if not cached or (after is not None and cached[0][1] <= after <= now) or cached[0][1] > now:
             taken = time.time()
             cached[:] = [(engine.app_snapshot(), taken)]
         return cached[0]
@@ -1693,7 +1785,8 @@ def resume_problem(entry):
     return engine.entry_problem(entry, os.path.isdir, finder)
 
 
-OLD_LIST = "the session list it read is too old to act on (the Mac slept?) - run it again"
+OLD_LIST = ("the session list it read is too old to act on (the Mac slept?), or from before"
+            " the clock was set back - run it again")
 
 
 def _why_text(reason, session_id, left):
@@ -3105,7 +3198,9 @@ def restore(argv):
         # call claimed: nothing was sent
         sending = False
         try:
-            tables = _tables()           # one process table for the claims, when one needs it
+            # one process table for the claims, when one needs it - taken again
+            # for a claim newer than it (_tables)
+            tables = _tables()
             for e_ in entries:
                 sid = e_.get("sessionId", "")
                 if sid in seen:
@@ -3119,6 +3214,11 @@ def restore(argv):
                     if why:
                         gone.append((e_, why))    # checked BEFORE the claim: not opening it
                     elif claim_launch(sid, decided_at=status.get("seen_at"), refresh=tables):
+                        if sid in _unrecorded():
+                            # its claim could not be written: none of this
+                            # restore will be sent - ask iTerm2 nothing
+                            print(f"ccwho restore: {_not_recorded()}", file=sys.stderr)
+                            return 1
                         openable.append(e_)
                     else:
                         reason, left = why_held(sid)

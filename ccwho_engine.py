@@ -1215,15 +1215,19 @@ def ae_error_code(err):
 _AE_ERROR_AT = re.compile(r"(\d+):(\d+): execution error")
 
 
+def ae_error_start(err):
+    """Where in the script osascript's last error came from, or None."""
+    found = _AE_ERROR_AT.findall(err or "")
+    return int(found[-1][0]) if found else None
+
+
 def ae_error_at(err, script, statement):
     """Did osascript's last error come from `statement` - the first line of
     `script` that is it? By the source range osascript puts before its
-    message (it may be a part of the statement); False when there is none."""
-    found = _AE_ERROR_AT.findall(err or "")
-    at = script.find(statement)
-    if not found or at < 0:
-        return False
-    return at <= int(found[-1][0]) < at + len(statement)
+    message (it may be a part of the statement; it starts at the tell target
+    when the statement is the last of its block); False when there is none."""
+    start, at = ae_error_start(err), script.find(statement)
+    return start is not None and at >= 0 and at <= start < at + len(statement)
 
 
 # Each launch script's first event: it writes nothing, so a -1743 that comes
@@ -1269,11 +1273,15 @@ def _is_iterm_daemon(name):
 
 def iterm_app_pid(procs_output):
     """Our running iTerm2 app, or None. Another user's iTerm2 is not ours to ask."""
+    pids = iterm_app_pids(procs_output)
+    return pids[0] if pids else None
+
+
+def iterm_app_pids(procs_output):
+    """Our running iTerm2 apps, lowest pid first."""
     me = os.getuid()
-    for pid, (_tty, uid, name) in sorted(parse_procs(procs_output).items()):
-        if uid == me and _is_iterm_app(name):
-            return pid
-    return None
+    return [pid for pid, (_tty, uid, name) in sorted(parse_procs(procs_output).items())
+            if uid == me and _is_iterm_app(name)]
 
 
 def is_iterm_app(procs_output, pid):

@@ -104,9 +104,11 @@ class TestCodexThreads(unittest.TestCase):
         self.home.index((A, "fix the navbar"))
         self.home.rollout(A, cwd="/Users/x/liveapp", originator="Codex Desktop")
         threads = self.read({4215: [A]})
-        self.assertEqual(threads, [{"thread": A, "name": "fix the navbar",
-                                    "cwd": "/Users/x/liveapp", "host_pid": 4215,
-                                    "originator": "Codex Desktop", "source": "vscode"}])
+        keys = ("thread", "name", "cwd", "host_pid", "originator", "source", "turn")
+        self.assertEqual([{k: t[k] for k in keys} for t in threads],
+                         [{"thread": A, "name": "fix the navbar", "cwd": "/Users/x/liveapp",
+                           "host_pid": 4215, "originator": "Codex Desktop", "source": "vscode",
+                           "turn": None}])
 
     def test_the_newest_name_wins(self):
         self.home.lock(A)
@@ -334,13 +336,20 @@ class TestCodexThreads(unittest.TestCase):
         with open(path, "w") as fh:
             fh.write(json.dumps({"type": "session_meta", "payload": {
                 "cwd": "/Users/x/\x1b]0;t\x07", "originator": "Codex\x1b[2J",
-                "source": {"subagent": "review"}}}) + "\n")
+                "source": "vs\x1b[2Jcode"}}) + "\n")
         t = self.read({1: [A]})[0]
         for field in ("name", "cwd", "originator", "source"):
             self.assertIsInstance(t[field], str)
             self.assertNotIn("\x1b", t[field])
             self.assertNotIn("\x07", t[field])
-        self.assertEqual(t["source"], "")
+
+    def test_a_source_that_is_no_text_is_empty(self):
+        self.home.lock(A)
+        path = self.home.rollout(A)
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"type": "session_meta", "payload": {
+                "cwd": "/x", "source": ["vscode", 1]}}) + "\n")
+        self.assertEqual(self.read({1: [A]})[0]["source"], "")
 
     def test_a_first_line_that_is_not_utf8_still_reads(self):
         self.home.lock(A)
@@ -431,8 +440,8 @@ class TestACodexThreadIsARow(unittest.TestCase):
 
     def test_each_open_thread_is_a_codex_row(self):
         rows = engine.codex_rows(self.FLEET)
-        self.assertEqual([(r["sessionId"], r["kind"], r["attention"]) for r in rows],
-                         [(A, "codex", "codex"), (C, "codex", "codex")])
+        self.assertEqual([(r["sessionId"], r["kind"]) for r in rows],
+                         [(A, "codex"), (C, "codex")])
         r = rows[0]
         self.assertEqual((r["project"], r["title"], r["procs"], r["ports"]),
                          ("liveapp", "fix the navbar", 2, [5173]))
@@ -469,12 +478,6 @@ class TestACodexThreadIsARow(unittest.TestCase):
         r = engine.codex_rows(self.FLEET)[1]
         self.assertEqual(r["project"], "codex")
         self.assertTrue(r["title"])
-
-    def test_the_codex_group_is_last(self):
-        claude = {"sessionId": "b", "attention": "program"}
-        groups = engine.ui_groups([claude] + engine.codex_rows(self.FLEET))
-        self.assertEqual([g["heading"] for g in groups][-1], "CODEX")
-        self.assertEqual(len(groups[-1]["rows"]), 2)
 
     def test_its_row_says_codex_and_where_not_a_window(self):
         r = engine.codex_rows(self.FLEET)[0]
@@ -664,6 +667,410 @@ class TestKillingACodexThreadsWork(unittest.TestCase):
     def test_a_pid_kill_keeps_the_note(self):                             # control
         p = procs.kill_plan("pid", {"pid": 30, "start": self.T}, self.world())
         self.assertIn("cannot tell whether", p["kill"][0].get("note", ""))
+
+
+def transcript(path, *events, pad=0):
+    """A rollout: session_meta, `pad` bytes of noise, then events - each a
+    (payload type, extra payload fields)."""
+    with open(path, "w") as fh:
+        fh.write(json.dumps({"type": "session_meta", "payload": {"cwd": "/x"}}) + "\n")
+        if pad:
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "agent_message",
+                                                                  "message": "x" * pad}}) + "\n")
+        for kind, extra in events:
+            fh.write(json.dumps({"type": "event_msg", "payload": dict({"type": kind}, **extra)})
+                     + "\n")
+
+
+class TestTheEndOfATranscriptSaysTheState(unittest.TestCase):
+    """The owner's D19 (2026-09-29): a Codex thread's state from its transcript's
+    end - task_started / task_complete (with the agent's last words) /
+    turn_aborted. Codex writes no approval request: a turn that went quiet is
+    "waiting?"."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, f"rollout-x-{A}.jsonl")
+
+    def test_a_done_turn_that_asks(self):
+        transcript(self.path, ("task_started", {}),
+                   ("task_complete", {"completed_at": 1790000000,
+                                      "last_agent_message": "I fixed it.\n\nShall I land it?"}))
+        t = engine.codex_turn(self.path, cache={})
+        self.assertEqual((t["turn"], t["ask"], t["ts"]), ("done", "Shall I land it?", 1790000000))
+
+    def test_a_done_turn_that_does_not_ask(self):
+        transcript(self.path, ("task_started", {}),
+                   ("task_complete", {"completed_at": 5, "last_agent_message": "Done: all green."}))
+        self.assertEqual(engine.codex_turn(self.path, cache={})["ask"], "")
+
+    def test_aborted_and_open(self):
+        transcript(self.path, ("task_started", {}), ("turn_aborted", {}))
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "aborted")
+        transcript(self.path, ("task_complete", {"completed_at": 1}), ("task_started", {}),
+                   ("token_count", {}))
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "open")
+
+    def test_no_boundary_is_none(self):
+        transcript(self.path)
+        self.assertIsNone(engine.codex_turn(self.path, cache={})["turn"])
+
+    def test_only_codex_s_own_events_are_boundaries(self):
+        # a response item that names a boundary is what was said, not an end
+        transcript(self.path, ("task_started", {}))
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "task_complete", "completed_at": 1}}) + "\n")
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "open")
+
+    def test_the_last_boundary_wins_past_a_long_line(self):
+        transcript(self.path, ("task_started", {}), pad=engine.CODEX_TAIL * 2)
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}) + "\n")
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "aborted")
+
+    def test_a_tool_call_without_output_is_what_can_wait(self):
+        # quiet after a tool call: a long build or an approval; quiet after the
+        # model's own words: thinking - never an approval (review 1 of D19)
+        transcript(self.path, ("task_started", {}))
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "function_call", "call_id": "c1"}}) + "\n")
+        self.assertTrue(engine.codex_turn(self.path, cache={})["pending_tool"])
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "c1"}}) + "\n")
+            fh.write(json.dumps({"type": "response_item", "payload": {"type": "message"}}) + "\n")
+        self.assertFalse(engine.codex_turn(self.path, cache={})["pending_tool"])
+
+    def noise(self, n):
+        with open(self.path, "a") as fh:
+            for _ in range(n):
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "item_completed", "item": "x" * 8000}}) + "\n")
+
+    def test_a_long_turn_is_still_open(self):
+        # review 1 of D19: 269 of 1157 real turns wrote more than the tail after
+        # their start - read back to the boundary, from a fresh start too
+        transcript(self.path, ("task_complete", {"completed_at": 1}), ("task_started", {}))
+        self.noise(2 * engine.CODEX_TAIL // 8000)
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "open")
+
+    def test_a_done_turn_far_back_is_still_done(self):                  # control
+        transcript(self.path, ("task_started", {}),
+                   ("task_complete", {"completed_at": 3, "last_agent_message": "Go?"}))
+        self.noise(2 * engine.CODEX_TAIL // 8000)
+        t = engine.codex_turn(self.path, cache={})
+        self.assertEqual((t["turn"], t["ask"], t["ts"]), ("done", "Go?", 3))
+
+    def test_a_line_written_in_two_parts_is_read_whole(self):
+        # review 2 of D19: a read while Codex wrote half a line lost that line
+        for kind, extra in (("task_complete", {"completed_at": 5, "last_agent_message": "Go?"}),):
+            transcript(self.path, ("task_started", {}))
+            with open(self.path, "a") as fh:
+                fh.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "function_call", "call_id": "c"}}) + "\n")
+            line = json.dumps({"type": "event_msg", "payload": dict({"type": kind}, **extra)}) + "\n"
+            cache = {}
+            with open(self.path, "a") as fh:
+                fh.write(line[:30])
+            engine.codex_turn(self.path, cache=cache)
+            with open(self.path, "a") as fh:
+                fh.write(line[30:])
+            warm = engine.codex_turn(self.path, cache=cache)
+            cold = engine.codex_turn(self.path, cache={})
+            self.assertEqual({k: warm[k] for k in ("turn", "ask", "ts", "pending_tool")},
+                             {k: cold[k] for k in ("turn", "ask", "ts", "pending_tool")})
+            self.assertEqual(warm["turn"], "done")
+
+    def test_a_half_line_on_a_grown_read_is_read_whole_later(self):
+        # review 3 of D19: the first read must be a WHOLE-line read into the
+        # cache, so the half line meets the grown read, not the cold one
+        cache = {}
+        transcript(self.path, ("task_started", {}))
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "open")
+        line = json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete", "completed_at": 5, "last_agent_message": "Go?"}}) + "\n"
+        with open(self.path, "a") as fh:
+            fh.write(line[:25])
+        engine.codex_turn(self.path, cache=cache)
+        with open(self.path, "a") as fh:
+            fh.write(line[25:])
+        warm = engine.codex_turn(self.path, cache=cache)
+        cold = engine.codex_turn(self.path, cache={})
+        self.assertEqual((warm["turn"], warm["ask"]), ("done", "Go?"))
+        self.assertEqual({k: warm[k] for k in ("turn", "ask", "ts", "pending_tool")},
+                         {k: cold[k] for k in ("turn", "ask", "ts", "pending_tool")})
+
+    def test_the_last_turns_time_goes_with_a_new_turn(self):
+        # a cold read stops at task_started; a warm or full read went past an
+        # older completion: both must say the same - no time for an open turn
+        transcript(self.path, ("task_complete", {"completed_at": 4}))
+        self.noise(2 * engine.CODEX_TAIL // 8000)
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+        cold = engine.codex_turn(self.path, cache={})
+        full = {"turn": None, "ask": "", "ts": None, "pending_tool": False}
+        with open(self.path, "rb") as fh:
+            for line in fh.read().split(b"\n"):
+                engine._codex_step(full, line)
+        self.assertEqual((cold["turn"], cold["ts"]), ("open", None))
+        self.assertEqual(full["ts"], None)
+
+
+    def test_an_interrupt_right_after_a_done_turn_has_no_time(self):
+        # the property check found it: complete, far back, then aborted - the
+        # cold read stops at the interrupt; the full read must agree
+        transcript(self.path, ("task_complete", {"completed_at": 4}))
+        self.noise(2 * engine.CODEX_TAIL // 8000)
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}) + "\n")
+        cold = engine.codex_turn(self.path, cache={})
+        full = {"turn": None, "ask": "", "ts": None, "pending_tool": False}
+        with open(self.path, "rb") as fh:
+            for line in fh.read().split(b"\n"):
+                engine._codex_step(full, line)
+        self.assertEqual((cold["turn"], cold["ts"]), (full["turn"], full["ts"]))
+        self.assertEqual(cold["ts"], None)
+
+    def test_a_last_line_without_its_newline_is_no_boundary_yet(self):
+        transcript(self.path, ("task_started", {}))
+        self.noise(2 * engine.CODEX_TAIL // 8000)
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "completed_at": 6}}))          # no "\n" yet
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "open")
+
+    def test_a_file_that_shrank_is_read_as_new(self):
+        cache = {}
+        transcript(self.path, ("task_started", {}))
+        self.noise(3)
+        engine.codex_turn(self.path, cache=cache)
+        with open(self.path, "r+") as fh:                  # the same inode, smaller
+            fh.truncate(0)
+        transcript(self.path, ("task_complete", {"completed_at": 2}))
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "done")
+
+    def test_a_grown_file_is_read_only_where_it_grew(self):
+        cache, seen = {}, []
+        transcript(self.path, ("task_started", {}))
+        self.noise(20)
+        engine.codex_turn(self.path, cache=cache)
+        real = engine._codex_step
+        engine._codex_step = lambda state, line: seen.append(line) or real(state, line)
+        self.addCleanup(setattr, engine, "_codex_step", real)
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "turn_aborted"}}) + "\n")
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "aborted")
+        self.assertLessEqual(len([l for l in seen if l]), 1)
+
+    def test_a_replaced_file_is_read_as_new(self):
+        cache = {}
+        transcript(self.path, ("task_started", {}))
+        self.noise(5)                                     # ~40 KB, still open
+        engine.codex_turn(self.path, cache=cache)
+        other = self.path + ".new"
+        transcript(other, ("task_complete", {"completed_at": 8}))   # its end early...
+        with open(other, "a") as fh:
+            for _ in range(10):                           # ...then more than the old size
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "item_completed", "item": "y" * 8000}}) + "\n")
+        os.replace(other, self.path)
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "done")
+
+    def test_a_cold_read_of_a_long_turn_is_linear(self):
+        # 40 MB took 6 s when each step re-read all it had read before
+        import time
+        transcript(self.path, ("task_started", {}))
+        self.noise(40 * 1024 * 1024 // 8000)
+        started = time.monotonic()
+        self.assertEqual(engine.codex_turn(self.path, cache={})["turn"], "open")
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_a_tool_search_can_wait_too(self):
+        transcript(self.path, ("task_started", {}))
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "tool_search_call"}}) + "\n")
+        self.assertTrue(engine.codex_turn(self.path, cache={})["pending_tool"])
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "tool_search_output"}}) + "\n")
+        self.assertFalse(engine.codex_turn(self.path, cache={})["pending_tool"])
+
+    def test_what_grew_without_a_boundary_keeps_the_state(self):
+        cache = {}
+        transcript(self.path, ("task_started", {}))
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "open")
+        self.noise(3)
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "open")
+
+    def test_a_transcript_that_grew_is_read_again(self):
+        cache = {}
+        transcript(self.path, ("task_started", {}))
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "open")
+        with open(self.path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "completed_at": 9}}) + "\n")
+        self.assertEqual(engine.codex_turn(self.path, cache=cache)["turn"], "done")
+
+    def test_the_words_kept_are_the_closing_question_only(self):
+        transcript(self.path, ("task_complete", {"completed_at": 1,
+                                                 "last_agent_message": "secret plan\n\nOK to go?"}))
+        t = engine.codex_turn(self.path, cache={})
+        self.assertNotIn("secret plan", json.dumps(t))
+
+
+class TestEveryWayOfReadingAgrees(unittest.TestCase):
+    """A property, from review 3 of D19: after any appends - lines split in two,
+    boundaries in any order, noise longer than a chunk - the warm read (one
+    cache the whole way), a cold read and a full forward read say the same."""
+
+    EVENTS = [("event_msg", "task_started", {}), ("event_msg", "turn_aborted", {}),
+              ("event_msg", "task_complete", {"last_agent_message": "Go on?"}),
+              ("event_msg", "task_complete", {"last_agent_message": "Done."}),
+              ("response_item", "function_call", {}), ("response_item", "function_call_output", {}),
+              ("response_item", "message", {}), ("event_msg", "item_completed", {"x": "z" * 900})]
+
+    def test_warm_cold_and_full_agree(self):
+        import random
+        was, engine.CODEX_TAIL = engine.CODEX_TAIL, 700        # many chunks, small files
+        self.addCleanup(setattr, engine, "CODEX_TAIL", was)
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        for seed in range(12):
+            rnd = random.Random(seed)
+            path = os.path.join(folder, f"rollout-{seed}-{A}.jsonl")
+            with open(path, "w") as fh:
+                fh.write(json.dumps({"type": "session_meta", "payload": {"cwd": "/x"}}) + "\n")
+            cache, pending, n = {}, "", 0
+            for step in range(40):
+                if pending and rnd.random() < 0.5:
+                    chunk, pending = pending, ""
+                else:
+                    top, kind, extra = rnd.choice(self.EVENTS)
+                    n += 1
+                    extra = dict(extra, completed_at=n) if kind == "task_complete" else extra
+                    line = json.dumps({"type": top, "payload": dict({"type": kind}, **extra)}) + "\n"
+                    cut = rnd.randrange(1, len(line)) if rnd.random() < 0.3 else len(line)
+                    chunk, pending = pending + line[:cut], line[cut:]
+                with open(path, "a") as fh:
+                    fh.write(chunk)
+                warm = engine.codex_turn(path, cache=cache)
+                cold = engine.codex_turn(path, cache={})
+                full = {"turn": None, "ask": "", "ts": None, "pending_tool": False}
+                data = open(path, "rb").read()
+                for line in data.split(b"\n")[:-1]:
+                    engine._codex_step(full, line)
+                keys = ("turn", "ask", "ts", "pending_tool")
+                self.assertEqual({k: warm[k] for k in keys}, full, (seed, step))
+                self.assertEqual({k: cold[k] for k in keys}, full, (seed, step))
+
+
+class TestACodexRowsState(unittest.TestCase):
+    NOW = 1790000000.0
+
+    def row(self, turn, ask="", ts=1, quiet=0, seen=None, pending=True):
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0],
+                 turn=turn, ask=ask, ts=ts, mtime=self.NOW - quiet, seen_ts=seen,
+                 pending_tool=pending)
+        return engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+
+    def test_each_end_is_its_state(self):
+        self.assertEqual(self.row("done", ask="Shall I land it?")["attention"], "asks")
+        self.assertEqual(self.row("done")["attention"], "review")
+        self.assertEqual(self.row("done", ts=7, seen=7)["attention"], "stopped")
+        self.assertEqual(self.row("aborted")["attention"], "stopped")
+        self.assertEqual(self.row("open", quiet=10)["attention"], "busy")
+        self.assertEqual(self.row("open", quiet=engine.CODEX_QUIET + 1)["attention"], "waiting")
+        # quiet with no tool call pending: the model thinks - busy
+        self.assertEqual(self.row("open", quiet=engine.CODEX_QUIET + 1, pending=False)
+                         ["attention"], "busy")
+        self.assertEqual(self.row(None)["attention"], "stopped")
+
+    def test_they_join_the_claude_groups(self):
+        heads = [g["heading"] for g in engine.ui_groups(
+            [self.row("done", ask="Go?"), self.row("open", quiet=5)])]
+        self.assertEqual(heads, ["NEEDS YOU", "BUSY"])
+        self.assertNotIn("CODEX", [h for h, _ in engine.UI_GROUPS])
+
+    def test_line_two_says_what_it_waits_for(self):
+        line = lambda r: "".join(t for t, _ in engine.ui_row_cells(r, width=140)[1])
+        self.assertIn("waiting? (maybe an approval)",
+                      line(self.row("open", quiet=engine.CODEX_QUIET + 1)))
+        self.assertIn("Shall I land it?", line(self.row("done", ask="Shall I land it?")))
+        self.assertIn("liveapp", line(self.row("done")))                  # else its folder
+
+    def test_the_row_still_says_codex(self):
+        first = "".join(t for t, _ in engine.ui_row_cells(self.row("done", ask="Go?"), 140)[0])
+        self.assertIn("Codex · VS Code", first)
+
+
+class TestTheStateReachesTheFleet(unittest.TestCase):
+    def test_a_thread_carries_its_turn(self):
+        home = Home()
+        self.addCleanup(home.done)
+        home.lock(A)
+        path = home.rollout(A)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "completed_at": 42,
+                "last_agent_message": "Tests pass.\n\nShall I merge?"}}) + "\n")
+        t = engine.codex_threads(home.path, lsof=lambda a: lsof_text({1: [A]}, home.path),
+                                 cache={})[0]
+        self.assertEqual((t["turn"], t["ask"], t["ts"]), ("done", "Shall I merge?", 42))
+        self.assertIsInstance(t["mtime"], float)
+
+    def test_a_thread_carries_its_pending_tool(self):
+        home = Home()
+        self.addCleanup(home.done)
+        home.lock(A)
+        path = home.rollout(A)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "function_call", "call_id": "c"}}) + "\n")
+        t = engine.codex_threads(home.path, lsof=lambda a: lsof_text({1: [A]}, home.path),
+                                 cache={})[0]
+        self.assertEqual((t["turn"], t["pending_tool"]), ("open", True))
+        with open(path, "a") as fh:                       # its output came: none pending
+            fh.write(json.dumps({"type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "c"}}) + "\n")
+        t = engine.codex_threads(home.path, lsof=lambda a: lsof_text({1: [A]}, home.path),
+                                 cache={})[0]
+        self.assertEqual((t["turn"], t["pending_tool"]), ("open", False))
+
+    def test_the_fleet_carries_the_turn_you_looked_at(self):
+        threads = [{"thread": A, "name": "", "cwd": "", "host_pid": 1, "originator": "",
+                    "source": "", "turn": "done", "ask": "", "ts": 42, "mtime": 1.0}]
+        att = {"codex": []}
+        self.assertEqual(engine.codex_fleet(threads, att, True, reviewed={A: 42})[0]["seen_ts"], 42)
+        self.assertIsNone(engine.codex_fleet(threads, att, True)[0]["seen_ts"])
+
+
+class TestASubagentThreadIsNoRow(unittest.TestCase):
+    """Review 1 of D19: half of all finished turns are subagents' - each would
+    sit in NEEDS YOU. Its parent thread is the row."""
+
+    def test_a_subagent_thread_is_not_listed(self):
+        home = Home()
+        self.addCleanup(home.done)
+        home.lock(A, C)
+        home.rollout(A)
+        path = home.rollout(C)
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"type": "session_meta", "payload": {
+                "cwd": "/x", "source": {"subagent": "review"}}}) + "\n")
+        threads = engine.codex_threads(home.path, lsof=lambda a: lsof_text({1: [A, C]}, home.path),
+                                       cache={})
+        self.assertEqual([t["thread"] for t in threads], [A])
+        with open(path, "w") as fh:                       # agent_path: the same
+            fh.write(json.dumps({"type": "session_meta", "payload": {
+                "cwd": "/x", "agent_path": "reviewer"}}) + "\n")
+        threads = engine.codex_threads(home.path, lsof=lambda a: lsof_text({1: [A, C]}, home.path),
+                                       cache={})
+        self.assertEqual([t["thread"] for t in threads], [A])
 
 
 class TestTheRealLsof(unittest.TestCase):

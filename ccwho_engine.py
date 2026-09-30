@@ -2062,15 +2062,161 @@ def codex_threads(home, lsof=None, cache=None, clock=None):
         meta = _codex_meta(home, thread, cache, now)
         if meta is None:
             continue                    # no transcript: not a thread you can see
+        if isinstance(meta.get("source"), dict) or meta.get("agent_path"):
+            continue                    # a subagent's thread: its parent is the row
         def text(v):
             # plain printable text, as every other row: a name can hold escapes,
             # and Codex writes an object `source` for a subagent
             return procs.printable(v) if isinstance(v, str) else ""
+        # its state, from its transcript's end (D19)
+        turn = codex_turn(cache.get(f"_codex_rollout:{home}:{thread}") or "", cache)
         out.append({"thread": thread, "name": text(names.get(thread, "")),
                     "cwd": text(meta.get("cwd")), "host_pid": held[thread],
                     "originator": text(meta.get("originator")),
-                    "source": text(meta.get("source"))})
+                    "source": text(meta.get("source")),
+                    "turn": turn["turn"], "ask": text(turn["ask"]), "ts": turn["ts"],
+                    "pending_tool": turn["pending_tool"], "mtime": turn["mtime"]})
     return out
+
+
+CODEX_TAIL = 256 * 1024   # bytes of a transcript's end read for its state
+CODEX_QUIET = 120          # seconds a turn in progress may write nothing and still be busy
+
+
+_TOOL_CALLS = ("function_call", "custom_tool_call", "local_shell_call", "tool_search_call")
+_TOOL_OUTPUTS = ("function_call_output", "custom_tool_call_output", "local_shell_call_output",
+                 "tool_search_output")
+_BOUNDARIES = (b'"task_started"', b'"task_complete"', b'"turn_aborted"')
+
+
+def _codex_event(line):
+    """(kind, payload) of a transcript line that says something about the
+    turn - a boundary, or a tool call or its output, or the model's message -
+    else None. Only lines that name one are parsed."""
+    if not any(m in line for m in _BOUNDARIES + (b'"response_item"',)):
+        return None
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return None
+    p = e.get("payload") if isinstance(e, dict) else None
+    kind = p.get("type") if isinstance(p, dict) else None
+    if e.get("type") == "event_msg" and kind in ("task_started", "task_complete", "turn_aborted"):
+        return kind, p
+    if e.get("type") == "response_item" and kind in _TOOL_CALLS + _TOOL_OUTPUTS + ("message",):
+        return kind, p
+    return None
+
+
+def _codex_step(state, line):
+    """The state after one line, read forward."""
+    ev = _codex_event(line)
+    if ev is None:
+        return
+    kind, p = ev
+    if kind == "task_started":
+        # an open turn has no completion time: a cold read stops here, so a
+        # time carried from an older turn would make two reads disagree
+        state.update(turn="open", ask="", ts=None, pending_tool=False)
+    elif kind == "task_complete":
+        text = p.get("last_agent_message")
+        text = text if isinstance(text, str) else ""
+        state.update(turn="done", ts=p.get("completed_at"), pending_tool=False,
+                     ask=_closing_line(text) if asks_user(text) else "")
+    elif kind == "turn_aborted":
+        # no completion time, as a new turn has none: a cold read stops here
+        state.update(turn="aborted", ask="", ts=None, pending_tool=False)
+    elif kind in _TOOL_CALLS:
+        state["pending_tool"] = True
+    else:                                   # an output, or the model's own words
+        state["pending_tool"] = False
+
+
+def codex_turn(path, cache=None):
+    """A Codex thread's state from its transcript's END (the owner's D19):
+    {"turn": "done" | "aborted" | "open" | None, "ask": the closing question
+    when a done turn asks one, "ts": when the last turn completed,
+    "pending_tool": a tool call with no output yet, "mtime"}. Codex writes
+    task_started / task_complete (with the agent's last words) / turn_aborted,
+    and never an approval request: a turn waiting for one is an open turn
+    gone quiet on a tool call. The first read goes back, a CODEX_TAIL at a
+    time, only as far as the last boundary (a long turn writes megabytes after
+    its start); later reads read only what was added. Of the words, only the
+    closing question is kept."""
+    cache = {} if cache is None else cache
+    empty = {"turn": None, "ask": "", "ts": None, "pending_tool": False, "mtime": None}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return dict(empty)
+    key = f"_codex_turn:{path}"
+    kept = cache.get(key)
+    ident = (st.st_size, st.st_mtime, st.st_ino)
+    if kept and kept[0] == ident:
+        return kept[1]
+    state = {k: v for k, v in empty.items() if k != "mtime"}
+    lines, offset = [], 0
+    try:
+        with open(path, "rb") as fh:
+            if kept and kept[0][2] == st.st_ino and st.st_size > kept[0][0]:
+                # grown, the same file: carry the state on from the end of the
+                # last WHOLE line read - a line half written then is read whole now
+                state.update({k: kept[1][k] for k in state})
+                offset = kept[2]
+                fh.seek(offset)
+                block = fh.read()
+                cut = block.rfind(b"\n") + 1
+                lines = block[:cut].split(b"\n")
+                offset += cut
+            else:
+                # back, a CODEX_TAIL at a time, looking only at each new chunk
+                # (and the part-line carried from the one before): linear
+                pieces, carry, pos = [], b"", st.st_size
+                while pos > 0:
+                    n = min(CODEX_TAIL, pos)
+                    pos -= n
+                    fh.seek(pos)
+                    block = fh.read(n) + carry
+                    part = block.split(b"\n")
+                    carry, body = (part[0], part[1:]) if pos > 0 else (b"", part)
+                    pieces.append(body)
+                    # only a whole line is a boundary: the file's last line,
+                    # before its newline, is still being written
+                    whole = body[:-1] if len(pieces) == 1 else body
+                    if any(_codex_event(l) and _codex_event(l)[0] in (
+                            "task_started", "task_complete", "turn_aborted")
+                           for l in whole if any(m in l for m in _BOUNDARIES)):
+                        break
+                lines = [l for body in reversed(pieces) for l in body]
+                # the last line may be half written: it is read next time, whole
+                if not lines or lines[-1] != b"":
+                    tail_len = len(lines[-1]) if lines else 0
+                    lines = lines[:-1]
+                else:
+                    tail_len = 0
+                offset = st.st_size - tail_len
+    except OSError:
+        lines = []
+    for line in lines:
+        _codex_step(state, line)
+    out = dict(state, mtime=st.st_mtime)
+    cache[key] = (ident, out, offset)
+    return out
+
+
+def codex_attention(t, now):
+    """A Codex thread's row state: asks / review / stopped / busy / waiting."""
+    turn = t.get("turn")
+    if turn == "done":
+        if t.get("ask"):
+            return "asks"
+        return "stopped" if t.get("ts") is not None and t.get("seen_ts") == t.get("ts") else "review"
+    if turn == "open":
+        # quiet on a tool call: a long build or an approval - Codex never says
+        # which; quiet after the model's own words is it thinking: busy
+        quiet = now - t["mtime"] if isinstance(t.get("mtime"), (int, float)) else 0
+        return "waiting" if quiet > CODEX_QUIET and t.get("pending_tool", True) else "busy"
+    return "stopped"
 
 
 def codex_where(thread):
@@ -2082,12 +2228,13 @@ def codex_where(thread):
     return "the ChatGPT app" if thread.get("originator") == "Codex Desktop" else "Codex"
 
 
-def codex_rows(fleet):
+def codex_rows(fleet, now=None):
     """The list's rows for the open Codex threads (D16), from collect()'s fleet.
     Never collect()'s own rows: those are Claude sessions to everything that
     reads them (--json, jump, show)."""
     threads = (fleet or {}).get("codex_threads") if isinstance(fleet, dict) else None
     home = os.path.expanduser("~")
+    now = time.time() if now is None else now
     out = []
     for t in threads or []:
         cwd = t.get("cwd") or ""
@@ -2099,7 +2246,8 @@ def codex_rows(fleet):
         # a UUIDv7 starts with its time (the same four hex for weeks): the short
         # id is its random end
         out.append({"sessionId": t["thread"], "short": t["thread"][-4:],
-                    "kind": "codex", "attention": "codex",
+                    "kind": "codex", "attention": codex_attention(t, now),
+                    "ask": clean(t.get("ask") or ""), "ts": t.get("ts"),
                     "project": clean(os.path.basename(cwd.rstrip("/"))) or "codex",
                     "name": "", "title": name, "tab_title": name, "since": "",
                     "where": codex_where(t), "folder": clean(folder), "cwd": cwd,
@@ -2145,7 +2293,7 @@ def read_codex_threads(env=None, cache=None):
         return None
 
 
-def codex_fleet(threads, att, ports_ok):
+def codex_fleet(threads, att, ports_ok, reviewed=None):
     """Each open Codex thread with its work: the processes whose Codex mark names
     it (helpers left out) and their ports - None when the ports were not read.
     None when the threads are not known. A Codex process whose thread is not
@@ -2157,6 +2305,8 @@ def codex_fleet(threads, att, ports_ok):
         mine = [p for p in att.get("codex") or [] if p.get("session") == t["thread"]]
         summary = procs.row_summary(mine)
         out.append(dict(t, procs=summary["procs"],
+                        # the finished turn you looked at: it leaves NEEDS YOU
+                        seen_ts=(reviewed or {}).get(t["thread"]),
                         ports=summary["ports"] if ports_ok else None,
                         pids=sorted(p["pid"] for p in mine if not p.get("helper"))))
     return out
@@ -3561,7 +3711,7 @@ def collect(cache=None, status=None):
     fleet["unknown_holders"] = unknown_holders
     # Codex threads open now (Phase 3, D15): their own list, never session rows
     fleet["codex_threads"] = codex_fleet(read_codex_threads(cache=cache), att,
-                                         ports_ok=ports is not None)
+                                         ports_ok=ports is not None, reviewed=reviewed)
     return rows, fleet
 
 
@@ -3608,7 +3758,7 @@ _C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[32m",
       "review": "\033[33m", "stuck": "\033[31;1m",
       "running": "\033[2m", "ready": "\033[32m", "waiting": "\033[33;1m",
       "busy": "\033[32m", "idle": "\033[2m",
-      "shell": "\033[32m", "program": "\033[2m", "codex": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
+      "shell": "\033[32m", "program": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
 
 def _paint(text, key, color):
@@ -3625,8 +3775,7 @@ def now_iso(now=None):
 _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
           "review": "FINISHED", "ready": "stopped", "stuck": "STUCK",
           "stopped": "STOPPED", "busy": "busy", "running": "running",
-          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program",
-          "codex": "codex"}
+          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program"}
 
 
 # Every escape a session might have printed, as a terminal reads it: an OSC up
@@ -3773,10 +3922,7 @@ UI_GROUPS = (("NEEDS YOU", ("blocked", "waiting", "asks", "review")),
              ("STOPPED", ("stopped", "ready", "shell", "idle")),
              ("BUSY", ("busy", "running")),
              # started by a program, which answers it: last, and never a question
-             ("PROGRAMS", ("program",)),
-             # Codex threads open in their app (D16): nothing to jump to - after
-             # every Claude session
-             ("CODEX", ("codex",)))
+             ("PROGRAMS", ("program",)))
 
 UI_WIDE = 140            # below this, the detail replaces the list instead of
                          # sitting beside it
@@ -3822,12 +3968,11 @@ def ui_groups(rows):
 # carries the state; the words stay plain.
 UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△", "stuck": "◆",
                  "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
-                 "busy": "●", "running": "●", "program": "·", "codex": "◇"}
+                 "busy": "●", "running": "●", "program": "·"}
 UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
                   "review": "review", "stuck": "needs",
                   "stopped": "quiet", "ready": "quiet", "shell": "quiet",
-                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet",
-                  "codex": "quiet"}
+                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet"}
 UI_UNKNOWN_MARK = "·"
 
 # What a part of a row IS, so the screen can decide how to draw it. The engine
@@ -3945,7 +4090,10 @@ def ui_row_cells(row, width=100, tag=""):
     # truncation eats, and a recap whose age you cannot see reads as the current
     # state of the work - which is exactly the mistake the age exists to prevent.
     if row.get("kind") == "codex":
-        mark, body = "", row.get("folder") or "(no folder yet)"
+        # what it waits for, when it waits; else where it works
+        mark = ""
+        body = ("waiting? (maybe an approval)" if row.get("attention") == "waiting"
+                else row.get("ask") or row.get("folder") or "(no folder yet)")
     elif row.get("recap"):
         age = row.get("recap_age") or "?"
         turns = row.get("turns_since_recap") or 0

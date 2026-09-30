@@ -1122,8 +1122,10 @@ class CcwhoUi(App):
                      if self.filter_text else "")
         # sessions are Claude's; the Codex threads are counted by their group
         sessions = sum(1 for r in self.fleet.rows if r.get("kind") != "codex")
+        codex = len(self.fleet.rows) - sessions
         header.update(
-            f"{sessions} sessions" + (f": {counts}" if counts else "")
+            f"{sessions} sessions" + (f" + {codex} codex" if codex else "")
+            + (f": {counts}" if counts else "")
             + when + searching + ("  " + self.status if self.status else ""))
         trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure)
                             if line)
@@ -1819,8 +1821,10 @@ class CcwhoUi(App):
         if not row:
             return
         if row.get("kind") == "codex":
-            # it lives in its app: nothing here can bring that forward
+            # it lives in its app: nothing here can bring that forward - but
+            # you have seen its finished turn
             self.said(f"it runs in {row.get('where') or 'Codex'} - open it there")
+            self.looked_at(row, row.get("ts"))
             return
         # Name it the way you picked it. "going to daf9..." is not something
         # you can check against the window that comes forward; the title is.

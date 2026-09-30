@@ -79,7 +79,11 @@ def doctor_checks(facts):
         else "update ccwho (brew upgrade ccwho); if it persists, Claude Code changed the"
         " file format - report it"))
 
-    if facts.get("iterm_ok", False) is None and facts.get("iterm_why") == "no-table":
+    # iTerm2's checks apply only while it is in use (D10, D14)
+    unused = ITERM2_UNUSED.get(facts.get("iterm_use", "in use"))
+    if unused:
+        out.append(_check("iterm2", True, unused, ""))
+    elif facts.get("iterm_ok", False) is None and facts.get("iterm_why") == "no-table":
         out.append(_check(
             "iterm2", False,
             "could not read the process list (ps) - cannot tell whether iTerm2 runs",
@@ -96,6 +100,10 @@ def doctor_checks(facts):
             "scriptable" if facts.get("iterm_ok") else
             "not running or not scriptable - no tab names, and `go` cannot focus a window",
             "start iTerm2, and allow it under System Settings > Privacy > Automation"))
+
+    terminal = _terminal_check(facts.get("terminal_says"), facts.get("terminal_age"))
+    if terminal:
+        out.append(terminal)
 
     out.append(_check(
         "ccwho:// handler", bool(facts.get("handler_registered")),
@@ -122,6 +130,12 @@ def doctor_checks(facts):
         f"job ran {age_words(ran)} ago, newest manifest {age_words(man)} old"
         + ("" if fresh else " - the job is loaded but not running"),
         "check the job: launchctl print gui/$(id -u)/com.lukaso.ccwho.save"))
+
+    if unused:
+        out.append(_check("hotkey reach", True, unused, ""))
+        out.append(_check("iTerm2 status hook", True, unused, ""))
+        out += usage_checks(facts.get("usage_roots"), facts.get("usage_newest_age"))
+        return out
 
     reach = hotkey_reach(facts)
     out.append(_check("hotkey reach", reach["ok"], reach["detail"], reach["fix"]))
@@ -268,6 +282,54 @@ def _check(name, ok, detail, fix):
     return {"name": name, "ok": bool(ok), "detail": detail, "fix": "" if ok else fix}
 
 
+# Terminal.app's row: what the list's own asks for its tab names came to
+# (terms.gate_says) - doctor asks it nothing. None: no row (never asked)
+_TERMINAL_RESTART = ("`ccwho save`, then quit and reopen Terminal.app - that ends every"
+                     " session in its tabs")
+
+
+_ASKED_AGAIN = "the list asks again while a session runs in one of its tabs"
+
+
+def _terminal_check(says, age=None):
+    """Terminal.app's row: what the list's last ask came to, and when - a
+    record, not a look now, so each row says so, and what asks again (review
+    2 of slices 4-5: a refusal outlived its fix, unexplained)."""
+    if says is None:
+        return None
+    last = f"the list's last ask, {age_words(age)} ago,"
+    if says == "refused":
+        return _check("Terminal.app", False,
+                      f"{last} was refused: no tab names for its tabs, and a jump there fails",
+                      "allow it under System Settings > Privacy & Security > Automation:"
+                      f" the app that asked, then Terminal; {_ASKED_AGAIN}")
+    if says == "slow":
+        return _check("Terminal.app", False,
+                      f"{last} is not answered yet - macOS may be showing a prompt asking"
+                      " whether an app may control Terminal",
+                      "answer the prompt; with none open, " + _TERMINAL_RESTART)
+    if says == "stuck":
+        return _check("Terminal.app", False,
+                      f"{last} timed out - ccwho has stopped asking it for tab names",
+                      _TERMINAL_RESTART)
+    return _check("Terminal.app", True,
+                  f"{last} was answered" if says == "answered" else
+                  f"{last} failed - {_ASKED_AGAIN}", "")
+
+
+# What the iTerm2 steps say while iTerm2 is not in use (iterm_use): passed, with
+# the step that puts it in use - the README's "Adding iTerm2 later" says the same
+ITERM2_UNUSED = {
+    "not installed": "not used: iTerm2 is not installed - install iTerm2 and start it, then"
+                     " run `ccwho setup` to add the hotkey",
+    "profile left": "not used: iTerm2 is not installed, but ccwho's hotkey profile is left in"
+                    " its folder - remove ~/Library/Application Support/iTerm2/DynamicProfiles/"
+                    "ccwho.json, or install iTerm2 and start it, then run `ccwho setup`",
+    "not running": "not used: iTerm2 is not running and has no ccwho hotkey - start it,"
+                   " then run `ccwho setup`",
+}
+
+
 def doctor_verdict(results):
     """0 when everything is fine, 1 when anything is not."""
     return 0 if all(r["ok"] for r in results) else 1
@@ -286,14 +348,21 @@ def doctor_banner(results):
 # Everything below reaches the world. Each one answers with a plain value and
 # never raises: a doctor that dies on the machine it is diagnosing is no use.
 
-def gather(ccwho_dir=None, settings_path=None, now=None):
+def gather(ccwho_dir=None, settings_path=None, now=None, home=None):
     why = {}
+    # iTerm2 is not looked at while it is not in use (D14): its Accessibility
+    # probe alone is an osascript to System Events
+    use = iterm_use(home)
+    iterm = use == "in use"
+    # macOS keeps Accessibility per app: only in iTerm2 is its answer iTerm2's
+    host = os.environ.get("TERM_PROGRAM") == "iTerm.app"
     return {
         # not shutil.which: a hotkey window and a launchd job both run without
         # a login shell, and `claude` is not on the PATH either of them gets.
         "claude": engine.find_tool("claude"),
         "session_files_bad": _session_files_bad(),
-        "iterm_ok": iterm_scriptable(why=why),
+        "iterm_use": use,
+        "iterm_ok": iterm_scriptable(why=why) if iterm else None,
         "iterm_why": why.get("refused"),
         "handler_registered": handler_registered(),
         "launchd_loaded": launchd_loaded(),
@@ -302,13 +371,43 @@ def gather(ccwho_dir=None, settings_path=None, now=None):
         "cc_status_hook": cc_status_hook(settings_path),
         # the hotkey is only global if iTerm2 had Accessibility when it
         # registered the key grab - see hotkey_reach
-        "accessibility": accessibility_ok(),
-        "iterm_granted_at": accessibility_granted_at(),
-        "iterm_started_at": iterm_started_at(),
+        "accessibility": accessibility_ok() if iterm and host else None,
+        "iterm_host": host,
+        "iterm_granted_at": accessibility_granted_at() if iterm else None,
+        "iterm_started_at": iterm_started_at() if iterm else None,
         # a crashed app can leave Secure Input on, and then no hotkey fires
-        "secure_input": secure_input_holder(),
+        "secure_input": secure_input_holder() if iterm else None,
         "settings_path": settings_path or os.path.expanduser("~/.claude/settings.json"),
+        **terminal_facts(),
     }
+
+
+def iterm_use(home=None, procs=None):
+    """Is iTerm2 in use (D14)? "in use": an iTerm2 app of ours runs, or ccwho's
+    hotkey profile is installed - its steps apply. Else "not running" when it is
+    installed, or "not installed". Read from ps, the disk and Spotlight, never by
+    asking it: an Apple Event would start it. A process list that could not be
+    read is "in use": its checks then say what is wrong."""
+    terms = engine.terms
+    table = terms.parse_procs(terms.app_snapshot() if procs is None else procs)
+    if not table or terms.ITERM2.pids_in(table):
+        return "in use"
+    # installed: None is Spotlight that could not answer - it may be there
+    installed = terms.ITERM2.installed()
+    if _our_profile(profile_path(home)):
+        return "profile left" if installed is False else "in use"
+    return "not installed" if installed is False else "not running"
+
+
+def terminal_facts():
+    """What the list's asks of Terminal.app for its tab names came to
+    (terms.gate_says), and how long ago - read from its gate, never asked:
+    the first Apple Event to it shows macOS's prompt, and the list asks it
+    only while a session runs in one of its tabs (D7). None: never asked."""
+    terms = engine.terms
+    when = terms.gate_when(terms.TERMINAL)
+    return {"terminal_says": terms.gate_says(terms.TERMINAL),
+            "terminal_age": None if when is None else max(0.0, time.time() - when)}
 
 
 def _session_files_bad():
@@ -651,6 +750,12 @@ def hotkey_reach(facts):
                       " the hotkey only works while iTerm2 is in front",
                       "restart iTerm2 once (ccwho save first: it ends every"
                       " session running in it)")
+    if facts.get("iterm_host") is False:
+        # Accessibility is kept per app: from here, the answer would have been
+        # this terminal's, not iTerm2's (review 2 of slices 4-5)
+        return _reach(True, "", "not checked from here - macOS keeps Accessibility for each"
+                      " app: run ccwho in an iTerm2 window (not in tmux, which may belong to"
+                      " another) to check it", "")
     return _reach(True, "", "the hotkey can reach you from any app", "")
 
 
@@ -849,26 +954,38 @@ def hotkey_current(home, wanted):
     return bool(mine) and mine == wanted["Profiles"][0]
 
 
-def _our_profile(path):
+def profile_entries(text):
+    """The entries of a Dynamic Profiles file's text, as they are: [] when it
+    is not that shape - it is iTerm2's folder, anything may be in it, and
+    doctor (--watch's banner too) and setup read it (reviews of slices 4-5)."""
+    try:
+        doc = json.loads(text or "")
+    except (ValueError, RecursionError):
+        return []
+    found = doc.get("Profiles") if isinstance(doc, dict) else None
+    return found if isinstance(found, list) else []
+
+
+def profiles_in(text):
+    """profile_entries that are profiles (dicts)."""
+    return [p for p in profile_entries(text) if isinstance(p, dict)]
+
+
+def _profiles(path):
     try:
         with open(path) as fh:
-            doc = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    for p in doc.get("Profiles", []):
-        if p.get("Guid") == PROFILE_GUID:
-            return p
-    return None
+            return profiles_in(fh.read())
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def _our_profile(path):
+    return next((p for p in _profiles(path) if p.get("Guid") == PROFILE_GUID), None)
 
 
 def hotkey_installed(home=None, hotkey=None):
     """Is OUR profile there, with a hotkey on it? Not "is there a profile"."""
-    try:
-        with open(profile_path(home)) as fh:
-            doc = json.load(fh)
-    except (OSError, ValueError):
-        return False
-    for p in doc.get("Profiles", []):
+    for p in _profiles(profile_path(home)):
         if p.get("Guid") == PROFILE_GUID and p.get("Has Hotkey"):
             if hotkey and p.get("HotKey Key Code") != HOTKEYS[hotkey]["code"]:
                 return False
@@ -959,6 +1076,15 @@ def setup_plan(facts):
                        if loaded else
                        "not loaded - a reboot would be a one-way door",
                        "setup renders the plist for this Mac and loads it"))
+
+    # iTerm2's steps apply only while it is in use (D10, D14): nothing is
+    # written under its folders, and nothing asked on its behalf
+    unused = ITERM2_UNUSED.get(facts.get("iterm_use", "in use"))
+    if unused:
+        steps.append(_step("hotkey", False, unused, ""))
+        steps.append(_step("hotkey reach", False, unused, ""))
+        steps.append(_step("iTerm2 status hook", False, unused, ""))
+        return steps
 
     steps.append(_step("hotkey", not facts.get("hotkey_installed"),
                        "installed" if facts.get("hotkey_installed")

@@ -134,6 +134,30 @@ class TestNoNameIsDefinedTwice(unittest.TestCase):
                 self.assertEqual({k: v for k, v in names.items() if v > 1}, {})
 
 
+class TestNoTestIsDefinedTwice(unittest.TestCase):
+    """A second method of one name in a class replaces the first without a
+    word, and its test never runs (two slices each added
+    test_after_the_setup_tests, 2026-09-30)."""
+
+    def test_every_test_method_has_a_name_of_its_own(self):
+        import ast
+        import collections
+        import glob
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        twice, classes = [], 0
+        for path in sorted(glob.glob(os.path.join(here, "test_*.py"))):
+            with open(path) as fh:
+                tree = ast.parse(fh.read())
+            for c in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+                classes += 1
+                names = collections.Counter(f.name for f in c.body
+                                            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)))
+                twice += [f"{os.path.basename(path)} {c.name}.{n}" for n, k in names.items() if k > 1]
+        self.assertGreater(classes, 100)                                 # control: it read them
+        self.assertEqual(twice, [])
+
+
 class TestEveryTestFileRunsInTheScript(unittest.TestCase):
     """`./test` is "every test, in one command": a test file it does not name
     never runs there, and a regression in it passes green (test_codex was

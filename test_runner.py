@@ -2725,6 +2725,119 @@ class TestSetupInstallsTheAutosaveJobForThisMachine(SetupHarness):
                           "and what was installed is untouched")
 
 
+
+class TestSetupLeavesITerm2AloneWhileItIsNotInUse(SetupHarness):
+    """D10, D14: while iTerm2 is not in use - not installed, or neither running
+    nor carrying ccwho's hotkey - setup writes nothing under iTerm2's folders and
+    asks macOS for nothing on its behalf. It says how to add it later."""
+
+    def iterm2_dir(self):
+        return os.path.join(self.home, "Library", "Application Support", "iTerm2")
+
+    def test_not_installed(self):
+        self.facts.update(iterm_use="not installed", iterm_ok=None, accessibility=False)
+        rc, out = self.run_setup(["--yes", "--no-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.iterm2_dir()), "an iTerm2 folder was made")
+        self.assertIn("install iTerm2 and start it, then run `ccwho setup`", out)
+        self.assertNotIn("asking macOS for Accessibility", out)
+
+    def test_installed_but_not_in_use(self):
+        self.facts.update(iterm_use="not running", iterm_ok=None)
+        rc, out = self.run_setup(["--no-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.iterm2_dir()))
+        self.assertIn("start it, then run `ccwho setup`", out)
+
+    def test_in_use_it_writes_the_hotkey(self):                          # control
+        self.facts.update(iterm_use="in use")
+        rc, out = self.run_setup(["--yes", "--no-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.exists(runner.setup.profile_path(self.home)))
+
+    def test_a_hotkey_asked_for_is_said_not_added(self):
+        # an explicit --hotkey while iTerm2 is not in use: say none was added,
+        # and why - never "nothing to do" (review of slices 4-5)
+        self.facts.update(iterm_use="not installed", iterm_ok=None)
+        rc, out = self.run_setup(["--yes", "--no-list", "--hotkey", "option-w"])
+        self.assertIn("no hotkey added", out)
+        self.assertIn("install iTerm2 and start it", out)
+        self.assertNotIn("nothing to do", out)
+        self.assertFalse(os.path.exists(self.iterm2_dir()))
+
+    def test_nothing_to_do_only_when_there_is_none(self):
+        self.facts.update(iterm_use="not installed", iterm_ok=None)
+        real = runner.shutil.which
+        runner.shutil.which = lambda n: None if n == "uv" else real(n)      # uv is to do
+        rc, out = self.run_setup(["--yes", "--no-list"])
+        self.assertNotIn("nothing to do", out)
+
+    def test_nothing_to_do_is_said_when_so(self):                                     # control
+        self.facts.update(iterm_use="not installed", iterm_ok=None)
+        rc, out = self.run_setup(["--yes", "--no-list"])
+        self.assertIn("already set up - nothing to do.", out)
+
+    def test_outside_iterm2_it_asks_no_accessibility(self):
+        # iTerm2 in use, setup run from another terminal: macOS would ask
+        # for that terminal's Accessibility, not iTerm2's (review 2 of 4-5)
+        self.facts.update(iterm_use="in use", iterm_host=False, accessibility=None)
+        rc, out = self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertNotIn("asking macOS for Accessibility", out)
+        self.assertIn("not checked from here", out)
+
+    def test_a_usage_statusline_written_is_something_done(self):
+        # review 2 of slices 4-5: "nothing to do" right after writing one
+        self.facts.update(iterm_use="not installed", iterm_ok=None)
+        root = os.path.join(self.home, ".claude")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "settings.json"), "w") as fh:
+            fh.write("{}")
+        self.usage_dirs = ([root], [])
+        rc, out = self.run_setup(["--yes", "--no-list"])
+        self.assertIn("statusLine", open(os.path.join(root, "settings.json")).read())
+        self.assertNotIn("nothing to do", out)
+
+    def test_a_second_no_usage_run_has_nothing_to_do(self):
+        # the opt-out file is written once; the same run again changes
+        # nothing and says so (review 3 of slices 4-5)
+        self.facts.update(iterm_use="not installed", iterm_ok=None)
+        root = os.path.join(self.home, ".claude")
+        os.makedirs(root, exist_ok=True)
+        self.usage_dirs = ([root], [])
+        _rc, first = self.run_setup(["--no-usage", "--no-list"])
+        _rc, second = self.run_setup(["--no-usage", "--no-list"])
+        self.assertNotIn("nothing to do", first)
+        self.assertIn("already set up - nothing to do.", second)
+
+    def test_a_no_to_usage_is_something_done(self):
+        self.facts.update(iterm_use="not installed", iterm_ok=None)
+        root = os.path.join(self.home, ".claude")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "settings.json"), "w") as fh:
+            fh.write("{}")
+        self.usage_dirs = ([root], [])
+        testkit.patch(self, runner, "_ask_tty", lambda prompt: "n")
+        _rc, out = self.run_setup(["--no-list"])
+        self.assertIn("off (your choice)", out)
+        self.assertNotIn("nothing to do", out)
+
+    def test_a_profile_file_of_another_shape(self):
+        # anything may be in iTerm2's folder: setup still installs ours
+        path = runner.setup.profile_path(self.home)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write('{"Profiles": ["x"]}')
+        self.facts.update(iterm_use="in use")
+        rc, out = self.run_setup(["--yes", "--no-list"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(runner.setup.hotkey_installed(self.home))
+
+    def test_its_facts_are_of_the_home_it_writes_to(self):
+        homes = []
+        runner.setup.gather = lambda **k: homes.append(k.get("home")) or dict(self.facts)
+        self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(homes, [self.home])
+
 class TestTheHotkeyIsWrittenAndProved(SetupHarness):
     def profile(self):
         return runner.setup.profile_path(self.home)
@@ -4019,6 +4132,28 @@ class TestUsageSetup(unittest.TestCase):
                                     ask=self.answer(reply), ccwho="/opt/homebrew/bin/ccwho")
         return rc, out.getvalue()
 
+
+    def test_a_damaged_opt_out_file_is_written_again(self):
+        # review 4 of slices 4-5: its read for "has it changed" must not
+        # stop setup - it is written again, as before
+        path = runner.opt_out_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        for damage in ("bytes", "mode"):
+            if damage == "mode" and os.geteuid() == 0:
+                continue                                # root reads anything
+            with open(path, "wb") as fh:
+                fh.write(b"\xff\xfe")
+            if damage == "mode":
+                os.chmod(path, 0)
+            changed = []
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = runner.usage_setup([self.root], [], yes=True, mode="off", changed=changed)
+            os.chmod(path, 0o600)
+            self.assertEqual(rc, 0, damage)
+            self.assertIn(path, changed, damage)
+            with open(path) as fh:
+                self.assertIsInstance(runner.setup.parse_opt_out(fh.read()), (list, set), damage)
     def backups(self):
         return [n for n in os.listdir(self.root) if n.startswith("settings.json.bak-ccwho")]
 
@@ -4291,7 +4426,8 @@ class TestSetupOffersUsage(SetupHarness):
     def test_setup_offers_it_for_the_interactive_dirs(self):
         self.usage_dirs = (["/h/.claude"], ["/h/.la"])
         rc, out, seen = self.call(["--yes", "--no-hotkey", "--no-list"])
-        self.assertEqual(seen, [(["/h/.claude"], ["/h/.la"], {"yes": True, "mode": ""})])
+        # changed: where it tells setup what it wrote (review 2 of slices 4-5)
+        self.assertEqual(seen, [(["/h/.claude"], ["/h/.la"], {"yes": True, "mode": "", "changed": []})])
 
     def test_no_usage_and_usage_are_modes(self):
         _, _, seen = self.call(["--no-usage", "--no-hotkey", "--no-list"])

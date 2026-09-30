@@ -631,7 +631,7 @@ def setup_cmd(argv):
               + ", ".join(sorted(setup.HOTKEYS)), file=sys.stderr)
         return 2
 
-    facts = setup.gather(ccwho_dir=ccwho_dir())
+    facts = setup.gather(ccwho_dir=ccwho_dir(), home=home)
     facts["uv"] = shutil.which("uv") or ""
     facts["hotkey_installed"] = setup.hotkey_current(
         home, setup.hotkey_profile(setup.window_command(ccwho_bin()),
@@ -689,8 +689,10 @@ def setup_cmd(argv):
     # Subscription usage comes from a statusLine in each interactive config dir.
     # The one step that writes another tool's file: it shows the diff and asks.
     roots, skipped = usage_roots()
+    wrote = []
     usage_setup(roots, skipped, yes=yes,
-                mode="off" if "--no-usage" in argv else "on" if "--usage" in argv else "")
+                mode="off" if "--no-usage" in argv else "on" if "--usage" in argv else "",
+                changed=wrote)
 
     # Said, never done: quitting iTerm2 ends every session running in it, which
     # is the user's call and nobody else's.
@@ -702,9 +704,13 @@ def setup_cmd(argv):
 
     # An installed hotkey is left alone: a second run must not take the key away
     # and ask you to press it again. Naming a key is how you change your mind.
+    # With iTerm2 not in use there is none to add (D14): the list above said so
     asked_for_a_key = "--hotkey" in argv
-    if "--no-hotkey" in argv:
-        pass
+    unused = setup.ITERM2_UNUSED.get(facts.get("iterm_use", "in use"))
+    no_hotkey = "--no-hotkey" in argv or unused is not None
+    if no_hotkey:
+        if unused and asked_for_a_key:
+            print("no hotkey added: " + unused.removeprefix("not used: "))
     elif facts["hotkey_installed"]:
         # Already exactly what we would write - including the key asked for,
         # because hotkey_current compares the whole profile. Rewriting it would
@@ -720,7 +726,10 @@ def setup_cmd(argv):
                             iterm_ok=facts.get("iterm_ok"), iterm_why=facts.get("iterm_why"))
         if rc:
             return 1
-    if "--no-hotkey" in argv and not did:
+    # "nothing to do" only when nothing was - no step, no settings file - and
+    # nothing is left but the hotkey this run was not to add
+    if (no_hotkey and not did and not wrote and not (todo - {"hotkey"})
+            and not (unused and asked_for_a_key)):
         print("already set up - nothing to do.")
 
     if "--no-list" in argv:
@@ -892,12 +901,9 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0, iterm
             before = fh.read()
 
     def key_of(text):
-        try:
-            for p in json.loads(text or "")["Profiles"]:
-                if p.get("Guid") == setup.PROFILE_GUID:
-                    return p.get("HotKey Key Code")
-        except (ValueError, KeyError, TypeError):
-            pass
+        for p in setup.profiles_in(text):       # any shape: it is iTerm2's folder
+            if p.get("Guid") == setup.PROFILE_GUID:
+                return p.get("HotKey Key Code")
         return None
 
     if before and key_of(before) not in (None, setup.HOTKEYS[hotkey]["code"]):
@@ -913,11 +919,8 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0, iterm
     def write(doc):
         # Ours is one profile in a file that may hold others. Replace the entry
         # with our Guid and keep every other one exactly as it was.
-        try:
-            existing = json.loads(before)["Profiles"]
-        except (TypeError, ValueError, KeyError):
-            existing = []
-        keep = [p for p in existing if p.get("Guid") != setup.PROFILE_GUID]
+        keep = [p for p in setup.profile_entries(before)
+                if not (isinstance(p, dict) and p.get("Guid") == setup.PROFILE_GUID)]
         write_atomic(path, json.dumps({"Profiles": keep + doc["Profiles"]},
                                       indent=2))
 
@@ -1081,7 +1084,9 @@ DOCTOR_TTL = 300.0
 
 def doctor_banner_cached(state, now=None):
     """One line for the watch header when something drifted, at most every
-    DOCTOR_TTL. Empty when everything ccwho needs is in place."""
+    DOCTOR_TTL. Empty when everything ccwho needs is in place. A line may lag
+    by up to DOCTOR_TTL - a prompt answered, a permission given: the next
+    look says so."""
     now = time.time() if now is None else now
     ts, line = state.get("_doctor", (None, ""))
     if ts is None or now - ts >= DOCTOR_TTL:
@@ -3261,14 +3266,17 @@ def guarded_write(path, before, new):
 USAGE_WHY = "Without this, you won't get usage info."
 
 
-def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
+def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None, changed=None):
     """ccwho's statusLine in each interactive config dir, asked for dir by dir.
 
     It is only added where no statusLine is set, and a no is remembered for
     that dir: a later setup does not ask again, and --yes does not override it.
     mode "on" (--usage) forgets every no; mode "off" (--no-usage) says no for
     every dir and takes ccwho's own statusLine back out, with the same care.
+    `changed`, a list, is told of each file written - a caller must not say
+    "nothing to do" after it.
     """
+    changed = [] if changed is None else changed
     ask = ask or _ask_tty
     command = setup.statusline_command(ccwho or ccwho_bin())
     # one spelling per dir: CLAUDE_CONFIG_DIR=/x/ and /x are the same dir
@@ -3281,8 +3289,18 @@ def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
         opted = set()
 
     def remember():
+        # written, and told, only when it changes: the same run twice has
+        # nothing to do the second time (review 3 of slices 4-5)
+        text = setup.render_opt_out(opted)
+        try:
+            same = _text_or_none(opt_out_path()) == text
+        except (OSError, ValueError):       # damaged or unreadable: written again, as before
+            same = False
+        if same:
+            return
         os.makedirs(ccwho_dir(), exist_ok=True)
-        write_atomic(opt_out_path(), setup.render_opt_out(opted))
+        write_atomic(opt_out_path(), text)
+        changed.append(opt_out_path())
 
     rc = 0
     if mode == "off":
@@ -3304,6 +3322,7 @@ def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
             print(setup.settings_diff(before, new, path), end="")
             if yes or _said_yes(ask(f"Remove ccwho's statusLine from {path}? [y/N] ")):
                 if guarded_write(path, before, new) == 0:
+                    changed.append(path)
                     continue
                 rc = 1
             still_on.append(path)
@@ -3362,6 +3381,8 @@ def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None):
             written = guarded_write(path, before, new)
             rc |= written
             wrote_any = wrote_any or written == 0
+            if written == 0:
+                changed.append(path)
     if wrote_any:
         # measured 2026-09-25: after setup wrote ~/.claude/settings.json, 11 of
         # 11 sessions already running reported - they reload it, no restart

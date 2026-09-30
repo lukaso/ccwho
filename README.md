@@ -21,7 +21,7 @@ or with a subcommand, it is the one-shot table above.
 
 ## Install
 
-macOS, iTerm2 and Claude Code.
+macOS, Claude Code, and iTerm2 or Terminal.app (see [Terminal.app](#terminalapp)).
 
 ```sh
 brew install lukaso/ccwho/ccwho
@@ -42,9 +42,65 @@ ccwho setup
 
 `ccwho setup` does the rest once, and says what it did: the `ccwho://` link
 handler, the autosave job, the iTerm2 hotkey window, and the Accessibility
-permission the hotkey needs to reach you from another app. It writes nothing on a
+permission the hotkey needs to reach you from another app (asked for when setup runs
+directly in an iTerm2 window, not in tmux: macOS gives it to the app setup runs in). It writes nothing on a
 machine that cannot work, and a second run changes nothing that is already right.
-`ccwho doctor` checks the same things later, read-only.
+`ccwho doctor` checks the same things later, read-only. The iTerm2 steps apply only
+while you use iTerm2 - it runs, or ccwho's hotkey is installed; otherwise setup and
+doctor say "not used" and what to do to add it ([Adding iTerm2 later](#adding-iterm2-later)).
+
+## Terminal.app
+
+ccwho runs in Terminal.app as it does in iTerm2 - the list, `--watch`, the live
+list, `setup` and `doctor` - and knows the sessions in Terminal.app's tabs:
+
+- a row in a Terminal.app tab has a window to go to, and Enter (or `ccwho jump`)
+  brings that tab to the front;
+- a new window - to attach a background session, or to reopen one - opens in the
+  app the session was last in; with nothing to say which, in the app ccwho runs in,
+  else in one that runs (iTerm2 first), else in iTerm2 if it is installed, else in
+  Terminal.app;
+- `ccwho save` records which app each session was in, and `restore --open` reopens
+  each in that app.
+
+A tab's first process is the `login` Terminal.app starts on its tty, so which tabs
+it shows is read from `ps`, like iTerm2's panes - no Apple Event.
+
+**The Automation prompt.** The first time an app asks Terminal.app something, macOS
+asks you whether that app may control Terminal. Allow it. Which app that is: the
+terminal ccwho runs in, or ccwho-jump.app for a click on a link.
+
+- In the background, the list and its commands ask Terminal.app only for its tab
+  names (the title Claude Code gives a tab, never the text on its screen), and only
+  while a Claude Code session runs in one of its tabs. The autosave job never asks
+  it.
+- A jump, a new window and a restore ask it because you asked for them.
+
+If you did not allow it, the rows show no tab names and a jump to a tab fails:
+System Settings > Privacy & Security > Automation, then the app that asked, then
+Terminal. `ccwho doctor` says so, and how long ago, from what the list's last ask
+found - doctor asks Terminal.app nothing itself, so after you allow it, it reads
+the same until the list asks again.
+
+ccwho never starts an app by asking it something: a background ask first checks,
+inside the same script, that the app runs.
+
+**Known limits.**
+
+- `restore --open` opens each Terminal.app session in a new window. After a restart
+  Terminal.app also reopens its old windows at a bare prompt, so you get both
+  ([#30](https://github.com/lukaso/ccwho/issues/30)).
+- Each ccwho process asks each app for its tab names at most once a minute while it
+  answers, and again 30 s after an ask that failed; several open lists and commands
+  ask more often ([#31](https://github.com/lukaso/ccwho/issues/31)).
+- The hotkey window is an iTerm2 feature.
+
+### Adding iTerm2 later
+
+Install iTerm2, start it, then run `ccwho setup` again directly in an iTerm2 window
+(not in tmux): it adds the hotkey window and asks for the permissions it needs - macOS
+gives Accessibility to the app setup runs in, and it is iTerm2 that needs it. There is nothing to undo
+first. From then on `ccwho doctor` checks the iTerm2 steps too.
 
 ## Why
 
@@ -123,7 +179,8 @@ not reported: iTerm2 holds Secure Input only while it is in front.
 
 A session started with `claude --bg`, or sent to the background from agent view,
 runs under the Claude Code daemon with no window at all. Enter on one opens a new
-iTerm2 window running `claude attach <short id>`, and the row blinks while it opens.
+window running `claude attach <short id>` - in the app the session was last in -
+and the row blinks while it opens.
 It is never resumed: `claude --resume` on a running session starts a second process
 on one transcript.
 
@@ -295,8 +352,9 @@ ccwho jump 19576          # ...by pid
 ccwho jump "vitest"       # ...by title substring
 ```
 
-An ambiguous query lists the candidates rather than guessing. Needs iTerm2; the
-lookup is `tty of session` over its windows.
+An ambiguous query lists the candidates rather than guessing. It goes to the app
+whose tab shows that tty: iTerm2 (`tty of session` over its windows) or Terminal.app
+(`tty` of each tab).
 
 ### Clickable, without a new UI
 
@@ -422,7 +480,8 @@ and exactly one pane have it; the status mark Claude Code puts in front (`✳`, 
 does not count. It writes only into a pane where nothing runs but a shell at its
 prompt, and clears a half-typed line there first. Every other session - and one
 whose pane closed before the write - opens in a new window, as before. `restore --check`
-says how many of the saved panes are open now.
+says how many of the saved panes are open now. A session saved from a Terminal.app
+tab reopens in a new Terminal.app window ([#30](https://github.com/lukaso/ccwho/issues/30)).
 
 **It saves itself.** Two ways, because the reboot this exists for is usually the one
 you did not plan. `ccwho --watch` writes a manifest every 5 minutes
@@ -464,12 +523,15 @@ and the verb is decided against the world at click time:
 
 - running, with a window -> **focus it** (reopening a live session would fork the
   conversation into two processes)
-- running, with no window -> **attach it** in a new iTerm2 window, with
+- running, with no window -> **attach it** in a new window, with
   `claude attach` - the same guard, never a second process
-- not running -> **reopen it** in a new iTerm2 window
+- not running -> **reopen it** in a new window
 - the live list could not be read -> **do nothing**: an empty list from a failed
   read looks exactly like "nothing is running"
 - in neither the live fleet nor any manifest -> say so, do nothing
+
+A new window opens in the app the session was last in (see
+[Terminal.app](#terminalapp)).
 
 So after a reboot every link in the list reopens, and ten minutes later the same
 link focuses the window it just made. The lookup spans **every** saved manifest,

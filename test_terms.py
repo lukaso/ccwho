@@ -10,6 +10,7 @@ import ast
 import os
 import re
 import subprocess
+import time
 import unittest
 
 import ccwho_engine as engine
@@ -451,6 +452,266 @@ class TestABackgroundAskChecksTheAppInsideTheScript(unittest.TestCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
 
 
+
+class TestWhatTheLastAskCameTo(unittest.TestCase):
+    """doctor reads what an app's gate recorded of the list's own asks
+    (gate_says) - it asks nothing itself: the first Apple Event to an app
+    shows macOS's prompt (D7). Read from the files only (review of slices
+    4-5: doctor used to ask Terminal.app, and so did setup)."""
+
+    ME = os.getuid()
+    stub = TestABackgroundAskChecksTheAppInsideTheScript.stub
+    RUNS = "  PID   UID UCOMM\n  400 %d Terminal\n" % os.getuid()
+
+    def says(self, procs=None):
+        def nothing(*a, **k):
+            raise AssertionError("gate_says started a process")
+        undo = [testkit.patch(self, subprocess, "Popen", nothing),
+                testkit.patch(self, subprocess, "run", nothing)]
+        try:
+            return terms.gate_says(terms.TERMINAL, procs=self.RUNS if procs is None else procs)
+        finally:
+            for u in reversed(undo):            # the test's own asks start processes
+                u()
+
+    def ask(self, text):
+        self.stub(text)
+        REAL_ASK(["-e", "x"], app=terms.TERMINAL)
+
+    def stub_again(self, text):
+        """A new osascript stub in the same state dir."""
+        with open(terms.OSASCRIPT, "w") as fh:
+            fh.write('#!/bin/sh\n%s\n' % text)
+
+    def test_never_asked(self):
+        self.stub("echo 1")
+        self.assertIsNone(self.says())
+
+    def test_answered(self):
+        self.ask("echo 1")
+        self.assertEqual(self.says(), "answered")
+
+    def test_refused(self):
+        self.ask('echo "execution error: Not authorized. (-1743)" >&2; exit 1')
+        self.assertEqual(self.says(), "refused")
+
+    def test_refused_and_settled_by_a_later_ask(self):
+        self.ask('echo "execution error: Not authorized. (-1743)" >&2; exit 1')
+        REAL_ASK(["-e", "x"], app=terms.TERMINAL)     # settles the first, then waits: not sent
+        self.assertEqual(self.says(), "refused")
+
+    def test_stuck_while_that_copy_runs(self):
+        self.ask('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
+        self.assertEqual(self.says(), "stuck")
+        restarted = "  PID   UID UCOMM\n  401 %d Terminal\n" % self.ME
+        self.assertIsNone(self.says(restarted), "a new copy has not been asked")
+
+    def test_the_app_quit_before_the_script_ran(self):
+        self.ask('echo "%s"' % terms.NOT_RUNNING)
+        self.assertIsNone(self.says())
+
+    def test_another_error(self):
+        self.ask('echo "execution error: odd. (-1728)" >&2; exit 1')
+        self.assertEqual(self.says(), "failed")
+
+    def state(self, **fields):
+        """A gate state as an ask leaves it, in the stub's state dir."""
+        import json
+        tmp = self.stub("echo 1")
+        d = os.path.join(tmp, "state")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, terms.TERMINAL.gate + ".json"), "w") as fh:
+            json.dump(fields, fh)
+        return d
+
+    def hold_the_lock(self, d):
+        import fcntl
+        fd = os.open(os.path.join(d, terms.TERMINAL.gate + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    # review 2 of slices 4-5: an ask in flight, an ask whose wrapper died, and
+    # what another boot left
+    def age(self, d, seconds):
+        """The gate's record made `seconds` ago."""
+        path = os.path.join(d, terms.TERMINAL.gate + ".json")
+        t = time.time() - seconds
+        os.utime(path, (t, t))
+
+    def test_an_ask_timed_out_whose_osascript_runs_is_slow(self):
+        testkit.patch(self, engine.terms, "boot_id", lambda: "NOW")
+        d = self.state(asked_pid=400, pending=True, slow=True, boot="NOW")
+        self.hold_the_lock(d)
+        self.assertEqual(self.says(), "slow")
+
+    def test_an_ask_in_flight_longer_than_any_may_take_is_slow(self):
+        # its list was killed while it waited: no one marked it slow
+        testkit.patch(self, engine.terms, "boot_id", lambda: "NOW")
+        d = self.state(asked_pid=400, pending=True, boot="NOW")
+        self.hold_the_lock(d)
+        self.age(d, terms.ASK_LONGEST + 5)
+        self.assertEqual(self.says(), "slow")
+
+    def test_a_healthy_ask_in_flight_is_not_slow(self):
+        # review 3 of slices 4-5: every ask is pending while it runs - one
+        # inside its time reads as what was recorded before it
+        import threading
+        self.ask("echo 1")                                  # answered before
+        self.stub_again("sleep 0.6; echo 1")
+        seen, done, raised = [], threading.Event(), []
+
+        def work():
+            try:
+                REAL_ASK(["-e", "x"], app=terms.TERMINAL, timeout=5)
+            except BaseException as ex:             # said below, never a hang
+                raised.append(ex)
+            finally:
+                done.set()
+        worker = threading.Thread(target=work)
+        worker.start()
+        deadline = time.time() + 10
+        while not done.is_set() and time.time() < deadline:
+            held = terms._lock_held(terms.TERMINAL)
+            seen.append((held, terms.gate_says(terms.TERMINAL, procs=self.RUNS)))
+            time.sleep(0.05)
+        worker.join(10)
+        self.assertEqual(raised, [])
+        self.assertTrue(done.is_set(), "the ask did not end")
+        self.assertNotIn("slow", [says for _held, says in seen])
+        # the in-flight reading ran: while the ask held the lock, nothing
+        # was known yet of this app but an answer from before - None
+        self.assertIn((True, None), seen)
+
+    def in_flight(self, **fields):
+        testkit.patch(self, engine.terms, "boot_id", lambda: "NOW")
+        d = self.state(asked_pid=400, pending=True, boot="NOW", **fields)
+        self.hold_the_lock(d)
+        return self.says()
+
+    def test_an_ask_in_flight_after_a_refusal_is_refused(self):
+        self.assertEqual(self.in_flight(last_error="-1743"), "refused")
+
+    def test_a_first_ask_in_flight_is_not_known(self):
+        # never answered: not "answered", not "slow" (review 4 of slices 4-5)
+        self.assertIsNone(self.in_flight())
+
+    def test_a_dead_wrapper_is_read_by_what_its_osascript_wrote(self):
+        # review 3 of slices 4-5: as the next ask settles it - the err file
+        testkit.patch(self, engine.terms, "boot_id", lambda: "NOW")
+        for err, want in (("execution error: No. (-1743)", "refused"),
+                          ("execution error: timed out. (-1712)", "stuck"),
+                          ("", "failed")):
+            d = self.state(asked_pid=400, pending=True, slow=True, boot="NOW")
+            with open(os.path.join(d, terms.TERMINAL.gate + ".err"), "w") as fh:
+                fh.write(err)
+            self.assertEqual(self.says(), want, err)
+
+    def test_no_boot_to_compare_keeps_stuck(self):
+        # boot_id() unreadable: as ask does, the quarantine holds
+        testkit.patch(self, engine.terms, "boot_id", lambda: None)
+        self.state(asked_pid=400, quarantine=400, last_error="-1712", boot="OLD")
+        self.assertEqual(self.says(), "stuck")
+
+    def test_a_reader_is_not_a_holder(self):
+        # two doctors reading at once: a shared look sees the lock free
+        import fcntl
+        d = self.state(asked_pid=400, pending=True, slow=True)
+        fd = os.open(os.path.join(d, terms.TERMINAL.gate + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        self.assertIs(terms._lock_held(terms.TERMINAL), False)
+
+    def test_a_late_answer_dates_the_record(self):
+        d = self.state(asked_pid=400)
+        self.age(d, 600)
+        with open(os.path.join(d, terms.TERMINAL.gate + ".status"), "w") as fh:
+            fh.write("0\n")
+        self.assertLess(time.time() - terms.gate_when(terms.TERMINAL), 30)
+
+    def test_one_whose_osascript_is_gone_failed(self):
+        testkit.patch(self, engine.terms, "boot_id", lambda: "NOW")
+        self.state(asked_pid=400, pending=True, boot="NOW")
+        self.assertEqual(self.says(), "failed")                   # the lock is free
+        self.state(asked_pid=400, pending=True, slow=True, boot="NOW")
+        self.assertEqual(self.says(), "failed")
+
+    def test_stuck_in_another_boot_is_not(self):
+        testkit.patch(self, engine.terms, "boot_id", lambda: "NOW")
+        self.state(asked_pid=400, quarantine=400, last_error="-1712", boot="OLD")
+        self.assertIsNone(self.says())
+        self.state(asked_pid=400, quarantine=400, last_error="-1712", boot="NOW")
+        self.assertEqual(self.says(), "stuck")                                  # control
+
+    def test_stuck_when_ps_could_not_be_read(self):
+        self.ask('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
+        self.assertEqual(self.says(procs=""), "stuck")
+
+    def test_a_real_answer_after_the_app_quit_first(self):
+        # one state dir for both asks: the sentinel first, an answer after
+        self.ask('d=$(dirname "$0"); if [ -f "$d/once" ]; then echo 1;'
+                 ' else touch "$d/once"; echo "%s"; fi' % terms.NOT_RUNNING)
+        self.assertIsNone(self.says())
+        REAL_ASK(["-e", "x"], app=terms.TERMINAL)
+        self.assertEqual(self.says(), "answered")
+
+    def test_a_list_killed_while_its_ask_waits(self):
+        # the osascript lives on in a session of its own: slow while it
+        # runs, what it ends with after
+        import sys
+        tmp = self.stub('sleep 1; echo "execution error: No. (-1743)" >&2; exit 1')
+        code = ("import os, sys, ccwho_terms as t\n"
+                "t.STATE_DIR, t.OSASCRIPT = sys.argv[1], sys.argv[2]\n"
+                "t.app_snapshot = lambda: '  PID   UID UCOMM\\n  400 %d Terminal\\n' % os.getuid()\n"
+                "t.ask(['-e', 'x'], app=t.TERMINAL, timeout=10)\n")
+        state = os.path.join(tmp, "state")
+        child = subprocess.Popen([sys.executable, "-c", code, state, os.path.join(tmp, "osascript")],
+                                 cwd=REPO, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        self.addCleanup(lambda: (child.poll() is None and child.kill(), child.wait(timeout=10)))
+        deadline = time.time() + 5
+        while not os.path.exists(os.path.join(tmp, "sent")) and time.time() < deadline:
+            time.sleep(0.02)
+        child.kill()
+        child.wait(timeout=10)
+        self.age(state, terms.ASK_LONGEST + 5)       # no one marked it slow: its age does
+        self.assertEqual(self.says(), "slow")
+        status = os.path.join(state, terms.TERMINAL.gate + ".status")
+        while not os.path.exists(status) and time.time() < deadline + 5:
+            time.sleep(0.05)
+        self.assertEqual(self.says(), "refused")
+
+    def test_how_old_the_record_is(self):
+        self.ask("echo 1")
+        age = time.time() - terms.gate_when(terms.TERMINAL)
+        self.assertTrue(0 <= age < 30, age)
+        self.stub("echo 1")
+        self.assertIsNone(terms.gate_when(terms.TERMINAL))                 # never asked
+
+    def late(self, text):
+        """An ask not answered in time, and what it says once its osascript
+        ends - before any later ask settles it."""
+        tmp = self.stub("sleep 0.5; " + text)
+        self.assertIsNone(REAL_ASK(["-e", "x"], app=terms.TERMINAL, timeout=0.1))
+        self.assertEqual(self.says(), "slow")
+        status = os.path.join(tmp, "state", terms.TERMINAL.gate + ".status")
+        deadline = time.time() + 5
+        while not os.path.exists(status) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(status))
+        return self.says()
+
+    def test_an_ask_answered_late(self):
+        self.assertEqual(self.late("echo 1"), "answered")
+
+    def test_a_late_answer_that_the_app_quit_first(self):
+        self.assertIsNone(self.late('echo "%s"' % terms.NOT_RUNNING))
+
+    def test_a_late_refusal(self):
+        self.assertEqual(self.late('echo "execution error: No. (-1743)" >&2; exit 1'), "refused")
+
+    def test_a_late_timeout_error_on_a_copy_that_runs(self):
+        self.assertEqual(self.late('echo "execution error: timed out. (-1712)" >&2; exit 1'), "stuck")
+
+
 class TestAJumpGoesToTheAppThatShowsTheTty(unittest.TestCase):
     """Jump asks the app whose tab shows the tty. The tty goes in as an argument
     of its own - never into the script text - and the script says where focus
@@ -813,6 +1074,11 @@ class TestGuardsHoldWhenModulesShareAProcess(unittest.TestCase):
 
     def test_one_module_alone(self):                                    # control
         self.run_in_order("test_terms.TestITerm2KeepsItsGateFiles")
+
+    def test_the_setup_tests_reach_no_app(self):
+        # doctor's facts reach the machine; its tests reach no app: not even
+        # the Accessibility probe's System Events (review of slices 4-5)
+        self.run_in_order("test_setup")
 
 
 # Run in a child after a test module has ended: is the terminal module the

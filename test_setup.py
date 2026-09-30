@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 import ccwho_setup as setup
@@ -27,12 +28,26 @@ def _unpinned_live_file_sessions(*a, **k):
                          "live_file_sessions")
 
 
+# Every background Apple Event goes through ccwho_terms.ask: here it answers
+# nothing, and says who reached it - doctor asks apps, and no test may
+GATE_ASKED = []
+
+
+def GATE_GUARD(args, **k):
+    GATE_ASKED.append(k.get("app"))
+    return None
+
+
 def setUpModule():
     setup.engine.live_file_sessions = _unpinned_live_file_sessions
+    testkit.fresh_terms(setup.engine).ask = GATE_GUARD
 
 
 def tearDownModule():
     setup.engine.live_file_sessions = REAL_LIVE_FILE_SESSIONS
+    testkit.fresh_terms(setup.engine)           # no guard or fake of ours stays on it
+    if GATE_ASKED:
+        raise AssertionError(f"a test reached the Apple Event gate: {GATE_ASKED}")
 
 HEALTHY = {
     "claude": "/Users/x/.local/bin/claude",
@@ -771,9 +786,19 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
                              ("handler_registered", True),
                              ("launchd_loaded", True),
                              ("cc_status_hook", True),
-                             ("secure_input_holder", None)):
+                             ("secure_input_holder", None),
+                             ("accessibility_ok", True),
+                             ("accessibility_granted_at", None),
+                             ("iterm_started_at", None)):
             self.addCleanup(setattr, setup, name, getattr(setup, name))
-            setattr(setup, name, lambda *a, **k: answer)
+            setattr(setup, name, lambda *a, _answer=answer, **k: _answer)
+        # which apps are in use is this machine's too: iTerm2 in use, and
+        # Terminal.app not - it would be asked
+        self.use, self.homes = "in use", []
+        for name in ("iterm_use", "terminal_facts"):
+            self.addCleanup(setattr, setup, name, getattr(setup, name))
+        setup.iterm_use = lambda home=None, procs=None: self.homes.append(home) or self.use
+        setup.terminal_facts = lambda: {"terminal_says": None, "terminal_age": None}
         self.addCleanup(setattr, setup.shutil, "which", setup.shutil.which)
         setup.shutil.which = lambda n: ""          # nothing on PATH at all
         # this machine's session files are not what these tests are about
@@ -827,6 +852,46 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
         self.addCleanup(setattr, setup.engine, "find_tool", real)
         setup.engine.find_tool = lambda n: ""
         self.assertEqual(setup.gather(ccwho_dir=self.tmp)["claude"], "")
+
+    ITERM2_FACTS = ("iterm_scriptable", "accessibility_ok", "accessibility_granted_at",
+                    "iterm_started_at", "secure_input_holder")
+
+    def looked_at(self):
+        called = []
+        for name in self.ITERM2_FACTS:
+            self.addCleanup(setattr, setup, name, getattr(setup, name))
+            setattr(setup, name, lambda *a, _n=name, **k: called.append(_n))
+        facts = setup.gather(ccwho_dir=self.tmp, home="/h")
+        return facts, called
+
+    def test_iterm2_not_in_use_is_not_looked_at(self):
+        # its Accessibility probe alone is an osascript to System Events (D14)
+        self.use = "not installed"
+        facts, called = self.looked_at()
+        self.assertEqual(called, [])
+        self.assertEqual(facts["iterm_use"], "not installed")
+        self.assertEqual(self.homes, ["/h"], "the home setup writes to is the one looked at")
+
+    def test_iterm2_in_use_is(self):                                   # control
+        testkit.patch(self, setup.os, "environ", dict(os.environ, TERM_PROGRAM="iTerm.app"))
+        facts, called = self.looked_at()
+        self.assertEqual(sorted(called), sorted(self.ITERM2_FACTS))
+        self.assertEqual(facts["iterm_use"], "in use")
+
+    def test_accessibility_is_only_asked_in_iterm2(self):
+        # macOS keeps it per app: asked from another terminal, the answer is
+        # that terminal's, not iTerm2's (review 2 of slices 4-5)
+        testkit.patch(self, setup.os, "environ", dict(os.environ, TERM_PROGRAM="Apple_Terminal"))
+        facts, called = self.looked_at()
+        self.assertNotIn("accessibility_ok", called)
+        self.assertIsNone(facts["accessibility"])
+        self.assertIs(facts["iterm_host"], False)
+
+    def test_terminal_app_s_facts_reach_doctor(self):
+        setup.terminal_facts = lambda: {"terminal_says": "refused", "terminal_age": 60.0}
+        check = by_name(setup.doctor_checks(setup.gather(ccwho_dir=self.tmp)))["Terminal.app"]
+        self.assertFalse(check["ok"])
+        self.assertIn("Automation", check["fix"])
 
 
 class TestAnInstalledProfileIsNotNecessarilyTheRightProfile(unittest.TestCase):
@@ -1093,8 +1158,23 @@ class TestTheGatherersForThatSurviveAnyMachine(unittest.TestCase):
     """Asking the machine these questions must never raise, and must never
     answer confidently when it could not look."""
 
+    # its probe is an osascript to System Events: faked, never run here
+    def accessibility(self, returncode=0, stderr="", raises=None):
+        def run(cmd, *a, **k):
+            if raises:
+                raise raises
+            return subprocess.CompletedProcess(cmd, returncode, stdout="", stderr=stderr)
+        testkit.patch(self, setup.subprocess, "run", run)
+        return setup.accessibility_ok()
+
     def test_asking_whether_we_have_accessibility_never_raises(self):
-        self.assertIn(setup.accessibility_ok(), (True, False, None))
+        self.assertIs(self.accessibility(raises=OSError("gone")), None)
+        self.assertIs(self.accessibility(raises=subprocess.TimeoutExpired("osascript", 10)), None)
+
+    def test_what_the_probe_says(self):
+        self.assertIs(self.accessibility(0), True)
+        self.assertIs(self.accessibility(1, "osascript is not allowed assistive access."), False)
+        self.assertIs(self.accessibility(1, "some other error"), None)
 
     def test_a_missing_database_reads_as_unknown(self):
         self.assertIsNone(setup.accessibility_granted_at(
@@ -1419,3 +1499,262 @@ class TheStartTimeOfITerm2IsOurs(unittest.TestCase):
         setup.iterm_started_at()
         self.assertNotIn("pgrep", " ".join(" ".join(c) for c in asked))
         self.assertIn("4242", " ".join(" ".join(c) for c in asked))
+
+
+# --------------------------------------------------- Terminal.app users (D10, D14, D15)
+
+ME = os.getuid()
+
+def procs_table(*rows):
+    """`ps -eo pid,tty,uid,ucomm`."""
+    return "  PID TT       UID UCOMM\n" + "".join(
+        "%5d %-8s %5d %s\n" % (pid, tty, uid, name) for pid, tty, uid, name in rows)
+
+
+class NoSubprocess(unittest.TestCase):
+    """Every process these facts would start is recorded instead; mdfind finds
+    nothing unless a test says so."""
+
+    def setUp(self):
+        self.started, self.mdfind, self.mdfind_rc = [], "", 0
+        self.addCleanup(setattr, setup.subprocess, "run", setup.subprocess.run)
+        self.addCleanup(setattr, setup.subprocess, "Popen", setup.subprocess.Popen)
+
+        def run(cmd, *a, **k):
+            self.started.append(list(cmd))
+
+            class Done:
+                returncode = self.mdfind_rc if cmd[0] == "mdfind" else 0
+                stdout, stderr = (self.mdfind if cmd[0] == "mdfind" else ""), ""
+            return Done()
+
+        def popen(cmd, *a, **k):
+            self.started.append(list(cmd))
+            raise OSError("no process in this test")
+        setup.subprocess.run, setup.subprocess.Popen = run, popen
+        terms = setup.engine.terms
+        self.addCleanup(setattr, terms, "APP_PATHS", terms.APP_PATHS)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        terms.APP_PATHS = {"iterm2": [os.path.join(self.home, "Applications", "iTerm.app")]}
+
+    def osascripts(self):
+        return [c for c in self.started if "osascript" in " ".join(c)]
+
+
+class TestWhetherITerm2IsInUse(NoSubprocess):
+    """In use (D14): an iTerm2 app of ours runs, or ccwho's hotkey profile is
+    installed. Else "not running" when it is installed, or "not installed" -
+    read from ps, the disk and Spotlight, never by asking it: an Apple Event
+    would start it."""
+
+    def use(self, *rows):
+        return setup.iterm_use(home=self.home, procs=procs_table(*rows))
+
+    def test_it_runs(self):
+        self.assertEqual(self.use((100, "??", ME, "iTerm2")), "in use")
+
+    def test_another_user_s_iterm2_is_not_ours(self):
+        self.assertEqual(self.use((100, "??", ME + 1, "iTerm2")), "not installed")
+
+    def test_ccwho_s_hotkey_profile_with_iterm2_closed(self):
+        self.mdfind = "/Applications/iTerm.app\n"          # installed: only not running
+        path = setup.profile_path(self.home)
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as fh:
+            json.dump(setup.hotkey_profile("ccwho"), fh)
+        self.assertEqual(self.use((1, "??", 0, "launchd")), "in use")
+
+    def test_a_profile_file_of_any_shape_that_is_not_ours(self):
+        # iTerm2's folder: anything may be in it, and doctor must still run
+        path = setup.profile_path(self.home)
+        os.makedirs(os.path.dirname(path))
+        for body in ("[]", '"x"', '{"Profiles": null}', '{"Profiles": ["x"]}', "{"):
+            with open(path, "w") as fh:
+                fh.write(body)
+            self.assertEqual(self.use((1, "??", 0, "launchd")), "not installed", body)
+            self.assertFalse(setup.hotkey_installed(self.home), body)
+
+    def test_a_search_that_failed_is_not_not_installed(self):
+        # Spotlight could not answer: it may be there - "start it", not
+        # "install it" (review 2 of slices 4-5)
+        self.mdfind_rc = 1
+        self.assertEqual(self.use((1, "??", 0, "launchd")), "not running")
+
+    def test_a_hotkey_profile_left_behind(self):
+        # iTerm2 removed, ccwho's profile still in its folder: not in use, and
+        # the note says what to remove
+        path = setup.profile_path(self.home)
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as fh:
+            json.dump(setup.hotkey_profile("ccwho"), fh)
+        self.assertEqual(self.use((1, "??", 0, "launchd")), "profile left")
+        note = setup.ITERM2_UNUSED["profile left"]
+        self.assertIn("DynamicProfiles/ccwho.json", note)
+        self.assertIn("remove", note)
+
+    def test_installed_but_closed_with_no_hotkey(self):
+        self.mdfind = "/Applications/iTerm.app\n"
+        self.assertEqual(self.use((1, "??", 0, "launchd")), "not running")
+
+    def test_not_installed(self):
+        self.assertEqual(self.use((1, "??", 0, "launchd")), "not installed")
+
+    def test_a_process_list_that_could_not_be_read_keeps_today_s_checks(self):
+        # they say what is wrong (no-table); a guess of "not used" would hide it
+        self.assertEqual(setup.iterm_use(home=self.home, procs=""), "in use")
+
+    def test_nothing_is_asked(self):
+        for rows in ([(100, "??", ME, "iTerm2")], [(1, "??", 0, "launchd")]):
+            self.use(*rows)
+        self.mdfind = "/Applications/iTerm.app\n"
+        self.use((1, "??", 0, "launchd"))
+        self.assertEqual(self.osascripts(), [])
+        self.assertTrue(self.started, "the control: Spotlight was asked")
+
+
+class TestITerm2StepsApplyOnlyWhenItIsInUse(unittest.TestCase):
+    """D10, D14: the iTerm2 steps - iTerm2 scriptable, hotkey, hotkey reach, the
+    status hook - pass with a note naming the next step while iTerm2 is not in
+    use, and setup plans nothing for them."""
+
+    ITERM2_STEPS = ("iterm2", "hotkey reach", "iTerm2 status hook")
+    INSTALL = ("not used: iTerm2 is not installed - install iTerm2 and start it, then run"
+               " `ccwho setup` to add the hotkey")
+    START = "not used: iTerm2 is not running and has no ccwho hotkey - start it, then run `ccwho setup`"
+
+    def unused(self, use):
+        # what gather leaves when it does not look at iTerm2
+        return facts(iterm_use=use, iterm_ok=None, cc_status_hook=False, accessibility=None,
+                     secure_input=None, uv="/x/uv", hotkey_installed=False)
+
+    def doctor(self, use):
+        results = setup.doctor_checks(self.unused(use))
+        self.assertEqual(setup.doctor_verdict(results), 0, [r for r in results if not r["ok"]])
+        return by_name(results)
+
+    def test_not_installed(self):
+        # each row names the step that puts it in use (review of slices 4-5)
+        checks = self.doctor("not installed")
+        for name in self.ITERM2_STEPS:
+            self.assertTrue(checks[name]["ok"], name)
+            self.assertEqual(checks[name]["detail"], self.INSTALL, name)
+
+    def test_installed_but_not_in_use(self):
+        checks = self.doctor("not running")
+        for name in self.ITERM2_STEPS:
+            self.assertEqual(checks[name]["detail"], self.START, name)
+
+    def test_in_use_keeps_today_s_checks(self):                          # control
+        checks = by_name(setup.doctor_checks(facts(iterm_use="in use", iterm_ok=False,
+                                                   cc_status_hook=False)))
+        self.assertFalse(checks["iterm2"]["ok"])
+        self.assertIn("Automation", checks["iterm2"]["fix"])
+        self.assertFalse(checks["iTerm2 status hook"]["ok"])
+
+    def test_a_fact_from_before_is_in_use(self):                         # control
+        self.assertEqual(by_name(setup.doctor_checks(facts(iterm_ok=False)))["iterm2"]["ok"], False)
+
+    def test_setup_plans_nothing_for_it(self):
+        for use, note in (("not installed", self.INSTALL), ("not running", self.START)):
+            steps = {s["name"]: s for s in setup.setup_plan(self.unused(use))}
+            for name in ("hotkey", "hotkey reach", "iTerm2 status hook"):
+                self.assertFalse(steps[name]["todo"], (use, name))
+                self.assertEqual(setup.step_mark(steps[name]), "ok  ", (use, name))
+                self.assertEqual(steps[name]["detail"], note, (use, name))
+
+    def test_setup_in_use_still_plans_the_hotkey(self):                  # control
+        steps = {s["name"]: s for s in setup.setup_plan(
+            facts(iterm_use="in use", uv="/x/uv", hotkey_installed=False, accessibility=False))}
+        self.assertTrue(steps["hotkey"]["todo"])
+        self.assertTrue(steps["hotkey reach"]["todo"])
+
+
+class TestDoctorSaysWhatTerminalAppLastAnswered(unittest.TestCase):
+    """D15, by the list's own asks: the list asks Terminal.app for tab names
+    only while a session runs in one of its tabs (D7), and its gate records
+    what each ask came to (terms.gate_says). doctor reads that and asks
+    nothing: the first Apple Event to an app shows macOS's prompt (review of
+    slices 4-5: doctor, and setup with it, used to ask Terminal.app)."""
+
+    def row(self, says, age=600.0):
+        return by_name(setup.doctor_checks(facts(terminal_says=says, terminal_age=age))).get("Terminal.app")
+
+    # each row says it is the list's last ask, how long ago, and what asks
+    # again (review 2 of slices 4-5: a refusal outlived the fix, unexplained)
+    def test_every_row_says_whose_ask_and_when(self):
+        for says in ("answered", "failed", "refused", "slow", "stuck"):
+            row = self.row(says)
+            self.assertIn("the list's last ask", row["detail"], says)
+            self.assertIn("10m ago", row["detail"], says)
+
+    def test_what_asks_again(self):
+        for says in ("failed", "refused"):
+            row = self.row(says)
+            self.assertIn("while a session runs in one of its tabs", row["detail"] + row["fix"], says)
+
+    def test_the_prompt_names_no_app_it_cannot_know(self):
+        detail = self.row("slow")["detail"]
+        self.assertIn("whether an app may control Terminal", detail)
+
+    def test_never_asked_is_no_row(self):
+        self.assertIsNone(self.row(None))
+
+    def test_an_iterm2_user_s_doctor_is_as_before(self):                  # control
+        names = [c["name"] for c in setup.doctor_checks(facts())]
+        self.assertEqual(names[:8], ["claude", "session files", "iterm2", "ccwho:// handler",
+                                     "autosave job", "autosave freshness", "hotkey reach",
+                                     "iTerm2 status hook"])
+        self.assertNotIn("Terminal.app", names)
+
+    def test_answered(self):
+        self.assertTrue(self.row("answered")["ok"])
+
+    def test_another_error_is_asked_again(self):
+        self.assertTrue(self.row("failed")["ok"])
+
+    def test_refused_says_where_to_allow_it(self):
+        row = self.row("refused")
+        self.assertFalse(row["ok"])
+        self.assertIn("Privacy & Security > Automation", row["fix"])
+        self.assertIn("Terminal", row["fix"])
+
+    def test_a_prompt_may_be_waiting(self):
+        row = self.row("slow")
+        self.assertFalse(row["ok"])
+        self.assertIn("prompt", row["detail"])
+        self.assertNotIn("Automation", row["fix"])
+
+    def test_a_restart_is_said_with_what_it_costs(self):
+        for says in ("slow", "stuck"):
+            fix = self.row(says)["fix"]
+            self.assertIn("ccwho save", fix, says)
+            self.assertIn("ends every session in its tabs", fix, says)
+
+
+class TestGatherReadsTerminalAppsGate(unittest.TestCase):
+    def test_it_reads_the_gate_of_terminal_app(self):
+        seen = []
+        terms = setup.engine.terms
+        testkit.patch(self, terms, "gate_says", lambda app, procs=None: seen.append(app) or "refused")
+        testkit.patch(self, terms, "gate_when", lambda app: seen.append(app) or time.time() - 120)
+        got = setup.terminal_facts()
+        self.assertEqual(got["terminal_says"], "refused")
+        self.assertTrue(115 < got["terminal_age"] < 200, got)
+        self.assertEqual(seen, [terms.TERMINAL, terms.TERMINAL])
+
+
+class TestTheHotkeysReachIsCheckedInITerm2(unittest.TestCase):
+    """Accessibility is kept per app: only in an iTerm2 window can ccwho see
+    iTerm2's (review 2 of slices 4-5: from Terminal.app it saw Terminal.app's)."""
+
+    def test_elsewhere_it_is_not_checked(self):
+        reach = setup.hotkey_reach(facts(iterm_host=False, accessibility=None))
+        self.assertTrue(reach["ok"])
+        self.assertIn("not checked from here", reach["detail"])
+        self.assertIn("iTerm2 window", reach["detail"])
+        self.assertIn("not in tmux", reach["detail"])         # tmux may belong to another app
+
+    def test_in_iterm2_it_is(self):                                             # control
+        reach = setup.hotkey_reach(facts(iterm_host=True, accessibility=True))
+        self.assertEqual(reach["detail"], "the hotkey can reach you from any app")

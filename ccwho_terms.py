@@ -731,7 +731,7 @@ def _read_gate(app, now):
         if type(v) is int or (type(v) is list and 0 < len(v) <= 64
                               and all(type(p) is int and p > 0 for p in v)):
             clean[key] = v
-    for key in ("pending", "slow"):
+    for key in ("pending", "slow", "unasked"):
         if state.get(key) is True:
             clean[key] = True
     wait = state.get("wait_until")
@@ -774,6 +774,7 @@ def _settle(app, state, now):
     if answered:
         state.pop("quarantine", None)
         state.pop("last_error", None)
+        state.pop("unasked", None)          # set again if this answer is the sentinel (ask)
         if slow:        # a late answer: the pause runs from when it was seen
             state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     else:
@@ -944,12 +945,102 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         if out is None:
             why["error"] = state.get("last_error")
         elif out.strip() == NOT_RUNNING:
-            # quit after ps said it ran: `is running` sends the app no event
+            # quit after ps said it ran: `is running` sends the app no event -
+            # the state must not say it answered (gate_says)
+            state["unasked"] = True
+            _write_gate(app, state)
             why.update(asked=False, refused="not-running")
             return None
         return out
     finally:
         os.close(fd)
+
+
+def gate_says(app, procs=None):
+    """What the last background ask to `app` came to, read from its gate's
+    files - never by asking (the first Apple Event to an app shows macOS's
+    prompt). None: never asked, or what was recorded no longer holds (the
+    app quit first; the copy that stopped answering is gone, or was of
+    another boot). Else "answered", "refused" (-1743: Automation), "stuck"
+    (-1712, on a copy that still runs - `procs`, default app_snapshot()),
+    "slow" (an ask whose osascript still runs: a prompt may be waiting), or
+    "failed" - as the next ask will record it."""
+    state = _read_gate(app, time.time())
+    asked = state.get("asked_pid")
+    now_boot = boot_id()
+    elsewhen = state.get("boot") is not None and now_boot is not None and state["boot"] != now_boot
+    status = _gate_text(app, "status")
+    if status is not None:                  # it ended; the next ask settles it
+        if status.strip() == "0":
+            return None if (_gate_text(app, "out") or "").strip() == NOT_RUNNING else "answered"
+        code, stuck = ae_error_code(_gate_text(app, "err") or ""), asked
+    elif state.get("pending") or state.get("slow"):
+        if _lock_held(app):
+            # its osascript still runs. Every ask does, for a moment: only
+            # one that timed out, or has run longer than any may (its list
+            # was killed), is slow - one inside its time reads as what was
+            # recorded before it (review 3 of slices 4-5)
+            try:
+                age = time.time() - os.stat(_gate_path(app, "json")).st_mtime
+            except OSError:
+                age = 0.0
+            if state.get("slow") or age > ASK_LONGEST:
+                return "slow"
+            code, stuck = state.get("last_error"), state.get("quarantine")
+            if code is None:
+                return None                 # not known before it answers
+        else:
+            # its wrapper died with no word: what its osascript wrote, as
+            # the next ask settles it
+            code, stuck = ae_error_code(_gate_text(app, "err") or "") or "failed", asked
+    else:
+        code, stuck = state.get("last_error"), state.get("quarantine")
+        if code is None:
+            return "answered" if asked is not None and not state.get("unasked") else None
+    if code == AE_TIMED_OUT:
+        if elsewhen:
+            return None                     # its copy went with that boot (as ask drops it)
+        stuck = [] if stuck is None else ([stuck] if type(stuck) is int else stuck)
+        table = app_snapshot() if procs is None else procs
+        if not parse_procs(table):
+            return "stuck"                  # no process list: as it was recorded
+        return "stuck" if set(stuck) & set(app.pids(table)) else None
+    return "refused" if code == AE_NOT_PERMITTED else "failed"
+
+
+# longer than any background ask may take to answer (they wait at most 5 s):
+# one still in flight after this is waiting on something - a prompt, a hang
+ASK_LONGEST = 30.0
+
+
+def gate_when(app):
+    """When `app`'s gate last recorded an ask (its state, or an ask's end),
+    on the wall clock - None when it never did."""
+    times = []
+    for name in ("json", "status"):
+        try:
+            times.append(os.stat(_gate_path(app, name)).st_mtime)
+        except OSError:
+            pass
+    return max(times) if times else None
+
+
+def _lock_held(app):
+    """Does an ask hold `app`'s gate lock now - its osascript still running?
+    Looked at, never waited for: a shared lock taken and let go at once."""
+    try:
+        fd = os.open(_gate_path(app, "lock"), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)                        # closing lets go of it
+    return False
 
 
 def _guarded_args(app, args):

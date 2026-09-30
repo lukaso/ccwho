@@ -36,13 +36,13 @@ def pin_ccwho_dir(runner):
 FORK_POINT = ((subprocess, "_fork_exec") if hasattr(subprocess, "_fork_exec")
               else (subprocess._posixsubprocess, "fork_exec"))
 
-# ccwho's spawn rule (_being_made, _never_ran) reads CPython's own frames and
+# ccwho's spawn rule (_being_made, _never_ran, _ended) reads CPython's own frames and
 # fields: run this with each Python that runs ccwho. A fork that fails and an
 # exec that fails ran nothing; an error once the process is made - before
 # exec's report, or while its output is read - may have. argv[1]: the repo.
 # Only harmless programs are run.
 SPAWN_RULE_CHECK = """
-import contextlib, errno, os, subprocess, sys
+import contextlib, errno, os, signal, subprocess, sys
 from unittest import mock
 sys.path.insert(0, sys.argv[1])
 import ccwho as r
@@ -58,10 +58,9 @@ def sort(argv, patch=None):
         p = r._being_made(ex)
         if r._never_ran(p):
             return "none-ran"
-        if p is not None:                   # made, not heard from: ended, as _send does
-            p.kill()
-            p.wait()
-        return "may-run"
+        if not r._ended(p):                 # made, not heard from: ended - killed - as _send does
+            return "not-ended"
+        return "may-run" if p is None or p.returncode == -signal.SIGKILL else "not-killed"
     return "ran"
 
 

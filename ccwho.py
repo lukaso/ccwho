@@ -164,11 +164,16 @@ def launch_in_iterm(script, deadline, sids):
     - anything else - a timeout, -1712, a signal, -1743 after the first
       event, an error after a write (a window closing while the pane-fill
       script walks them), an error raised after osascript's process was made
-      (before exec's report - the process is then ended and reaped, as
-      subprocess.run ends one it gives up on - or while its output was read),
-      whatever its errno, or one that cannot be placed: unresolved, bound to
-      the iTerm2 a table taken after the send shows - to each of them, when
-      it shows two of ours (_sent).
+      (before exec's report, or while its output was read), whatever its
+      errno, or one that cannot be placed: unresolved, bound to the iTerm2 a
+      table taken after the send shows - to each of them, when it shows two
+      of ours (_sent). A process Popen's constructor made is first ended and
+      reaped when it can be (_ended), as subprocess.run ends one it gives up
+      on, and only then are the claims bound; on Ctrl-C, only when its
+      process is found and shown ended (_popen_in). One that cannot be
+      ended, or found, leaves the record made before the send, which names
+      its send lock: held while that lock is (_sending), dated when it is let
+      go (_dated).
     A launch that cannot be recorded is not sent."""
     if _unrecorded().keys() & set(sids):
         # its claim could not be written: nothing to mark, nothing to send
@@ -221,7 +226,29 @@ def _never_ran(p):
     making of (_being_made)? None was made (its pipes, fork, an argument
     refused), or exec reported it could not run and it was reaped. False for
     None: raised after, or where _being_made cannot tell."""
-    return p is not None and (not getattr(p, "_child_created", True) or p.returncode is not None)
+    return p is not None and (not getattr(p, "_child_created", True)
+                              or getattr(p, "returncode", None) is not None)
+
+
+_RUN_CODE = subprocess.run.__code__      # subprocess.run's own, taken at import
+
+
+def _popen_in(ex):
+    """The Popen `ex` was raised with, from its frames: the one whose
+    constructor raised it (_being_made), else subprocess.run's own
+    (`process`, once made) - else None, where this cannot tell (raised on
+    run's `with` line, or by a fake run)."""
+    made = _being_made(ex)
+    if made is not None:
+        return made
+    tb = ex.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code is _RUN_CODE:
+            p = tb.tb_frame.f_locals.get("process")
+            if isinstance(p, subprocess.Popen):
+                return p
+        tb = tb.tb_next
+    return None
 
 
 def _ended(p):
@@ -230,13 +257,15 @@ def _ended(p):
     killed and reaped here, as subprocess.run ends one it gives up on? True
     when there is none. False when it could not be ended: the send is then
     not recorded as over (_sent) - the record made before it names the send
-    lock, which that process holds, and holds while it runs (_sending)."""
-    if p is None or not getattr(p, "_child_created", False):
+    lock, which that process holds, and holds while it runs (_sending).
+    Ended only when it can be shown to be (its returncode, read as a Popen
+    of another CPython may lack it)."""
+    if p is None:
         return True
     with contextlib.suppress(Exception):
         p.kill()
         p.wait()
-    return p.returncode is not None
+    return getattr(p, "returncode", None) is not None
 
 
 def _send(script, deadline, sids, lock):
@@ -255,7 +284,10 @@ def _send(script, deadline, sids, lock):
         p = _being_made(ex)
         if _never_ran(p):
             # no process was made, or exec reported it could not run (and it
-            # was reaped): osascript never ran, nothing was sent
+            # was reaped): osascript never ran, nothing was sent. (_never_ran
+            # reads "no child noted" as none made: an error of these kinds
+            # comes only from what Popen calls - never between its fork and
+            # its note of the child, as a Ctrl-C can)
             drop_claims(sids)
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
         if _ended(p):
@@ -263,8 +295,17 @@ def _send(script, deadline, sids, lock):
         return None, f"could not drive iTerm2 ({type(ex).__name__}) - {MAY_STILL_RUN}"
     except BaseException as ex:
         # Ctrl-C: it may still run. (A closed terminal kills us without a
-        # word: the record made before the send holds then.)
-        if _ended(_being_made(ex)):
+        # word: the record made before the send holds then.) The send is
+        # recorded as over only when its process is found and shown ended
+        # (_popen_in, _ended). A Ctrl-C between Popen's fork and its note of
+        # the child, or on subprocess.run's `with` line, leaves a process of
+        # ours running with the send lock that nothing names: the record made
+        # before the send names that lock - held while it is held
+        # (_sending), dated when it is let go (_dated). (Shown ended: a
+        # returncode, which only reaping a child sets - one whose fork was
+        # never noted has no pid to kill or reap.)
+        p = _popen_in(ex)
+        if p is not None and _ended(p):
             _sent(sids)
         raise
     if r.returncode == 0:

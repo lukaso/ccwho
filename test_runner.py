@@ -5729,12 +5729,19 @@ class TestASendThatHasEndedIsNotBeingSent(unittest.TestCase):
         self.assertTrue(self.ended(self.SIDS[0]))
 
     def test_after_ctrl_c(self):
+        # a Ctrl-C that shows no process of the send's ended (here none was
+        # made) leaves the record made before it: once its lock is free, not
+        # "starting" - held by an iTerm2 of ours as any unresolved launch, and
+        # cleared by restarting that iTerm2
         def interrupted(cmd, **kw):
             raise KeyboardInterrupt
         runner.subprocess.run = interrupted
         with self.assertRaises(KeyboardInterrupt):
             runner.launch_in_iterm("script", 60.0, self.SIDS[:1])
-        self.assertTrue(self.ended(self.SIDS[0]))
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: p == 4242))
+        self.assertEqual(runner.why_held(self.SIDS[0]), ("unresolved", 0))
+        runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n5151 {os.getuid()} iTerm2\n"
+        self.assertTrue(runner.claim_launch(self.SIDS[0], alive=lambda p: p == 5151))
 
     def test_while_it_is_being_sent_it_holds(self):                         # control
         seen = []
@@ -10263,7 +10270,7 @@ class TestAScanStartAfterNowReleasesNothing(unittest.TestCase):
 
 class TestTheSpawnRuleOnEachPythonThatRunsCcwho(unittest.TestCase):
     """_send sorts a spawn error by CPython's own frames and fields
-    (_being_made, _never_ran): checked on this Python and on the system's
+    (_being_made, _never_ran, _ended): checked on this Python and on the system's
     (/usr/bin/python3 - `ccwho` runs on whichever python3 is first on PATH).
     The list's (uv's) is checked by test_ui."""
 
@@ -10283,3 +10290,195 @@ class TestTheSpawnRuleOnEachPythonThatRunsCcwho(unittest.TestCase):
     def test_the_systems(self):
         got, err = self.sorts("/usr/bin/python3")
         self.assertEqual(got, testkit.SPAWN_RULE_SORTS, err)
+
+
+class TestAPopenWithoutTheFieldsTheSpawnRuleReads(unittest.TestCase):
+    """_never_ran and _ended read CPython's own Popen fields (_child_created,
+    returncode). On a Python without them the rule fails closed: a child may
+    exist - the claims are neither dropped nor bound while it may run."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS[:1], _F.setUp
+
+    class Bare:
+        """A Popen with none of the fields: kill and wait do nothing."""
+        def kill(self):
+            pass
+
+        def wait(self):
+            pass
+
+    def test_the_rule(self):
+        self.assertFalse(runner._never_ran(self.Bare()))
+        self.assertFalse(runner._ended(self.Bare()))
+
+    def test_a_send_that_raised_in_one(self):
+        bound = []
+        self.addCleanup(setattr, runner, "_being_made", runner._being_made)
+        self.addCleanup(setattr, runner, "_sent", runner._sent)
+        runner._being_made = lambda ex: self.Bare()
+        runner._sent = lambda sids: bound.append(sids)
+
+        def run(cmd, **kw):
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        runner.subprocess.run = run
+        why = runner.launch_in_iterm("script", 1.0, self.SIDS)[1]
+        self.assertIn(runner.MAY_STILL_RUN, why)
+        self.assertEqual(bound, [])                             # not bound while it may run
+        rec = runner._read_claim(self.SIDS[0])                  # nor dropped
+        self.assertIs(rec.get("unresolved"), True)
+        self.assertIsNone(rec.get("iterm_pid"))
+
+    def test_one_that_can_be_ended(self):                                       # control
+        class Ends(self.Bare):
+            _child_created, returncode = True, None
+
+            def wait(self):
+                self.returncode = -9
+        bound = []
+        self.addCleanup(setattr, runner, "_being_made", runner._being_made)
+        self.addCleanup(setattr, runner, "_sent", runner._sent)
+        runner._being_made = lambda ex: Ends()
+        runner._sent = lambda sids: bound.append(list(sids))
+
+        def run(cmd, **kw):
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        runner.subprocess.run = run
+        runner.launch_in_iterm("script", 1.0, self.SIDS)
+        self.assertEqual(bound, [list(self.SIDS)])              # ended: bound, as the send is over
+
+
+class TestACtrlCJustAfterTheFork(unittest.TestCase):
+    """Ctrl-C can land in Popen's constructor after its fork and before it
+    notes the child (pid, _child_created): a process of ours may run
+    osascript with the send lock that nothing names. The claim stays on that
+    lock - never bound while it may run."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS[:1], _F.setUp
+
+    def launched(self, fork):
+        real, forked = getattr(*testkit.FORK_POINT), []
+
+        def fork_then_ctrl_c(*a, **k):
+            if fork:
+                forked.append(real(*a, **k))
+            raise KeyboardInterrupt
+        self.addCleanup(lambda: [(os.kill(pid, 9), os.waitpid(pid, 0)) for pid in forked])
+
+        def run(cmd, **kw):
+            with mock.patch.object(*testkit.FORK_POINT, side_effect=fork_then_ctrl_c):
+                return REAL_RUN(["/bin/sleep", "30"], **kw)
+        runner.subprocess.run = run
+        with self.assertRaises(KeyboardInterrupt):
+            runner.launch_in_iterm("script", 1.0, self.SIDS)
+        return forked
+
+    def test_a_child_nothing_names(self):
+        forked = self.launched(fork=True)
+        self.assertEqual(len(forked), 1)
+        rec = runner._read_claim(self.SIDS[0])
+        self.assertIsNotNone(rec.get("send"))
+        self.assertIsNone(rec.get("iterm_pid"))
+        # held while it runs - whatever the table shows
+        runner.engine.app_snapshot = lambda: NO_ITERM
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+        self.assertEqual(runner.why_held(self.SIDS[0]), ("starting", 0))
+        # and judged on a table once it has ended: no iTerm2 - it goes
+        os.kill(forked[0], 9)
+        os.waitpid(forked[0], 0)
+        forked.clear()
+        self.assertTrue(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+
+    def test_one_made_as_run_enters_it(self):
+        # Ctrl-C after Popen returned, before subprocess.run's `with` - its
+        # clean-up never runs, and no constructor frame names the process
+        made = []
+
+        def enter(p):
+            made.append(p)
+            raise KeyboardInterrupt
+        self.addCleanup(lambda: [(p.kill(), p.wait()) for p in made])
+
+        def run(cmd, **kw):
+            with mock.patch.object(subprocess.Popen, "__enter__", enter):
+                return REAL_RUN(["/bin/sleep", "30"], **kw)
+        runner.subprocess.run = run
+        with self.assertRaises(KeyboardInterrupt):
+            runner.launch_in_iterm("script", 1.0, self.SIDS)
+        self.assertIsNone(made[0].poll(), "the test needs it running")
+        rec = runner._read_claim(self.SIDS[0])
+        self.assertIsNotNone(rec.get("send"))
+        self.assertIsNone(rec.get("iterm_pid"))
+        runner.engine.app_snapshot = lambda: NO_ITERM
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+        self.assertEqual(runner.why_held(self.SIDS[0]), ("starting", 0))
+        made[0].kill()
+        made[0].wait()
+        self.assertTrue(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+
+    def test_none_made(self):                                                   # control
+        self.assertEqual(self.launched(fork=False), [])
+        # no process holds the lock: its file goes, the send is over - judged
+        # on a table after it, never held for good
+        self.assertEqual([n for n in os.listdir(os.path.join(self.tmp, "launching"))
+                          if n.endswith(".send")], [])
+        self.assertFalse(runner._sending(runner._read_claim(self.SIDS[0])))
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+        self.assertEqual(runner.why_held(self.SIDS[0]), ("unresolved", 0))
+
+
+class TestACtrlCInTheCleanUpOfTheSend(unittest.TestCase):
+    """A second Ctrl-C in subprocess.run's clean-up (its kill) leaves its
+    process running, and no constructor frame names it: the send is never
+    recorded as over on Ctrl-C - the claim stays on its send lock."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS[:1], _F.setUp
+
+    def test_a_process_left_running(self):
+        run = failing_after_start(self, KeyboardInterrupt(), "communicate", ("/bin/sleep", "30"))
+        with mock.patch.object(subprocess.Popen, "kill", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.subprocess.run = run
+                runner.launch_in_iterm("script", 1.0, self.SIDS)
+        self.assertIsNone(self.children[-1].poll(), "the test needs it running")
+        rec = runner._read_claim(self.SIDS[0])
+        self.assertIsNotNone(rec.get("send"))
+        self.assertTrue(runner._sending(rec))
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+        self.assertEqual(runner.why_held(self.SIDS[0]), ("starting", 0))
+
+    def test_one_that_ended(self):                                              # control
+        run = failing_after_start(self, KeyboardInterrupt(), "communicate", ("/bin/sleep", "30"))
+        with self.assertRaises(KeyboardInterrupt):
+            runner.subprocess.run = run
+            runner.launch_in_iterm("script", 1.0, self.SIDS)
+        # subprocess.run killed it, and it is found and shown ended: the send
+        # is over - bound to the iTerm2 a table after it shows
+        self.assertEqual(self.children[-1].returncode, -signal.SIGKILL)
+        rec = runner._read_claim(self.SIDS[0])
+        self.assertNotIn("send", rec)
+        self.assertEqual(rec["iterm_pid"], [4242])
+
+
+class TestACtrlCWithAProcessThatCannotBeEnded(unittest.TestCase):
+    """Ctrl-C while Popen waits for exec's report, and the process it made
+    cannot be ended: the claim stays on its send lock, never bound while that
+    process may run."""
+
+    _A = TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack
+    SIDS, setUp, sent = _A.SIDS, _A.setUp, _A.sent
+
+    def test_it_keeps_its_send_lock(self):
+        sid = self.SIDS[33]
+        run = failing_after_start(self, KeyboardInterrupt(), "_close_pipe_fds", ("/bin/sleep", "30"))
+        with mock.patch.object(subprocess.Popen, "kill", side_effect=OSError(errno.EPERM, "no")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sent(sid, run)
+        self.assertIsNone(self.children[-1].returncode)
+        rec = runner._read_claim(sid)
+        self.assertIsNotNone(rec.get("send"))
+        self.assertTrue(runner._sending(rec))
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: False))
+        self.assertEqual(runner.why_held(sid), ("starting", 0))

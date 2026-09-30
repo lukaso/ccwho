@@ -10,12 +10,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
 import time
 import subprocess
 import unittest
+from unittest import mock
 
 import ccwho as runner
 import testkit
@@ -4526,7 +4528,7 @@ class TestARestoreThatTimedOutKeepsItsClaims(unittest.TestCase):
         class Refused:
             returncode, stdout, stderr = 1, "", "Not authorized (-1743)"
         self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
-        self.run_stuck(lambda cmd, **kw: Refused())
+        self.run_stuck(refused_at(runner.engine.AE_PROBE))
         self.assertFalse(self.held(self.DEAD_SID))
 
     def test_the_deadline_passed_is_the_one_for_its_windows(self):
@@ -4645,7 +4647,8 @@ class TestALaunchIsClaimedAsUnresolvedBeforeItIsSent(unittest.TestCase):
         self.assertTrue(self.held_while_iterm2_lives(self.SIDS[0]))
 
     def test_a_refusal_with_a_code_gives_them_back(self):                     # control
-        self.outcome(1, "execution error: Not authorized to send Apple events to iTerm2. (-1743)")
+        runner.subprocess.run = refused_at(runner.engine.AE_PROBE)
+        runner.launch_in_iterm(runner.engine.iterm_run_script("cd /x && claude"), 1.0, self.SIDS[:1])
         self.assertFalse(self.held_while_iterm2_lives(self.SIDS[0]))
 
     def test_a_timeout_inside_iterm2_says_it_may_still_run(self):
@@ -4982,9 +4985,10 @@ class TestARestoreSaysWhatAnUnresolvedClaimMeans(unittest.TestCase):
 
 class TestALaunchLetsGoOnlyWhenNothingOfItCanRun(unittest.TestCase):
     """A claim is given back only when none of the launch ran and none can:
-    iTerm2 refused Apple Events (-1743), or refused the one window it was
-    asked for. A refusal part way through many windows leaves the first ones
-    running; a signal or a failure with no code may have sent the event."""
+    iTerm2 refused Apple Events (-1743) at the script's first event, before
+    anything was written. A refusal part way through - -1743 after that
+    probe included - leaves the first windows running; a signal or a failure
+    with no code may have sent the event."""
 
     _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
     SIDS, setUp, held_while_iterm2_lives = _F.SIDS, _F.setUp, _F.held_while_iterm2_lives
@@ -5011,9 +5015,9 @@ class TestALaunchLetsGoOnlyWhenNothingOfItCanRun(unittest.TestCase):
         self.assertTrue(self.held_while_iterm2_lives(self.SIDS[0]))
         self.assertIn("may still run", why)
 
-    def test_apple_events_refused_gives_one_window_back(self):              # control
-        # several: TestARefusalPartWayThroughSeveralWindows
-        res, why = self.launch(1, "Not authorized to send Apple events to iTerm2. (-1743)", self.SIDS[:1])
+    def test_apple_events_refused_at_the_first_event_gives_them_back(self):  # control
+        runner.subprocess.run = refused_at(runner.engine.AE_PROBE)
+        res, why = runner.launch_in_iterm(runner.engine.iterm_run_script("cd /x && claude"), 1.0, self.SIDS[:1])
         self.assertFalse(self.held_while_iterm2_lives(self.SIDS[0]))
         self.assertIn("refused (-1743)", why)
 
@@ -5065,8 +5069,9 @@ class TestAnAttachRefusalIsSaidByItsCode(unittest.TestCase):
 
 class TestACallerSaysALaunchMayStillRun(unittest.TestCase):
     """What `ccwho open` and `restore --open` print for an outcome that may
-    still run: not "refused", not osascript's text, and never a negative exit
-    code (a signal's number)."""
+    still run: not osascript's text, never a negative exit code (a signal's
+    number), and not "refused" - but for -1743 after the script's first
+    event: "refused ... part way through", with MAY_STILL_RUN."""
 
     _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
     LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
@@ -5113,7 +5118,8 @@ class TestACallerSaysALaunchMayStillRun(unittest.TestCase):
         self.assertTrue(self.held(self.LIVE_SID) and self.held(self.DEAD_SID))
 
     def test_a_refusal_of_one_window_gives_it_back(self):                   # control
-        self.fails(1, "Not authorized to send Apple events to iTerm2. (-1743)")
+        self.fails(1, "")
+        runner.subprocess.run = refused_at(runner.engine.AE_PROBE)
         self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
         rc, out = self._restore_open()
         self.assertEqual(rc, 1)
@@ -5484,14 +5490,16 @@ class TestALaunchIsHeldByTheITerm2ThatGotIt(unittest.TestCase):
         runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
 
     def test_a_restarted_iterm2_holds_it(self):
+        # 4242 ran when the launch began (the setUp's table); the one after the
+        # send shows only 5151 - restarted meanwhile, and it got the event
         self.timed_out(f"  PID UID UCOMM\n5151 {os.getuid()} iTerm2\n")
         self.assertFalse(runner.claim_launch(self.SIDS[0], now=time.time() + 3600,
                                              alive=lambda p: p == 5151))
 
-    def test_it_is_bound_to_the_one_the_table_shows(self):                 # control
-        self.timed_out(ITERM_TABLE)
-        with open(runner._claim_path(self.SIDS[0])) as fh:
-            self.assertEqual(json.load(fh)["iterm_pid"], 4242)
+    def test_the_one_from_before_the_restart_does_not(self):                  # control
+        self.timed_out(f"  PID UID UCOMM\n5151 {os.getuid()} iTerm2\n")
+        self.assertTrue(runner.claim_launch(self.SIDS[0], now=time.time() + 3600,
+                                            alive=lambda p: p == 4242))
 
 
 class TestAStaleTableIsNotProofOfAGoneITerm2(unittest.TestCase):
@@ -5511,7 +5519,7 @@ class TestAStaleTableIsNotProofOfAGoneITerm2(unittest.TestCase):
 
     def older(self):
         """A table taken before the claim was written, showing no iTerm2."""
-        return lambda: ("  PID UID UCOMM\n1 0 launchd\n", self.T - 120)
+        return lambda after=None: ("  PID UID UCOMM\n1 0 launchd\n", self.T - 120)
 
     def test_a_live_pid_missing_from_an_older_table(self):
         self.claim(os.getpid())
@@ -5529,17 +5537,18 @@ class TestAStaleTableIsNotProofOfAGoneITerm2(unittest.TestCase):
     def test_an_older_table_binds_nothing(self):
         # a batch's table taken before this claim: its iTerm2 may have died
         # before the one that got the launch started - bound to it, the claim
-        # would be let go the moment it is seen dead
+        # would be let go the moment it is seen dead. A new one is taken.
         tables = runner._tables()
         runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n4242 {os.getuid()} iTerm2\n"
         tables()                                            # taken now, before the claim
         time.sleep(0.01)
         runner._write_claim(self.SID, {"pid": DEAD, "since": time.time(), "sessionId": self.SID,
                                        "unresolved": True, "iterm_pid": None})
+        runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n5151 {os.getuid()} iTerm2\n"
         self.assertFalse(runner.claim_launch(self.SID, now=time.time() + 1, refresh=tables,
-                                             alive=lambda p: p == 4242))
+                                             alive=lambda p: p == 5151))
         with open(runner._claim_path(self.SID)) as fh:
-            self.assertIsNone(json.load(fh)["iterm_pid"], "bound on a table older than the claim")
+            self.assertEqual(json.load(fh)["iterm_pid"], 5151, "bound on a table older than the claim")
 
 
 class TestALaunchNotOursAnyMoreIsNotSent(unittest.TestCase):
@@ -5590,7 +5599,7 @@ class TestTheListSaysALaunchThatMayStillRun(unittest.TestCase):
     def test_a_refused_reopen_still_could_not(self):                      # control
         class Refused:
             returncode, stdout, stderr = 1, "", "Not authorized (-1743)"
-        runner.subprocess.run = lambda cmd, **kw: Refused()
+        runner.subprocess.run = refused_at(runner.engine.AE_PROBE)
         self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
         self.assertIn("could not reopen", runner.reopen_saved())
 
@@ -6024,7 +6033,7 @@ class TestAReceiverThatDiedTookItsEventWithIt(unittest.TestCase):
             returncode, stdout, stderr = 1, "", "execution error: Connection is invalid. (-609)"
         self.assertTrue(self.after(lambda cmd, **kw: R()))
 
-    def test_a_timeout_still_moves_it(self):                                  # control
+    def test_a_timeout_binds_it_to_the_iterm2_after_the_send(self):           # control
         def stuck(cmd, **kw):
             raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
         self.assertFalse(self.after(stuck))
@@ -6488,7 +6497,7 @@ class TestAClaimLaunchTakesAtMostOneNewTable(unittest.TestCase):
             "T = time.time(); sid = '4f2b91ac-1111-4222-8333-abcdefabcdef'\n"
             "r._write_claim(sid, {'pid': 4000000, 'since': T - 60, 'sessionId': sid, 'unresolved': True,"
             " 'iterm_pid': os.getpid()})\n"
-            "print(r.claim_launch(sid, now=T, refresh=lambda: ('  PID UID UCOMM\\n1 0 launchd\\n', T - 120)))\n")
+            "print(r.claim_launch(sid, now=T, refresh=lambda after=None: ('  PID UID UCOMM\\n1 0 launchd\\n', T - 120)))\n")
         here = os.path.dirname(os.path.abspath(__file__))
         try:
             r = subprocess.run([sys.executable, "-B", "-c", code], cwd=here, capture_output=True, text=True,
@@ -6507,7 +6516,7 @@ class TestAScanWithNoClaimsTakesNoLock(unittest.TestCase):
 
     def locks(self):
         taken, real = [], runner._claims_locked
-        runner._claims_locked = lambda: taken.append(1) or real()
+        runner._claims_locked = lambda **kw: taken.append(1) or real(**kw)
         self.addCleanup(setattr, runner, "_claims_locked", real)
         return taken
 
@@ -7740,25 +7749,36 @@ class TestTheOsascriptItRunsHoldsTheSend(unittest.TestCase):
 class TestATableFromDuringASendReleasesNothing(unittest.TestCase):
     """A table taken while a launch was being sent - before its osascript had
     started iTerm2 - must never release that launch once the send is over:
-    only one taken after the send was seen to end can."""
+    it is judged on a table taken after the send was seen to end, which
+    shows the iTerm2 the osascript started."""
 
     _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
     SIDS, setUp = _F.SIDS, _F.setUp
 
-    def test_after_a_send_whose_ps_could_not_be_read(self):
+    def timed_out(self, after):
+        # another restore takes its batch table during this send, when no
+        # iTerm2 runs; after the send the table is `after`
         sid, batch, sending = self.SIDS[0], runner._tables(), []
-        runner.engine.app_snapshot = lambda: NO_ITERM if sending else ""    # after it: unreadable
+        runner.engine.app_snapshot = lambda: NO_ITERM if sending else after
 
         def run(cmd, **kw):
             sending.append(1)
-            batch()                                     # another restore's table, taken now
+            batch()
+            time.sleep(0.01)
             sending.clear()
             raise subprocess.TimeoutExpired(cmd, 1)
         runner.subprocess.run = run
         runner.launch_in_iterm("script", 1.0, [sid])
-        self.assertFalse(runner.claim_launch(sid, alive=lambda p: False, refresh=batch))
-        runner.engine.app_snapshot = lambda: NO_ITERM
-        self.assertTrue(runner.claim_launch(sid, alive=lambda p: False))    # control: a table after
+        return sid, batch
+
+    def test_bound_to_the_iterm2_its_osascript_started(self):
+        sid, batch = self.timed_out(ITERM_TABLE)
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: p == 4242, refresh=batch))
+
+    def test_after_a_send_whose_ps_could_not_be_read(self):
+        sid, batch = self.timed_out("")
+        runner.engine.app_snapshot = lambda: ITERM_TABLE        # the one its osascript started
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: p == 4242, refresh=batch))
 
     def test_after_a_launcher_that_died_mid_send(self):
         # killed before it could record what the send did: its record names
@@ -7769,8 +7789,13 @@ class TestATableFromDuringASendReleasesNothing(unittest.TestCase):
         runner.engine.app_snapshot = lambda: NO_ITERM
         batch()                                         # taken while it was being sent
         os.close(fd)                                    # it dies: the lock goes, its file stays
-        self.assertFalse(runner.claim_launch(sid, alive=lambda p: False, refresh=batch))
-        self.assertTrue(runner.claim_launch(sid, alive=lambda p: False))    # control: a table after
+        runner.engine.app_snapshot = lambda: ITERM_TABLE
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: p == 4242, refresh=batch))
+
+    def test_a_table_after_the_send_with_no_iterm2(self):                       # control
+        sid, batch = self.timed_out(ITERM_TABLE)
+        runner.engine.app_snapshot = lambda: NO_ITERM
+        self.assertTrue(runner.claim_launch(sid, alive=lambda p: p == 4242))
 
 
 class TestARefusalPartWayThroughSeveralWindows(unittest.TestCase):
@@ -7890,7 +7915,7 @@ class TestWhyHeldIsWhatTheRefusalSaid(unittest.TestCase):
     def test_after_two_tables_that_could_not_tell(self):
         runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 60, "sessionId": self.SID,
                                        "unresolved": True, "iterm_pid": None, "boot": "THIS-BOOT"})
-        older = lambda: (NO_ITERM, self.T - 120)          # from before the claim: tells nothing
+        older = lambda after=None: (NO_ITERM, self.T - 120)   # from before the claim: tells nothing
         self.assertFalse(runner.claim_launch(self.SID, refresh=older))
         os.remove(runner._claim_path(self.SID))
         self.assertEqual(runner.why_held(self.SID), ("unresolved", 0))
@@ -8023,3 +8048,258 @@ class TestWhatAClaimNamesIsReadWithCare(unittest.TestCase):
         self.assertFalse(os.path.islink(runner._claim_path(self.SID)))
         with open(target) as fh:
             self.assertIs(json.load(fh).get("launched"), True)
+
+
+class TestABatchJudgesEachClaimOnATableAfterIt(unittest.TestCase):
+    """A restore shares one table for its claims. A claim re-dated when its
+    send is seen over is newer than that table: it gets one taken after it -
+    never the older one, and never "held" for want of one."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def sent_and_died(self, sids):
+        # a restore of these whose launcher died mid-send: one send lock,
+        # let go of, named by all of them
+        token, fd = runner._hold_send()
+        for sid in sids:
+            self.assertTrue(runner.claim_unresolved(sid, None, send=token))
+        os.close(fd)
+
+    def test_all_of_them_reopen_with_no_iterm2(self):
+        sids = self.SIDS[:3]
+        self.sent_and_died(sids)
+        runner.engine.app_snapshot = lambda: NO_ITERM
+        tables = runner._tables()
+        self.assertEqual([runner.claim_launch(s, alive=lambda p: False, refresh=tables) for s in sids],
+                         [True, True, True])
+
+    def test_all_of_them_held_by_a_running_iterm2(self):                        # control
+        sids = self.SIDS[:3]
+        self.sent_and_died(sids)
+        runner.engine.app_snapshot = lambda: ITERM_TABLE
+        tables = runner._tables()
+        self.assertEqual([runner.claim_launch(s, alive=lambda p: p == 4242, refresh=tables) for s in sids],
+                         [False, False, False])
+
+
+class TestNothingFromTheFutureIsTrusted(unittest.TestCase):
+    """The wall clock can be set back: a decision, or a table, stamped later
+    than now was made before the step - its order against claims and
+    sightings written since is unknown."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_decision_from_the_future(self):
+        # scan at 10000, clock set back to 6400, a sighting at 6402: the
+        # decision at "10000" must not take the session
+        runner._write_claim(self.SID, {"sessionId": self.SID, "seen": True, "since": self.T - 5, "until": self.T})
+        self.assertFalse(runner.claim_launch(self.SID, decided_at=time.time() + 3600))
+        self.assertEqual(runner.why_held(self.SID)[0], "old list")
+
+    def test_a_decision_just_made(self):                                        # control
+        self.assertTrue(runner.claim_launch(self.SID, decided_at=time.time() - 1))
+
+    def test_a_table_from_the_future(self):
+        runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 60, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": None, "boot": "THIS-BOOT"})
+        future = lambda after=None: (NO_ITERM, time.time() + 7200)
+        self.assertFalse(runner.claim_launch(self.SID, alive=lambda p: False, refresh=future))
+
+
+class TestTheClaimDirIsPrivate(unittest.TestCase):
+    """Another user who can write in launching/ can remove a send lock's file
+    mid-send - and the claim reads as not being sent."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_made_private_whatever_the_umask(self):
+        old = os.umask(0)
+        try:
+            runner._claims_dir()
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmp, "launching")).st_mode), 0o700)
+
+    def test_one_open_to_others_is_made_private(self):
+        d = os.path.join(self.tmp, "launching")
+        os.makedirs(d)
+        os.chmod(d, 0o777)
+        runner._claims_dir()
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_one_of_another_user_is_refused(self):
+        os.makedirs(os.path.join(self.tmp, "launching"))
+        sent = []
+        runner.subprocess.run = lambda *a, **k: sent.append(a)
+        with mock.patch.object(runner.os, "geteuid", return_value=os.getuid() + 1):
+            self.assertTrue(runner.claim_launch(self.SID))
+            self.assertIn(self.SID, runner._unrecorded())
+            res, why = runner.launch_in_iterm("script", 1.0, [self.SID])
+        self.assertFalse(os.path.lexists(runner._claim_path(self.SID)))
+        self.assertIsNone(res)
+        self.assertIn("could not record", why)
+        self.assertEqual(sent, [])
+
+    def test_one_of_ours(self):                                                 # control
+        self.assertTrue(runner.claim_launch(self.SID))
+        self.assertTrue(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_link_is_said_as_one(self):
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(other)
+        os.symlink(other, os.path.join(self.tmp, "launching"))
+        runner.subprocess.run = lambda *a, **k: self.fail("sent")
+        self.assertTrue(runner.claim_launch(self.SID))
+        res, why = runner.launch_in_iterm("script", 1.0, [self.SID])
+        self.assertIn("not a link", why)
+
+
+class TestAClaimsLockHeldForGoodStopsNoScan(unittest.TestCase):
+    """A ccwho stopped (Ctrl-Z) while it holds the claims lock must not
+    freeze every scan and every list: a scan does not wait for it, and a
+    launch waits a while, then refuses."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def hold_the_lock(self):
+        d = os.path.join(self.tmp, "launching")
+        os.makedirs(d, exist_ok=True)
+        fd = os.open(os.path.join(d, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def within(self, seconds, call):
+        out = []
+        t = threading.Thread(target=lambda: out.append(call()), daemon=True)
+        t.start()
+        t.join(seconds)
+        return out
+
+    def test_a_scan_does_not_wait(self):
+        runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 60, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": None})
+        self.hold_the_lock()
+        self.assertEqual(self.within(3, lambda: runner.release_claims([self.SID], self.T)), [None])
+
+    def test_a_launch_waits_a_while_then_refuses(self):
+        self.addCleanup(setattr, runner, "CLAIMS_LOCK_SECONDS", runner.CLAIMS_LOCK_SECONDS)
+        runner.CLAIMS_LOCK_SECONDS = 0.2
+        self.hold_the_lock()
+        runner.subprocess.run = lambda *a, **k: self.fail("sent")
+        self.assertEqual(self.within(3, lambda: runner.claim_launch(self.SID)), [True])
+        res, why = runner.launch_in_iterm("script", 1.0, [self.SID])
+        self.assertIsNone(res)
+        self.assertIn("stopped", why)
+
+    def test_a_scan_with_the_lock_free(self):                                   # control
+        runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 60, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": None})
+        runner.release_claims([self.SID], self.T)
+        with open(runner._claim_path(self.SID)) as fh:
+            self.assertIs(json.load(fh).get("seen"), True)
+
+
+class TestTheSweepKnowsASendLockByItsToken(unittest.TestCase):
+    """A send lock is named by a token, not a session id: a narrower session
+    id pattern must not leave its files behind for good."""
+
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_an_old_one_with_a_session_id_pattern_of_uuids(self):
+        token, fd = runner._hold_send()
+        os.close(fd)
+        os.utime(runner._send_path(token), (self.T - 7200, self.T - 7200))
+        self.addCleanup(setattr, runner.engine, "_SESSION_ID", runner.engine._SESSION_ID)
+        runner.engine._SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+        runner.release_claims([], self.T)
+        self.assertFalse(os.path.exists(runner._send_path(token)))
+
+
+class TestASendValueNoCcwhoWrote(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_values_that_are_no_token(self):
+        for send in (5, ["ab" * 16], {"x": 1}, True):
+            rec = {"pid": DEAD, "since": time.time() - 60, "sessionId": self.SID, "unresolved": True,
+                   "iterm_pid": None, "send": send}
+            runner._write_claim(self.SID, rec)
+            runner.release_claims([self.SID], time.time())
+            runner._write_claim(self.SID, rec)
+            self.assertTrue(runner.claim_launch(self.SID), send)
+
+    def test_a_token_held(self):                                                # control
+        held = runner._hold_send()
+        self.addCleanup(runner._let_go_send, held)
+        runner._write_claim(self.SID, {"pid": DEAD, "since": time.time() - 60, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": None, "send": held[0]})
+        self.assertFalse(runner.claim_launch(self.SID))
+
+
+def refused_at(where):
+    """osascript as iTerm2 refusing Apple Events (-1743) at the statement of
+    the script it runs that `where` starts - its range, as osascript gives it."""
+    def run(cmd, **kw):
+        at = cmd[-1].index(where)
+
+        class R:
+            returncode, stdout = 1, ""
+            stderr = (f"{at}:{at + len(where)}: execution error: Not authorized to send"
+                      " Apple events to iTerm2. (-1743)")
+        return R()
+    return run
+
+
+class TestAnAutomationRefusalIsPlacedByItsStatement(unittest.TestCase):
+    """-1743 is Automation refused. At the script's first event - a probe
+    that writes nothing - nothing was sent: the claims go, and the line says
+    how to allow it. Anywhere after it a window may have been written, even
+    in a script of one window (the pane fill walks on after its write): the
+    claims stay."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp, held_while_iterm2_lives = _F.SIDS, _F.setUp, _F.held_while_iterm2_lives
+
+    def script(self, sids):
+        return runner.engine.iterm_open_script([{"sessionId": s, "cwd": "/x", "project": "x"} for s in sids])
+
+    def test_every_script_starts_with_the_probe(self):
+        for script in (self.script(self.SIDS[:2]), runner.engine.iterm_run_script("cd /x && claude")):
+            first = script.splitlines()[1].strip()
+            self.assertEqual(first, runner.engine.AE_PROBE, script)
+
+    def test_at_the_probe_nothing_was_sent(self):
+        runner.subprocess.run = refused_at(runner.engine.AE_PROBE)
+        res, why = runner.launch_in_iterm(self.script(self.SIDS[:3]), 1.0, self.SIDS[:3])
+        self.assertIsNone(res)
+        self.assertIn("refused (-1743)", why)
+        self.assertIn("Automation", why)
+        self.assertNotIn(runner.MAY_STILL_RUN, why)
+        self.assertFalse(any(self.held_while_iterm2_lives(s) for s in self.SIDS[:3]))
+
+    def test_after_it_they_stay(self):                                          # control
+        runner.subprocess.run = refused_at("create window")
+        res, why = runner.launch_in_iterm(self.script(self.SIDS[:3]), 1.0, self.SIDS[:3])
+        self.assertIn("Automation", why)
+        self.assertIn(runner.MAY_STILL_RUN, why)
+        self.assertTrue(all(self.held_while_iterm2_lives(s) for s in self.SIDS[:3]))
+
+    def test_after_a_write_in_one_window(self):
+        sid = self.SIDS[0]
+        script = runner.engine.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+                                                 fill={sid: "U-1"})
+        runner.subprocess.run = refused_at("end repeat")          # walking on, after the write
+        runner.launch_in_iterm(script, 1.0, [sid])
+        self.assertTrue(self.held_while_iterm2_lives(sid))
+
+    def test_one_with_no_place(self):
+        # a -1743 osascript gives no range for: nothing says nothing was sent
+        class R:
+            returncode, stdout, stderr = 1, "", "Not authorized to send Apple events to iTerm2. (-1743)"
+        runner.subprocess.run = lambda cmd, **kw: R()
+        runner.launch_in_iterm(self.script(self.SIDS[:1]), 1.0, self.SIDS[:1])
+        self.assertTrue(self.held_while_iterm2_lives(self.SIDS[0]))

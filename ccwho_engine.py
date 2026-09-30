@@ -1209,6 +1209,28 @@ def ae_error_code(err):
     """The Apple Event error code osascript ended its message with, or None."""
     m = _AE_ERROR.search(err or "")
     return m.group(1) if m else None
+
+
+# where in the script osascript's error came from: "<start>:<end>: execution error"
+_AE_ERROR_AT = re.compile(r"(\d+):(\d+): execution error")
+
+
+def ae_error_at(err, script, statement):
+    """Did osascript's last error come from `statement` - the first line of
+    `script` that is it? By the source range osascript puts before its
+    message (it may be a part of the statement); False when there is none."""
+    found = _AE_ERROR_AT.findall(err or "")
+    at = script.find(statement)
+    if not found or at < 0:
+        return False
+    return at <= int(found[-1][0]) < at + len(statement)
+
+
+# Each launch script's first event: it writes nothing, so a -1743 that comes
+# from it - Automation refused, or a consent prompt answered "Don't Allow" -
+# means nothing of the script was sent (ae_error_at).
+AE_PROBE = "count windows"
+_ITERM_HEAD = 'tell application "iTerm2"\n  %s\n  activate\n' % AE_PROBE
 # $0 is osascript, $1 the state dir. Output goes to files: a pipe nobody reads
 # any more fills at 64 KB, and the child - holding the lock - never exits. The
 # status is written last, so it exists only for an ask that ran to its end. The
@@ -2867,7 +2889,7 @@ def iterm_run_script(cmd):
     restore script, used when a click lands on a session that is no longer up."""
     if not cmd:
         return ""
-    return ('tell application "iTerm2"\n  activate\n'
+    return (_ITERM_HEAD +
             '  set w to (create window with default profile)\n'
             '  tell current session of w\n'
             '    write text %s\n  end tell\nend tell\n' % applescript_str(cmd))
@@ -2992,7 +3014,7 @@ def iterm_open_script(entries, fill=None):
                  "        end try",
                  "      end repeat", "    end repeat", "  end repeat"]
     body = "\n".join(head + lines + ["  return done"])
-    return 'tell application "iTerm2"\n  activate\n%s\nend tell\n' % body
+    return _ITERM_HEAD + '%s\nend tell\n' % body
 
 
 # -------------------------------------------------------------------- assemble

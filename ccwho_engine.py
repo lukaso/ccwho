@@ -1298,10 +1298,13 @@ def app_snapshot():
     """The cheap process table: no tty column (0.03 s of ps, where the tty
     column costs 0.2 s) - enough to find iTerm2 outside a scan."""
     try:
-        return subprocess.run(["ps", "-eo", "pid,uid,ucomm"], capture_output=True,
-                              text=True, errors="replace", timeout=APP_SNAPSHOT_SECONDS).stdout
+        r = subprocess.run(["ps", "-eo", "pid,uid,ucomm"], capture_output=True,
+                           text=True, errors="replace", timeout=APP_SNAPSHOT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return ""
+    # one that did not end cleanly may have printed part of the table: an
+    # iTerm2 missing from it is not gone
+    return r.stdout if r.returncode == 0 else ""
 
 
 @functools.cache
@@ -1481,7 +1484,8 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
                            error=ahead.get("last_error"))
                 return None
         now = time.time() if fixed_now is None else fixed_now
-        pid = iterm_app_pid(app_snapshot() if procs is None else procs)
+        table = app_snapshot() if procs is None else procs
+        pid = iterm_app_pid(table)
         if pid is None:
             why["refused"] = "no-iterm"     # `tell application "iTerm2"` would launch it
             return None
@@ -1494,10 +1498,12 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
             state.pop("quarantine")         # of an iTerm2 before a reboot: its pid is nobody's now
                                             # (a boot not recorded, or not readable: it holds)
             state.pop("last_error", None)
-        if state.get("quarantine") not in (None, pid):
-            state.pop("quarantine")         # a restarted iTerm2
+        if state.get("quarantine") not in (None, pid) and not is_iterm_app(table, state["quarantine"]):
+            state.pop("quarantine")         # a restarted iTerm2: the stuck one is gone
             state.pop("last_error", None)
-        elif state.get("quarantine") == pid:
+        elif state.get("quarantine") is not None:
+            # still running - beside a lower one too: `tell application
+            # "iTerm2"` may reach it yet
             why.update(refused="stuck", error=state.get("last_error"))
             return None
         elif now < state.get("wait_until", 0):

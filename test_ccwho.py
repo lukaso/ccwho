@@ -7456,6 +7456,24 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
             json.dump({"quarantine": 100, "asked_pid": 100, "last_error": "-1712", "boot": boot}, f)
         self.stub("echo ok")
 
+    def quarantined_on(self, pid):
+        os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
+        with open(self.state("json"), "w") as f:
+            json.dump({"quarantine": pid, "asked_pid": pid, "last_error": "-1712", "boot": "THIS-BOOT"}, f)
+        self.stub("echo ok")
+
+    def test_a_quarantined_iterm2_still_running_beside_a_lower_one(self):
+        # two of ours: `tell application "iTerm2"` may reach the stuck one yet
+        self.quarantined_on(200)
+        why = {}
+        self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], timeout=10.0, procs=apps((100, ME, IT), (200, ME, IT)),
+                                          why=why))
+        self.assertEqual(why.get("refused"), "stuck")
+
+    def test_a_quarantined_iterm2_gone(self):                                   # control
+        self.quarantined_on(200)
+        self.assertEqual(ccwho.iterm_ask(["-e", "whatever"], timeout=10.0, procs=apps((100, ME, IT))), "ok\n")
+
     def test_a_quarantine_from_before_a_reboot_is_dropped(self):
         # a pid names a process only within a boot: after one, an iTerm2 with
         # the old one's pid is a new iTerm2
@@ -7622,3 +7640,26 @@ class TestACarriedPaneIsText(unittest.TestCase):
     def test_a_pane_that_is_not_text_is_not_carried(self):
         man = ccwho.manifest_from_rows([self.ROW], panes=None, known={"s1": {"pane": ["G"], "tabTitle": 5}})
         self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]), ("", ""))
+
+
+class TestATableFromAPsThatFailedIsNone(unittest.TestCase):
+    """A ps that died part way prints part of the table: an iTerm2 missing
+    from it is not gone. Anything but a clean exit reads as no table."""
+
+    def run_ps(self, returncode, stdout):
+        class R:
+            pass
+        R.returncode, R.stdout = returncode, stdout
+        real = ccwho.subprocess.run
+        self.addCleanup(setattr, ccwho.subprocess, "run", real)
+        ccwho.subprocess.run = lambda *a, **k: R()
+        return ccwho.app_snapshot()
+
+    def test_killed_part_way(self):
+        self.assertEqual(self.run_ps(-9, "  PID UID UCOMM\n1 0 launchd\n"), "")
+
+    def test_failed(self):
+        self.assertEqual(self.run_ps(1, "  PID UID UCOMM\n1 0 launchd\n"), "")
+
+    def test_a_clean_exit(self):                                                # control
+        self.assertEqual(self.run_ps(0, "  PID UID UCOMM\n1 0 launchd\n"), "  PID UID UCOMM\n1 0 launchd\n")

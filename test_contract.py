@@ -135,14 +135,35 @@ class TestEveryTestFileRunsInTheScript(unittest.TestCase):
     never runs there, and a regression in it passes green (test_codex was
     missing, review 2026-09-29)."""
 
+    @staticmethod
+    def modules_run(script):
+        """The modules `./test` runs whole: CORE, and the UI stage's bare ids -
+        a stage that names one class of a module (module.Class) does not run
+        the module (review 4 of the terminal-app slice 1)."""
+        import re
+        script = script.replace("\\\n", " ")
+        core = re.search(r'^CORE="([^"]*)"', script, re.M).group(1).split()
+        ui = re.search(r"python -m unittest ([A-Za-z_. ]+?)\s+\"\$@\"", script).group(1).split()
+        return set(core) | {t for t in ui if "." not in t}
+
+    def script(self):
+        import os
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test")) as fh:
+            return fh.read()
+
     def test_every_test_module_is_named(self):
         import os
         import re
         here = os.path.dirname(os.path.abspath(__file__))
-        script = open(os.path.join(here, "test")).read()
-        core = re.search(r'^CORE="([^"]*)"', script, re.M).group(1).split()
-        ui = re.search(r"python -m unittest ([a-z_ ]+?)\s+\"\$@\"", script).group(1).split()
+        run = self.modules_run(self.script())
         files = sorted(f[:-3] for f in os.listdir(here)
                        if re.fullmatch(r"test_[a-z_]+\.py", f))
-        self.assertEqual(sorted(set(files) - set(core) - set(ui)), [])
-        self.assertIn("test_ui", ui)                                     # control: it parsed
+        self.assertEqual(sorted(set(files) - run), [])
+        self.assertIn("test_ui", run)                                    # control: it parsed
+
+    def test_a_class_a_stage_names_does_not_run_its_module(self):
+        script = self.script()
+        self.assertIn("test_terms.TestTheTestsPatchNamesThatExist", script)
+        without = script.replace(" test_terms ", " ", 1)
+        self.assertNotIn("test_terms", self.modules_run(without))
+        self.assertIn("test_terms", self.modules_run(script))           # control

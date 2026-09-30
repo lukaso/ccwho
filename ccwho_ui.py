@@ -2233,7 +2233,7 @@ class Adapter:
         """One new iTerm2 window, running `claude attach <id>`."""
         try:
             done = subprocess.run(
-                ["osascript", "-e", engine.iterm_run_script(cmd)],
+                ["osascript", "-e", engine.terms.ITERM2.run_script(cmd)],
                 capture_output=True, text=True, errors="replace", timeout=deadline)
         except subprocess.TimeoutExpired:
             return f"iTerm2 did not answer in {deadline:g}s"
@@ -2241,7 +2241,8 @@ class Adapter:
             return f"could not reach iTerm2 ({type(ex).__name__})"
         if done.returncode:
             # its code, never its text: osascript's message quotes paths
-            return f"could not open a window - {engine.osascript_trouble(done.returncode, done.stderr)}"
+            trouble = engine.terms.ITERM2.trouble(done.returncode, done.stderr)
+            return f"could not open a window - {trouble}"
         return "attached it in a new window"
 
     def copy(self, text, deadline=2.0):
@@ -2285,7 +2286,7 @@ class Adapter:
             return f"could not reach iTerm2 ({type(ex).__name__})"
         # what jump.applescript says, or osascript's code - never its text
         return (done.stdout or "").strip() or (
-            engine.osascript_trouble(done.returncode, done.stderr) if done.returncode else "done")
+            engine.terms.ITERM2.trouble(done.returncode, done.stderr) if done.returncode else "done")
 
 
 def main():

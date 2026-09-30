@@ -113,3 +113,72 @@ print(sort(["/usr/bin/true"], (testkit.FORK_POINT, BlockingIOError(errno.EAGAIN,
       masked(), ctrl_c("communicate"), ctrl_c("__enter__"))
 """
 SPAWN_RULE_SORTS = ["none-ran", "none-ran", "may-run", "may-run", "not-ended", "found-ended", "not-found"]
+
+
+_ABSENT = object()                 # "not on the object": None is a value like any other
+_LIVE = {}                         # (id(obj), name) -> the patches of it still on, oldest first
+
+
+def patch(test, obj, name, value):
+    """obj.name = value until `test` ends, or until the undo it returns is
+    called. The undo acts on THIS obj - a restore that looks the object up
+    again when it runs lands on whatever the name leads to then, and a hot
+    reload swaps ccwho_terms - and puts back exactly what obj itself held: a
+    method an app has from its class is removed from the app, never replaced
+    by a bound copy (review 3 of the terminal-app slice 1).
+
+    Refused before anything is set (reviews 4, 5): a name obj does not have -
+    a typo would put a fake nothing reads, and leave the real one on - and an
+    obj whose setattr does not simply store the value on it: one that passes
+    it on (a proxy), or a data descriptor of its class (a property, a slot).
+    An undo while a later patch of the same name is on changes nothing and
+    raises; the cleanups, last first, undo both. An undo after the code under
+    test set the name itself, or took it away, puts the original back."""
+    import types
+    if not hasattr(obj, name):
+        raise AttributeError(f"{obj!r} has no attribute {name!r} to patch")
+    cls = type(obj)
+    plain = cls.__setattr__ in (object.__setattr__, types.ModuleType.__setattr__, type.__setattr__)
+    held = next((vars(k)[name] for k in cls.__mro__ if name in vars(k)), None)
+    if not plain or hasattr(type(held), "__set__"):
+        raise TypeError(f"{name!r} set on {obj!r} would not land on it: patch it where it lives")
+    own = vars(obj)
+    old = own.get(name, _ABSENT)
+    setattr(obj, name, value)
+    if vars(obj).get(name, _ABSENT) is not value:
+        raise AssertionError(f"{name!r} did not land on {obj!r}")    # refused above; never seen
+    token, key = object(), (id(obj), name)
+    _LIVE.setdefault(key, []).append(token)
+
+    def undo():
+        live = _LIVE.get(key, [])
+        if token not in live:
+            return                                  # undone already
+        if live[-1] is not token:
+            raise AssertionError(f"{name!r} on {obj!r} was patched again: undo that first")
+        live.pop()
+        if not live:
+            _LIVE.pop(key, None)
+        if old is not _ABSENT:
+            setattr(obj, name, old)
+        elif name in vars(obj):
+            delattr(obj, name)
+    test.addCleanup(undo)
+    return undo
+
+
+def fresh_terms(engine):
+    """ccwho_terms loaded new from its file - its own functions, nothing a test
+    put on it - and made the engine's and sys.modules'. Returns it.
+
+    A hot reload SWAPS that module (the engine is re-read in place, the rule
+    modules are not): a guard or a fake put on the old one guards nothing, and
+    a function kept from it runs with the old module's STATE_DIR and
+    OSASCRIPT - the real ~/.cache/ccwho, a real osascript (review of the
+    terminal-app slice 1). So a test module takes the live module fresh when it
+    starts and when it ends, and keeps no ccwho_terms object across tests."""
+    import sys
+    fresh = engine._load_beside(sys.modules["ccwho_terms"])
+    sys.modules["ccwho_terms"] = fresh
+    engine.terms = fresh
+    return fresh

@@ -300,6 +300,16 @@ def merge_sessions(agent_rows, file_rows):
     return agents + [r for r in file_rows or [] if r.get("sessionId") not in have]
 
 
+def ps_rows(ps_output):
+    """(pid, ppid, command) rows of `ps -eo pid,ppid,command`: pid as text,
+    ppid as an int, in ps's order. A line without all three is skipped."""
+    for line in (ps_output or "").splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) < 3 or not fields[1].isdigit():
+            continue
+        yield fields[0], int(fields[1]), fields[2]
+
+
 def parse_ps_table(text):
     """pid -> (start, command) from `ps -axo pid=,lstart=,comm=` run under
     LC_ALL=C TZ=UTC. The start is five words ("Tue Sep 22 13:45:15 2026"),

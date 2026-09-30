@@ -14,6 +14,7 @@ import tempfile
 import unittest
 
 import ccwho_setup as setup
+import testkit
 
 
 # Reading this machine's session files is machine state; see test_ccwho. Every
@@ -260,28 +261,19 @@ class TestFactGatherersSurviveTheMachine(unittest.TestCase):
             seen["script"] = args[-1]
             return "3\n"
 
-        real = setup.engine.iterm_ask
-        setup.engine.iterm_ask = fake_ask
-        try:
-            self.assertTrue(setup.iterm_scriptable())
-        finally:
-            setup.engine.iterm_ask = real
+        testkit.patch(self, setup.engine.terms.ITERM2, "ask", fake_ask)
+        self.assertTrue(setup.iterm_scriptable())
         self.assertIn('tell application "iTerm2"', seen["script"])
         self.assertNotIn("System Events", seen["script"])
 
     def test_a_refused_automation_prompt_is_not_scriptable(self):
         # an ask that was made, and refused: -1743 is errAEEventNotPermitted
-        real = setup.engine.iterm_ask
-
         def refused(args, timeout=5.0, why=None, **k):
             if why is not None:
                 why.update({"asked": True, "refused": None, "error": "-1743"})
             return None
-        setup.engine.iterm_ask = refused
-        try:
-            self.assertIs(setup.iterm_scriptable(), False)
-        finally:
-            setup.engine.iterm_ask = real
+        testkit.patch(self, setup.engine.terms.ITERM2, "ask", refused)
+        self.assertIs(setup.iterm_scriptable(), False)
 
 
 class TestVerdict(unittest.TestCase):
@@ -1332,7 +1324,7 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
     and must not send you to System Settings. An Automation refusal still does."""
 
     def setUp(self):
-        self.addCleanup(setattr, setup.engine, "iterm_ask", setup.engine.iterm_ask)
+        self.iterm = setup.engine.terms.ITERM2
 
     def fake(self, out, **why):
         def ask(args, timeout=5.0, why=None, **k):
@@ -1342,7 +1334,7 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
             self.kw = k
             return out
         self.why = why
-        setup.engine.iterm_ask = ask
+        testkit.patch(self, self.iterm, "ask", ask)
 
     def test_a_stuck_iterm2_is_not_knowing(self):
         self.fake(None, refused="stuck", error="-1712")
@@ -1412,9 +1404,9 @@ class TheStartTimeOfITerm2IsOurs(unittest.TestCase):
     """iterm_started_at found iTerm2 with `pgrep -x iTerm2`: argv[0], any user."""
 
     def test_it_finds_iterm2_the_way_the_gate_does(self):
-        self.addCleanup(setattr, setup.engine, "app_snapshot", setup.engine.app_snapshot)
+        self.addCleanup(setattr, setup.engine.terms, "app_snapshot", setup.engine.terms.app_snapshot)
         self.addCleanup(setattr, setup.subprocess, "run", setup.subprocess.run)
-        setup.engine.app_snapshot = lambda: f"  PID UID UCOMM\n4242 {os.getuid()} iTerm2\n"
+        setup.engine.terms.app_snapshot = lambda: f"  PID UID UCOMM\n4242 {os.getuid()} iTerm2\n"
         asked = []
 
         def run(cmd, **k):

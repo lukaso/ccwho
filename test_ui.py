@@ -2903,7 +2903,7 @@ class TestTheListReloadsLikeTheWatch(unittest.TestCase):
 
     def test_every_rule_module_is_re_read(self):
         for mod, handle in (("ccwho_brief", "brief"), ("ccwho_index", "ccwho_index"),
-                            ("ccwho_procs", "procs")):
+                            ("ccwho_procs", "procs"), ("ccwho_terms", "terms")):
             with self.subTest(module=mod):
                 m = __import__(mod)
                 path = m.__file__

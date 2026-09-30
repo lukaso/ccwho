@@ -12,7 +12,7 @@
 set -e
 cd "$(dirname "$0")"
 
-CORE="test_ccwho test_procs test_world test_signal test_kill_cli test_runner test_brief test_index test_setup test_contract test_panel test_usage test_codex"
+CORE="test_ccwho test_terms test_procs test_world test_signal test_kill_cli test_runner test_brief test_index test_setup test_contract test_panel test_usage test_codex"
 echo "== engine, brief, index, setup, runner (stdlib) =="
 python3 -m unittest $CORE "$@"
 
@@ -22,4 +22,6 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "uv is not installed, so the UI tests cannot run: brew install uv" >&2
   exit 1
 fi
-exec uv run --quiet --with "textual>=8.0,<9" python -m unittest test_ui test_ui_kill test_ui_codex "$@"
+# and the scan of what the tests patch, now with ccwho_ui importable
+exec uv run --quiet --with "textual>=8.0,<9" python -m unittest test_ui test_ui_kill test_ui_codex \
+  test_terms.TestTheTestsPatchNamesThatExist "$@"

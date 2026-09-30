@@ -290,30 +290,32 @@ class ThePanelWindowIsABackgroundAsk(unittest.TestCase):
     def setUp(self):
         import subprocess
         eng = panel.setup.engine
-        real = (eng.iterm_ask, eng.app_snapshot, eng.tty_snapshot, subprocess.run)
-        self.addCleanup(lambda: (setattr(eng, "iterm_ask", real[0]), setattr(eng, "app_snapshot", real[1]),
-                                 setattr(eng, "tty_snapshot", real[2]), setattr(subprocess, "run", real[3])))
+        terms = eng.terms              # put back on the objects they were taken from
+        real = (terms.app_snapshot, eng.tty_snapshot, subprocess.run)
+        self.addCleanup(lambda: (terms.ITERM2.__dict__.pop("ask", None),
+                                 setattr(terms, "app_snapshot", real[0]),
+                                 setattr(eng, "tty_snapshot", real[1]), setattr(subprocess, "run", real[2])))
 
         def direct(*a, **k):
             raise AssertionError("a program run directly, not through the gate")
         subprocess.run = direct
         self.tables = []
-        eng.app_snapshot = lambda: self.tables.append(1) or self.TABLE
+        eng.terms.app_snapshot = lambda: self.tables.append(1) or self.TABLE
         eng.tty_snapshot = lambda: self.fail("the expensive table, for a pid")
 
     def test_the_window_id_comes_through_the_gate(self):
         seen = []
-        panel.setup.engine.iterm_ask = lambda args, timeout=5.0, **k: seen.append((args, k)) or "4242\n"
+        panel.setup.engine.terms.ITERM2.ask = lambda args, timeout=5.0, **k: seen.append((args, k)) or "4242\n"
         self.assertEqual(panel.panel_window_id("ABC-123"), 4242)
         self.assertIn('"ABC-123"', seen[0][0][-1])
 
     def test_no_answer_is_no_window(self):                              # control
-        panel.setup.engine.iterm_ask = lambda *a, **k: None
+        panel.setup.engine.terms.ITERM2.ask = lambda *a, **k: None
         self.assertIsNone(panel.panel_window_id("ABC-123"))
 
     def test_one_look_takes_one_table(self):
         seen = []
-        panel.setup.engine.iterm_ask = lambda args, timeout=5.0, **k: seen.append(k) or None
+        panel.setup.engine.terms.ITERM2.ask = lambda args, timeout=5.0, **k: seen.append(k) or None
         panel._resolve({"ITERM_SESSION_ID": "w0t0p0:ABC-123", "ITERM_PROFILE": "ccwho"})
         self.assertEqual(len(self.tables), 1)
         self.assertEqual([k.get("procs") for k in seen], [self.TABLE])

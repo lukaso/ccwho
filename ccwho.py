@@ -118,7 +118,7 @@ def unknown_flags(argv):
 
 
 # Things you asked for (jump, open, restore) go straight to iTerm2 - they are one
-# at a time by nature, unlike the background asks behind engine.iterm_ask - but
+# at a time by nature, unlike the background asks behind engine.terms.ask - but
 # never without a deadline: an osascript with none waits as long as a stuck
 # iTerm2 does, which is forever (2026-09-29).
 # 20 s, not the list's 5 (FOCUS_DEADLINE): a command waits where you typed it,
@@ -156,7 +156,7 @@ def launch_in_iterm(script, deadline, sids):
     - nothing was sent - an error raised in Popen's constructor before any
       process was made (its pipes, fork, an argument refused), or after exec
       reported the program could not run (_being_made) - or iTerm2 refused
-      Apple Events (-1743) at the script's first event (engine.AE_PROBE,
+      Apple Events (-1743) at the script's first event (engine.terms.AE_PROBE,
       which writes nothing): the claims go (drop_claims);
     - iTerm2 quit during it (-600/-609): the event died with it, and what it
       opened may still start - held LAUNCH_CLAIM_SECONDS, cut off
@@ -342,8 +342,9 @@ def _send(script, deadline, sids, lock):
         return r, ""
     # its code, never its text: the list shows this line, and osascript's
     # message quotes data (paths, tab names)
-    code = engine.ae_error_code(r.stderr)
-    if code == engine.AE_NOT_PERMITTED and engine.ae_error_at(r.stderr, script, engine.AE_PROBE):
+    terms = engine.terms
+    code = terms.ae_error_code(r.stderr)
+    if code == terms.AE_NOT_PERMITTED and terms.ae_error_at(r.stderr, script, terms.AE_PROBE):
         # refused at the script's first event, which writes nothing
         drop_claims(sids)
         return None, f"iTerm2 refused ({code}) - nothing was sent; {AUTOMATION}"
@@ -354,13 +355,13 @@ def _send(script, deadline, sids, lock):
         return None, (f"the launch was {CUT_OFF} ({code}) - what it opened may still start;"
                       f" try again in {int(LAUNCH_CLAIM_SECONDS)} s")
     _sent(sids)
-    if code == engine.AE_TIMED_OUT:
+    if code == terms.AE_TIMED_OUT:
         return None, f"iTerm2 did not answer ({code}) - {MAY_STILL_RUN}"
-    if code == engine.AE_NOT_PERMITTED:
+    if code == terms.AE_NOT_PERMITTED:
         # after the first event - or no telling where: what came before the
         # refusal may have been written (the pane fill walks on after its
         # write), so what may run holds
-        where = " part way through" if engine.ae_error_start(r.stderr) is not None else ""
+        where = " part way through" if terms.ae_error_start(r.stderr) is not None else ""
         return None, f"iTerm2 refused ({code}){where} - {AUTOMATION}; {MAY_STILL_RUN}"
     # killed by a signal, failed with no code, or failed after a write
     how = code or ("stopped by a signal" if r.returncode < 0 else f"exit {r.returncode}")
@@ -376,7 +377,7 @@ def _sent(sids):
     table shows none, or cannot be read, the record from before the send
     stays: it names its send lock, and is dated when that is first seen let
     go of (_dated); any iTerm2 of ours holds it."""
-    shown = engine.iterm_app_pids(engine.app_snapshot())
+    shown = engine.terms.ITERM2.pids(engine.terms.app_snapshot())
     if shown:
         for sid in sids:
             claim_unresolved(sid, shown)
@@ -432,7 +433,9 @@ def jump(argv):
         return 1
     # what jump.applescript says, or osascript's code - never its text, which
     # quotes paths and tab names
-    out = (res.stdout or "").strip() or f"ccwho: {engine.osascript_trouble(res.returncode, res.stderr)}"
+    out = (res.stdout or "").strip()
+    if not out:
+        out = f"ccwho: {engine.terms.ITERM2.trouble(res.returncode, res.stderr)}"
     print(out)
     return 0 if out.startswith("focused") else 1
 
@@ -1208,8 +1211,8 @@ def _pid_alive(pid):
     return True
 
 
-_boot_id = engine.boot_id
-_above_std = engine._above_std          # bound at import: the list reloads the engine, never ccwho
+_boot_id = engine.terms.boot_id
+_above_std = engine.terms.above_std          # bound at import: the list reloads the engine, never ccwho
 
 
 def _mono():
@@ -1976,7 +1979,7 @@ def _iterm_holds(rec, alive, table, taken):
         return False, rec
     if table is None:
         return None
-    if not engine.parse_procs(table):
+    if not engine.terms.parse_procs(table):
         return True, rec
     # a table taken after the claim was written: only such a one can bind it
     # or call its iTerm2 gone - an older one may predate that iTerm2. (Not
@@ -1984,10 +1987,10 @@ def _iterm_holds(rec, alive, table, taken):
     # clock alone - tests' - dated ahead is not trusted.)
     fresh = taken is not None and float(rec.get("since", 0)) < taken <= _now()
     if pids is None:
-        found = engine.iterm_app_pids(table)
+        found = engine.terms.ITERM2.pids(table)
         if found:
             return True, (dict(rec, iterm_pid=found) if fresh else rec)
-    elif set(pids) & set(engine.iterm_app_pids(table)):
+    elif set(pids) & set(engine.terms.ITERM2.pids(table)):
         return True, rec
     return (False, rec) if fresh else None
 
@@ -2076,7 +2079,7 @@ def _tables():
         # a claim dated ahead of now can have no table after it yet: none taken for it
         if not cached or (after is not None and cached[0][1] <= after <= _mono()):
             mono = _mono()
-            cached[:] = [(engine.app_snapshot(), mono)]
+            cached[:] = [(engine.terms.app_snapshot(), mono)]
         table, mono = cached[0]
         return table, mono + _skew(), mono
     return get
@@ -2185,7 +2188,7 @@ def open_session(argv):
         # that is already running; reopening it would fork the conversation.
         _LOCAL.send_began = True                # a window may still open (_interruptible)
         try:
-            res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
+            res = subprocess.run(["osascript", "-e", engine.terms.ITERM2.run_script(value)],
                                  capture_output=True, text=True, errors="replace",
                                  timeout=ITERM_ACTION_DEADLINE)
         except subprocess.TimeoutExpired:
@@ -2195,7 +2198,7 @@ def open_session(argv):
         if res.returncode != 0:
             # its code, not its text: osascript's message quotes paths
             print("ccwho open: could not open a window - %s"
-                  % engine.osascript_trouble(res.returncode, res.stderr), file=sys.stderr)
+                  % engine.terms.ITERM2.trouble(res.returncode, res.stderr), file=sys.stderr)
             return 1
         print(f"attached {sid} in a new window")
         return 0
@@ -2217,7 +2220,7 @@ def open_session(argv):
             reason, left = why_held(sid)
             print(f"ccwho open: not launching {sid} - {_why_text(reason, sid, left)}.", file=sys.stderr)
             return 1
-        res, why = launch_in_iterm(engine.iterm_run_script(value), ITERM_ACTION_DEADLINE, [sid])
+        res, why = launch_in_iterm(engine.terms.ITERM2.run_script(value), ITERM_ACTION_DEADLINE, [sid])
         if res is None:
             print(f"ccwho open: {why}", file=sys.stderr)
             return 1
@@ -3304,7 +3307,7 @@ def save(argv):
               file=sys.stderr)
         print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
         return 1
-    panes = engine.panes_snapshot()
+    panes = engine.terms.ITERM2.panes()
     # iTerm2 not asked (None): keep the panes the last save knew
     known = ({e_.get("sessionId"): e_ for e_ in engine.manifest_entries(newest_manifest())
               if isinstance(e_.get("sessionId"), str)} if panes is None else None)
@@ -3526,7 +3529,7 @@ def restore(argv):
         saved = {e_.get("pane") for e_ in engine.manifest_entries(man) if e_.get("pane")}
         if saved:
             # asked only of a manifest that names panes: nothing else to count
-            live = {p["pane"] for p in engine.panes_snapshot(direct=True).values()}
+            live = {p["pane"] for p in engine.terms.ITERM2.panes(direct=True).values()}
             print(f"iTerm2 has {len(saved & live)} of {len(saved)} saved panes open now.")
         if ok:
             print(f"restorable: {n} session(s) in {path}")
@@ -3621,7 +3624,7 @@ def restore(argv):
             fill = {}
             if openable and any(e_.get("pane") or e_.get("tabTitle") for e_ in openable):
                 # the panes iTerm2 restored: resume each session where it was
-                fill = engine.match_panes(openable, engine.panes_snapshot(direct=True),
+                fill = engine.match_panes(openable, engine.terms.ITERM2.panes(direct=True),
                                           engine.idle_snapshot(), saved=entries)
             script = engine.iterm_open_script(openable, fill=fill)
             if not script and (running or starting) and not (unusable or gone or waiting):

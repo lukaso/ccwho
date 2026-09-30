@@ -342,11 +342,11 @@ def iterm_scriptable(timeout=5.0, why=None):
     never asked.
     """
     why = {} if why is None else why
-    out = engine.iterm_ask(["-e", 'tell application "iTerm2" to count windows'],
-                           timeout=timeout, wait=SCRIPTABLE_WAIT, why=why)
+    out = engine.terms.ITERM2.ask(["-e", 'tell application "iTerm2" to count windows'],
+                                  timeout=timeout, wait=SCRIPTABLE_WAIT, why=why)
     if out is not None:
         return out.strip().isdigit()
-    if why.get("error") == engine.AE_NOT_PERMITTED or why.get("refused") == "no-iterm":
+    if why.get("error") == engine.terms.AE_NOT_PERMITTED or why.get("refused") == "no-iterm":
         return False
     return None         # stuck, silent, busy, waiting, its state dir unwritable, or no process list
 
@@ -531,7 +531,7 @@ def iterm_started_at(pid=None, timeout=10.0):
     if pid is None:
         # the gate's way: the kernel's name for the program, and our uid - not
         # `pgrep -x`, which matches argv[0] and any user
-        pid = engine.iterm_app_pid(engine.app_snapshot())
+        pid = engine.terms.ITERM2.pid(engine.terms.app_snapshot())
         if pid is None:
             return None
     try:

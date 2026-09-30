@@ -36,7 +36,8 @@ def pin_ccwho_dir(runner):
 FORK_POINT = ((subprocess, "_fork_exec") if hasattr(subprocess, "_fork_exec")
               else (subprocess._posixsubprocess, "fork_exec"))
 
-# ccwho's spawn rule (_being_made, _never_ran, _ended) reads CPython's own frames and
+# ccwho's spawn rule (_being_made, _never_ran, _ended, _popen_in, _interrupted)
+# reads CPython's own frames and
 # fields: run this with each Python that runs ccwho. A fork that fails and an
 # exec that fails ran nothing; an error once the process is made - before
 # exec's report, or while its output is read - may have. argv[1]: the repo.
@@ -56,7 +57,7 @@ def sort(argv, patch=None):
             subprocess.run(argv, capture_output=True, pass_fds=(fd,), timeout=30)
     except (OSError, ValueError, TypeError) as ex:
         p = r._being_made(ex)
-        if r._never_ran(p):
+        if r._never_ran(p) and not r._interrupted(ex):
             return "none-ran"
         if not r._ended(p):                 # made, not heard from: ended - killed - as _send does
             return "not-ended"
@@ -64,9 +65,51 @@ def sort(argv, patch=None):
     return "ran"
 
 
+def masked():
+    # Ctrl-C just after the real fork, hidden by an error raised as it unwinds
+    real, forked = getattr(*testkit.FORK_POINT), []
+
+    def fork(*a, **k):
+        forked.append(real(*a, **k))
+        try:
+            raise KeyboardInterrupt
+        except KeyboardInterrupt:
+            raise OSError(errno.EBADF, "x")
+    try:
+        return sort(["/bin/sleep", "30"], (testkit.FORK_POINT, fork))
+    finally:
+        for pid in forked:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
+def ctrl_c(where):
+    # Ctrl-C in subprocess.run once its Popen is made: from communicate
+    # (run's own process, found and ended) or its `with` line (none found)
+    made = []
+
+    def interrupted(self, *a, **k):
+        made.append(self)
+        raise KeyboardInterrupt
+    try:
+        with mock.patch.object(subprocess.Popen, where, interrupted):
+            subprocess.run(["/bin/sleep", "30"], capture_output=True, pass_fds=(fd,), timeout=30)
+    except KeyboardInterrupt as ex:
+        p = r._popen_in(ex)
+        if p is None:
+            return "not-found"
+        return "found-ended" if r._ended(p) and p.returncode == -signal.SIGKILL else "found-not-killed"
+    finally:
+        for q in made:
+            q.kill()
+            q.wait()
+    return "ran"
+
+
 print(sort(["/usr/bin/true"], (testkit.FORK_POINT, BlockingIOError(errno.EAGAIN, "no process"))),
       sort(["/nonexistent/ccwho-test/osascript"]),
-      sort(["/usr/bin/true"], ((subprocess.Popen, "_close_pipe_fds"), OSError(errno.EBADF, "x"))),
-      sort(["/usr/bin/true"], ((subprocess.Popen, "communicate"), OSError(errno.EIO, "x"))))
+      sort(["/bin/sleep", "30"], ((subprocess.Popen, "_close_pipe_fds"), OSError(errno.EBADF, "x"))),
+      sort(["/usr/bin/true"], ((subprocess.Popen, "communicate"), OSError(errno.EIO, "x"))),
+      masked(), ctrl_c("communicate"), ctrl_c("__enter__"))
 """
-SPAWN_RULE_SORTS = ["none-ran", "none-ran", "may-run", "may-run"]
+SPAWN_RULE_SORTS = ["none-ran", "none-ran", "may-run", "may-run", "not-ended", "found-ended", "not-found"]

@@ -1317,6 +1317,25 @@ def boot_id():
     return buf.value.decode() if ok and buf.value else None
 
 
+def _above_std(fd):
+    """fd as a descriptor above stdin, stdout and stderr (the original
+    closed): a ccwho started with one of them closed gets that number from
+    os.open, and a child it passes a lock to (pass_fds) has those replaced -
+    its pipes, its DEVNULL - before it runs: that child would hold no lock."""
+    if fd > 2:
+        return fd
+    try:
+        return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+    finally:
+        os.close(fd)
+
+
+def _gate_lock():
+    """The gate's lock file, opened above stdin, stdout and stderr: the ask's
+    wrapper - which holds it for the ask - gets DEVNULL for those."""
+    return _above_std(os.open(_gate_path("lock"), os.O_RDWR | os.O_CREAT, 0o600))
+
+
 def _gate_path(name):
     return os.path.join(ITERM_STATE_DIR, "iterm-ae." + name)
 
@@ -1461,7 +1480,7 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     try:
         os.makedirs(ITERM_STATE_DIR, mode=0o700, exist_ok=True)
         os.chmod(ITERM_STATE_DIR, 0o700)
-        fd = os.open(_gate_path("lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fd = _gate_lock()
     except OSError:
         why["refused"] = "io"
         return None

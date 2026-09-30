@@ -251,15 +251,31 @@ def _popen_in(ex):
     return None
 
 
+def _interrupted(ex):
+    """Was `ex` raised while an interrupt (Ctrl-C) was being handled - one in
+    its chain (__context__, __cause__) that is no Exception? It may then hide
+    a Ctrl-C that landed between Popen's fork and its note of the child."""
+    seen, e = set(), ex.__context__ or ex.__cause__
+    while e is not None and id(e) not in seen:
+        if not isinstance(e, Exception):
+            return True
+        seen.add(id(e))
+        e = e.__context__ or e.__cause__
+    return False
+
+
 def _ended(p):
-    """Is the process Popen's constructor left (_being_made: made, exec not
-    heard from - it may be running osascript, holding the send lock) ended -
-    killed and reaped here, as subprocess.run ends one it gives up on? True
-    when there is none. False when it could not be ended: the send is then
-    not recorded as over (_sent) - the record made before it names the send
-    lock, which that process holds, and holds while it runs (_sending).
-    Ended only when it can be shown to be (its returncode, read as a Popen
-    of another CPython may lack it)."""
+    """Is the send's process p ended - killed and reaped here, as
+    subprocess.run ends one it gives up on? p is the one Popen's constructor
+    left (_being_made: the error branch) or the one found on Ctrl-C
+    (_popen_in). Ended only when it can be shown to be: its returncode, which
+    only reaping sets (read as a Popen of another CPython may lack it).
+    False when it could not be ended: the send is then not recorded as over
+    (_sent) - the record made before it names the send lock, which that
+    process holds, and holds while it runs (_sending). True for None - which
+    means "ended" only in the error branch, where subprocess.run has already
+    ended its own; a caller whose None means "cannot tell" (_popen_in's) must
+    not take it for ended."""
     if p is None:
         return True
     with contextlib.suppress(Exception):
@@ -282,12 +298,14 @@ def _send(script, deadline, sids, lock):
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
         p = _being_made(ex)
-        if _never_ran(p):
+        if _never_ran(p) and not _interrupted(ex):
             # no process was made, or exec reported it could not run (and it
             # was reaped): osascript never ran, nothing was sent. (_never_ran
             # reads "no child noted" as none made: an error of these kinds
             # comes only from what Popen calls - never between its fork and
-            # its note of the child, as a Ctrl-C can)
+            # its note of the child, as a Ctrl-C can. One raised while a
+            # Ctrl-C was handled - a pipe closed as it unwound - may hide one
+            # that landed there: then it is no proof, and the claims stay)
             drop_claims(sids)
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
         if _ended(p):
@@ -304,6 +322,7 @@ def _send(script, deadline, sids, lock):
         # (_sending), dated when it is let go (_dated). (Shown ended: a
         # returncode, which only reaping a child sets - one whose fork was
         # never noted has no pid to kill or reap.)
+        _LOCAL.stopped_send = True              # _interruptible says it may still run
         p = _popen_in(ex)
         if p is not None and _ended(p):
             _sent(sids)
@@ -1395,6 +1414,19 @@ def _claims_locked(wait=None):
 _SEND_TOKEN = re.compile(r"[0-9a-f]{32}")
 
 
+def _above_std(fd):
+    """fd as a descriptor above stdin, stdout and stderr (the original
+    closed): a ccwho started with one of them closed gets that number from
+    os.open, and a child it passes a lock to (pass_fds) has those replaced -
+    its pipes, its DEVNULL - before it runs: that child would hold no lock."""
+    if fd > 2:
+        return fd
+    try:
+        return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+    finally:
+        os.close(fd)
+
+
 def _hold_send():
     """A launch's send lock: a file of its own - a new name, made exclusively,
     never through a link - locked from before its claims are marked
@@ -1409,7 +1441,7 @@ def _hold_send():
     fd); raises OSError when it cannot be made."""
     token = uuid.uuid4().hex
     path = os.path.join(_claims_dir(), f"{token}.send")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    fd = _above_std(os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
@@ -1686,7 +1718,10 @@ def _reason(rec, now, decided_at, lead=None):
     if rec.get("seen") is True:
         return "newer", 0
     if rec.get("unresolved") is True:
-        return ("starting", 0) if _sending(rec) else ("unresolved", 0)
+        if not _sending(rec):
+            return "unresolved", 0
+        # its launcher gone, its osascript still holds the lock
+        return ("starting", 0) if _pid_alive(rec.get("pid")) else ("sending", 0)
     if rec.get("launched") is True:
         left = math.ceil(LAUNCH_CLAIM_SECONDS - _age(rec, now, lead))
         if rec.get("cut_off") is True and left > 0:
@@ -2123,6 +2158,8 @@ def _why_text(reason, session_id, left):
         "unreadable": (f"its claim file cannot be read: {_claim_path(session_id)}."
                        " Remove it if no ccwho is launching it"),
         "unresolved": f"an earlier launch did not finish inside iTerm2; {MAY_STILL_RUN}",
+        "sending": ("an earlier launch is still being sent - its ccwho is gone, its osascript"
+                    " runs on; try again when it ends, or restart iTerm2"),
         "cut off": f"an earlier launch was {CUT_OFF}; try again in {left} s",
     }.get(reason, "it is already starting in another window")
 
@@ -3517,7 +3554,8 @@ def restore(argv):
         openable, running, unusable, starting, seen = [], [], [], [], set()
         gone = []
         # why_held's reasons -> the entries held for each (the rest: starting)
-        held = {"old list": [], "newer": [], "unreadable": [], "unresolved": [], "cut off": []}
+        held = {"old list": [], "newer": [], "unreadable": [], "unresolved": [], "sending": [],
+                "cut off": []}
         # from the first claim to the send, any way out - a return, an error
         # sorting the entries or in the pane lookup - lets go of what this
         # call claimed: nothing was sent
@@ -3567,7 +3605,8 @@ def restore(argv):
                 print(f"ccwho restore: {e_.get('project') or e_.get('sessionId') or '?'}"
                       " cannot be reopened from this manifest", file=sys.stderr)
             # each line leads with a word the list's `o` counts it by
-            for reason, lead in (("unresolved", "still waiting on"), ("cut off", "holding"),
+            for reason, lead in (("unresolved", "still waiting on"), ("sending", "still waiting on"),
+                                 ("cut off", "holding"),
                                  ("unreadable", "blocked"), ("newer", "changed")):
                 for e_, left in held[reason]:
                     print(f"ccwho restore: {lead} {e_.get('project') or e_.get('sessionId')}"
@@ -3575,7 +3614,8 @@ def restore(argv):
             if held["old list"]:
                 print(f"ccwho restore: {OLD_LIST}.", file=sys.stderr)
                 return 1
-            waiting = held["unresolved"] or held["cut off"] or held["unreadable"] or held["newer"]
+            waiting = (held["unresolved"] or held["sending"] or held["cut off"] or held["unreadable"]
+                       or held["newer"])
             fill = {}
             if openable and any(e_.get("pane") or e_.get("tabTitle") for e_ in openable):
                 # the panes iTerm2 restored: resume each session where it was
@@ -3642,6 +3682,22 @@ def _arg(argv, flag, default):
     return default
 
 
+def _interruptible(command, args):
+    """A command that may send a launch (open, restore): Ctrl-C ends it with
+    exit 130 and a line, no traceback - one that came during a send says the
+    launch may still run (a user who read only a traceback would take it as
+    cancelled, and start the session by hand)."""
+    _LOCAL.stopped_send = False
+    try:
+        return command(args)
+    except KeyboardInterrupt:
+        if _LOCAL.__dict__.pop("stopped_send", False):
+            print(f"ccwho: stopped - {MAY_STILL_RUN}", file=sys.stderr)
+        else:
+            print("ccwho: stopped - nothing was sent", file=sys.stderr)
+        return 130
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     # Bare `ccwho` on a terminal is the live list. Piped, redirected, or under
@@ -3664,7 +3720,7 @@ def main(argv=None):
         maybe_trim_log()          # after, so the save's own output is in what we bound
         return rc
     if argv and argv[0] == "restore":
-        return restore(argv[1:])
+        return _interruptible(restore, argv[1:])
     if argv and argv[0] == "ls":
         return ls(argv[1:])
     if argv and argv[0] == "ps":
@@ -3682,7 +3738,7 @@ def main(argv=None):
     if argv and argv[0] == "show":
         return show(argv[1:])
     if argv and argv[0] == "open":
-        return open_session(argv[1:])
+        return _interruptible(open_session, argv[1:])
     if argv and argv[0] == "url":
         return url(argv[1:])
     if "--help" in argv or "-h" in argv:

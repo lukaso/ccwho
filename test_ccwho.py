@@ -1,4 +1,5 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
+import fcntl
 import json
 import re
 import os
@@ -6918,13 +6919,32 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         return False
 
     def ended(self):
-        return self.until(lambda: os.path.exists(self.state("status")))
+        """The ask ran to its end: its status is written AND its wrapper, which
+        writes the status and then exits, has let go of the lock."""
+        def free():
+            if not os.path.exists(self.state("status")):
+                return False
+            fd = os.open(self.state("lock"), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                return False
+            finally:
+                os.close(fd)
+        return self.until(free)
+
+    def assert_launches(self, n):
+        """The stub logs as it starts - which can be after an ask that timed
+        out has returned: wait for n to show up, then say it is exactly n."""
+        self.until(lambda: self.launches() >= n)
+        self.assertEqual(self.launches(), n)
 
     def test_an_answer_comes_back(self):                                # control
         self.stub('echo "ttys001\tmy tab"')
         self.assertEqual(self.ask(), "ttys001\tmy tab\n")
         self.assertEqual(self.ask(), "ttys001\tmy tab\n")
-        self.assertEqual(self.launches(), 2)
+        self.assert_launches(2)
 
     def test_no_iterm2_running_means_no_ask(self):
         # `tell application "iTerm2"` would LAUNCH it
@@ -6937,12 +6957,13 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
 
     def test_while_one_ask_is_in_flight_no_second_is_sent(self):
         self.stub("sleep 1.5; echo late")
-        why = {}
+        why, why2 = {}, {}
         self.assertIsNone(self.ask(timeout=0.3))
         self.assertIsNone(self.ask(timeout=0.3, now=time.time() + 60, why=why))
-        self.assertIsNone(self.ask(timeout=0.3, now=time.time() + 60))
-        self.assertEqual(self.launches(), 1)
+        self.assertIsNone(self.ask(timeout=0.3, now=time.time() + 60, why=why2))
+        self.assert_launches(1)
         self.assertEqual(why.get("refused"), "busy")
+        self.assertFalse(why.get("asked") or why2.get("asked"), "a second ask was sent")
 
     def test_an_ask_that_timed_out_runs_to_its_end(self):
         # killing it frees nothing inside iTerm2 - and would free the lock. The
@@ -6960,7 +6981,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.assertIsNone(self.ask(timeout=0.3, now=t))
         self.assertTrue(self.ended())
         self.assertIsNone(self.ask(now=t + 5), "asked again 5 s after a timeout")
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
 
     def test_the_wait_counts_from_when_the_late_answer_was_seen(self):
         # an ask started at t, given up at t+5, answering at t+40 has used up a
@@ -6971,7 +6992,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.assertTrue(self.ended())
         self.assertIsNone(self.ask(now=t + 40), "the late answer was seen now")
         self.assertIsNone(self.ask(now=t + 60))
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
         self.assertEqual(self.ask(now=t + 71), "late\n")                # control
 
     def test_the_time_is_read_after_the_lock_is_taken(self):
@@ -6999,7 +7020,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         why = {}
         self.assertIsNone(self.ask(now=time.time() + 3600, why=why))
         self.assertIsNone(self.ask(now=time.time() + 86400))
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
         self.assertEqual(why.get("refused"), "stuck")
 
     def test_an_ask_whose_wrapper_died_still_counts(self):
@@ -7018,7 +7039,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.stub('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
         self.assertIsNone(self.ask(pid=100))
         self.assertIsNone(self.ask(pid=100))
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
         self.stub('echo back')
         self.assertEqual(self.ask(pid=200), "back\n")
 
@@ -7043,7 +7064,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
             ccwho._write_gate = real
         # an hour later, past any wait: only the quarantine can still say no
         self.assertIsNone(self.ask(now=time.time() + 3600), "the evidence of -1712 was thrown away")
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
 
     def test_any_other_error_waits_thirty_seconds_and_says_which(self):
         self.stub('echo "Not authorized to send Apple events to iTerm2. (-1743)" >&2; exit 1')
@@ -7051,7 +7072,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         first, second = {}, {}
         self.assertIsNone(self.ask(now=t, why=first))
         self.assertIsNone(self.ask(now=t + 29, why=second))
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
         self.assertEqual(first.get("error"), "-1743")
         self.assertEqual((second.get("refused"), second.get("error")), ("waiting", "-1743"))
         self.stub('echo ok')
@@ -7143,7 +7164,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         other = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True,
                                text=True, timeout=20, cwd=here)
         self.assertEqual(other.stdout.strip(), "None")
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
         self.assertTrue(self.ended())
         # control: once the child is gone the lock is free (the first call sees
         # the late answer and waits; one past that wait asks)
@@ -7152,7 +7173,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         later = code.replace("time.time() + 600", "time.time() + 700")
         subprocess.run([sys.executable, "-B", "-c", later], capture_output=True,
                        text=True, timeout=20, cwd=here)
-        self.assertEqual(self.launches(), 2)
+        self.assert_launches(2)
 
 
 class TestTabNamesAndPanesAskThroughTheGate(unittest.TestCase):
@@ -7354,6 +7375,7 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
     _F = TestBackgroundAsksNeverPileUpInITerm2
     setUp, stub, launches, table, state, ask, until, ended = (
         _F.setUp, _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+    assert_launches = _F.assert_launches
 
     def test_a_quoted_code_does_not_quarantine(self):
         self.stub('echo \'execution error: Can’t get item 3 of {"x (-1712)"}. (-1728)\' >&2; exit 1')
@@ -7420,7 +7442,7 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
         self.assertTrue(self.until(lambda: self.ask(now=time.time() + 60, why=why) is None
                                    and why.get("refused") != "busy"))
         self.assertEqual(why.get("refused"), "stuck")
-        self.assertEqual(self.launches(), 1)
+        self.assert_launches(1)
 
     def test_an_error_pauses_from_when_it_came_back(self):
         self.stub('sleep 0.5; echo "Not authorized (-1743)" >&2; exit 1')

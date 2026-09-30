@@ -4,6 +4,7 @@ A flag that is silently ignored is the failure mode these cover: --watch=3 and -
 both used to fall through to one-shot with no complaint.
 """
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -4325,19 +4326,33 @@ class TestAClaimOutlivesALaunchThatMayStillHappen(unittest.TestCase):
         runner.claim_launch(self.SID, now=self.T - 60)
         runner.claim_unresolved(self.SID, now=self.T - 60, iterm_pid=4242)
         runner.engine.app_snapshot = lambda: ITERM_TABLE
-        real = runner._booted
-        self.addCleanup(setattr, runner, "_booted", real)
-        runner._booted = lambda: self.T - 30
+        real = runner._boot_id
+        self.addCleanup(setattr, runner, "_boot_id", real)
+        runner._boot_id = lambda: "ANOTHER-BOOT"
         self.assertTrue(runner.claim_launch(self.SID, now=self.T, alive=lambda pid: pid == 4242))
 
     def test_a_claim_since_the_mac_started_is_not(self):                # control
         runner.claim_launch(self.SID, now=self.T - 60)
         runner.claim_unresolved(self.SID, now=self.T - 60, iterm_pid=4242)
         runner.engine.app_snapshot = lambda: ITERM_TABLE
-        real = runner._booted
-        self.addCleanup(setattr, runner, "_booted", real)
-        runner._booted = lambda: self.T - 90
         self.assertFalse(runner.claim_launch(self.SID, now=self.T, alive=lambda pid: pid == 4242))
+
+    def test_the_boot_is_told_by_its_id_not_the_clock(self):
+        # a wall clock stepped forward makes a claim of this boot look older
+        # than the boot: its id says it is not
+        runner.claim_launch(self.SID, now=self.T - 30 * 86400)
+        runner.claim_unresolved(self.SID, now=self.T - 30 * 86400, iterm_pid=4242)
+        runner.engine.app_snapshot = lambda: ITERM_TABLE
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T, alive=lambda pid: pid == 4242))
+
+    def test_a_clock_stepped_back_does_not_void_a_claim(self):
+        # written when the clock was 5 minutes ahead
+        me = os.getpid()
+        runner._write_claim(self.SID, {"pid": DEAD, "since": self.T + 300, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": me, "until": self.T + 300,
+                                       "boot": runner._boot_id()})
+        runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n{me} {os.getuid()} iTerm2\n"
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T + 1))
 
 
 class TestTwoCcwhosNeverBothTakeAStaleClaim(unittest.TestCase):
@@ -4367,23 +4382,47 @@ class TestTwoCcwhosNeverBothTakeAStaleClaim(unittest.TestCase):
         self.assertEqual([got[0], other[1]].count(True), 1, (got, other[1:]))
 
     def test_a_claim_made_while_a_sighting_lets_go_survives_it(self):
-        # the sighting read the old claim; another ccwho replaced it before
-        # the sighting removed it - and removed the new one with it
+        # the sighting read the old claim; another ccwho replaced it before the
+        # sighting wrote over it - and the new claim was lost
         runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 100, "sessionId": self.SID})
-        other, test = [], self
+        other, real = [], runner._read_claim
 
-        class Sighting:
-            def __gt__(self, since):          # `since < seen_at`, between read and remove
-                if not other:
-                    t = threading.Thread(target=lambda: other.append(runner.claim_launch(test.SID)))
-                    other.append(t)
-                    t.start()
-                    t.join(1.0)
-                return True
-        runner.release_claims([self.SID], Sighting())
+        def reading(sid):
+            rec = real(sid)
+            if not other:                     # the sighting, between read and write
+                t = threading.Thread(target=lambda: other.append(runner.claim_launch(self.SID)))
+                other.append(t)
+                t.start()
+                t.join(1.0)
+            return rec
+        runner._read_claim = reading
+        self.addCleanup(setattr, runner, "_read_claim", real)
+        runner.release_claims([self.SID], self.T)
         other[0].join(10)
         self.assertTrue(other[1])
-        self.assertTrue(os.path.exists(runner._claim_path(self.SID)), "the new claim was removed")
+        with open(runner._claim_path(self.SID)) as fh:
+            self.assertEqual(json.load(fh).get("pid"), os.getpid(), "the new claim was lost")
+
+
+class TestAClaimIsOwnedByTheCallThatMadeIt(unittest.TestCase):
+    """The list runs each restore in a thread of one process: a claim one of
+    them took over from another is not the first one's to send."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_claim_another_thread_took_over(self):
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T - 100))   # aged past its time
+        other = []
+        t = threading.Thread(target=lambda: other.append(runner.claim_launch(self.SID, now=self.T)))
+        t.start()
+        t.join(10)
+        self.assertEqual(other, [True])
+        self.assertFalse(runner.claim_unresolved(self.SID, 4242, now=self.T + 1))
+
+    def test_its_own_claim(self):                                          # control
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T))
+        self.assertTrue(runner.claim_unresolved(self.SID, 4242, now=self.T + 1))
 
 
 class TestOnlyOurOwnClaimIsRewrittenOrDropped(unittest.TestCase):
@@ -4525,7 +4564,9 @@ class TestALaunchIsClaimedAsUnresolvedBeforeItIsSent(unittest.TestCase):
         runner.subprocess.run = stuck
         res, why = runner.launch_in_iterm("script", 1.0, self.SIDS)
         self.assertIsNone(res)
-        self.assertEqual(len(self.tables), 1, "one ps for the batch, not one per session")
+        # one before the send, one after an outcome that may still run - per
+        # batch, never per session
+        self.assertEqual(len(self.tables), 2, "one ps before and one after, for the batch")
         self.assertTrue(all(self.held_while_iterm2_lives(s) for s in self.SIDS))
 
     def test_ctrl_c_during_the_launch_leaves_them_held(self):
@@ -4719,9 +4760,11 @@ class TestOpenReleasesTheClaimOfASessionItSeesRunning(unittest.TestCase):
         self.assertIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
 
     def test_a_held_claim_says_what_holds_it(self):                          # control
+        # not "timed out": a signal, no code or a refusal part way hold it too
         rc, out = self._open(self.SID)
         self.assertEqual(rc, 1)
-        self.assertIn("timed out", out)
+        self.assertIn("did not finish", out)
+        self.assertNotIn("timed out", out)
         self.assertIn("restart iTerm2", out)
 
     def test_a_launch_that_timed_out_in_this_process_says_so(self):
@@ -4868,6 +4911,7 @@ class TestARestoreSaysWhatAnUnresolvedClaimMeans(unittest.TestCase):
         rc, out = self._restore_open()
         self.assertNotEqual(rc, 0, "nothing was reopened")
         self.assertIn("restart iTerm2", out)
+        self.assertNotIn("timed out", out)
         self.assertNotIn("another ccwho is opening it", out)
         self.assertNotIn("already running or starting", out)
         self.assertEqual(len(self.snapshots), 1, "one process table for the batch")
@@ -4914,10 +4958,12 @@ class TestALaunchLetsGoOnlyWhenNothingOfItCanRun(unittest.TestCase):
         self.assertIn("may still run", why)
         self.assertNotIn("refused", why)
 
-    def test_one_window_refused_gives_its_claim_back(self):                # control
-        res, why = self.launch(1, "execution error: Can’t get current window. (-1728)", self.SIDS[:1])
-        self.assertFalse(self.held_while_iterm2_lives(self.SIDS[0]))
-        self.assertIn("refused (-1728)", why)
+    def test_one_session_refused_keeps_it_too(self):
+        # its resume line may be written already: the pane-fill script walks
+        # every window after writing, and a window closing then fails it
+        res, why = self.launch(1, "execution error: Can\u2019t get window 3. (-1728)", self.SIDS[:1])
+        self.assertTrue(self.held_while_iterm2_lives(self.SIDS[0]))
+        self.assertIn("may still run", why)
 
     def test_apple_events_refused_gives_them_all_back(self):                # control
         res, why = self.launch(1, "Not authorized to send Apple events to iTerm2. (-1743)", self.SIDS[:3])
@@ -4931,6 +4977,7 @@ class TestALaunchLetsGoOnlyWhenNothingOfItCanRun(unittest.TestCase):
             self.assertIn("may still run", why)
             self.assertNotIn("refused", why)
             self.assertNotIn("something odd", why)
+            self.assertNotIn("-15", why, "a signal's number read as an exit code")
 
     def test_a_disk_that_fills_part_way_leaves_none_held(self):
         # the rollback must not need the disk space whose lack it rolls back
@@ -5181,11 +5228,367 @@ class TestEveryScanLetsGoOfWhatItSeesRunning(unittest.TestCase):
         outside, seen = [], 0
         for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
             for node in ast.walk(fn):
+                # any receiver: tick() scans with the hot-reloaded engine, `eng`
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "collect"
-                        and getattr(node.func.value, "id", "") == "engine"):
+                        and node.func.attr == "collect"):
                     seen += 1
                     if fn.name != "scan":
                         outside.append(f"{fn.name}:{node.lineno}")
         self.assertGreater(seen, 0, "the scan found no collect at all")        # control
         self.assertEqual(outside, [])
+
+
+class TestTheWatchLoopLetsGoOfWhatItSeesRunning(unittest.TestCase):
+    """`ccwho` and `ccwho --watch` scan through tick(), with the engine they
+    reload - a scan like any other."""
+
+    _F = TestEveryScanLetsGoOfWhatItSeesRunning
+    SID, JOB, setUp, rows, free = _F.SID, _F.JOB, _F.setUp, _F.rows, _F.free
+
+    def tick(self):
+        real = runner.usage_snapshot
+        runner.usage_snapshot = lambda rows, now=None, record=True: {"state": "unknown"}
+        try:
+            return runner.tick({"watch": False, "ticks": 0}, [], False)
+        finally:
+            runner.usage_snapshot = real
+
+    def test_a_tick_that_sees_it(self):
+        self.rows([dict(TestUsageInTheTable.ROWS[0], sessionId=self.SID)])
+        self.tick()
+        self.assertTrue(self.free())
+
+    def test_a_tick_that_does_not(self):                                   # control
+        self.rows([dict(TestUsageInTheTable.ROWS[0], sessionId=self.JOB)])
+        self.tick()
+        self.assertFalse(self.free())
+
+
+class TestNoPsRunsWhileTheClaimsAreLocked(unittest.TestCase):
+    """Every scan waits on the claims lock: a ps under it (up to 20 s on a
+    loaded Mac) froze the list's scan behind a click."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_the_table_is_taken_with_the_lock_free(self):
+        me = os.getpid()
+        runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 60, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": me, "until": self.T - 30})
+        free = []
+
+        def snapshot():
+            fd = os.open(os.path.join(self.tmp, "launching", ".lock"), os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                free.append(True)
+            except OSError:
+                free.append(False)
+            finally:
+                os.close(fd)
+            return f"  PID UID UCOMM\n{me} {os.getuid()} iTerm2\n"
+        runner.engine.app_snapshot = snapshot
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T))
+        self.assertTrue(free and all(free), free)
+
+
+class TestAClaimWithTimesNoCcwhoWrites(unittest.TestCase):
+    """A claim is read off disk: times no ccwho sets - not finite, in the
+    future, a send longer than any deadline - must not hold a session for
+    good, where neither an iTerm2 restart nor a reboot clears it."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def claim(self, **rec):
+        runner._write_claim(self.SID, dict({"pid": DEAD, "sessionId": self.SID}, **rec))
+
+    def test_an_endless_send(self):
+        self.claim(since=self.T, unresolved=True, iterm_pid=DEAD, until=float("inf"))
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T + 1))
+
+    def test_a_send_a_year_long(self):
+        self.claim(since=0.0, unresolved=True, iterm_pid=DEAD, until=self.T + 365 * 86400)
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T))
+
+    def test_a_launch_from_tomorrow(self):
+        self.claim(since=self.T + 86400, launched=True)
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T))
+
+    def test_a_sighting_clears_a_launch_from_tomorrow(self):
+        self.claim(since=self.T + 86400, launched=True)
+        runner.release_claims([self.SID], self.T)
+        self.assertFalse(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_send_in_range_still_holds(self):                           # control
+        self.claim(since=self.T, unresolved=True, iterm_pid=DEAD, until=self.T + 10)
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T + 1))
+
+
+class TestASightingOutranksAnOlderDecision(unittest.TestCase):
+    """B reads "not running" and stalls; A launches the session; a scan sees
+    it running and lets go of A's claim. B, deciding on its older read, must
+    not take the free claim and launch it a second time."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_decision_older_than_the_sighting_is_refused(self):
+        runner.claim_launch(self.SID, now=self.T + 1)                      # A
+        runner.release_claims([self.SID], self.T + 2)                     # seen running
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T + 3, decided_at=self.T))
+
+    def test_a_decision_newer_than_the_sighting_is_not(self):             # control
+        runner.claim_launch(self.SID, now=self.T + 1)
+        runner.release_claims([self.SID], self.T + 2)
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T + 4, decided_at=self.T + 2.5))
+
+    def test_a_sighting_goes_when_the_session_is_seen_long_after(self):
+        runner.claim_launch(self.SID, now=self.T - 1)
+        runner.release_claims([self.SID], self.T)
+        runner.release_claims([self.SID], self.T + 10)
+        self.assertTrue(os.path.exists(runner._claim_path(self.SID)))          # control
+        runner.release_claims([self.SID], self.T + runner.SIGHTING_SECONDS + 1)
+        self.assertFalse(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_full_disk_still_lets_go(self):
+        # the sighting cannot be written: the claim goes all the same
+        runner.claim_launch(self.SID, now=self.T - 1)
+        real = runner._write_claim
+        runner._write_claim = lambda sid, record: False
+        self.addCleanup(setattr, runner, "_write_claim", real)
+        runner.release_claims([self.SID], self.T)
+        self.assertFalse(os.path.exists(runner._claim_path(self.SID)))
+
+
+class TestOpenDecidesOnItsOwnScan(unittest.TestCase):
+    SID, ENTRY = TestOpenNeverForksALiveSession.SID, TestOpenNeverForksALiveSession.ENTRY
+    tearDown = TestOpenNeverForksALiveSession.tearDown
+    _open = TestOpenNeverForksALiveSession._open
+
+    def setUp(self):
+        TestOpenNeverForksALiveSession.setUp(self)
+
+        def another_ccwho_launches_it_meanwhile(entry):
+            a = time.time()
+            runner.claim_launch(self.SID, now=a, pid=DEAD)                 # A
+            runner.release_claims([self.SID], a + 0.5)                    # a scan sees it
+            return ""
+        runner.resume_problem = another_ccwho_launches_it_meanwhile
+
+    def test_open_does_not_launch_it_again(self):
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+    def test_restore_does_not_launch_it_again(self):
+        d = os.path.join(self.tmp, "restore")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            runner.restore(["--open", "--from", os.path.join(d, "2026-08-01T0001.json")])
+        self.assertNotIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+
+class TestALaunchIsHeldByTheITerm2ThatGotIt(unittest.TestCase):
+    """The event goes to whatever iTerm2 runs when it is sent: one restarted
+    between the lookup and the send got it. After an outcome that may still
+    run, the claim holds on the iTerm2 running then, if the one recorded is gone."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def timed_out(self, after):
+        tables = [ITERM_TABLE, after]
+        runner.engine.app_snapshot = lambda: tables.pop(0) if len(tables) > 1 else tables[0]
+
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = stuck
+        runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
+
+    def test_a_restarted_iterm2_holds_it(self):
+        self.timed_out(f"  PID UID UCOMM\n5151 {os.getuid()} iTerm2\n")
+        self.assertFalse(runner.claim_launch(self.SIDS[0], now=time.time() + 3600,
+                                             alive=lambda p: p == 5151))
+
+    def test_the_one_recorded_still_running_keeps_it(self):              # control
+        # another iTerm2 beside it, with a lower pid: still the one recorded
+        self.timed_out(f"  PID UID UCOMM\n1111 {os.getuid()} iTerm2\n4242 {os.getuid()} iTerm2\n")
+        with open(runner._claim_path(self.SIDS[0])) as fh:
+            self.assertEqual(json.load(fh)["iterm_pid"], 4242)
+
+
+class TestAStaleTableIsNotProofOfAGoneITerm2(unittest.TestCase):
+    """restore takes one table for all its claims. An iTerm2 started since -
+    and sent a launch that timed out - is missing from it: a live pid it does
+    not show as iTerm2 is looked at again on a new table."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+    OLD = "  PID UID UCOMM\n1 0 launchd\n"
+
+    def claim(self, iterm_pid):
+        runner._write_claim(self.SID, {"pid": DEAD, "since": self.T - 60, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": iterm_pid, "until": self.T - 30})
+
+    def now_running(self, *pids):
+        runner.engine.app_snapshot = lambda: "  PID UID UCOMM\n1 0 launchd\n" + "".join(
+            f"{p} {os.getuid()} iTerm2\n" for p in pids)
+
+    def test_a_live_pid_missing_from_the_old_table(self):
+        self.claim(os.getpid())
+        self.now_running(os.getpid())
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T, procs=self.OLD))
+
+    def test_an_iterm2_the_old_table_did_not_have(self):
+        self.claim(None)
+        self.now_running(os.getpid())
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T, procs=self.OLD))
+
+    def test_a_new_table_that_agrees_lets_it_go(self):                    # control
+        self.claim(os.getpid())
+        self.now_running()
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T, procs=self.OLD))
+
+
+class TestALaunchNotOursAnyMoreIsNotSent(unittest.TestCase):
+    """Between claim_launch and the send, a scan saw the session running, or
+    another ccwho took the claim over: not a disk failure, and not sent."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_seen_running_in_between(self):
+        runner.release_claims(self.SIDS[:1], time.time() + 1)
+        sent = []
+        runner.subprocess.run = lambda cmd, **kw: sent.append(cmd)
+        res, why = runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
+        self.assertIsNone(res)
+        self.assertEqual(sent, [])
+        self.assertNotIn("could not record", why)
+        self.assertIn("running", why)
+
+    def test_a_dir_that_cannot_be_written_sends_nothing(self):           # control
+        blocker = os.path.join(self.tmp, "file")
+        open(blocker, "w").close()
+        os.environ["CCWHO_DIR"] = blocker
+        sent = []
+        runner.subprocess.run = lambda cmd, **kw: sent.append(cmd)
+        self.assertTrue(runner.claim_launch(self.SIDS[0]))       # not held by another...
+        res, why = runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
+        self.assertEqual(sent, [])                                  # ...but not sent
+        self.assertIn("could not record", why)
+
+
+class TestTheListSaysALaunchThatMayStillRun(unittest.TestCase):
+    """`o` puts "could not reopen" before a failed restore's last line. One
+    that may still run did not fail: that prefix contradicts the line."""
+
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    setUp, tearDown, write_manifest = _F.setUp, _F.tearDown, _F.write_manifest
+
+    def test_a_timed_out_reopen(self):
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = stuck
+        said = runner.reopen_saved()
+        self.assertNotIn("could not reopen", said)
+        self.assertIn("restart iTerm2", said)
+
+    def test_a_refused_reopen_still_could_not(self):                      # control
+        class Refused:
+            returncode, stdout, stderr = 1, "", "Not authorized (-1743)"
+        runner.subprocess.run = lambda cmd, **kw: Refused()
+        self.assertIn("could not reopen", runner.reopen_saved())
+
+
+class TestJumpSaysARefusalByItsCode(unittest.TestCase):
+    SID, ENTRY = TestOpenNeverForksALiveSession.SID, TestOpenNeverForksALiveSession.ENTRY
+    setUp, tearDown = TestOpenNeverForksALiveSession.setUp, TestOpenNeverForksALiveSession.tearDown
+
+    def test_the_code_not_the_text(self):
+        self.live = [{"sessionId": self.SID, "pid": 42, "tty": "ttys032",
+                      "title": "t", "name": "n", "project": "liveapp"}]
+
+        class Refused:
+            returncode, stdout = 1, ""
+            stderr = "execution error: Can\u2019t get tab of /Users/x/secret. (-1728)"
+        runner.subprocess.run = lambda cmd, **kw: Refused()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.jump(["ttys032"])
+        text = out.getvalue() + err.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("(-1728)", text)
+        self.assertNotIn("/Users/x/secret", text)
+
+
+class TestASendThatHasEndedIsNotBeingSent(unittest.TestCase):
+    """"Being sent" holds a claim while osascript runs - not until its deadline.
+    A Ctrl-C, or a failure that came back early, ended the send: a retry after
+    restarting iTerm2 must not be told it is "already starting"."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def ended(self, sid):
+        # the iTerm2 it went to gone: only the send itself could hold it now
+        return runner.claim_is_unresolved(sid) and runner.claim_launch(sid, alive=lambda p: False)
+
+    def test_after_a_failure_that_came_back_early(self):
+        class R:
+            returncode, stdout, stderr = 1, "", "execution error: Connection is invalid. (-609)"
+        runner.subprocess.run = lambda cmd, **kw: R()
+        res, _ = runner.launch_in_iterm("script", 60.0, self.SIDS[:2])
+        self.assertIsNone(res)
+        self.assertTrue(self.ended(self.SIDS[0]))
+
+    def test_after_ctrl_c(self):
+        def interrupted(cmd, **kw):
+            raise KeyboardInterrupt
+        runner.subprocess.run = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            runner.launch_in_iterm("script", 60.0, self.SIDS[:1])
+        self.assertTrue(self.ended(self.SIDS[0]))
+
+    def test_while_it_is_being_sent_it_holds(self):                         # control
+        seen = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        def sending(cmd, **kw):
+            seen.append((runner.claim_launch(self.SIDS[0], alive=lambda p: False),
+                         runner.claim_is_unresolved(self.SIDS[0])))
+            return Done()
+        runner.subprocess.run = sending
+        runner.launch_in_iterm("script", 60.0, self.SIDS[:1])
+        self.assertEqual(seen, [(False, False)], "held, and said to be starting")
+
+    def test_a_send_from_before_the_mac_started_is_over(self):
+        runner.claim_unresolved(self.SIDS[0], 4242, now=time.time() - 30, until=time.time() + 60)
+        real = runner._boot_id
+        self.addCleanup(setattr, runner, "_boot_id", real)
+        runner._boot_id = lambda: "ANOTHER-BOOT"
+        self.assertTrue(runner.claim_launch(self.SIDS[0], alive=lambda p: True))
+
+
+class TestARestoreAfterAnEndedSendIsNotStarting(unittest.TestCase):
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    setUp, tearDown, write_manifest, _restore_open = _F.setUp, _F.tearDown, _F.write_manifest, _F._restore_open
+
+    def test_the_second_restore_says_they_are_waiting(self):
+        me = os.getpid()
+        runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n{me} {os.getuid()} iTerm2\n"
+        self.addCleanup(setattr, runner.engine, "app_snapshot", GUARDS["app_snapshot"])
+
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = stuck
+        self._restore_open()
+        rc, out = self._restore_open()
+        self.assertNotIn("already running or starting", out)
+        self.assertIn("still waiting on", out)
+        self.assertNotEqual(rc, 0)

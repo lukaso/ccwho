@@ -284,13 +284,42 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
             collector.fleet()
         finally:
             ui.engine.collect = real
-        return os.path.exists(os.path.join(tmp, "launching", self.SID + ".json"))
+        return runner.claim_is_unresolved(self.SID)
 
     def test_a_session_on_the_list_lets_go_of_its_claim(self):
         self.assertFalse(self.claim_after([row(self.SID)]))
 
     def test_one_not_on_it_keeps_it(self):                              # control
         self.assertTrue(self.claim_after([row("99999999-9999-4999-8999-999999999999")]))
+
+    def test_a_claim_made_during_the_lists_scan_survives_it(self):
+        # the list's `claude agents` read can take 30 s: a claim made while it
+        # ran may be a new launch of a session that has ended since
+        import os, shutil, tempfile, time
+        import ccwho as runner
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.environ["CCWHO_DIR"] = tmp
+        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+
+        def collect(cache=None, status=None):
+            time.sleep(0.02)
+            runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time(), "sessionId": self.SID,
+                                           "unresolved": True, "iterm_pid": 4_000_000, "until": 0})
+            time.sleep(0.02)
+            status.update(source_ok=True)
+            return [row(self.SID)], {}
+        collector = ui.Collector()
+        collector.reload = lambda: None
+        collector.secure_input = lambda: ""
+        collector.usage = lambda rows: {"state": "unknown"}
+        real = ui.engine.collect
+        ui.engine.collect = collect
+        try:
+            collector.fleet()
+        finally:
+            ui.engine.collect = real
+        self.assertTrue(runner.claim_is_unresolved(self.SID))
 
 
 class TestKeys(UiTest):
@@ -408,6 +437,28 @@ class TestTheAdapterTalksToIterm(unittest.TestCase):
             ui.subprocess.run = real
         self.assertIn("/dev/ttys022", seen["cmd"])
         self.assertNotIn("/dev//dev", " ".join(seen["cmd"]))
+
+    def said_after_a_refusal(self, act):
+        class Refused:
+            returncode, stdout = 1, ""
+            stderr = "execution error: Can\u2019t get window of /Users/x/secret. (-1728)"
+        real = ui.subprocess.run
+        ui.subprocess.run = lambda *a, **k: Refused()
+        try:
+            return act(ui.Adapter())
+        finally:
+            ui.subprocess.run = real
+
+    def test_a_refused_focus_is_said_by_its_code(self):
+        # osascript's message quotes paths and tab names: its code, never its text
+        said = self.said_after_a_refusal(lambda a: a.focus({"tty": "ttys022", "pid": 1}))
+        self.assertIn("(-1728)", said)
+        self.assertNotIn("/Users/x/secret", said)
+
+    def test_a_refused_attach_is_said_by_its_code(self):
+        said = self.said_after_a_refusal(lambda a: a.attach("claude attach x"))
+        self.assertIn("(-1728)", said)
+        self.assertNotIn("/Users/x/secret", said)
 
     def test_a_session_with_no_window_says_so_and_runs_nothing(self):
         ran = []

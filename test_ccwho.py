@@ -3436,6 +3436,13 @@ class TestCollectCarriesTheCodexThreads(MachinelessCollect):
             ccwho.agents_json = real
         self.assertIs(seen[0], cache)
 
+    def test_the_turn_you_looked_at_reaches_the_threads(self):
+        real = ccwho.load_reviewed
+        ccwho.load_reviewed = lambda *a, **k: {self.T["thread"]: 42}
+        self.addCleanup(setattr, ccwho, "load_reviewed", real)
+        rows, fleet = self.collect([dict(self.T, turn="done", ask="", ts=42, mtime=1.0)])
+        self.assertEqual(fleet["codex_threads"][0]["seen_ts"], 42)
+
     def test_ports_not_read_are_none(self):
         ccwho.listen_ports = lambda: None
         rows, fleet = self.collect([dict(self.T)])

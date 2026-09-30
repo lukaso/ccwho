@@ -35,29 +35,30 @@ class CodexCollector(KillCollector):
 
 
 class TestTheCodexRows(UiTest):
-    async def test_an_open_thread_is_a_row_under_codex_last(self):
+    async def test_an_open_thread_is_a_row_in_the_claude_groups(self):
+        # the owner's D19: its state places it; the row says it is Codex
         app = self.app(collector=CodexCollector())
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
             text = self.screen_text(app)
-            self.assertIn("CODEX", text)
+            self.assertNotIn("CODEX", text)
             self.assertIn("fix the navbar", text)
             self.assertIn("Codex · VS Code", text)
-            self.assertLess(text.index("NEEDS YOU"), text.index("CODEX"))
+            self.assertIn("STOPPED", text)                    # no turn read: stopped
 
     async def test_the_header_counts_sessions_and_codex_apart(self):
         app = self.app(collector=CodexCollector())
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
             header = str(app.query_one("#header").content)
-            self.assertIn("1 sessions", header)
-            self.assertIn("1 codex", header)
+            self.assertIn("1 sessions + 1 codex", header)
 
     async def test_no_threads_no_group(self):                            # control
         app = self.app(collector=CodexCollector(procs=dict(PROCS, codex_threads=None)))
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
-            self.assertNotIn("CODEX", self.screen_text(app))
+            self.assertNotIn("fix the navbar", self.screen_text(app))
+            self.assertNotIn("codex", str(app.query_one("#header").content))
 
     async def test_enter_says_where_it_runs_and_opens_nothing(self):
         adapter = FakeAdapter()
@@ -69,6 +70,26 @@ class TestTheCodexRows(UiTest):
             self.assertEqual((adapter.asked, adapter.attached), ([], []))
             self.assertIn("VS Code", app.status)
             self.assertIn("open it there", app.status)
+
+    async def test_enter_on_a_finished_thread_counts_as_looked_at(self):
+        done = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0], turn="done", ask="",
+                                               ts=42, mtime=1.0)])
+        seen = []
+        real = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: seen.append((sid, ts))
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", real)
+        app = self.app(collector=CodexCollector(procs=done))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            row = next(r for r in app.fleet.rows if r.get("kind") == "codex")
+            self.assertEqual(row["attention"], "review")
+            app.selected = T
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(seen, [(T, 42)])
+            self.assertEqual(row["attention"], "stopped")
 
     async def test_its_detail_says_what_it_is_and_lists_its_processes(self):
         app = self.app(collector=CodexCollector())

@@ -7094,7 +7094,9 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
         t = time.time()
         for bad in ("{not json", '{"wait_until": "x"}', '{"wait_until": null}',
-                    '{"wait_until": 1e308}', '{"quarantine": [1]}', "[]", '{"pending": "yes"}'):
+                    '{"wait_until": 1e308}', '{"quarantine": [[1]]}', '{"quarantine": [1, {"a": 2}]}',
+                    '{"quarantine": []}', '{"quarantine": [-100]}', '{"quarantine": "1"}',
+                    "[]", '{"pending": "yes"}'):
             with open(self.state("json"), "w") as f:
                 f.write(bad)
             self.assertEqual(self.ask(now=t), "fine\n", bad)
@@ -7717,7 +7719,7 @@ class TestTheGateSaysAnUnreadableTableAsOne(unittest.TestCase):
         self.stub("echo ok")
         why = {}
         self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], procs="", why=why))
-        self.assertEqual(why.get("refused"), "io")
+        self.assertEqual(why.get("refused"), "no-table")
 
     def test_a_table_with_no_iterm2(self):                                      # control
         self.stub("echo ok")
@@ -7741,3 +7743,40 @@ class TestTheGateSaysAnUnreadableTableAsOne(unittest.TestCase):
         self.assertIsNone(self.ask(wait=2.0, why=why))
         self.assertLess(time.monotonic() - t, 1.0)
         self.assertEqual(why.get("refused"), "io")
+
+
+class TestTheGateWritesOneIterm2AsOnePid(unittest.TestCase):
+    """A gate reader started before lists (the hotkey panel keeps its engine)
+    keeps an int: with one iTerm2 of ours - the usual case - the gate writes
+    one."""
+
+    _F = TestBackgroundAsksNeverPileUpInITerm2
+    stub, launches, table, state, ask, until, ended = (
+        _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+    setUp = TestTheGateAfterASlowOrFailedAsk.setUp
+
+    def asked(self, procs):
+        self.stub("echo 'execution error: AppleEvent timed out. (-1712)' >&2; exit 1")
+        ccwho.iterm_ask(["-e", "whatever"], timeout=10.0, procs=procs)
+        self.assertTrue(self.until(lambda: ccwho.iterm_ask(["-e", "x"], timeout=10.0, procs=procs) is None
+                                   and ccwho._read_gate(time.time()).get("quarantine") is not None))
+        return ccwho._read_gate(time.time())["quarantine"]
+
+    def test_one(self):
+        self.assertEqual(self.asked(apps((100, ME, IT))), 100)
+
+    def test_two(self):                                                          # control
+        self.assertEqual(self.asked(apps((100, ME, IT), (200, ME, IT))), [100, 200])
+
+
+class TestTheGateSaysAPsThatFailedAsOne(unittest.TestCase):
+    _F = TestBackgroundAsksNeverPileUpInITerm2
+    stub, launches, table, state, ask, until, ended = (
+        _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+    setUp = TestTheGateAfterASlowOrFailedAsk.setUp
+
+    def test_no_table(self):
+        self.stub("echo ok")
+        why = {}
+        self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], procs="", why=why))
+        self.assertEqual(why.get("refused"), "no-table")

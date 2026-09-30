@@ -6416,12 +6416,12 @@ class TestAJudgementThatBreaksHoldsTheClaim(unittest.TestCase):
                "unresolved": True, "iterm_pid": me}
         runner._write_claim(self.SID, rec)
         runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n{me} {os.getuid()} iTerm2\n"
-        real = runner.engine.is_iterm_app
-        self.addCleanup(setattr, runner.engine, "is_iterm_app", real)
+        real = runner.engine.iterm_app_pids
+        self.addCleanup(setattr, runner.engine, "iterm_app_pids", real)
 
         def renamed(*a):
-            raise AttributeError("is_iterm_app")
-        runner.engine.is_iterm_app = renamed
+            raise AttributeError("iterm_app_pids")
+        runner.engine.iterm_app_pids = renamed
         self.assertFalse(runner.claim_launch(self.SID, now=self.T))
         with open(runner._claim_path(self.SID)) as fh:
             self.assertEqual(unstamped(json.load(fh)), rec)
@@ -8626,9 +8626,9 @@ class TestTheWordsForAClockAndARefusal(unittest.TestCase):
     SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
     setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
 
-    def test_the_old_list_text_says_a_clock_too(self):
-        self.assertIn("clock", runner.OLD_LIST)
+    def test_the_old_list_text(self):
         self.assertIn("too old", runner.OLD_LIST)
+        self.assertNotIn("clock", runner.OLD_LIST)
 
     def test_a_refusal_with_no_place_is_not_part_way(self):
         class R:
@@ -9078,3 +9078,273 @@ class TestAFlockErrorNamesTheLock(unittest.TestCase):
         runner.subprocess.run = lambda *a, **k: self.fail("sent")
         why = runner.launch_in_iterm("script", 1.0, [self.SID])[1]
         self.assertIn(os.path.join(self.tmp, "launching", ".lock"), why)
+
+
+class TestTheSweepKeepsALaunchStillHeldAwake(TheClocks, unittest.TestCase):
+    """A launch held for its time awake is kept by the sweep too: the first
+    scan after an hour asleep must not remove what the judge still holds."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def launched(self, cut_off=False):
+        sid = self.SIDS[0]
+        if cut_off:
+            class Gone:
+                returncode, stdout, stderr = 1, "", "execution error: gone. (-609)"
+            runner.subprocess.run = lambda *a, **k: Gone()
+        else:
+            class Done:
+                returncode, stdout, stderr = 0, "", ""
+            runner.subprocess.run = lambda *a, **k: Done()
+        runner.launch_in_iterm("script", 1.0, [sid])
+        return sid
+
+    def woke(self, sid, awake):
+        self.move(wall=3600, mono=3600, up=awake)
+        runner.release_claims([], time.time(), runner._mono())       # the scan after waking, swept
+        return runner.claim_launch(sid, alive=lambda p: False, decided_at=time.time() - 2,
+                                   decided_mono=runner._mono() - 2)
+
+    def test_an_hour_asleep_ten_seconds_awake(self):
+        sid = self.launched()
+        self.assertFalse(self.woke(sid, 10))
+        self.assertEqual(runner.why_held(sid), ("starting", 0))
+
+    def test_cut_off_and_asleep(self):
+        sid = self.launched(cut_off=True)
+        self.assertFalse(self.woke(sid, 10))
+        reason, left = runner.why_held(sid)
+        self.assertEqual(reason, "cut off")
+        self.assertTrue(75 <= left <= 81, left)
+
+    def test_its_time_awake_over(self):                                         # control
+        sid = self.launched()
+        self.assertTrue(self.woke(sid, 91))
+
+
+class TestNoWallClockAgesALaunch(TheClocks, unittest.TestCase):
+    """A launch's age is its time awake: a wall clock set back while a claim
+    waited for the lock does not make it old."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_set_back_while_it_waited(self):
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        runner.subprocess.run = lambda *a, **k: Done()
+        sid = self.SIDS[0]
+        runner.launch_in_iterm("script", 1.0, [sid])
+        real = runner._claims_locked
+
+        @contextlib.contextmanager
+        def stepped(**kw):
+            self.move(wall=-200)                                  # while it waited
+            with real(**kw):
+                yield
+        runner._claims_locked = stepped
+        self.addCleanup(setattr, runner, "_claims_locked", real)
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: False))
+
+
+class TestOneJudgementReadsOneClock(TheClocks, unittest.TestCase):
+    """A decision and the record it is judged against are put on the wall
+    clock by the same reading: a step between them misorders nothing."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_step_inside_the_judgement(self):
+        m = runner._mono()
+        runner._write_claim(self.SID, {"sessionId": self.SID, "seen": True, "since": time.time() - 1,
+                                       "until": time.time()})
+        real = runner._read_claim
+
+        def read_after_a_step(sid):
+            self.move(wall=-200)                   # after the decision was put on the clock
+            return real(sid)
+        runner._read_claim = read_after_a_step
+        self.addCleanup(setattr, runner, "_read_claim", real)
+        self.assertFalse(runner.claim_launch(self.SID, decided_at=time.time() - 20, decided_mono=m - 20))
+
+
+class TestAStampIsTheRecordsOwnTime(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_slow_boot_id_does_not_move_it(self):
+        runner._boot_id = lambda: (time.sleep(0.003), "THIS-BOOT")[1]    # a cold first call
+        t = time.time()
+        runner._write_claim(self.SID, {"pid": 1, "owner": "x", "since": t, "sessionId": self.SID})
+        self.assertAlmostEqual(runner._read_claim(self.SID)["since"], t, delta=0.0005)
+
+
+class TestAClockNoCcwhoWroteIsNoClaim(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def raw(self, clock, age=10):
+        path = runner._claim_path(self.SID)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write('{"pid": 4000000, "owner": "x", "since": %r, "sessionId": "%s", "launched": true,'
+                     ' "clock": %s}' % (time.time() - age, self.SID, clock))
+
+    BAD = ("[]", "{}", '["THIS-BOOT"]', '["THIS-BOOT", "x", 0]', '["THIS-BOOT", 0, "x"]',
+           '["THIS-BOOT", ' + "1" + "0" * 400 + ', 0]', '["x", 0, -' + "1" + "0" * 400 + "]",
+           '["THIS-BOOT", true, 0]', "[1, 0, 0]")
+
+    def test_each_of_them(self):
+        for bad in self.BAD:
+            self.raw(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                runner._read_claim(self.SID)
+            runner.release_claims([self.SID], time.time())
+            self.assertFalse(os.path.exists(runner._claim_path(self.SID)), bad)
+            self.raw(bad)
+            self.assertTrue(runner.claim_launch(self.SID), bad)
+
+    def test_swept_too(self):
+        self.raw('["x", 0, ' + "1" + "0" * 400 + "]", age=7200)
+        os.utime(runner._claim_path(self.SID), (time.time() - 7200, time.time() - 7200))
+        runner.release_claims([], time.time())
+        self.assertFalse(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_clock_of_floats(self):                                           # control
+        self.raw('["x", 1e300, 0]')
+        self.assertIs(runner._read_claim(self.SID).get("launched"), True)
+
+
+class TestTheScansClocksReachTheJudgement(TheClocks, unittest.TestCase):
+    """open and restore order their scan by the clock that never steps -
+    through scan(), release_claims and claim_launch as they run."""
+
+    _F = TestOpenNeverForksALiveSession
+    SID, ENTRY, tearDown, _open = _F.SID, _F.ENTRY, _F.tearDown, _F._open
+
+    def setUp(self):
+        self._F.setUp(self)
+
+        def stepped_scan(cache=None, status=None):
+            status["seen_at"] += 20                      # stamped by a clock 20 s fast
+            time.sleep(0.01)
+            runner.release_claims([self.SID], time.time(), runner._mono())   # another scan sees it
+            self.move(wall=25, mono=25, up=25)
+            status["source_ok"] = True
+            return [], 0
+        runner.engine.collect = stepped_scan
+        os.makedirs(os.path.join(runner.ccwho_dir(), "launching"), exist_ok=True)
+        runner._write_claim(self.SID, {"pid": DEAD, "owner": "x", "since": time.time() - 1,
+                                       "sessionId": self.SID, "launched": True})
+
+    def test_open(self):
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+    def test_a_release_by_its_start(self):
+        # a launch 5 s after a scan whose wall stamp ran 20 s fast: the scan
+        # started before it - it stays a launch
+        m = runner._mono()
+        runner._write_claim(self.SID, {"pid": DEAD, "owner": "x", "since": time.time() + 5,
+                                       "sessionId": self.SID, "launched": True,
+                                       "clock": [runner._boot_id(), m + 5, runner._uptime() + 5]})
+        runner.release_claims([self.SID], time.time() + 20, m)
+        with open(runner._claim_path(self.SID)) as fh:
+            self.assertIs(json.load(fh).get("launched"), True)
+
+
+class TestTheRestoresScanReachesTheJudgement(TheClocks, unittest.TestCase):
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    tearDown, write_manifest, _restore_open = _F.tearDown, _F.write_manifest, _F._restore_open
+
+    def setUp(self):
+        self._F.setUp(self)
+        self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
+
+        def stepped_scan(cache=None, status=None):
+            status["seen_at"] += 20
+            time.sleep(0.01)
+            runner.release_claims([self.DEAD_SID], time.time(), runner._mono())
+            self.move(wall=25, mono=25, up=25)
+            status["source_ok"] = True
+            return [], 0
+        runner.engine.collect = stepped_scan
+        runner._write_claim(self.DEAD_SID, {"pid": DEAD, "owner": "x", "since": time.time() - 1,
+                                            "sessionId": self.DEAD_SID, "launched": True})
+
+    def test_restore(self):
+        rc, out = self._restore_open()
+        self.assertNotEqual(rc, 0, out)
+        self.assertNotIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+
+class TestEveryClaimOfASendIsStampedAnew(unittest.TestCase):
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_the_other_one_read_again(self):
+        a, b, batch = self.SIDS[0], self.SIDS[1], runner._tables()
+        token, fd = runner._hold_send()
+        for sid in (a, b):
+            self.assertTrue(runner.claim_unresolved(sid, None, send=token))
+        runner.engine.app_snapshot = lambda: NO_ITERM
+        batch()                                               # during the send
+        os.close(fd)
+        time.sleep(0.01)
+        unreadable = lambda after=None: ("", time.time())
+        self.assertFalse(runner.claim_launch(a, alive=lambda p: False, refresh=unreadable))   # re-dates both
+        runner.engine.app_snapshot = lambda: ITERM_TABLE
+        self.assertFalse(runner.claim_launch(b, alive=lambda p: p == 4242, refresh=batch))
+
+
+class TestACutOffWaitIsItsTimeAwake(TheClocks, unittest.TestCase):
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_an_hour_asleep(self):
+        class Gone:
+            returncode, stdout, stderr = 1, "", "execution error: gone. (-609)"
+        runner.subprocess.run = lambda *a, **k: Gone()
+        runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
+        self.move(wall=3600, mono=3600, up=10)
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: False))
+        reason, left = runner.why_held(self.SIDS[0])
+        self.assertEqual(reason, "cut off")
+        self.assertTrue(75 <= left <= 81, left)
+
+
+class TestABatchTablesTimeFollowsTheClock(TheClocks, unittest.TestCase):
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_a_claim_newer_than_the_table_after_a_step(self):
+        sid, batch = self.SIDS[0], runner._tables()
+        runner.engine.app_snapshot = lambda: NO_ITERM
+        batch()
+        time.sleep(0.01)
+        runner.claim_unresolved(sid, None)                     # written after the table
+        self.move(wall=5, mono=10, up=10)                      # 10 s on, the clock set back 5
+        runner.engine.app_snapshot = lambda: ITERM_TABLE
+        self.assertFalse(runner.claim_launch(sid, alive=lambda p: p == 4242, refresh=batch))
+
+
+class TestAMonotonicDecisionIsNotOldForAClockStep(TheClocks, unittest.TestCase):
+    """A decision stamped on the monotonic clock is as old as it is: a wall
+    clock set back since does not make it "from the future", nor "old"."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_set_back_by_more_than_the_slack(self):
+        decided = (time.time(), runner._mono())
+        self.move(wall=-700)
+        self.assertTrue(runner.claim_launch(self.SID, decided_at=decided[0], decided_mono=decided[1]))
+
+    def test_one_that_is_old(self):                                              # control
+        decided = (time.time(), runner._mono())
+        self.move(wall=700, mono=700, up=700)
+        self.assertFalse(runner.claim_launch(self.SID, decided_at=decided[0], decided_mono=decided[1]))
+        self.assertEqual(runner.why_held(self.SID)[0], "old list")

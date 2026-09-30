@@ -79,7 +79,12 @@ def doctor_checks(facts):
         else "update ccwho (brew upgrade ccwho); if it persists, Claude Code changed the"
         " file format - report it"))
 
-    if facts.get("iterm_ok", False) is None:
+    if facts.get("iterm_ok", False) is None and facts.get("iterm_why") == "no-table":
+        out.append(_check(
+            "iterm2", False,
+            "could not read the process list (ps) - cannot tell whether iTerm2 runs",
+            "run `ccwho doctor` again; if it persists, check that /bin/ps runs"))
+    elif facts.get("iterm_ok", False) is None:
         # the gate would not ask: iTerm2 is not answering Apple Events
         out.append(_check(
             "iterm2", False,
@@ -282,12 +287,14 @@ def doctor_banner(results):
 # never raises: a doctor that dies on the machine it is diagnosing is no use.
 
 def gather(ccwho_dir=None, settings_path=None, now=None):
+    why = {}
     return {
         # not shutil.which: a hotkey window and a launchd job both run without
         # a login shell, and `claude` is not on the PATH either of them gets.
         "claude": engine.find_tool("claude"),
         "session_files_bad": _session_files_bad(),
-        "iterm_ok": iterm_scriptable(),
+        "iterm_ok": iterm_scriptable(why=why),
+        "iterm_why": why.get("refused"),
         "handler_registered": handler_registered(),
         "launchd_loaded": launchd_loaded(),
         "last_run_age": last_run_age(ccwho_dir, now=now),
@@ -317,7 +324,7 @@ def _session_files_bad():
 SCRIPTABLE_WAIT = 3.0     # a background ask in flight takes about 0.6 s
 
 
-def iterm_scriptable(timeout=5.0):
+def iterm_scriptable(timeout=5.0, why=None):
     """Can we ASK iTerm2 something? Not "is it running". True, False, or None.
 
     Automation access is granted per application pair and can be refused; a
@@ -330,9 +337,11 @@ def iterm_scriptable(timeout=5.0):
     pause after it) - the Automation fix. None: running but not answered - stuck
     (-1712), its own ask timed out, the gate is holding off, or ccwho cannot
     write its gate state in ~/.cache/ccwho. Restarting iTerm2 (or fixing that
-    dir) is the fix, not System Settings.
+    dir) is the fix, not System Settings - unless the gate could not read the
+    process list at all (`why` gets refused="no-table"): then iTerm2 was
+    never asked.
     """
-    why = {}
+    why = {} if why is None else why
     out = engine.iterm_ask(["-e", 'tell application "iTerm2" to count windows'],
                            timeout=timeout, wait=SCRIPTABLE_WAIT, why=why)
     if out is not None:

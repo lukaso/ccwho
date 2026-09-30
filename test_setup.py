@@ -1370,6 +1370,20 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
         self.assertNotIn("Automation", text)
         self.assertIn("restart iTerm2", text)
 
+    def test_a_process_list_that_could_not_be_read_is_said_as_one(self):
+        # ps failed: iTerm2 was never asked - not "not answering", and no
+        # restart of it
+        self.fake(None, refused="no-table")
+        why = {}
+        self.assertIsNone(setup.iterm_scriptable(why=why))
+        self.assertEqual(why.get("refused"), "no-table")
+        facts = {"iterm_ok": None, "iterm_why": why.get("refused")}
+        check = next(c for c in setup.doctor_checks(facts) if c["name"] == "iterm2")
+        text = " ".join(str(v) for v in check.values())
+        self.assertIn("process list", text)
+        self.assertNotIn("not answering", text)
+        self.assertNotIn("restart iTerm2", text)
+
     def test_doctor_still_names_automation_when_iterm2_refused(self):   # control
         check = next(c for c in setup.doctor_checks({"iterm_ok": False}) if c["name"] == "iterm2")
         self.assertIn("Automation", " ".join(str(v) for v in check.values()))

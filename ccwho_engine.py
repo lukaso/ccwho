@@ -1284,23 +1284,13 @@ def iterm_app_pids(procs_output):
             if uid == me and _is_iterm_app(name)]
 
 
-def is_iterm_app(procs_output, pid):
-    """Is `pid` an iTerm2 app of ours, by its own entry in the table - not
-    whichever iTerm2 has the lowest pid, and not a process that reused it."""
-    _tty, uid, name = parse_procs(procs_output).get(pid, ("", -1, ""))
-    return uid == os.getuid() and _is_iterm_app(name)
-
-
-APP_SNAPSHOT_SECONDS = 20.0       # the longest app_snapshot() waits for ps
-
-
-def _ps(args, timeout=20, env=None):
-    """ps's output, or None when it could not be run or did not exit cleanly:
-    one killed part way may have printed part of the table, and a process
-    missing from it is not gone (nor a pane idle)."""
+def _ps(args, env=None):
+    """ps's output - waited for 20 s at most - or None when it could not be
+    run or did not exit cleanly: one killed part way may have printed part of
+    the table, and a process missing from it is not gone (nor a pane idle)."""
     try:
         r = subprocess.run(["ps", *args], capture_output=True, text=True, errors="replace",
-                           timeout=timeout, env=env)
+                           timeout=20, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -1309,7 +1299,7 @@ def _ps(args, timeout=20, env=None):
 def app_snapshot():
     """The cheap process table: no tty column (0.03 s of ps, where the tty
     column costs 0.2 s) - enough to find iTerm2 outside a scan."""
-    return _ps(["-eo", "pid,uid,ucomm"], timeout=APP_SNAPSHOT_SECONDS) or ""
+    return _ps(["-eo", "pid,uid,ucomm"]) or ""
 
 
 @functools.cache
@@ -1504,11 +1494,10 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         now = time.time() if fixed_now is None else fixed_now
         table = app_snapshot() if procs is None else procs
         if not parse_procs(table):
-            why["refused"] = "io"           # no table: not "no iTerm2" (the Automation fix)
+            why["refused"] = "no-table"     # ps failed: not "no iTerm2", nor a stuck one
             return None
         pids = iterm_app_pids(table)
-        pid = pids[0] if pids else None
-        if pid is None:
+        if not pids:
             why["refused"] = "no-iterm"     # `tell application "iTerm2"` would launch it
             return None
         state, _, saved = _settle(_read_gate(now), now)
@@ -1522,7 +1511,7 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
             state.pop("last_error", None)
         stuck = state.get("quarantine")
         stuck = [] if stuck is None else ([stuck] if type(stuck) is int else stuck)
-        if stuck and not any(is_iterm_app(table, p) for p in stuck):
+        if stuck and not set(stuck) & set(pids):
             state.pop("quarantine")         # restarted: none that may be stuck runs
             state.pop("last_error", None)
         elif stuck:
@@ -1533,8 +1522,10 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         elif now < state.get("wait_until", 0):
             why.update(refused="waiting", error=state.get("last_error"))
             return None
-        # every iTerm2 of ours it may reach: `tell application "iTerm2"` picks one
-        state.update(asked_pid=pids, pending=True, boot=boot_id())
+        # every iTerm2 of ours it may reach: `tell application "iTerm2"` picks
+        # one. One is written as its pid: a reader from before lists (a
+        # hotkey panel keeps its engine) keeps that quarantine
+        state.update(asked_pid=pids[0] if len(pids) == 1 else pids, pending=True, boot=boot_id())
         if not _write_gate(state):
             why["refused"] = "io"
             return None

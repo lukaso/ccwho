@@ -2080,8 +2080,10 @@ class Collector:
 
     def fleet(self):
         import time
+        import ccwho as runner
         self.reload()
-        status, seen_at, seen_mono = {}, time.time(), time.clock_gettime(time.CLOCK_MONOTONIC)
+        # the clock release_claims reads the scan's start by
+        status, seen_at, seen_mono = {}, time.time(), runner._mono()
         try:
             rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen

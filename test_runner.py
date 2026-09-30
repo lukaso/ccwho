@@ -10668,8 +10668,10 @@ class TestASendLockItsLauncherLeftSaysSo(unittest.TestCase):
 
 
 # a ccwho started with stdin, stdout and stderr closed: its locks, and a child
-# that must hold them. argv: repo, result file, "closed" or "open". Only
-# harmless programs run.
+# that must hold them. argv: repo, result file, mode - "open", "closed", or
+# "closed-unguarded" (closed, and ccwho's and the engine's _above_std made
+# identity: the locks left low). Writes: high, sending, freed, gate_high,
+# gate_freed. Only harmless programs run.
 STD_CLOSED_PROBE = r"""
 import os, subprocess, sys
 repo, result, mode = sys.argv[1:4]
@@ -10782,20 +10784,27 @@ class TestAStoppedCommandDiesOfSigint(unittest.TestCase):
     of SIGINT - an exit 130 lets it launch the next."""
 
     def ended(self, flagged):
+        """(its wait status, what it printed to stdout - a file: buffered)"""
         code = ("import sys; sys.path.insert(0, sys.argv[1]); import ccwho; "
+                "print('already open: a'); "
                 + ("ccwho._LOCAL.interrupted = True; " if flagged else "")
                 + "ccwho._exit(130)")
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        return REAL_RUN([sys.executable, "-c", code, os.path.dirname(os.path.abspath(runner.__file__))],
-                        capture_output=True, timeout=60,
-                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", HOME=tmp, CCWHO_DIR=tmp)).returncode
+        with open(os.path.join(tmp, "out"), "w") as out:
+            rc = REAL_RUN([sys.executable, "-c", code, os.path.dirname(os.path.abspath(runner.__file__))],
+                          stdout=out, stderr=subprocess.DEVNULL, timeout=60,
+                          env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", HOME=tmp,
+                                   CCWHO_DIR=tmp)).returncode
+        with open(os.path.join(tmp, "out")) as fh:
+            return rc, fh.read()
 
     def test_after_a_ctrl_c(self):
-        self.assertEqual(self.ended(True), -signal.SIGINT)
+        # dies of SIGINT - and what it printed reaches its file first
+        self.assertEqual(self.ended(True), (-signal.SIGINT, "already open: a\n"))
 
     def test_otherwise(self):                                                   # control
-        self.assertEqual(self.ended(False), 130)
+        self.assertEqual(self.ended(False), (130, "already open: a\n"))
 
     def test_interruptible_marks_it(self):
         def before(args):
@@ -10850,3 +10859,87 @@ class TestARestoreWithALauncherlessSendBesideAnOpenOne(unittest.TestCase):
         self.assertIn("still waiting on b", out)
         self.assertNotIn("already running or starting", out)
         self.assertEqual(rc, 1)
+
+
+class TestAnErrorThatHidesACtrlCInRunsCleanUp(unittest.TestCase):
+    """A Ctrl-C while osascript's output is read, a second in run's kill, and
+    an error from its clean-up that takes its place: no constructor frame,
+    so the error branch finds run's own process (_popen_in), ends it, and
+    only then binds the claims - the Ctrl-C still stops the command. One that
+    cannot be ended leaves the claim on its send lock."""
+
+    _A = TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack
+    SIDS, setUp, sent = _A.SIDS, _A.setUp, _A.sent
+
+    def launched(self, kill_fails):
+        sid = self.SIDS[35]
+        run = failing_after_start(self, KeyboardInterrupt(), "communicate", ("/bin/sleep", "30"))
+        real_kill, calls = subprocess.Popen.kill, []
+
+        def kill(p):
+            calls.append(p)
+            if len(calls) == 1:
+                raise KeyboardInterrupt                         # run's kill, interrupted
+            if kill_fails:
+                raise OSError(errno.EPERM, "Operation not permitted")
+            return real_kill(p)
+
+        def exit_fails(p, *exc):
+            raise OSError(errno.EBADF, "Bad file descriptor")   # its pipes, closed as it unwound
+        at_the_table = []
+        runner.engine.app_snapshot = lambda: at_the_table.append(self.children[-1].returncode) or ITERM_TABLE
+        with mock.patch.object(subprocess.Popen, "kill", kill), \
+                mock.patch.object(subprocess.Popen, "__exit__", exit_fails):
+            with self.assertRaises(KeyboardInterrupt):
+                self.sent(sid, run)
+        return sid, at_the_table
+
+    def test_it_is_ended_before_it_is_bound(self):
+        sid, at_the_table = self.launched(kill_fails=False)
+        self.assertEqual(self.children[-1].returncode, -signal.SIGKILL)
+        self.assertEqual(at_the_table, [-signal.SIGKILL])       # its table taken once it ended
+        rec = runner._read_claim(sid)
+        self.assertNotIn("send", rec)
+        self.assertEqual(rec["iterm_pid"], [4242])
+
+    def test_one_that_cannot_be_ended_stays_on_its_lock(self):                 # control
+        sid, _ = self.launched(kill_fails=True)
+        self.assertIsNone(self.children[-1].returncode)
+        rec = runner._read_claim(sid)
+        self.assertIsNotNone(rec.get("send"))
+        self.assertTrue(runner._sending(rec))
+
+
+class TestAHiddenCtrlCWithNoProcessFound(unittest.TestCase):
+    """An error that hides a Ctrl-C where no Popen can be found - not one being
+    made, not run's own: no process can be shown ended, so the claims stay on
+    the send lock, not bound - and the Ctrl-C stops the command."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS[:1], _F.setUp
+
+    def run_raising(self, hidden):
+        def run(cmd, **kw):
+            if not hidden:
+                raise OSError(errno.EIO, "Input/output error")
+            try:
+                raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                raise OSError(errno.EBADF, "Bad file descriptor")
+        runner.subprocess.run = run
+
+    def test_it_hid_one(self):
+        self.run_raising(hidden=True)
+        with self.assertRaises(KeyboardInterrupt):
+            runner.launch_in_iterm("script", 1.0, self.SIDS)
+        rec = runner._read_claim(self.SIDS[0])
+        self.assertIsNotNone(rec.get("send"))
+        self.assertIsNone(rec.get("iterm_pid"))
+
+    def test_it_hid_none(self):                                                 # control
+        self.run_raising(hidden=False)
+        why = runner.launch_in_iterm("script", 1.0, self.SIDS)[1]
+        self.assertIn(runner.MAY_STILL_RUN, why)
+        rec = runner._read_claim(self.SIDS[0])
+        self.assertNotIn("send", rec)
+        self.assertEqual(rec["iterm_pid"], [4242])

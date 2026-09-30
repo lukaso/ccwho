@@ -271,16 +271,15 @@ def _interrupted(ex):
 
 def _ended(p):
     """Is the send's process p ended - killed and reaped here, as
-    subprocess.run ends one it gives up on? p is the one Popen's constructor
-    left (_being_made: the error branch) or the one found on Ctrl-C
-    (_popen_in). Ended only when it can be shown to be: its returncode, which
+    subprocess.run ends one it gives up on? p is the one _popen_in finds:
+    the one Popen's constructor left, or subprocess.run's own (a Ctrl-C in
+    its clean-up can leave it running). Ended only when it can be shown to
+    be: its returncode, which
     only reaping sets (read as a Popen of another CPython may lack it).
     False when it could not be ended: the send is then not recorded as over
     (_sent) - the record made before it names the send lock, which that
-    process holds, and holds while it runs (_sending). True for None - which
-    means "ended" only in the error branch, where subprocess.run has already
-    ended its own; a caller whose None means "cannot tell" (_popen_in's) must
-    not take it for ended."""
+    process holds, and holds while it runs (_sending). True for None: a
+    caller whose None means "cannot tell" must not take it for ended."""
     if p is None:
         return True
     with contextlib.suppress(Exception):
@@ -314,7 +313,11 @@ def _send(script, deadline, sids, lock):
             # that landed there: then it is no proof, and the claims stay)
             drop_claims(sids)
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
-        if _ended(p):
+        # the send's process - being made, or subprocess.run's own - ended
+        # before the claims are bound; none found: bound only when no Ctrl-C
+        # was hidden (then subprocess.run ended its own)
+        q = _popen_in(ex)
+        if _ended(q) if q is not None else stop is None:
             _sent(sids)                         # it may have run: its event may be out
         if stop is not None:
             raise stop                          # the Ctrl-C it hid: the command stops
@@ -1736,7 +1739,9 @@ def why_held(session_id):
     read - it has changed; "unresolved": an earlier launch did not finish and
     may still run; "sending": its send lock is held by an osascript whose
     ccwho is gone; "cut off": iTerm2 quit during an earlier launch; else
-    "starting" (its launcher alive: another ccwho is opening it)."""
+    "starting" - a claim whose launcher is alive, an unresolved launch whose
+    send lock is held by its live launcher, or a launch iTerm2 ran, held up
+    to LAUNCH_CLAIM_SECONDS until seen running."""
     return _refusals().pop(session_id, ("starting", 0))
 
 
@@ -3834,8 +3839,12 @@ def main(argv=None):
 def _exit(rc):
     """The process's end: one whose command was stopped by Ctrl-C
     (_interruptible) dies of SIGINT, as an uncaught one does - bash ends a
-    loop around it only when its child died of SIGINT; else rc."""
+    loop around it only when its child died of SIGINT - once what it printed
+    is flushed (a file or a pipe holds it in a buffer); else rc."""
     if _LOCAL.__dict__.pop("interrupted", False):
+        for out in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                out.flush()
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         os.kill(os.getpid(), signal.SIGINT)
     raise SystemExit(rc)

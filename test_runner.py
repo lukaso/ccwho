@@ -67,6 +67,64 @@ MOVES_ITSELF = {"_SHOWN_LAST", "index", "usage"}     # ccwho rebinds these (glob
 def setUpModule():
     install_guards()
     _UNPIN.append(testkit.pin_ccwho_dir(runner))
+    _fresh_claim_state()
+
+
+def _fresh_claim_state():
+    """Every test here starts with no claim state an earlier one left in
+    ccwho's thread-local store (_LOCAL: why a claim could not be recorded,
+    the tokens of claims taken, refusals, a give-up mark) - the next
+    launch_in_iterm on the thread reads it. Wraps each test class's setUp."""
+    for cls in list(globals().values()):
+        if isinstance(cls, type) and issubclass(cls, unittest.TestCase) and cls.__module__ == __name__:
+            def setUp(self, _real=cls.setUp):
+                runner._LOCAL.__dict__.clear()
+                self.addCleanup(runner._LOCAL.__dict__.clear)
+                _real(self)
+            cls.setUp = setUp
+
+
+def spawn_failing(ex):
+    """A subprocess.run for osascript whose process is never made: the real
+    run - of a harmless program, never osascript - its fork failing with
+    `ex`, raised where Popen makes the process."""
+    def run(cmd, **kw):
+        real = subprocess._fork_exec
+
+        def fork_exec(*a, **k):
+            raise ex
+        subprocess._fork_exec = fork_exec
+        try:
+            return REAL_RUN(["/usr/bin/true"], **kw)
+        finally:
+            subprocess._fork_exec = real
+    return run
+
+
+def exec_failing():
+    """A subprocess.run for osascript whose exec fails: the real run of a
+    program that is not there."""
+    return lambda cmd, **kw: REAL_RUN(["/nonexistent/ccwho-test/osascript"], **kw)
+
+
+def failing_after_start(test, ex, where="communicate"):
+    """A subprocess.run for osascript whose process - a harmless program,
+    never osascript - is made, and then `ex` is raised: while its output is
+    read (communicate), or while Popen still waits for exec's report
+    (_close_pipe_fds). A child left unwaited is reaped when the test ends."""
+    def run(cmd, **kw):
+        real = getattr(subprocess.Popen, where)
+
+        def failing(self, *a, **k):
+            if where != "communicate":
+                test.addCleanup(lambda p=self: (os.waitpid(p.pid, 0), setattr(p, "returncode", 0)))
+            raise ex
+        setattr(subprocess.Popen, where, failing)
+        try:
+            return REAL_RUN(["/usr/bin/true"], **kw)
+        finally:
+            setattr(subprocess.Popen, where, real)
+    return run
 
 
 def tearDownModule():
@@ -409,9 +467,25 @@ class TestSaveAndRestore(unittest.TestCase):
     SECRET = "/Users/x/secret-project/.env"
 
     def test_a_reopen_that_cannot_drive_iterm2_says_the_type_only(self):
+        said = self.reopened_with(spawn_failing(FileNotFoundError(errno.ENOENT, "No such file",
+                                                                  self.SECRET)))
+        self.assertTrue(said.startswith("could not reopen"), said)
+        self.assertIn("could not drive iTerm2 (FileNotFoundError)", said)
+        self.assertNotIn(runner.MAY_STILL_RUN, said)
+        self.assertNotIn(self.SECRET, said)
+
+    def test_a_reopen_that_may_have_run_says_the_type_only(self):
+        said = self.reopened_with(failing_after_start(self, OSError(errno.EIO, self.SECRET)))
+        self.assertFalse(said.startswith("could not reopen"), said)
+        self.assertIn("could not drive iTerm2 (OSError)", said)
+        self.assertIn(runner.MAY_STILL_RUN, said)
+        self.assertNotIn(self.SECRET, said)
+
+    def reopened_with(self, fake):
         self._save()
         d = runner.restore_dir()
         path = os.path.join(d, os.listdir(d)[0])
+
         def no_rows(cache=None, status=None):
             if status is not None:
                 status["source_ok"] = True
@@ -419,17 +493,16 @@ class TestSaveAndRestore(unittest.TestCase):
         runner.engine.collect = no_rows                 # nothing live: it would reopen
         real_rp, real_run = runner.resume_problem, runner.subprocess.run
         runner.resume_problem = lambda row: ""
+
         def run(argv, *a, **k):
             if argv and argv[0] == "osascript":
-                raise OSError(self.SECRET)
+                return fake(argv, *a, **k)
             return real_run(argv, *a, **k)
         runner.subprocess.run = run
         try:
-            said = runner.reopen_saved(path)
+            return runner.reopen_saved(path)
         finally:
             runner.subprocess.run, runner.resume_problem = real_run, real_rp
-        self.assertIn("could not drive iTerm2 (OSError)", said)
-        self.assertNotIn(self.SECRET, said)
 
     def test_a_reopen_of_a_bad_manifest_says_the_type_only(self):
         d = runner.restore_dir()
@@ -4676,9 +4749,7 @@ class TestALaunchIsClaimedAsUnresolvedBeforeItIsSent(unittest.TestCase):
         self.assertTrue(self.held_while_iterm2_lives(self.SIDS[0]))
 
     def test_osascript_that_cannot_start_gives_them_back(self):
-        def cannot(cmd, **kw):
-            raise FileNotFoundError(errno.ENOENT, "No such file or directory", "osascript")
-        runner.subprocess.run = cannot
+        runner.subprocess.run = spawn_failing(FileNotFoundError(errno.ENOENT, "No such file or directory"))
         res, why = runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
         self.assertIn("could not drive iTerm2 (FileNotFoundError)", why)
         self.assertFalse(self.held_while_iterm2_lives(self.SIDS[0]))
@@ -6454,9 +6525,8 @@ class TestALaunchThatNeverStartedLetsGo(unittest.TestCase):
     SIDS, setUp, held_while_iterm2_lives = _F.SIDS, _F.setUp, _F.held_while_iterm2_lives
 
     def test_an_argument_that_cannot_be_passed(self):
-        def bad(cmd, **kw):
-            raise ValueError("embedded null byte")
-        runner.subprocess.run = bad
+        # the real run, of a harmless program: its argument stops it before a process is made
+        runner.subprocess.run = lambda cmd, **kw: REAL_RUN(["/usr/bin/true", "a\0b"], **kw)
         res, why = runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
         self.assertIsNone(res)
         self.assertIn("(ValueError)", why)
@@ -6812,9 +6882,7 @@ class TestTheListSaysACutOffLaunchAsOne(unittest.TestCase):
         self.assertNotIn("nothing in that manifest", again)
 
     def test_a_real_failure_still_could_not(self):                          # control
-        def cannot(cmd, **kw):
-            raise FileNotFoundError(errno.ENOENT, "No such file or directory")     # never ran
-        runner.subprocess.run = cannot
+        runner.subprocess.run = exec_failing()                                    # never ran
         self.assertTrue(runner.reopen_saved().startswith("could not reopen"))
 
 
@@ -8116,25 +8184,48 @@ class TestABatchJudgesEachClaimOnATableAfterIt(unittest.TestCase):
                          [False, False, False])
 
 
-class TestABatchTableFromTheFutureIsTakenAgain(unittest.TestCase):
-    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+class TestABatchTableIsTakenAgainOnlyForAClaimNewerThanIt(unittest.TestCase):
+    """_tables keeps a batch's table by its monotonic time: a wall clock step
+    neither takes it again nor ages it. A claim newer than it (`after`, on
+    the monotonic clock) takes a new one; one dated ahead of now cannot."""
+
     setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
 
-    def test_the_clock_set_back_after_it(self):
-        tables = runner._tables()
-        runner.engine.app_snapshot = lambda: NO_ITERM
+    def counted(self):
+        calls = []
+        runner.engine.app_snapshot = lambda: calls.append(1) or NO_ITERM
+        return calls, runner._tables()
+
+    def test_a_step_before_a_claim_older_than_it(self):
+        calls, tables = self.counted()
+        first = tables()
         real = time.time
-        with mock.patch.object(runner.time, "time", lambda: real() + 7200):
-            tables()
-        runner._write_claim(self.SID, {"pid": DEAD, "since": time.time() - 60, "sessionId": self.SID,
-                                       "unresolved": True, "iterm_pid": None, "boot": "THIS-BOOT"})
-        self.assertTrue(runner.claim_launch(self.SID, alive=lambda p: False, refresh=tables))
+        for step in (7200, -7200):
+            with mock.patch.object(runner.time, "time", lambda: real() + step):
+                again = tables(first[2] - 1)
+            self.assertEqual((len(calls), again[2]), (1, first[2]), step)
+
+    def test_a_claim_newer_than_it(self):                                        # control
+        calls, tables = self.counted()
+        first = tables()
+        time.sleep(0.01)
+        again = tables(runner._mono())
+        self.assertEqual(len(calls), 2)
+        self.assertGreater(again[2], first[2])
+
+    def test_a_claim_dated_ahead_of_now(self):
+        calls, tables = self.counted()
+        tables()
+        tables(runner._mono() + 60)
+        self.assertEqual(len(calls), 1)
 
 
 class TestNothingFromTheFutureIsTrusted(unittest.TestCase):
-    """The wall clock can be set back: a decision, or a table, stamped later
-    than now was made before the step - its order against claims and
-    sightings written since is unknown."""
+    """The wall clock can be set back: a decision stamped later than now was
+    made before the step - its order against claims and sightings written
+    since is unknown. A table's time is on the monotonic clock in use
+    (_tables), never ahead; one given on the wall clock alone - a
+    (table, taken) refresh, tests' - dated ahead is not trusted either."""
 
     SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
     setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
@@ -8780,8 +8871,7 @@ class TestALockThatCannotWorkIsNoWait(unittest.TestCase):
                 raise OSError(errno.ENOTSUP, "not supported")
         self.addCleanup(runner._LOCAL.__dict__.pop, "lock_gave_up", None)
         self.addCleanup(setattr, runner, "fcntl", real)
-        self.addCleanup(setattr, runner.engine, "fcntl", runner.engine.fcntl)
-        runner.fcntl = runner.engine.fcntl = NoFlock()
+        runner.fcntl = NoFlock()        # ccwho's own lock: the engine's is not used
         t = time.monotonic()
         self.assertTrue(runner.claim_launch(self.SID))
         self.assertLess(time.monotonic() - t, 1.0)
@@ -9602,54 +9692,53 @@ class TestScanHandsItsStartToTheRelease(TheClocks, unittest.TestCase):
 
 
 class TestOnlyAnErrorBeforeOsascriptRanGivesTheClaimsBack(unittest.TestCase):
-    """subprocess.run raises before osascript ran - it could not be started
-    (exec, its pipes) or refused an argument - or after, while its output was
-    read, when its event may already be in iTerm2 (a killed osascript does
-    not cancel it). Only the first gives the claims back; an error that could
-    be either holds them."""
+    """subprocess.run raises while Popen is still making osascript's process
+    - its pipes, fork, exec's report, an argument refused: nothing ran - or
+    after, while its output is read, when its event may already be in iTerm2
+    (a killed osascript does not cancel it). Only the first gives the claims
+    back. Told by where it was raised, never by its errno: fork's EAGAIN is
+    poll(2)'s too."""
 
     _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
     SIDS, setUp, held_while_iterm2_lives = _F.SIDS, _F.setUp, _F.held_while_iterm2_lives
 
-    def sent(self, sid, ex):
-        def run(cmd, **kw):
-            raise ex
+    def sent(self, sid, run):
         runner.subprocess.run = run
         return runner.launch_in_iterm("script", 1.0, [sid])[1]
 
     def test_before_it_ran(self):
-        for i, ex in enumerate((FileNotFoundError(errno.ENOENT, "No such file or directory"),
-                                PermissionError(errno.EACCES, "Permission denied"),
-                                PermissionError(errno.EPERM, "Operation not permitted"),
-                                OSError(errno.ENOEXEC, "Exec format error"),
-                                OSError(errno.E2BIG, "Argument list too long"),
-                                NotADirectoryError(errno.ENOTDIR, "Not a directory"),
-                                OSError(errno.ELOOP, "Too many levels of symbolic links"),
-                                OSError(errno.ENAMETOOLONG, "File name too long"),
-                                OSError(errno.EMFILE, "Too many open files"),
-                                OSError(errno.ENFILE, "Too many open files in system"),
-                                ValueError("embedded null byte"), TypeError("bad argument"))):
-            with self.subTest(ex=ex):
-                why = self.sent(self.SIDS[i], ex)
-                self.assertIn(f"could not drive iTerm2 ({type(ex).__name__})", why)
-                self.assertNotIn(runner.MAY_STILL_RUN, why)
+        cells = [spawn_failing(ex) for ex in (
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            PermissionError(errno.EACCES, "Permission denied"),
+            BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),    # no process left
+            OSError(errno.ENOMEM, "Cannot allocate memory"),
+            OSError(errno.EIO, "Input/output error"),
+            ValueError("embedded null byte"), TypeError("bad argument"))] + [exec_failing()]
+        for i, run in enumerate(cells):
+            with self.subTest(i=i):
+                why = self.sent(self.SIDS[i], run)
+                self.assertRegex(why, r"^could not drive iTerm2 \(\w+\)$")
                 self.assertFalse(self.held_while_iterm2_lives(self.SIDS[i]))
 
-    def test_after_it_may_have_run(self):
-        # read(2) and poll(2) - osascript's output - give these too; fork
-        # gives EAGAIN and ENOMEM, and poll(2) on macOS EAGAIN
-        for i, ex in enumerate((OSError(errno.EIO, "Input/output error"),
-                                OSError(errno.EBADF, "Bad file descriptor"),
-                                BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
-                                OSError(errno.ENOMEM, "Cannot allocate memory"),
-                                OSError("no errno"))):
-            with self.subTest(ex=ex):
-                why = self.sent(self.SIDS[20 + i], ex)
-                self.assertIn(f"could not drive iTerm2 ({type(ex).__name__})", why)
+    def test_after_it_started(self):
+        cells = [failing_after_start(self, ex) for ex in (
+            OSError(errno.EIO, "Input/output error"),
+            BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),    # poll(2)
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            PermissionError(errno.EPERM, "Operation not permitted"),
+            OSError("no errno"), ValueError("I/O operation on closed file"))]
+        # made, and exec not yet heard from: it may be running
+        cells.append(failing_after_start(self, OSError(errno.EBADF, "Bad file descriptor"),
+                                         "_close_pipe_fds"))
+        for i, run in enumerate(cells):
+            with self.subTest(i=i):
+                sid = self.SIDS[20 + i]
+                why = self.sent(sid, run)
+                self.assertTrue(why.startswith("could not drive iTerm2 ("), why)
                 self.assertIn(runner.MAY_STILL_RUN, why)
                 # bound to the iTerm2 a table after it shows (_sent)
-                self.assertEqual(runner._read_claim(self.SIDS[20 + i])["iterm_pid"], [4242])
-                self.assertTrue(self.held_while_iterm2_lives(self.SIDS[20 + i]))
+                self.assertEqual(runner._read_claim(sid)["iterm_pid"], [4242])
+                self.assertTrue(self.held_while_iterm2_lives(sid))
 
 
 class TestOnlyNoSuchProcessIsAProcessGone(unittest.TestCase):
@@ -9677,7 +9766,7 @@ class TestOnlyNoSuchProcessIsAProcessGone(unittest.TestCase):
             with self.subTest(ex=ex):
                 self.probe_says(ex)
                 self.assertIs(runner._pid_alive(4242), alive)
-        for pid in (None, "x", 0, -1, 2 ** 70):
+        for pid in (None, "x", "4242", 4242.0, True, 0, -1, 2 ** 70):
             with self.subTest(pid=pid):
                 self.assertIs(runner._pid_alive(pid), False)
 
@@ -9931,3 +10020,102 @@ class TestATryOnceThatFailsKeepsItsWindow(unittest.TestCase):
         t = time.monotonic()
         self.assertTrue(runner.claim_launch(self.SID))
         self.assertGreater(runner._LOCAL.lock_gave_up, t)
+
+
+class TestTheSweepNeverTakesAFileMadeAfterItsScan(unittest.TestCase):
+    """A file is recent from SIGHTING_SECONDS before its scan's start to
+    SIGHTING_SECONDS past the clock now: a scan that took longer than that
+    (the Mac slept while `claude agents` ran) must not take a send lock made
+    since, before its launcher locks it. A start on the monotonic clock is
+    never after now - one given ahead is taken as now."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def send_file(self, mtime):
+        d = os.path.join(self.tmp, "launching")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "ab" * 16 + ".send")
+        open(path, "w").close()                         # made, not yet locked
+        os.utime(path, (mtime, mtime))
+        return d, path
+
+    def test_one_made_after_a_long_scan_started(self):
+        for start in (-700, -3600, 3600):
+            with self.subTest(start=start):
+                d, path = self.send_file(time.time())
+                runner._sweep(d, time.time() + start, runner._mono() + start)
+                self.assertTrue(os.path.exists(path))
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(os.path.join(d, ".swept"))
+
+    def test_a_marker_made_after_it_started(self):
+        d, path = self.send_file(time.time() - 7200)    # one the sweep would take
+        mark = os.path.join(d, ".swept")
+        open(mark, "w").close()                         # a sweep 1 s ago, by a later scan
+        os.utime(mark, (time.time() - 1, time.time() - 1))
+        runner._sweep(d, time.time() - 700, runner._mono() - 700)
+        self.assertTrue(os.path.exists(path))
+
+    def test_an_old_one_no_one_holds(self):                                     # control
+        d, path = self.send_file(time.time() - 3600)
+        runner._sweep(d, time.time() - 700, runner._mono() - 700)
+        self.assertFalse(os.path.exists(path))
+
+
+class TestASendLockRemovedAsItIsMadeIsNone(unittest.TestCase):
+    """_hold_send makes its file, then locks it. A file removed in between
+    would leave a lock on no name: every claim naming it would read "the
+    send is over". It is refused - never a lock on a file that is gone."""
+
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def locked_after(self, between):
+        real = runner.fcntl
+
+        class Fcntl:
+            LOCK_EX, LOCK_NB, LOCK_SH = fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_SH
+
+            def flock(self, fd, op):
+                between()
+                return real.flock(fd, op)
+        self.addCleanup(setattr, runner, "fcntl", real)
+        runner.fcntl = Fcntl()
+
+    def sends(self):
+        d = os.path.join(self.tmp, "launching")
+        return [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".send")]
+
+    def test_removed_before_its_lock(self):
+        self.locked_after(lambda: [os.unlink(p) for p in self.sends()])
+        with self.assertRaises(OSError):
+            runner._hold_send()
+
+    def test_replaced_before_its_lock(self):
+        def replaced():
+            for p in self.sends():
+                os.unlink(p)
+                open(p, "w").close()
+        self.locked_after(replaced)
+        with self.assertRaises(OSError):
+            runner._hold_send()
+
+    def test_left_as_it_was_made(self):                                         # control
+        self.locked_after(lambda: None)
+        held = runner._hold_send()
+        self.addCleanup(runner._let_go_send, held)
+        self.assertTrue(runner._sending({"send": held[0]}))
+
+
+class TestNoClaimStateCrossesTests(unittest.TestCase):
+    """A claim_launch that failed leaves why in ccwho's thread-local store
+    (_LOCAL), and the next launch_in_iterm on the thread reads it: every
+    test here starts with none (setUpModule)."""
+
+    def test_a_refused_dir_then_a_busy_lock(self):
+        for first in (TestARefusalSaysItsReason("test_a_ccwho_dir_not_ours"),
+                      TestTheClaimDirIsPrivate("test_one_of_another_user_is_refused")):
+            r = unittest.TestResult()
+            first.run(r)
+            TestAClaimsLockHeldForGoodStopsNoScan("test_a_launch_waits_a_while_then_refuses").run(r)
+            self.assertEqual((r.failures, r.errors), ([], []), first)

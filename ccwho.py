@@ -153,18 +153,20 @@ def launch_in_iterm(script, deadline, sids):
     leaves it held while its osascript runs. Then, by outcome:
     - all of it ran (rc 0): launched (claim_launched), held until seen, or
       LAUNCH_CLAIM_SECONDS - and against any decision made before it;
-    - nothing was sent (osascript could not be started - an error only exec
-      or its pipes give, _NOT_STARTED - or refused an argument), or iTerm2
-      refused Apple Events (-1743) at the script's first event
-      (engine.AE_PROBE, which writes nothing): the claims go (drop_claims);
+    - nothing was sent - an error raised while subprocess.run was still
+      making osascript's process (_while_starting: its pipes, fork, exec's
+      report, an argument refused) - or iTerm2 refused Apple Events (-1743)
+      at the script's first event (engine.AE_PROBE, which writes nothing):
+      the claims go (drop_claims);
     - iTerm2 quit during it (-600/-609): the event died with it, and what it
       opened may still start - held LAUNCH_CLAIM_SECONDS, cut off
       (claim_launched);
     - anything else - a timeout, -1712, a signal, -1743 after the first
       event, an error after a write (a window closing while the pane-fill
-      script walks them), any other OSError (it may come while osascript's
-      output is read): unresolved, bound to the iTerm2 a table taken after
-      the send shows - to each of them, when it shows two of ours (_sent).
+      script walks them), an error raised after osascript's process was made
+      (while its output was read), whatever its errno: unresolved, bound to
+      the iTerm2 a table taken after the send shows - to each of them, when
+      it shows two of ours (_sent).
     A launch that cannot be recorded is not sent."""
     if _unrecorded().keys() & set(sids):
         # its claim could not be written: nothing to mark, nothing to send
@@ -195,13 +197,22 @@ def launch_in_iterm(script, deadline, sids):
         _let_go_send(send)
 
 
-# What subprocess.run raises only before osascript ran: exec's errors (not
-# found, not allowed, no program, its arguments too long) and its pipes' (no
-# descriptor left). Any other may come after its event went out - fork's
-# EAGAIN and ENOMEM too, which poll(2) and read(2) give while its output is
-# read - and holds.
-_NOT_STARTED = frozenset((errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC, errno.E2BIG,
-                          errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG, errno.EMFILE, errno.ENFILE))
+def _while_starting(ex):
+    """Was `ex` raised while subprocess.run was still making osascript's
+    process - in Popen's constructor, before any child was made (its pipes,
+    fork, an argument refused), or after exec reported the program could not
+    run (the child has exited)? Then nothing ran. Told by where it was
+    raised, never by its errno (fork's EAGAIN is poll(2)'s too): anything
+    raised after - while its output was read, or it was waited for - or while
+    a child was made and exec not yet heard from, may come after its event
+    went out; so may anything this cannot place."""
+    tb = ex.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code is subprocess.Popen.__init__.__code__:
+            p = tb.tb_frame.f_locals.get("self")
+            return not getattr(p, "_child_created", True) or getattr(p, "returncode", None) is not None
+        tb = tb.tb_next
+    return False
 
 
 def _send(script, deadline, sids, lock):
@@ -214,18 +225,13 @@ def _send(script, deadline, sids, lock):
     except subprocess.TimeoutExpired:
         _sent(sids)
         return None, f"iTerm2 did not answer in {deadline:g}s - {MAY_STILL_RUN}"
-    except (ValueError, TypeError) as ex:
-        # nothing was sent: an argument refused before osascript could start
-        # (a NUL byte)
-        drop_claims(sids)
+    except (OSError, ValueError, TypeError) as ex:
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
-        return None, f"could not drive iTerm2 ({type(ex).__name__})"
-    except OSError as ex:
-        if ex.errno in _NOT_STARTED:
-            drop_claims(sids)                   # nothing was sent: osascript did not start
+        if _while_starting(ex):
+            drop_claims(sids)                   # nothing was sent: osascript never ran
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
-        _sent(sids)                             # it may have run: its output was being read
+        _sent(sids)                             # it may have run: its event may be out
         return None, f"could not drive iTerm2 ({type(ex).__name__}) - {MAY_STILL_RUN}"
     except BaseException:
         # Ctrl-C: it may still run. (A closed terminal kills us without a
@@ -1092,19 +1098,14 @@ def _pid_alive(pid):
     """Is there a process with this pid? Only "no such process" (ESRCH) says
     it is gone: one of another user's (EPERM) is there, and a probe refused
     for another reason (a sandbox's) tells nothing - it holds, and the table
-    decides (_iterm_holds). What is no pid is no process."""
-    try:
-        pid = int(pid)
-    except (ValueError, TypeError, OverflowError):
-        return False
-    if not 0 < pid < 2 ** 31:
+    decides (_iterm_holds). What is no pid (_read_claim's rule) is no
+    process."""
+    if type(pid) is not int or not 0 < pid < 2 ** 31:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
+    except OSError as ex:
+        return ex.errno != errno.ESRCH
     return True
 
 
@@ -1329,15 +1330,19 @@ def _hold_send():
     is exactly that lock held (_sending): it dies with its holders - the
     launcher and the osascript it runs - and outlasts a launcher stopped
     mid-send (Ctrl-Z); no clock says how long a send may take. It is made
-    new and locked before any claim names it, and others only probe it
-    without waiting (_sending; the sweep, which removes it only when no one
-    holds it): no removal of it can hide a send. Returns (token, fd); raises
-    OSError when it cannot be made."""
+    new and locked before any claim names it - and refused when, locked, its
+    name no longer names it (removed before the lock was had) - and others
+    only probe it without waiting (_sending; the sweep, which removes it only
+    when no one holds it): no removal of it can hide a send. Returns (token,
+    fd); raises OSError when it cannot be made."""
     token = uuid.uuid4().hex
-    fd = os.open(os.path.join(_claims_dir(), f"{token}.send"),
-                 os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    path = os.path.join(_claims_dir(), f"{token}.send")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held, named = os.fstat(fd), os.lstat(path)
+        if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            raise OSError(errno.ENOENT, "the send lock was removed as it was made", path)
     except OSError:
         os.close(fd)
         raise
@@ -1713,10 +1718,10 @@ def _sweep(d, now, now_mono=None):
     """Remove what no scan will read again: sightings and claims past their
     time whose session is not seen any more - each such launch would leave a
     file for good, in a dir every scan lists. Once per SIGHTING_SECONDS, by a
-    marker's time, across processes; only files that old are read. A time
-    further ahead than that - a marker or file written while the clock ran
-    ahead, set right since - is none: the sweep runs, and judges the file by
-    its own times. A launch
+    marker's time, across processes; only files that old are read (_recent).
+    A time further ahead of the clock now than that - a marker or file
+    written while the clock ran ahead, set right since - is none: the sweep
+    runs, and judges the file by its own times. A launch
     that may still run stays - unless it cannot hold without a ps: made in
     another boot, or on an iTerm2 that is gone. A send lock goes when no one
     holds it. Only files ccwho writes (_CLAIM_FILE: a session id's claim and
@@ -1724,13 +1729,14 @@ def _sweep(d, now, now_mono=None):
     a symlink; one entry it cannot read does not stop the rest."""
     mark = os.path.join(d, ".swept")
     try:
-        if abs(os.stat(mark).st_mtime - now) < SIGHTING_SECONDS:
+        if _recent(os.stat(mark).st_mtime, now):
             return
     except OSError:
         pass
     with contextlib.suppress(OSError), _claims_locked(wait=0):
         if now_mono is not None:
-            now = now_mono + _skew()                    # the scan's start, on the clock now
+            # the scan's start, on the clock now - never after now
+            now = min(now_mono, _mono()) + _skew()
         with contextlib.suppress(OSError):
             _mark_swept(d, mark, now)
         for e in os.scandir(d):
@@ -1740,7 +1746,7 @@ def _sweep(d, now, now_mono=None):
                 continue                         # not a file ccwho writes
             try:
                 st = e.stat(follow_symlinks=False)
-                if not stat.S_ISREG(st.st_mode) or abs(st.st_mtime - now) < SIGHTING_SECONDS:
+                if not stat.S_ISREG(st.st_mode) or _recent(st.st_mtime, now):
                     continue
                 if m.group(2) == "send":
                     _sweep_send(e.path)
@@ -1762,6 +1768,17 @@ def _sweep(d, now, now_mono=None):
                 os.remove(e.path)                # a sighting, an old claim, a leftover
             except (OSError, ValueError):
                 continue
+
+
+def _recent(mtime, now):
+    """Is a file's time one the sweep leaves: from SIGHTING_SECONDS before
+    `now` - its scan's start - to SIGHTING_SECONDS past the clock NOW (_now),
+    or past `now` when it is later (a start given on the wall clock alone,
+    taken at its word - its marker is dated by it)? A scan can take longer
+    than that (the Mac asleep while it ran): a file made since it started -
+    a send lock not yet locked - is recent, never "ahead". Only one dated
+    further ahead was written while the clock ran ahead, set right since."""
+    return now - SIGHTING_SECONDS < mtime <= max(now, _now()) + SIGHTING_SECONDS
 
 
 def _mark_swept(d, mark, now):
@@ -1840,7 +1857,9 @@ def _iterm_holds(rec, alive, table, taken):
     if not engine.parse_procs(table):
         return True, rec
     # a table taken after the claim was written: only such a one can bind it
-    # or call its iTerm2 gone - an older one may predate that iTerm2
+    # or call its iTerm2 gone - an older one may predate that iTerm2. (Not
+    # after now: _tables' time never is; a (table, taken) given on the wall
+    # clock alone - tests' - dated ahead is not trusted.)
     fresh = taken is not None and float(rec.get("since", 0)) < taken <= _now()
     if pids is None:
         found = engine.iterm_app_pids(table)

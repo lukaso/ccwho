@@ -21,6 +21,20 @@ import ccwho_engine as engine
 import ccwho_procs as procs
 from test_signal import DEAD, LIVE, OTHER, T, Machine, _end_own, _settled, live_at, world
 
+
+_UNPIN = []
+
+
+def setUpModule():
+    import ccwho
+    import testkit
+    _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
+
+
+def tearDownModule():
+    while _UNPIN:
+        _UNPIN.pop()()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 

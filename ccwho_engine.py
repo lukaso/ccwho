@@ -1282,6 +1282,19 @@ def _gate_text(name):
         return None
 
 
+def osascript_trouble(returncode, stderr):
+    """What went wrong with an osascript, in words a screen can show: its
+    Apple Event code, never its message - which quotes paths and tab names.
+    -1712 is iTerm2 not answering, not a refusal; a negative status is a
+    signal, not a number to show."""
+    code = ae_error_code(stderr)
+    if code == AE_TIMED_OUT:
+        return f"iTerm2 did not answer ({code})"
+    if code:
+        return f"iTerm2 refused ({code})"
+    return "osascript was stopped by a signal" if returncode < 0 else f"osascript failed (exit {returncode})"
+
+
 def _read_gate(now):
     """A damaged or missing state file is a closed gate: asking once is cheap,
     never asking again is not. So is any field of the wrong type, and a wait

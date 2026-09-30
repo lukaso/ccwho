@@ -6,6 +6,20 @@ detail shows what it is and its processes; `x` offers "kill its processes"
 import unittest
 
 import ccwho_ui as ui
+
+
+_UNPIN = []
+
+
+def setUpModule():
+    import ccwho
+    import testkit
+    _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
+
+
+def tearDownModule():
+    while _UNPIN:
+        _UNPIN.pop()()
 from test_ui import LIVE, FakeAdapter, FakeCollector, UiTest
 from test_ui_kill import KillCollector, RowBoxTest, prep
 

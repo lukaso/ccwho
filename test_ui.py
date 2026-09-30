@@ -14,6 +14,20 @@ import unittest
 from unittest import mock
 
 import ccwho_ui as ui
+
+
+_UNPIN = []
+
+
+def setUpModule():
+    import ccwho
+    import testkit
+    _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
+
+
+def tearDownModule():
+    while _UNPIN:
+        _UNPIN.pop()()
 from textual.widgets import Input
 
 
@@ -454,6 +468,20 @@ class TestTheAdapterTalksToIterm(unittest.TestCase):
         said = self.said_after_a_refusal(lambda a: a.focus({"tty": "ttys022", "pid": 1}))
         self.assertIn("(-1728)", said)
         self.assertNotIn("/Users/x/secret", said)
+
+    def test_a_focus_iterm2_did_not_answer_is_not_a_refusal(self):
+        class Stuck:
+            returncode, stdout, stderr = 1, "", "execution error: AppleEvent timed out. (-1712)"
+        real = ui.subprocess.run
+        ui.subprocess.run = lambda *a, **k: Stuck()
+        try:
+            said = ui.Adapter().focus({"tty": "ttys022", "pid": 1})
+            attached = ui.Adapter().attach("claude attach x")
+        finally:
+            ui.subprocess.run = real
+        for text in (said, attached):
+            self.assertNotIn("refused", text)
+            self.assertIn("did not answer", text)
 
     def test_a_refused_attach_is_said_by_its_code(self):
         said = self.said_after_a_refusal(lambda a: a.attach("claude attach x"))

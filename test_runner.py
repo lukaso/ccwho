@@ -17,6 +17,9 @@ import subprocess
 import unittest
 
 import ccwho as runner
+import testkit
+
+REAL_CCWHO_DIR = runner.ccwho_dir
 
 
 # Reading this machine's processes, ports and session files is machine state; see
@@ -49,13 +52,26 @@ def install_guards():
         setattr(runner.engine, name, guard)
 
 
+_UNPIN = []
+REAL_RUN, REAL_TIME = subprocess.run, time.time
+
+
 def setUpModule():
     install_guards()
+    _UNPIN.append(testkit.pin_ccwho_dir(runner))
 
 
 def tearDownModule():
     for name, real in REAL.items():
         setattr(runner.engine, name, real)
+    while _UNPIN:
+        _UNPIN.pop()()
+    # a test that replaced these and did not put them back breaks the next
+    # module's tests, far from the cause: say so here
+    leaked = [n for n, now, real in (("subprocess.run", subprocess.run, REAL_RUN),
+                                     ("time.time", time.time, REAL_TIME)) if now is not real]
+    subprocess.run, time.time = REAL_RUN, REAL_TIME
+    assert not leaked, f"left replaced by a test: {leaked}"
 
 
 class TestASearchFindsTheJobForItsParkedTerminal(unittest.TestCase):
@@ -196,11 +212,13 @@ class TestParseAge(unittest.TestCase):
 class TestRestoreDir(unittest.TestCase):
     def test_defaults_under_home_because_it_must_outlive_a_reboot(self):
         old = os.environ.pop("CCWHO_DIR", None)
+        pinned, runner.ccwho_dir = runner.ccwho_dir, REAL_CCWHO_DIR   # a path only: nothing written
         try:
             d = runner.restore_dir()
             self.assertTrue(d.startswith(os.path.expanduser("~")), d)
             self.assertNotIn("/tmp", d, "a temp dir does not survive the reboot it exists for")
         finally:
+            runner.ccwho_dir = pinned
             if old is not None:
                 os.environ["CCWHO_DIR"] = old
 
@@ -4289,6 +4307,7 @@ class TestAClaimOutlivesALaunchThatMayStillHappen(unittest.TestCase):
         self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(setattr, runner.engine, "app_snapshot", GUARDS["app_snapshot"])
+        self.addCleanup(setattr, runner.subprocess, "run", runner.subprocess.run)
         self.T = time.time()
 
     def test_an_unresolved_claim_holds_while_its_iterm2_lives(self):
@@ -5320,6 +5339,11 @@ class TestAClaimWithTimesNoCcwhoWrites(unittest.TestCase):
         runner.release_claims([self.SID], self.T)
         self.assertFalse(os.path.exists(runner._claim_path(self.SID)))
 
+    def test_a_sighting_that_ends_next_year(self):
+        # it would refuse every decision for a year
+        self.claim(since=self.T, seen=True, until=self.T + 365 * 86400)
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T + 1, decided_at=self.T + 1))
+
     def test_a_send_in_range_still_holds(self):                           # control
         self.claim(since=self.T, unresolved=True, iterm_pid=DEAD, until=self.T + 10)
         self.assertFalse(runner.claim_launch(self.SID, now=self.T + 1))
@@ -5592,3 +5616,476 @@ class TestARestoreAfterAnEndedSendIsNotStarting(unittest.TestCase):
         self.assertNotIn("already running or starting", out)
         self.assertIn("still waiting on", out)
         self.assertNotEqual(rc, 0)
+
+
+class TestAClaimNoCcwhoWroteNeverCrashesAScan(unittest.TestCase):
+    """A claim is read off disk. Whatever is in it - a number too big for a
+    float, a pid no process can have, a sighting with no time - it is "no
+    claim", taken over or removed: never an exception out of every scan."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def raw(self, text):
+        d = os.path.join(self.tmp, "launching")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, self.SID + ".json"), "w") as fh:
+            fh.write(text)
+
+    def survives(self):
+        self.assertFalse(runner.claim_is_unresolved(self.SID))
+        runner.drop_claims([self.SID])
+        runner.release_claims([self.SID], time.time())
+        self.assertFalse(os.path.exists(runner._claim_path(self.SID)), "a record no ccwho wrote stayed")
+        self.assertTrue(runner.claim_launch(self.SID, procs=""))
+
+    def test_a_since_too_big_for_a_float(self):
+        self.raw('{"pid": 1, "since": 1' + "0" * 400 + ', "sessionId": "x"}')
+        self.survives()
+
+    def test_an_until_too_big_for_a_float(self):
+        self.raw('{"pid": 1, "since": 1, "unresolved": true, "until": 1' + "0" * 400 + "}")
+        self.survives()
+
+    def test_a_sighting_with_no_time(self):
+        self.raw('{"seen": true, "sessionId": "x"}')
+        self.survives()
+
+    def test_pids_no_process_can_have(self):
+        for rec in ({"pid": 2 ** 31, "since": self.T},
+                    {"pid": 1e10, "since": self.T},
+                    {"pid": DEAD, "since": self.T - 60, "unresolved": True,
+                     "iterm_pid": 2 ** 31, "until": self.T - 30}):
+            self.raw(json.dumps(rec))
+            self.assertTrue(runner.claim_launch(self.SID, procs=""), rec)
+            with open(runner._claim_path(self.SID)) as fh:
+                self.assertEqual(json.load(fh).get("pid"), os.getpid())
+
+    def test_a_record_ccwho_wrote_still_holds(self):                         # control
+        self.raw(json.dumps({"pid": os.getpid(), "owner": "x", "since": time.time(),
+                             "sessionId": self.SID}))
+        self.assertFalse(runner.claim_launch(self.SID, procs=""))
+
+
+class TestTheLongestRestoreIsStillAClaim(unittest.TestCase):
+    """A restore's send window grows with its windows; a claim whose window
+    is longer than any ccwho sets is "no claim ccwho wrote". The two limits
+    must agree, or a big restore's own claims are taken over mid-send."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_thousand_windows(self):
+        now = time.time()
+        self.assertTrue(runner.claim_launch(self.SID, now=now))
+        until = now + runner.restore_deadline(1000) + runner.SEND_GRACE
+        self.assertTrue(runner.claim_unresolved(self.SID, 4242, now=now, until=until))
+        other = []
+        t = threading.Thread(target=lambda: other.append(runner.claim_launch(self.SID, now=now + 5)))
+        t.start()
+        t.join(10)
+        self.assertEqual(other, [False])
+
+
+class TestOldClaimFilesAreSwept(unittest.TestCase):
+    """A sighting of a session that ends before the next one is never read
+    again; neither is the claim of a launch that never showed up. Every scan
+    lists the dir: without a sweep, each such launch leaves a file for good."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    OTHER = "99999999-9999-4999-8999-999999999999"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def sighted(self):
+        runner.claim_launch(self.SID, now=self.T - 1)
+        runner.release_claims([self.SID], self.T)
+        self.assertTrue(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_sighting_no_scan_lists_again(self):
+        self.sighted()
+        runner.release_claims([self.OTHER], self.T + runner.SIGHTING_SECONDS + 1)
+        self.assertFalse(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_one_still_young_stays(self):                                  # control
+        self.sighted()
+        runner.release_claims([self.OTHER], self.T + runner.SIGHTING_SECONDS - 1)
+        self.assertTrue(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_launch_that_may_still_run_stays(self):                      # control
+        runner.claim_launch(self.SID, now=self.T)
+        runner.claim_unresolved(self.SID, os.getpid(), now=self.T)
+        runner.release_claims([self.OTHER], self.T + 30 * 86400)
+        self.assertTrue(os.path.exists(runner._claim_path(self.SID)))
+
+    def test_a_sweep_runs_once_in_its_time(self):
+        # every scan calls release_claims: the dir is walked once per
+        # SIGHTING_SECONDS, not once a scan
+        walks, real = [], os.scandir
+        runner.os.scandir = lambda d: walks.append(d) or real(d)
+        self.addCleanup(setattr, runner.os, "scandir", real)
+        runner.claim_launch(self.SID, now=self.T)
+        for i in range(3):
+            runner.release_claims([self.OTHER], self.T + i)
+        self.assertEqual(len(walks), 1)
+        runner.release_claims([self.OTHER], self.T + runner.SIGHTING_SECONDS + 1)
+        self.assertEqual(len(walks), 2)                                       # control
+
+    def test_a_scan_reads_no_fresh_claim_it_does_not_list(self):
+        runner.claim_launch(self.SID, now=self.T)
+        read, real = [], runner._read_claim
+        runner._read_claim = lambda sid: read.append(sid) or real(sid)
+        self.addCleanup(setattr, runner, "_read_claim", real)
+        runner.release_claims([self.OTHER], self.T + 1)
+        self.assertEqual(read, [])
+
+
+class TestASightingCountsUntilItsScanEnded(unittest.TestCase):
+    """Scans overlap: C starts, B starts and reads "not running", the session
+    appears, C reads it. C's sighting is dated by C's start - earlier than
+    B's - yet it saw what B missed. B must not launch it again."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_decision_made_while_the_sighting_scan_ran(self):
+        runner.claim_launch(self.SID, now=self.T - 10)                      # A
+        runner.release_claims([self.SID], self.T - 5)                      # C: started at T-5, ends now
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T + 1, decided_at=self.T - 3))  # B
+
+    def test_a_decision_made_after_it_ended(self):                          # control
+        runner.claim_launch(self.SID, now=self.T - 10)
+        runner.release_claims([self.SID], self.T - 5)
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T + 2, decided_at=time.time() + 1))
+
+
+class TestASendStaysProtectedWhileItsIterm2IsLookedUp(unittest.TestCase):
+    """After a timeout _sent() takes a ps - up to 20 s - to see which iTerm2
+    got the event. The send window must still hold the claim meanwhile, or a
+    retry takes it over from a restarted iTerm2 that holds the launch."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_a_retry_during_the_lookup(self):
+        sid, start, other = self.SIDS[0], time.time(), []
+
+        def snapshot():
+            if len(self.tables) == 1:          # _sent's lookup, 20 s into it
+                t = threading.Thread(target=lambda: other.append(runner.claim_launch(
+                    sid, now=start + 1.0 + 20 + 1, alive=lambda p: False)))
+                t.start()
+                t.join(10)
+            self.tables.append(1)
+            return ITERM_TABLE
+        runner.engine.app_snapshot = snapshot
+
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = stuck
+        runner.launch_in_iterm("script", 1.0, [sid])
+        self.assertEqual(other, [False])
+
+
+class TestASendAcrossASleepIsStillAClaim(unittest.TestCase):
+    """A Mac asleep for hours during a send: the record written after it must
+    not read as a send longer than any deadline - "no claim ccwho wrote"."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def test_two_hours_asleep(self):
+        real = time.time
+        self.addCleanup(setattr, time, "time", real)
+
+        def slept(cmd, **kw):
+            time.time = lambda: real() + 7200
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = slept
+        runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
+        self.assertFalse(runner.claim_launch(self.SIDS[0], alive=lambda p: p == 4242))
+
+
+class TestAnUnrecordedLaunchIsNotBlamedOnAnotherCcwho(unittest.TestCase):
+    """Our claim could not be written over a stale one (a full disk): that is
+    "could not record", not "another ccwho is opening it"."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_stale_claim_and_a_dir_that_cannot_be_written(self):
+        runner.claim_launch("99999999-9999-4999-8999-999999999999")     # the lock file exists
+        runner._write_claim(self.SID, {"pid": DEAD, "owner": "x", "since": time.time() - 1000,
+                                       "sessionId": self.SID, "launched": True})
+        d = os.path.join(self.tmp, "launching")
+        os.chmod(d, 0o555)
+        self.addCleanup(os.chmod, d, 0o755)
+        runner.subprocess.run = lambda *a, **k: self.fail("sent")
+        self.assertTrue(runner.claim_launch(self.SID))
+        res, why = runner.launch_in_iterm("script", 1.0, [self.SID])
+        self.assertIsNone(res)
+        self.assertIn("could not record", why)
+
+
+class TestTheListSaysAWaitingLaunchAsOne(unittest.TestCase):
+    """The second `o` after one that timed out ends on restore's own "still
+    waiting on" line - that is not a failure either."""
+
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    setUp, tearDown, write_manifest = _F.setUp, _F.tearDown, _F.write_manifest
+
+    def test_the_second_reopen(self):
+        me = os.getpid()
+        runner.engine.app_snapshot = lambda: f"  PID UID UCOMM\n{me} {os.getuid()} iTerm2\n"
+        self.addCleanup(setattr, runner.engine, "app_snapshot", GUARDS["app_snapshot"])
+
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        runner.subprocess.run = stuck
+        runner.reopen_saved()
+        said = runner.reopen_saved()
+        self.assertNotIn("could not reopen", said)
+        self.assertIn("restart iTerm2", said)
+
+
+class TestARestoreTakesOneNewTableForAllItsClaims(unittest.TestCase):
+    """A claim its table cannot settle takes a new one - once for the batch,
+    not once a session."""
+
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    setUp, tearDown, write_manifest, _restore_open = _F.setUp, _F.tearDown, _F.write_manifest, _F._restore_open
+
+    def test_two_claims_no_table_can_settle(self):
+        snapshots, at_send = [], []
+        runner.engine.app_snapshot = lambda: snapshots.append(1) or "  PID UID UCOMM\n1 0 launchd\n"
+        self.addCleanup(setattr, runner.engine, "app_snapshot", GUARDS["app_snapshot"])
+        for sid in (self.LIVE_SID, self.DEAD_SID):
+            runner._write_claim(sid, {"pid": DEAD, "since": time.time() - 60, "sessionId": sid,
+                                      "unresolved": True, "iterm_pid": None, "until": 0})
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        runner.subprocess.run = lambda *a, **k: at_send.append(len(snapshots)) or Done()
+        self._restore_open()
+        # the batch's table, one new one for the claims, one at the send
+        self.assertEqual(at_send, [3])
+
+
+class TestAnOsascriptFailureIsWordedTheSameEverywhere(unittest.TestCase):
+    """-1712 is iTerm2 not answering - not a refusal; a negative exit status
+    is a signal, not a number to show."""
+
+    SID, ENTRY = TestOpenNeverForksALiveSession.SID, TestOpenNeverForksALiveSession.ENTRY
+
+    def test_the_words(self):
+        say = runner.engine.osascript_trouble
+        self.assertNotIn("refused", say(1, "execution error: AppleEvent timed out. (-1712)"))
+        self.assertIn("did not answer", say(1, "execution error: AppleEvent timed out. (-1712)"))
+        self.assertNotIn("-15", say(-15, ""))
+        self.assertIn("(-1728)", say(1, "Can\u2019t get window of /Users/x/secret. (-1728)"))  # control
+        self.assertNotIn("/Users/x/secret", say(1, "Can\u2019t get window of /Users/x/secret. (-1728)"))
+
+    def test_jump_uses_them(self):
+        f = TestOpenNeverForksALiveSession
+        f.setUp(self)
+        self.addCleanup(f.tearDown, self)
+        self.live = [{"sessionId": f.SID, "pid": 42, "tty": "ttys032",
+                      "title": "t", "name": "n", "project": "liveapp"}]
+
+        class Stuck:
+            returncode, stdout, stderr = 1, "", "execution error: AppleEvent timed out. (-1712)"
+        runner.subprocess.run = lambda cmd, **kw: Stuck()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.jump(["ttys032"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("refused", out.getvalue() + err.getvalue())
+        self.assertIn("did not answer", out.getvalue() + err.getvalue())
+
+
+class TestALaunchOutranksAnOlderDecision(unittest.TestCase):
+    """A launch made after a caller decided "not running" holds against that
+    caller - however slow its scan was, not only for 90 s."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def launched(self):
+        runner._write_claim(self.SID, {"pid": DEAD, "owner": "x", "since": self.T,
+                                       "sessionId": self.SID, "launched": True})
+
+    def test_a_scan_slower_than_the_claim_time(self):
+        self.launched()
+        self.assertFalse(runner.claim_launch(self.SID, now=self.T + 120, decided_at=self.T - 1))
+
+    def test_a_decision_after_the_launch(self):                              # control
+        self.launched()
+        self.assertTrue(runner.claim_launch(self.SID, now=self.T + 120, decided_at=self.T + 1))
+
+
+class TestAReceiverThatDiedTookItsEventWithIt(unittest.TestCase):
+    """-609 and -600: the iTerm2 the event went to is gone, and the event with
+    it. A new iTerm2 - the one you started - never had it: the claim stays on
+    the dead one, and goes."""
+
+    _F = TestALaunchIsClaimedAsUnresolvedBeforeItIsSent
+    SIDS, setUp = _F.SIDS, _F.setUp
+
+    def after(self, outcome):
+        tables = [ITERM_TABLE, f"  PID UID UCOMM\n5151 {os.getuid()} iTerm2\n"]
+        runner.engine.app_snapshot = lambda: tables.pop(0) if len(tables) > 1 else tables[0]
+        runner.subprocess.run = outcome
+        runner.launch_in_iterm("script", 1.0, self.SIDS[:1])
+        return runner.claim_launch(self.SIDS[0], now=time.time() + 3600, alive=lambda p: p == 5151)
+
+    def test_connection_invalid(self):
+        class R:
+            returncode, stdout, stderr = 1, "", "execution error: Connection is invalid. (-609)"
+        self.assertTrue(self.after(lambda cmd, **kw: R()))
+
+    def test_a_timeout_still_moves_it(self):                                  # control
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        self.assertFalse(self.after(stuck))
+
+
+class TestAFailedWriteOverAnOldSightingIsADiskProblem(unittest.TestCase):
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_it_says_could_not_record(self):
+        runner._write_claim(self.SID, {"sessionId": self.SID, "seen": True, "since": self.T - 100,
+                                       "until": self.T - 99})
+        real = runner._write_claim
+        runner._write_claim = lambda sid, record: False                   # the disk is full
+        self.addCleanup(setattr, runner, "_write_claim", real)
+        runner.subprocess.run = lambda *a, **k: self.fail("sent")
+        self.assertTrue(runner.claim_launch(self.SID, decided_at=self.T))
+        res, why = runner.launch_in_iterm("script", 1.0, [self.SID])
+        self.assertIn("could not record", why)
+
+
+class TestOneReopenAtATime(unittest.TestCase):
+    """`o` runs the restore in a thread, and takes its output by swapping the
+    process's stdout: two at once mixed their lines and left stdout on a
+    buffer. A second `o` while one runs is told so."""
+
+    def test_a_second_while_one_runs(self):
+        started, go, said = threading.Event(), threading.Event(), []
+        real = runner.restore
+
+        def slow(argv):
+            started.set()
+            go.wait(10)
+            print("opened 1 window(s). each is at its project, resuming its own session.")
+            return 0
+        runner.restore = slow
+        self.addCleanup(setattr, runner, "restore", real)
+        before = sys.stdout
+        t = threading.Thread(target=lambda: said.append(runner.reopen_saved()))
+        t.start()
+        self.assertTrue(started.wait(10))
+        second = runner.reopen_saved()
+        go.set()
+        t.join(10)
+        self.assertIn("already", second)
+        self.assertIn("reopened 1", said[0])
+        self.assertIs(sys.stdout, before)
+        self.assertIn("reopened", runner.reopen_saved())                     # control: free again
+
+
+class TestDecidedAtIsTheScanStart(unittest.TestCase):
+    """What a caller decides from its scan, it decided when the scan STARTED:
+    a launch and a sighting while its `claude agents` read ran are newer."""
+
+    _F = TestOpenNeverForksALiveSession
+    SID, ENTRY, tearDown, _open = _F.SID, _F.ENTRY, _F.tearDown, _F._open
+
+    def setUp(self):
+        self._F.setUp(self)
+
+        def slow_read(cache=None, status=None):
+            # our read said not running; meanwhile another ccwho launched it
+            # and a scan that started after ours saw it
+            time.sleep(0.01)
+            a = time.time()
+            runner.claim_launch(self.SID, now=a, pid=DEAD)
+            runner.release_claims([self.SID], a + 0.001)
+            time.sleep(0.01)
+            status["source_ok"] = True
+            return [], 0
+        runner.engine.collect = slow_read
+
+    def test_open_does_not_launch_it_again(self):
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+    def test_restore_does_not_launch_it_again(self):
+        d = os.path.join(self.tmp, "restore")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            runner.restore(["--open", "--from", os.path.join(d, "2026-08-01T0001.json")])
+        self.assertNotIn("claude --resume", " ".join(" ".join(c) for c in self.runs))
+
+
+class TestA1712EndsTheSend(unittest.TestCase):
+    """-1712 - the usual outcome of a big restore - ends the send like any
+    other: a retry after restarting iTerm2 is not "already starting"."""
+
+    _F = TestASendThatHasEndedIsNotBeingSent
+    SIDS, setUp, ended = _F.SIDS, _F.setUp, _F.ended
+
+    def test_after_iterm2_timed_out_inside(self):
+        class R:
+            returncode, stdout = 1, ""
+            stderr = "execution error: iTerm2 got an error: AppleEvent timed out. (-1712)"
+        runner.subprocess.run = lambda cmd, **kw: R()
+        res, why = runner.launch_in_iterm("script", 60.0, self.SIDS[:1])
+        self.assertIsNone(res)
+        self.assertIn("may still run", why)
+        self.assertTrue(self.ended(self.SIDS[0]))
+
+
+class TestNoTestReachesTheRealCcwhoDir(unittest.TestCase):
+    """A test that pops CCWHO_DIR - or never set it - lands in a temp dir,
+    never in the user's own ~/.ccwho (a sweep there deleted real files)."""
+
+    def test_without_ccwho_dir(self):
+        old = os.environ.pop("CCWHO_DIR", None)
+        try:
+            d = runner.ccwho_dir()
+        finally:
+            if old is not None:
+                os.environ["CCWHO_DIR"] = old
+        self.assertNotEqual(os.path.realpath(d), os.path.realpath(os.path.expanduser("~/.ccwho")))
+
+    def test_with_ccwho_dir(self):                                          # control
+        os.environ["CCWHO_DIR"] = "/somewhere/else"
+        try:
+            self.assertEqual(runner.ccwho_dir(), "/somewhere/else")
+        finally:
+            os.environ.pop("CCWHO_DIR", None)
+
+
+class TestASightingAcrossASleepIsStillOne(unittest.TestCase):
+    """The list's scan runs across hours of sleep: its sighting spans them.
+    That is no send, and no endless one - still a sighting."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_a_scan_that_started_two_hours_ago(self):
+        now = time.time()
+        runner._write_claim(self.SID, {"pid": DEAD, "since": now - 7300, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": DEAD, "until": now - 7300})
+        runner.release_claims([self.SID], now - 7205)
+        self.assertFalse(runner.claim_launch(self.SID, now=now + 1, decided_at=now - 2))
+
+    def test_a_decision_after_it(self):                                    # control
+        now = time.time()
+        runner._write_claim(self.SID, {"pid": DEAD, "since": now - 7300, "sessionId": self.SID,
+                                       "unresolved": True, "iterm_pid": DEAD, "until": now - 7300})
+        runner.release_claims([self.SID], now - 7205)
+        self.assertTrue(runner.claim_launch(self.SID, now=now + 2, decided_at=now + 1))

@@ -2230,8 +2230,7 @@ class Adapter:
             return f"could not reach iTerm2 ({type(ex).__name__})"
         if done.returncode:
             # its code, never its text: osascript's message quotes paths
-            return ("could not open a window"
-                    f" ({engine.ae_error_code(done.stderr) or f'exit {done.returncode}'})")
+            return f"could not open a window - {engine.osascript_trouble(done.returncode, done.stderr)}"
         return "attached it in a new window"
 
     def copy(self, text, deadline=2.0):
@@ -2274,8 +2273,7 @@ class Adapter:
             return f"could not reach iTerm2 ({type(ex).__name__})"
         # what jump.applescript says, or osascript's code - never its text
         return (done.stdout or "").strip() or (
-            f"iTerm2 refused ({engine.ae_error_code(done.stderr) or f'exit {done.returncode}'})"
-            if done.returncode else "done")
+            engine.osascript_trouble(done.returncode, done.stderr) if done.returncode else "done")
 
 
 def main():

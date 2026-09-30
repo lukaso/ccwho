@@ -7,6 +7,20 @@ The world is the fake collector's: nothing here reads or signals the machine."""
 import unittest
 
 import ccwho_ui as ui
+
+
+_UNPIN = []
+
+
+def setUpModule():
+    import ccwho
+    import testkit
+    _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
+
+
+def tearDownModule():
+    while _UNPIN:
+        _UNPIN.pop()()
 from test_ui import BUSY, HOLDING, PROCS, FakeCollector, UiTest
 
 KILL = {"pid": 20, "ppid": 1, "start": "Tue Sep 22 13:45:15 2026", "command": "next-server",

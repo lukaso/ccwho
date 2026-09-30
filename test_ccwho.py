@@ -1,4 +1,5 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
+import errno
 import fcntl
 import json
 import re
@@ -5172,7 +5173,7 @@ class TestPsSpeaksTheSessionFilesLanguage(unittest.TestCase):
         seen = {}
 
         class Done:
-            stdout = ""
+            returncode, stdout = 0, ""
 
         real = ccwho.subprocess.run
         ccwho.subprocess.run = lambda argv, **kw: seen.update(kw, argv=argv) or Done()
@@ -7470,6 +7471,19 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
                                           why=why))
         self.assertEqual(why.get("refused"), "stuck")
 
+    def test_every_iterm2_an_ask_may_have_reached_is_quarantined(self):
+        # two of ours when it timed out: either may be the stuck one
+        self.stub("echo 'execution error: AppleEvent timed out. (-1712)' >&2; exit 1")
+        two = apps((100, ME, IT), (200, ME, IT))
+        self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], timeout=10.0, procs=two))
+        self.stub("echo ok")
+        why = {}
+        self.assertTrue(self.until(lambda: ccwho.iterm_ask(["-e", "whatever"], timeout=10.0,
+                                                           procs=apps((200, ME, IT)), why=why) is None
+                                   and why.get("refused") != "busy"))
+        self.assertEqual(why.get("refused"), "stuck")
+        self.assertEqual(ccwho.iterm_ask(["-e", "whatever"], timeout=10.0, procs=apps((300, ME, IT))), "ok\n")
+
     def test_a_quarantined_iterm2_gone(self):                                   # control
         self.quarantined_on(200)
         self.assertEqual(ccwho.iterm_ask(["-e", "whatever"], timeout=10.0, procs=apps((100, ME, IT))), "ok\n")
@@ -7663,3 +7677,67 @@ class TestATableFromAPsThatFailedIsNone(unittest.TestCase):
 
     def test_a_clean_exit(self):                                                # control
         self.assertEqual(self.run_ps(0, "  PID UID UCOMM\n1 0 launchd\n"), "  PID UID UCOMM\n1 0 launchd\n")
+
+
+class TestNoPsReaderTrustsAPsThatFailed(unittest.TestCase):
+    """Every process table ccwho reads from ps: a ps that did not exit cleanly
+    may have printed part of it - taken as no table at all."""
+
+    def run_ps(self, fn, returncode, stdout):
+        class R:
+            pass
+        R.returncode, R.stdout, R.stderr = returncode, stdout, ""
+        real = ccwho.subprocess.run
+        self.addCleanup(setattr, ccwho.subprocess, "run", real)
+        ccwho.subprocess.run = lambda *a, **k: R()
+        return fn()
+
+    ROWS = "  PID TTY UID UCOMM\n  100 ttys001 501 iTerm2\n"
+
+    def test_each_of_them(self):
+        for fn in (ccwho.tty_snapshot, ccwho.ps_snapshot, ccwho.ps_snapshot_elapsed):
+            self.assertEqual(self.run_ps(fn, -9, self.ROWS), "", fn.__name__)
+        self.assertEqual(self.run_ps(ccwho.idle_snapshot, 1, "  PID TTY COMMAND\n  1 ttys001 -zsh\n"), set())
+        self.assertEqual(self.run_ps(REAL["ps_table"], 1, "  1 Tue Sep 22 14:45:15 2026 /sbin/launchd\n"), {})
+
+    def test_a_clean_exit(self):                                                # control
+        self.assertEqual(self.run_ps(ccwho.tty_snapshot, 0, self.ROWS), self.ROWS)
+
+
+class TestTheGateSaysAnUnreadableTableAsOne(unittest.TestCase):
+    """A process table that could not be read is not "no iTerm2": that sends
+    the user to the Automation settings for nothing."""
+
+    _F = TestBackgroundAsksNeverPileUpInITerm2
+    stub, launches, table, state, ask, until, ended = (
+        _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
+    setUp = TestTheGateAfterASlowOrFailedAsk.setUp
+
+    def test_an_empty_table(self):
+        self.stub("echo ok")
+        why = {}
+        self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], procs="", why=why))
+        self.assertEqual(why.get("refused"), "io")
+
+    def test_a_table_with_no_iterm2(self):                                      # control
+        self.stub("echo ok")
+        why = {}
+        self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], procs=apps((1, 0, "launchd")), why=why))
+        self.assertEqual(why.get("refused"), "no-iterm")
+
+    def test_a_lock_that_cannot_work(self):
+        # flock failing for no other holder: not "busy", and no wait
+        self.stub("echo ok")
+        real = ccwho.fcntl
+
+        class NoFlock:
+            LOCK_EX, LOCK_NB, LOCK_SH = fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_SH
+
+            def flock(self, fd, op):
+                raise OSError(errno.ENOTSUP, "not supported")
+        ccwho.fcntl = NoFlock()
+        self.addCleanup(setattr, ccwho, "fcntl", real)
+        why, t = {}, time.monotonic()
+        self.assertIsNone(self.ask(wait=2.0, why=why))
+        self.assertLess(time.monotonic() - t, 1.0)
+        self.assertEqual(why.get("refused"), "io")

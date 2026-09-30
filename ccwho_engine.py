@@ -1294,17 +1294,22 @@ def is_iterm_app(procs_output, pid):
 APP_SNAPSHOT_SECONDS = 20.0       # the longest app_snapshot() waits for ps
 
 
+def _ps(args, timeout=20, env=None):
+    """ps's output, or None when it could not be run or did not exit cleanly:
+    one killed part way may have printed part of the table, and a process
+    missing from it is not gone (nor a pane idle)."""
+    try:
+        r = subprocess.run(["ps", *args], capture_output=True, text=True, errors="replace",
+                           timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
 def app_snapshot():
     """The cheap process table: no tty column (0.03 s of ps, where the tty
     column costs 0.2 s) - enough to find iTerm2 outside a scan."""
-    try:
-        r = subprocess.run(["ps", "-eo", "pid,uid,ucomm"], capture_output=True,
-                           text=True, errors="replace", timeout=APP_SNAPSHOT_SECONDS)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    # one that did not end cleanly may have printed part of the table: an
-    # iTerm2 missing from it is not gone
-    return r.stdout if r.returncode == 0 else ""
+    return _ps(["-eo", "pid,uid,ucomm"], timeout=APP_SNAPSHOT_SECONDS) or ""
 
 
 @functools.cache
@@ -1359,8 +1364,10 @@ def _read_gate(now):
         return {}
     clean = {}
     for key in ("quarantine", "asked_pid"):
-        if type(state.get(key)) is int:
-            clean[key] = state[key]
+        v = state.get(key)
+        if type(v) is int or (type(v) is list and 0 < len(v) <= 64
+                              and all(type(p) is int and p > 0 for p in v)):
+            clean[key] = v
     for key in ("pending", "slow"):
         if state.get(key) is True:
             clean[key] = True
@@ -1427,13 +1434,14 @@ def _settle(state, now):
 
 def _take_lock(fd, wait, give_up=lambda: False):
     """True with the lock; False after `wait` seconds, or as soon as
-    `give_up()` says the wait is for nothing."""
+    `give_up()` says the wait is for nothing. Only another holder is waited
+    for: any other flock error - a file system without it - is raised."""
     end = time.monotonic() + wait
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except OSError:
+        except BlockingIOError:
             if time.monotonic() >= end or give_up():
                 return False
             time.sleep(0.05)
@@ -1466,7 +1474,12 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         why["refused"] = "io"
         return None
     try:
-        if not _take_lock(fd, 0):
+        try:
+            free = _take_lock(fd, 0)
+        except OSError:
+            why["refused"] = "io"           # no lock can be had: not "busy"
+            return None
+        if not free:
             # an ask in flight, maybe in another process. Queue behind it only
             # while it is a healthy one: behind one that already timed out, or
             # into a pause, the answer is a refusal anyway - waiting only
@@ -1479,13 +1492,22 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
                 ahead.update(_read_gate(early))
                 ahead["hopeless"] = bool(ahead.get("slow") or early < ahead.get("wait_until", 0))
                 return ahead["hopeless"]
-            if hopeless() or not wait or not _take_lock(fd, wait, give_up=hopeless):
+            try:
+                queued = not hopeless() and wait and _take_lock(fd, wait, give_up=hopeless)
+            except OSError:
+                why["refused"] = "io"
+                return None
+            if not queued:
                 why.update(refused="waiting" if wait and ahead["hopeless"] else "busy",
                            error=ahead.get("last_error"))
                 return None
         now = time.time() if fixed_now is None else fixed_now
         table = app_snapshot() if procs is None else procs
-        pid = iterm_app_pid(table)
+        if not parse_procs(table):
+            why["refused"] = "io"           # no table: not "no iTerm2" (the Automation fix)
+            return None
+        pids = iterm_app_pids(table)
+        pid = pids[0] if pids else None
         if pid is None:
             why["refused"] = "no-iterm"     # `tell application "iTerm2"` would launch it
             return None
@@ -1498,18 +1520,21 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
             state.pop("quarantine")         # of an iTerm2 before a reboot: its pid is nobody's now
                                             # (a boot not recorded, or not readable: it holds)
             state.pop("last_error", None)
-        if state.get("quarantine") not in (None, pid) and not is_iterm_app(table, state["quarantine"]):
-            state.pop("quarantine")         # a restarted iTerm2: the stuck one is gone
+        stuck = state.get("quarantine")
+        stuck = [] if stuck is None else ([stuck] if type(stuck) is int else stuck)
+        if stuck and not any(is_iterm_app(table, p) for p in stuck):
+            state.pop("quarantine")         # restarted: none that may be stuck runs
             state.pop("last_error", None)
-        elif state.get("quarantine") is not None:
-            # still running - beside a lower one too: `tell application
+        elif stuck:
+            # one of them still runs - beside another too: `tell application
             # "iTerm2"` may reach it yet
             why.update(refused="stuck", error=state.get("last_error"))
             return None
         elif now < state.get("wait_until", 0):
             why.update(refused="waiting", error=state.get("last_error"))
             return None
-        state.update(asked_pid=pid, pending=True, boot=boot_id())
+        # every iTerm2 of ours it may reach: `tell application "iTerm2"` picks one
+        state.update(asked_pid=pids, pending=True, boot=boot_id())
         if not _write_gate(state):
             why["refused"] = "io"
             return None
@@ -1698,12 +1723,8 @@ def idle_ttys(ps_output):
 
 
 def idle_snapshot():
-    try:
-        out = subprocess.run(["ps", "-eo", "pid,tty,command"], capture_output=True,
-                             text=True, errors="replace", timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    return idle_ttys(out)
+    out = _ps(["-eo", "pid,tty,command"])
+    return set() if out is None else idle_ttys(out)
 
 
 # Tab names change when you rename a tab or a session's title updates - minutes,
@@ -1745,29 +1766,16 @@ def titles_cached(cache, now=None, procs=None, owners=None):
 
 
 def tty_snapshot():
-    try:
-        # the executable last: it may hold spaces ("Application Support")
-        return subprocess.run(["ps", "-eo", "pid,tty,uid,ucomm"], capture_output=True,
-                              text=True, errors="replace", timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    # the executable last: it may hold spaces ("Application Support")
+    return _ps(["-eo", "pid,tty,uid,ucomm"]) or ""
 
 
 def ps_snapshot_elapsed():
-    try:
-        return subprocess.run(["ps", "-eo", "pid,ppid,etime,command"],
-                              capture_output=True, text=True, errors="replace", timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    return _ps(["-eo", "pid,ppid,etime,command"]) or ""
 
 
 def ps_snapshot():
-    try:
-        return subprocess.run(
-            ["ps", "-eo", "pid,ppid,command"], capture_output=True, text=True, errors="replace", timeout=20
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    return _ps(["-eo", "pid,ppid,command"]) or ""
 
 
 # Where the tools ccwho shells out to actually live. A process with no login
@@ -1796,13 +1804,8 @@ def ps_table():
     """pid -> (start, command) for every process, the start in the exact text a
     session file stores as procStart. The C locale and UTC are what make them
     comparable: a local, localised `ps` prints "Tue 22 Sep 14:45:15"."""
-    try:
-        text = subprocess.run(["ps", "-axo", "pid=,lstart=,comm="], capture_output=True,
-                              text=True, errors="replace", timeout=20,
-                              env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    return procs.parse_ps_table(text)
+    text = _ps(["-axo", "pid=,lstart=,comm="], env=dict(os.environ, LC_ALL="C", TZ="UTC"))
+    return {} if text is None else procs.parse_ps_table(text)
 
 
 def read_procargs(pid):

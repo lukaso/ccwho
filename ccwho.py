@@ -153,15 +153,17 @@ def launch_in_iterm(script, deadline, sids):
     leaves it held while its osascript runs. Then, by outcome:
     - all of it ran (rc 0): launched (claim_launched), held until seen, or
       LAUNCH_CLAIM_SECONDS - and against any decision made before it;
-    - nothing was sent (osascript did not start, or refused an argument), or
-      iTerm2 refused Apple Events (-1743) at the script's first event
+    - nothing was sent (osascript could not be started - an error only exec
+      or its pipes give, _NOT_STARTED - or refused an argument), or iTerm2
+      refused Apple Events (-1743) at the script's first event
       (engine.AE_PROBE, which writes nothing): the claims go (drop_claims);
     - iTerm2 quit during it (-600/-609): the event died with it, and what it
       opened may still start - held LAUNCH_CLAIM_SECONDS, cut off
       (claim_launched);
     - anything else - a timeout, -1712, a signal, -1743 after the first
       event, an error after a write (a window closing while the pane-fill
-      script walks them): unresolved, bound to the iTerm2 a table taken after
+      script walks them), any other OSError (it may come while osascript's
+      output is read): unresolved, bound to the iTerm2 a table taken after
       the send shows - to each of them, when it shows two of ours (_sent).
     A launch that cannot be recorded is not sent."""
     if _unrecorded().keys() & set(sids):
@@ -193,6 +195,15 @@ def launch_in_iterm(script, deadline, sids):
         _let_go_send(send)
 
 
+# What subprocess.run raises only before osascript ran: exec's errors (not
+# found, not allowed, no program, its arguments too long) and its pipes' (no
+# descriptor left). Any other may come after its event went out - fork's
+# EAGAIN and ENOMEM too, which poll(2) and read(2) give while its output is
+# read - and holds.
+_NOT_STARTED = frozenset((errno.ENOENT, errno.EACCES, errno.EPERM, errno.ENOEXEC, errno.E2BIG,
+                          errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG, errno.EMFILE, errno.ENFILE))
+
+
 def _send(script, deadline, sids, lock):
     """launch_in_iterm's send, with its send lock held - by osascript too."""
     try:
@@ -203,13 +214,19 @@ def _send(script, deadline, sids, lock):
     except subprocess.TimeoutExpired:
         _sent(sids)
         return None, f"iTerm2 did not answer in {deadline:g}s - {MAY_STILL_RUN}"
-    except (OSError, ValueError, TypeError) as ex:
-        # nothing was sent: osascript did not start, or refused an argument
-        # before it could (a NUL byte)
+    except (ValueError, TypeError) as ex:
+        # nothing was sent: an argument refused before osascript could start
+        # (a NUL byte)
         drop_claims(sids)
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
         return None, f"could not drive iTerm2 ({type(ex).__name__})"
+    except OSError as ex:
+        if ex.errno in _NOT_STARTED:
+            drop_claims(sids)                   # nothing was sent: osascript did not start
+            return None, f"could not drive iTerm2 ({type(ex).__name__})"
+        _sent(sids)                             # it may have run: its output was being read
+        return None, f"could not drive iTerm2 ({type(ex).__name__}) - {MAY_STILL_RUN}"
     except BaseException:
         # Ctrl-C: it may still run. (A closed terminal kills us without a
         # word: the record made before the send holds then.)
@@ -1060,7 +1077,9 @@ CLOCK_STEP_SECONDS = 3600.0
 # A sighting or launch dated further ahead than this is none ccwho wrote. One
 # dated less far ahead was written before the clock was set back: it keeps
 # its times, and holds until the clock catches up - never re-dated, which
-# would let a decision older than it through.
+# would let a decision older than it through. Nor is any record - an
+# unresolved launch too - stamped in this boot with a monotonic time or an
+# uptime this far ahead of those clocks, which never step (_read_claim).
 FAR_FUTURE_SECONDS = 86400.0
 SIGHTING_SECONDS = 600.0          # longer than any caller takes from its scan to its claim
 # A decision given on the wall clock alone (no decided_mono - no caller in
@@ -1070,10 +1089,22 @@ CLOCK_SLACK_SECONDS = 1.0
 
 
 def _pid_alive(pid):
+    """Is there a process with this pid? Only "no such process" (ESRCH) says
+    it is gone: one of another user's (EPERM) is there, and a probe refused
+    for another reason (a sandbox's) tells nothing - it holds, and the table
+    decides (_iterm_holds). What is no pid is no process."""
     try:
-        os.kill(int(pid), 0)
-    except (OSError, ValueError, TypeError):
+        pid = int(pid)
+    except (ValueError, TypeError, OverflowError):
         return False
+    if not 0 < pid < 2 ** 31:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
     return True
 
 
@@ -1092,14 +1123,25 @@ def _uptime():
     return time.clock_gettime(time.CLOCK_UPTIME_RAW)
 
 
+def _now():
+    """The wall clock now, on this judgement's reading of it (_skew): inside
+    a claims-lock section, the one taken when the lock was had - every
+    record read there is put on it (_read_claim), so a step while the section
+    runs moves nothing it writes, reads or compares; outside one, the wall
+    clock."""
+    return _mono() + _skew()
+
+
 def _clock_now():
-    """(the wall clock, "clock": [boot, monotonic, uptime]) read at one
-    instant - the boot id first, its first call is slow. What a record whose
-    time is "now" is written with, in the lock it is written under (_mark,
-    _take, _see, _dated): a step or a sleep while its writer waited for the
-    lock can then neither age it nor date it back."""
+    """(the wall clock now - _now() -, "clock": [boot, monotonic, uptime])
+    read at one instant - the boot id first, its first call is slow. What a
+    record whose time is "now" is written with, in the lock it is written
+    under (_mark, _take, _see, _dated): a step or a sleep while its writer
+    waited for the lock, or while it holds it, can then neither age it nor
+    date it back or ahead."""
     boot = _boot_id()
-    return time.time(), [boot, _mono(), _uptime()]
+    mono, up = _mono(), _uptime()
+    return mono + _skew(), [boot, mono, up]
 
 
 def _stamped(record):
@@ -1121,7 +1163,9 @@ def _skew():
     """The wall clock less the monotonic one: what turns a monotonic time into
     a wall clock time now. One reading for a whole locked judgement
     (_claims_locked): a decision and the records it is judged against are
-    put on the same clock, whatever the wall clock does meanwhile."""
+    put on the same clock, whatever the wall clock does meanwhile - and so
+    is "now" (_now, _clock_now). What a section hands to the next is on the
+    monotonic clock (_take, _tables)."""
     frozen = _LOCAL.__dict__.get("skew")
     return frozen if frozen is not None else time.time() - _mono()
 
@@ -1248,15 +1292,22 @@ def _claims_locked(wait=None):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
             raise OSError(f"{path} is not a lock of this user's own - remove it")
-        try:
-            had = engine._take_lock(fd, wait)       # waits only while another holds it
-        except OSError as ex:                       # no lock can be had here at all
-            raise OSError(ex.errno, ex.strerror, path) from ex
-        if not had:
-            if launch and wait:
-                _LOCAL.lock_gave_up = time.monotonic()
-            raise BlockingIOError(errno.EWOULDBLOCK, "another ccwho holds the claims lock"
-                                  " - a stopped job? (resume or quit it)")
+        # its own wait, not the engine's: the list reloads the engine, never
+        # this file - the guard's lock must not change under a running one
+        end = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:     # another holds it
+                if time.monotonic() >= end:
+                    if launch and wait:
+                        _LOCAL.lock_gave_up = time.monotonic()
+                    raise BlockingIOError(errno.EWOULDBLOCK, "another ccwho holds the claims lock"
+                                          " - a stopped job? (resume or quit it)")
+                time.sleep(0.02)
+            except OSError as ex:       # no other holder: no lock can be had here at all
+                raise OSError(ex.errno, ex.strerror, path) from ex
         _LOCAL.lock_gave_up = None
         _LOCAL.skew = time.time() - _mono()     # one reading of the clocks for this judgement
         try:
@@ -1355,13 +1406,15 @@ def _read_claim(session_id):
     hold - and ValueError when it is not one ccwho wrote: no dict, no time,
     times it never sets (not finite; an until before its since; a sighting
     ending, or any claim but an unresolved launch starting, more than
-    FAR_FUTURE_SECONDS ahead of the clock), a pid no process can have. Such
+    FAR_FUTURE_SECONDS ahead of the clock; a stamp of this boot's - on any
+    record - that far ahead of its clocks), a pid no process can have. Such
     a record would crash every scan, or hold a session for good, past an
     iTerm2 restart and a reboot. A record stamped in this boot (_stamped)
-    comes back with its times on the wall clock now. An unresolved launch
-    dated ahead of the clock is kept: _dated judges it as of the moment it is
-    first read. A link, a FIFO - no regular file - is no claim ccwho wrote
-    either (_open_in_claims): never followed, never waited on."""
+    comes back with its times on the wall clock now (_now). An unresolved
+    launch dated ahead of the wall clock - one not stamped in this boot - is
+    kept: _dated judges it as of the moment it is first read. A link, a FIFO
+    - no regular file - is no claim ccwho wrote either (_open_in_claims):
+    never followed, never waited on."""
     with os.fdopen(_open_in_claims(_claim_path(session_id))) as fh:
         try:
             rec = json.load(fh)
@@ -1393,7 +1446,7 @@ def _read_claim(session_id):
         rec["since"] = since
         if "until" in rec:
             rec["until"] = until
-    far = time.time() + FAR_FUTURE_SECONDS
+    far = _now() + FAR_FUTURE_SECONDS
     bad = ((rec.get("seen") is True and until > far)
            or ("until" in rec and until < since)
            or (since > far and rec.get("unresolved") is not True))
@@ -1495,7 +1548,7 @@ def _theirs(session_id):
         rec = _read_claim(session_id)
         if rec.get("seen") is True:
             return True
-        verdict = _held(rec, time.time(), _pid_alive, None, None, None)
+        verdict = _held(rec, _now(), _pid_alive, None, None, None)
     except (OSError, ValueError, TypeError):
         return False
     return rec.get("owner") != _tokens().get(session_id) and (verdict is None or verdict[0])
@@ -1646,7 +1699,7 @@ def _see(sid, seen_at):
             os.remove(path)
     elif rec.get("seen") is not True and (
             float(rec.get("since", 0)) < seen_at
-            or (rec.get("unresolved") is True and float(rec["since"]) > time.time() + CLOCK_STEP_SECONDS)):
+            or (rec.get("unresolved") is True and float(rec["since"]) > _now() + CLOCK_STEP_SECONDS)):
         wall, clock = _clock_now()
         sighting = {"sessionId": sid, "seen": True, "since": seen_at, "until": max(seen_at, wall)}
         _write_claim(sid, dict(sighting, clock=clock) if sighting["until"] == wall else sighting)
@@ -1660,7 +1713,10 @@ def _sweep(d, now, now_mono=None):
     """Remove what no scan will read again: sightings and claims past their
     time whose session is not seen any more - each such launch would leave a
     file for good, in a dir every scan lists. Once per SIGHTING_SECONDS, by a
-    marker's time, across processes; only files that old are read. A launch
+    marker's time, across processes; only files that old are read. A time
+    further ahead than that - a marker or file written while the clock ran
+    ahead, set right since - is none: the sweep runs, and judges the file by
+    its own times. A launch
     that may still run stays - unless it cannot hold without a ps: made in
     another boot, or on an iTerm2 that is gone. A send lock goes when no one
     holds it. Only files ccwho writes (_CLAIM_FILE: a session id's claim and
@@ -1668,7 +1724,7 @@ def _sweep(d, now, now_mono=None):
     a symlink; one entry it cannot read does not stop the rest."""
     mark = os.path.join(d, ".swept")
     try:
-        if os.stat(mark).st_mtime > now - SIGHTING_SECONDS:
+        if abs(os.stat(mark).st_mtime - now) < SIGHTING_SECONDS:
             return
     except OSError:
         pass
@@ -1684,7 +1740,7 @@ def _sweep(d, now, now_mono=None):
                 continue                         # not a file ccwho writes
             try:
                 st = e.stat(follow_symlinks=False)
-                if not stat.S_ISREG(st.st_mode) or st.st_mtime > now - SIGHTING_SECONDS:
+                if not stat.S_ISREG(st.st_mode) or abs(st.st_mtime - now) < SIGHTING_SECONDS:
                     continue
                 if m.group(2) == "send":
                     _sweep_send(e.path)
@@ -1785,7 +1841,7 @@ def _iterm_holds(rec, alive, table, taken):
         return True, rec
     # a table taken after the claim was written: only such a one can bind it
     # or call its iTerm2 gone - an older one may predate that iTerm2
-    fresh = taken is not None and float(rec.get("since", 0)) < taken <= time.time()
+    fresh = taken is not None and float(rec.get("since", 0)) < taken <= _now()
     if pids is None:
         found = engine.iterm_app_pids(table)
         if found:
@@ -1798,8 +1854,9 @@ def _iterm_holds(rec, alive, table, taken):
 def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=None, lead=None,
           taken_mono=None):
     """claim_launch's judgement, under the lock: True taken, False held, or
-    the claim's since (a float) when it needs a process table taken after
-    that. Only a missing file (FileNotFoundError) or a record no ccwho wrote
+    the claim's since on the monotonic clock (a float) when it needs a
+    process table taken after that - handed out of the section, on no
+    reading of the wall clock (_tables). Only a missing file (FileNotFoundError) or a record no ccwho wrote
     (ValueError) is no claim: a file there that cannot be read holds, and so
     does an error while judging one - the guard fails closed (the list
     reloads the engine, never this file). A decision older than
@@ -1808,7 +1865,7 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
     the wall clock alone is also refused when more than CLOCK_SLACK_SECONDS
     later than the clock now - set back since, its order against what was
     written since is unknown. Why it said no is kept for why_held."""
-    clock = time.time()
+    wall = _now()
     if taken_mono is not None:
         taken = taken_mono + _skew()                  # the table's time, on the clock now
     if decided_mono is not None:
@@ -1816,8 +1873,8 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
         old = _mono() + (lead or 0.0) - decided_mono > SIGHTING_SECONDS
         decided_at = decided_mono + _skew()           # the scan's start, on the clock now
     else:
-        old = decided_at is not None and not (max(now, clock) - SIGHTING_SECONDS <= decided_at
-                                              <= clock + CLOCK_SLACK_SECONDS)
+        old = decided_at is not None and not (max(now, wall) - SIGHTING_SECONDS <= decided_at
+                                              <= wall + CLOCK_SLACK_SECONDS)
     if old:
         _refusals()[session_id] = ("old list", 0)
         return False
@@ -1833,7 +1890,7 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
     except Exception:
         verdict = (True, rec)
     if verdict is None:
-        return float(rec["since"])
+        return float(rec["since"]) - _skew()    # on the monotonic clock
     held, keep = verdict
     if held:
         if keep is not rec:
@@ -1846,8 +1903,8 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
     token = uuid.uuid4().hex
     claim = {"pid": pid, "owner": token, "since": now, "sessionId": session_id}
     if lead is None:                    # now: read here, with its clocks
-        wall, clock = _clock_now()
-        claim.update(since=wall, clock=clock)
+        at, stamp = _clock_now()
+        claim.update(since=at, clock=stamp)
     if _write_claim(session_id, claim):
         _unrecorded().pop(session_id, None)
         if pid == os.getpid():
@@ -1867,20 +1924,20 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
 def _tables():
     """One process table for a batch of claims, taken when first needed:
     get(after) -> (table, when it was taken on the wall clock now, the same on
-    the monotonic clock). One not taken after `after` - a claim's since - is
-    taken again, if one can be (`after` is not ahead of now): a claim is
-    never judged on a table older than it (_iterm_holds). A clock step moves
-    its time with it, and takes no new one."""
+    the monotonic clock). One not taken after `after` - a claim's since, on
+    the monotonic clock (_take) - is taken again, if one can be (`after` is
+    not ahead of now): a claim is never judged on a table older than it
+    (_iterm_holds). Both are compared on the monotonic clock: no wall clock
+    step between the judgement and its table moves either."""
     cached = []
 
     def get(after=None):
-        now = time.time()
-        taken = cached[0][1] + now - _mono() if cached else None    # on the wall clock now
         # a claim dated ahead of now can have no table after it yet: none taken for it
-        if taken is None or (after is not None and taken <= after <= now):
-            taken, mono = time.time(), _mono()
+        if not cached or (after is not None and cached[0][1] <= after <= _mono()):
+            mono = _mono()
             cached[:] = [(engine.app_snapshot(), mono)]
-        return cached[0][0], taken, cached[0][1]
+        table, mono = cached[0]
+        return table, mono + _skew(), mono
     return get
 
 

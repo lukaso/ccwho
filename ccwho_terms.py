@@ -46,7 +46,13 @@ class App:
     message says; `script_name` the name AppleScript tells; `gate` the prefix
     of this app's gate files in STATE_DIR."""
 
-    key = label = script_name = gate = ""
+    key = label = script_name = gate = term_program = ""
+    # asked for tab names only while a session sits in one of its tabs: the
+    # first Apple Event to an app makes macOS ask whether ccwho may control it
+    ask_only_for_sessions = False
+    # the shells in its tabs live on when it quits (iTerm2's session daemon):
+    # a launch cut off by its quit may still start what it opened
+    shells_outlive_it = False
 
     def is_app(self, name):
         """Is a process of this name (ucomm: the kernel's name for the
@@ -60,8 +66,12 @@ class App:
     def pids(self, procs_output):
         """This app's processes of ours, lowest pid first. Another user's copy
         is not ours to ask."""
+        return self.pids_in(parse_procs(procs_output))
+
+    def pids_in(self, table):
+        """pids(), from a parse_procs() table the caller already has."""
         me = os.getuid()
-        return [pid for pid, (_tty, uid, name) in sorted(parse_procs(procs_output).items())
+        return [pid for pid, (_tty, uid, name) in sorted(table.items())
                 if uid == me and self.is_app(name)]
 
     def pid(self, procs_output):
@@ -74,28 +84,42 @@ class App:
         daemon) started on it. A tab's identity - not the lowest pid on the
         tty: pids wrap at 99999, and a command started after the wrap would
         have a lower one."""
-        table = parse_procs(procs_output)
+        return self.owners_in(parse_procs(procs_output), procs.ps_rows(ps_output))
+
+    def owners_in(self, table, rows):
+        """owners(), from a parse_procs() table and a list of procs.ps_rows()
+        the caller already has: survey() reads each once for every app."""
         me = os.getuid()
         hosts = {pid for pid, (_tty, uid, name) in table.items()
                  if uid == me and self.is_host(name)}
         out = {}
-        for pid, ppid, _cmd in procs.ps_rows(ps_output):
+        for pid, ppid, _cmd in rows:
             tty = table.get(int(pid), ("",))[0] if pid.isdigit() else ""
             if tty and ppid in hosts:
                 out[short_tty_full(tty)] = int(pid)
         return out
 
-    def ttys(self, ps_output, procs_output, owners=None):
+    def ttys(self, ps_output, procs_output):
         """The terminals this app shows, from ps alone - or None when no copy
-        of ours runs. `owners` is self.owners() of the same two tables, when
-        the caller has it."""
+        of ours runs. A scan has survey(), which says the same for every app."""
         if self.pid(procs_output) is None:
             return None
-        return set(self.owners(ps_output, procs_output) if owners is None else owners)
+        return set(self.owners(ps_output, procs_output))
 
     def ask(self, args, **kw):
         """A background Apple Event to this app: through the gate (ask)."""
         return ask(args, app=self, **kw)
+
+    def installed(self):
+        """Is the app on this Mac? Read from the disk, never by asking it:
+        True, False, or None when that could not be told."""
+        return True
+
+    def jump_args(self, device):
+        """osascript's arguments that bring the tab showing `device` (/dev/ttysNNN)
+        to the front: a script that takes the device as its argument - never
+        in its text - and says where focus landed."""
+        raise NotImplementedError
 
     def trouble(self, returncode, stderr):
         """What went wrong with an osascript to this app, in words a screen can
@@ -120,6 +144,21 @@ class App:
 
 class ITerm2(App):
     key, label, script_name, gate = "iterm2", "iTerm2", "iTerm2", "iterm-ae"
+    shells_outlive_it = True
+    term_program, bundle_id = "iTerm.app", "com.googlecode.iterm2"
+
+    def installed(self):
+        """Where it is put, then Spotlight by its bundle id - never AppleScript,
+        which would start it. None when Spotlight could not answer: that is not
+        "not installed" (review 2 of slices 2-3)."""
+        if any(os.path.isdir(os.path.expanduser(p)) for p in APP_PATHS.get(self.key, ())):
+            return True
+        try:
+            found = subprocess.run(["mdfind", "kMDItemCFBundleIdentifier == '%s'" % self.bundle_id],
+                                   capture_output=True, text=True, errors="replace", timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return bool(found.stdout.strip()) if found.returncode == 0 else None
 
     def is_app(self, name):
         return name == "iTerm2"                   # whatever the bundle is called
@@ -130,7 +169,7 @@ class ITerm2(App):
         # ucomm keeps 16 characters
         return self.is_app(name) or name.startswith("iTermServer-")
 
-    def ttys(self, ps_output, procs_output, owners=None):
+    def ttys(self, ps_output, procs_output):
         """The terminals iTerm2 shows, from ps alone: a pane's first process is
         started by iTerm2's session daemon (iTermServer-*), or by iTerm2 itself
         when it runs without one. Measured 2026-09-29: 28 of 28 panes, the same
@@ -145,10 +184,13 @@ class ITerm2(App):
         None when no iTerm2 app of ours is running: the daemon keeps every shell
         alive after iTerm2 quits, with the same parent, and not one has a window.
         """
-        return super().ttys(ps_output, procs_output, owners)
+        return super().ttys(ps_output, procs_output)
 
     # every launch script starts with AE_PROBE, which writes nothing
     head = 'tell application "iTerm2"\n  %s\n  activate\n' % AE_PROBE
+
+    def jump_args(self, device):
+        return [os.path.join(HERE, "jump.applescript"), device]
 
     def titles_script(self):
         """AppleScript for "what does each tab SAY", in one round trip.
@@ -215,16 +257,19 @@ class ITerm2(App):
             'end tell\n'
         )
 
-    def panes(self, timeout=5.0, direct=False):
+    def panes(self, timeout=5.0, direct=False, may_start=False):
         """Ask iTerm2 for its panes (parse_panes). In the background (a save)
         through the gate: None when it was not asked, and the save keeps the
         panes it knew. `direct` is for a restore - something you do, which asks
         iTerm2 itself and gets {} when it cannot, and then opens windows, as it
-        always did."""
+        always did. Guarded (D13) unless `may_start`: a check opens nothing, so
+        its ask must not start iTerm2; --open sends it a window anyway, and its
+        restored panes are worth finding as they always were."""
         if direct:
+            script = self.panes_script() if may_start else guarded(self, self.panes_script())
             try:
-                done = subprocess.run(["osascript", "-e", self.panes_script()], capture_output=True,
-                                      text=True, errors="replace", timeout=timeout)
+                done = subprocess.run(["osascript", "-e", script],
+                                      capture_output=True, text=True, errors="replace", timeout=timeout)
             except (OSError, subprocess.SubprocessError):
                 return {}
             return parse_panes(done.stdout) if done.returncode == 0 else {}
@@ -304,16 +349,191 @@ class ITerm2(App):
         return self.head + '%s\nend tell\n' % body
 
 
+class TerminalApp(App):
+    """Terminal.app. Measured 2026-09-29: a tab's first process is the `login`
+    Terminal.app starts on its tty; there is no daemon, so its shells end with
+    it. A tab has no lasting id and no split panes; its `custom title` is the
+    title a program sets (Claude Code's "✳ topic"). A tab's `contents` is its
+    screen text, and is never read."""
+
+    key, label, script_name, gate = "terminal", "Terminal.app", "Terminal", "terminal-ae"
+    term_program = "Apple_Terminal"
+    ask_only_for_sessions = True
+    # every launch script starts with AE_PROBE, which writes nothing
+    head = 'tell application "Terminal"\n  %s\n  activate\n' % AE_PROBE
+
+    def run_script(self, cmd):
+        """One Terminal.app window running one command: `do script` with no tab
+        to run in opens a window of its own."""
+        if not cmd:
+            return ""
+        return self.head + '  do script %s\nend tell\n' % applescript_str(cmd)
+
+    def open_script(self, items):
+        """A new window for each (pane id, command) in `items`, the ids ignored:
+        a restore does not fill the windows Terminal.app reopens (D8, #30). It
+        answers nothing - no pane was written into."""
+        # gstack-shortcut(dec-5d46df4a-6075-4492-9855-51815a2508f2): a restore
+        # opens each Terminal.app session in a new window and never fills the
+        # tabs Terminal.app reopened itself - they stay beside it (#30). Upgrade
+        # when the #30 probe shows a relaunched Terminal.app keeps a tab's tty
+        # or custom title.
+        cmds = [cmd for _uid, cmd in items or [] if cmd]
+        if not cmds:
+            return ""
+        body = "".join('  do script %s\n' % applescript_str(cmd) for cmd in cmds)
+        return self.head + body + '  return ""\nend tell\n'
+
+    def is_app(self, name):
+        return name == "Terminal"
+
+    def jump_args(self, device):
+        # a constant here, not a file: the brew formula ships *.py by pattern and
+        # AppleScript files by name (D9)
+        return ["-e", _TERMINAL_JUMP, device]
+
+    def titles_script(self):
+        """tty<TAB>custom title, one tab a line - two events a window."""
+        return (
+            'tell application "Terminal"\n'
+            '  set d to (ASCII character 9)\n'
+            '  set out to ""\n'
+            '  repeat with w in windows\n'
+            '    set ts to tty of every tab of w\n'
+            '    set ns to custom title of every tab of w\n'
+            '    repeat with j from 1 to count of ts\n'
+            '      set out to out & (item j of ts) & d & (item j of ns) & linefeed\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            '  return out\n'
+            'end tell\n'
+        )
+
+
+# Terminal.app's jump (TerminalApp.jump_args). The window by id, as in
+# jump.applescript: `repeat with w in windows` hands back an index-based
+# reference, and raising a window reorders them - the jump would then raise the
+# window next to the one asked for. Then it says where focus landed.
+_TERMINAL_JUMP = """on run argv
+  set target to item 1 of argv
+  tell application "Terminal"
+    set winId to missing value
+    set tabNo to 0
+    repeat with w in windows
+      set i to 0
+      repeat with t in tabs of w
+        set i to i + 1
+        try
+          if (tty of t) is target then
+            set winId to id of w
+            set tabNo to i
+          end if
+        end try
+      end repeat
+    end repeat
+    if winId is missing value then return "not found: " & target
+    set selected of tab tabNo of window id winId to true
+    set index of window id winId to 1
+    activate
+    try
+      set landed to tty of selected tab of front window
+    on error
+      set landed to "unknown"
+    end try
+  end tell
+  if landed is target then return "focused " & target
+  return "asked for " & target & " but landed on " & landed
+end run
+"""
+
+HERE = os.path.dirname(os.path.realpath(__file__))
 ITERM2 = ITerm2()
-APPS = (ITERM2,)
+TERMINAL = TerminalApp()
+APPS = (ITERM2, TERMINAL)
+
+
+# where an app is installed, looked at before Spotlight (App.installed)
+APP_PATHS = {"iterm2": ["/Applications/iTerm.app", "~/Applications/iTerm.app"]}
+
+
+def default_app(env, snapshot=None, installed=None):
+    """The app a new window opens in when nothing says which (D6): the terminal
+    ccwho runs in (TERM_PROGRAM); with none - a link click - an app of ours
+    that runs, iTerm2 first; with none running, iTerm2 when it is installed,
+    else Terminal.app. `snapshot()` gives the process table, and is called
+    only when TERM_PROGRAM does not decide (a restore passes its batch's one
+    table); default app_snapshot. `installed(app)` is App.installed, or a
+    caller's memo of it for a batch."""
+    by_name = {app.term_program: app for app in APPS if app.term_program}
+    here = by_name.get((env or {}).get("TERM_PROGRAM", ""))
+    if here is not None:
+        return here
+    table = (snapshot or app_snapshot)()
+    for app in APPS:
+        if app.pid(table) is not None:
+            return app
+    return ITERM2 if (installed or (lambda app: app.installed()))(ITERM2) else TERMINAL
+
+
+def open_window(app, cmd, deadline):
+    """A new window of `app` running `cmd` - something you do: asked directly,
+    with a deadline. "" when it opened, else what went wrong (osascript's code,
+    never its text)."""
+    try:
+        done = subprocess.run(["osascript", "-e", app.run_script(cmd)], capture_output=True,
+                              text=True, errors="replace", timeout=deadline)
+    except subprocess.TimeoutExpired:
+        return f"{app.label} did not answer in {deadline:g}s"
+    except OSError as ex:
+        return f"could not reach {app.label} ({type(ex).__name__})"
+    return f"could not open a window - {app.trouble(done.returncode, done.stderr)}" if done.returncode else ""
+
+
+def app_of(row):
+    """The App whose tab shows a row (its "terminal"), or None: no app ccwho
+    knows shows it. A row with no "terminal" at all comes from an engine
+    before apps were recorded (a hot reload): everything then was iTerm2."""
+    key = row.get("terminal", ITERM2.key)
+    return next((app for app in APPS if app.key == key), None) if key else None
+
+
+def no_app(tty):
+    """What a jump says about a tty no app ccwho knows shows."""
+    return f"no terminal app ccwho knows shows {short_tty_full(tty)}"
+
+
+def focus(app, tty, deadline):
+    """Bring the tab showing `tty` to the front - something you do: asked
+    directly, not through the gate, and never without a deadline (an osascript
+    with none waits as long as a stuck app does). What the app's jump script
+    says, or what went wrong - osascript's code, never its text, which quotes
+    paths and tab names."""
+    device = tty if tty.startswith("/dev/") else f"/dev/{tty}"
+    try:
+        done = subprocess.run(["osascript", *app.jump_args(device)], capture_output=True,
+                              text=True, errors="replace", timeout=deadline)
+    except subprocess.TimeoutExpired:
+        return f"{app.label} did not answer in {deadline:g}s"
+    except OSError as ex:
+        return f"could not reach {app.label} ({type(ex).__name__})"
+    return (done.stdout or "").strip() or (
+        app.trouble(done.returncode, done.stderr) if done.returncode else "done")
+
+
+def survey(ps_output, procs_output):
+    """app key -> (App.owners, whether a copy of ours runs): which tty each app
+    has a pane on, and whether it can tell. Each table is read once for every
+    app - a scan's cost does not grow with the number of apps."""
+    table, rows = parse_procs(procs_output), list(procs.ps_rows(ps_output))
+    return {app.key: (app.owners_in(table, rows), bool(app.pids_in(table))) for app in APPS}
 
 
 def owners(ps_output, procs_output):
-    """tty -> the pane's own process, for every app: App.owners, joined. A tty
+    """tty -> the pane's own process, for every app: survey()'s, joined. A tty
     is one app's at a time."""
     out = {}
-    for app in APPS:
-        out.update(app.owners(ps_output, procs_output))
+    for app_panes, _running in survey(ps_output, procs_output).values():
+        out.update(app_panes)
     return out
 
 
@@ -404,6 +624,33 @@ def ae_error_at(err, script, statement):
     when the statement is the last of its block); False when there is none."""
     start, at = ae_error_start(err), script.find(statement)
     return start is not None and at >= 0 and at <= start < at + len(statement)
+
+
+# what a guarded script answers when its app is not running (guarded)
+NOT_RUNNING = "ccwho:not-running"
+
+
+def guarded(app, script):
+    """`script`, sent so that it cannot start `app`: inside `run script`,
+    behind an `is running` check. osascript starts an app when it COMPILES a
+    tell to it - before any check in the same script runs - so a tell in the
+    open would start an app that quit after ps said it ran (probe 2026-09-29:
+    `if application "TextEdit" is running then tell ...` started TextEdit; this
+    form did not, and still read a running Terminal.app). Answers NOT_RUNNING
+    when the app is not running. Only its name is left for the moment between
+    the check and the inner compile."""
+    return ('if application %s is running then\n'
+            '  return run script %s\n'
+            'end if\n'
+            'return %s\n' % (applescript_str(app.script_name), _script_literal(script),
+                              applescript_str(NOT_RUNNING)))
+
+
+def _script_literal(script):
+    """A whole script as one AppleScript string: backslash and quote escaped,
+    each line break a \\n - unlike applescript_str, which drops them, as data
+    must never break a line. This is ccwho's own script, never data."""
+    return '"%s"' % script.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def applescript_str(text):
@@ -574,11 +821,16 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     long to queue behind an ask in flight; a scan queues for nothing.
 
     `why`, a dict, is told what happened: "asked" (an event was sent),
-    "refused" (no-iterm - no copy of the app of ours runs -, no-table - the
-    process list could not be read -, io - its state, lock or spawn failed -,
-    busy, stuck, waiting) and "error" (the Apple Event error code that ended
-    osascript's message, "timeout", or "failed" when it ended with none).
+    "refused" (not-running - no copy of the app of ours runs, by ps or by the
+    check inside the script (guarded) -, no-table - the process list could not
+    be read -, io - its state, lock or spawn failed -, busy, stuck, waiting)
+    and "error" (the Apple Event error code that ended osascript's message,
+    "timeout", or "failed" when it ended with none).
+
+    `args` is ["-e", script]: the script is sent guarded. Anything else is a
+    ValueError, raised before the gate is touched.
     """
+    sent = _guarded_args(app, args)
     if why is None:
         why = {}
     why.update({"asked": False, "refused": None, "error": None})
@@ -620,12 +872,13 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
                 return None
         now = time.time() if fixed_now is None else fixed_now
         table = app_snapshot() if procs is None else procs
-        if not parse_procs(table):
+        parsed = parse_procs(table)
+        if not parsed:
             why["refused"] = "no-table"     # ps failed: not "no app", nor a stuck one
             return None
-        pids = app.pids(table)
+        pids = app.pids_in(parsed)
         if not pids:
-            why["refused"] = "no-iterm"     # `tell application` would launch it
+            why["refused"] = "not-running"  # `tell application` would launch it
             return None
         state, _, saved = _settle(app, _read_gate(app, now), now)
         if not saved:
@@ -658,7 +911,7 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
             return None
         try:
             child = subprocess.Popen(
-                ["/bin/sh", "-c", _ask_sh(app), OSASCRIPT, STATE_DIR, *args],
+                ["/bin/sh", "-c", _ask_sh(app), OSASCRIPT, STATE_DIR, *sent],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, pass_fds=(fd,), start_new_session=True)
         except OSError:
@@ -690,9 +943,21 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         state, out, _saved = _settle(app, state, done)
         if out is None:
             why["error"] = state.get("last_error")
+        elif out.strip() == NOT_RUNNING:
+            # quit after ps said it ran: `is running` sends the app no event
+            why.update(asked=False, refused="not-running")
+            return None
         return out
     finally:
         os.close(fd)
+
+
+def _guarded_args(app, args):
+    """osascript's arguments with the script guarded: ["-e", script] only - a
+    background ask sends nothing else."""
+    if len(args) != 2 or args[0] != "-e":
+        raise ValueError("a background ask is one script: [\"-e\", script]")
+    return ["-e", guarded(app, args[1])]
 
 
 # ------------------------------------------------------ tab names and panes
@@ -733,9 +998,11 @@ PANES_WAIT = 10.0      # a save every 15 minutes may wait out the list's ask
 TITLES_TTL = 60.0
 
 
-def titles_cached(cache, now=None, procs=None, owners=None):
-    """The tab names, at most once per TITLES_TTL. `cache` is the runner's dict,
-    the same idiom as the transcript window cache; None means always ask.
+def titles_cached(cache, now=None, procs=None, owners=None, apps=None):
+    """The tab names of `apps`, each at most once per TITLES_TTL: tty -> name.
+    `cache` is the runner's dict, the same idiom as the transcript window cache;
+    None means always ask. Without `apps`, the apps asked whenever they run:
+    one asked only for its sessions (D7) is asked only when the caller says so.
 
     An answer - even "no tabs" - is kept for the minute. No answer is not: the
     names it had stay up and the next tick asks again, which costs nothing
@@ -746,18 +1013,31 @@ def titles_cached(cache, now=None, procs=None, owners=None):
     session's - with no new ask.
     """
     now = time.time() if now is None else now
+    if apps is None:
+        apps = [app for app in APPS if not app.ask_only_for_sessions]
     if cache is None:
-        return ITERM2.titles(procs=procs) or {}
+        out = {}
+        for app in apps:
+            out.update(app.titles(procs=procs) or {})
+        return out
     owners = owners or {}
     entry = cache.get("_titles")
     # any other shape was written by the engine before a hot reload: a miss
-    ts, titles, seen = (entry if isinstance(entry, tuple) and len(entry) == 3
-                        and isinstance(entry[2], dict) else (None, {}, {}))
-    kept = {t: name for t, name in titles.items() if seen.get(t) == owners.get(t)}
-    if ts is not None and now - ts < TITLES_TTL:
-        return kept
-    fresh = ITERM2.titles(procs=procs)
-    if fresh is None:
-        return kept     # not asked: the names it had, and ask again next tick
-    cache["_titles"] = (now, fresh, owners)
-    return fresh
+    per_app = entry if isinstance(entry, dict) else {}
+    out = {}
+    for app in apps:
+        got = per_app.get(app.key)
+        ts, titles, seen = (got if isinstance(got, tuple) and len(got) == 3
+                            and isinstance(got[2], dict) else (None, {}, {}))
+        kept = {t: name for t, name in titles.items() if seen.get(t) == owners.get(t)}
+        if ts is not None and now - ts < TITLES_TTL:
+            out.update(kept)
+            continue
+        fresh = app.titles(procs=procs)
+        if fresh is None:
+            out.update(kept)    # not asked: the names it had, and ask again next tick
+            continue
+        per_app[app.key] = (now, fresh, owners)
+        out.update(fresh)
+    cache["_titles"] = per_app
+    return out

@@ -1847,10 +1847,10 @@ class CcwhoUi(App):
             self.attaching(value, row, self.jumps)      # answer would never end
             return
         if row.get("windowed") is False:
-            # We asked iTerm2 about this tty and it had never heard of it: the
-            # session is alive with nowhere to go to - `claude bg-spare` does
-            # this. Asking iTerm2 anyway returns "not found: /dev/ttys042",
-            # which is not an answer anyone can act on.
+            # No terminal app shows this tty: the session is alive with
+            # nowhere to go to - `claude bg-spare` does this. Asking an app
+            # anyway answers "not found: /dev/ttys042", which is not an
+            # answer anyone can act on.
             self.said(engine.no_window_note(row))
             return
         self.mark_acting(row.get("sessionId", ""))
@@ -1897,7 +1897,7 @@ class CcwhoUi(App):
 
     @work(thread=True)
     def attaching(self, cmd, row, jump):
-        said = self.adapter.attach(cmd, deadline=FOCUS_DEADLINE)
+        said = self.adapter.attach(cmd, deadline=FOCUS_DEADLINE, row=row)
         self.call_from_thread(self.landed, said, row, jump)
 
     @work(thread=True)
@@ -2227,23 +2227,18 @@ class Collector:
 
 
 class Adapter:
-    """iTerm2, behind a door the tests can close."""
+    """The terminal apps, behind a door the tests can close."""
 
-    def attach(self, cmd, deadline=FOCUS_DEADLINE):
-        """One new iTerm2 window, running `claude attach <id>`."""
+    def attach(self, cmd, deadline=FOCUS_DEADLINE, row=None):
+        """One new window running `claude attach <id>`, in the app the session
+        was last seen in, else where you are (ccwho.window_app, D6)."""
+        import ccwho as runner                  # the runner is never reloaded: this is it
         try:
-            done = subprocess.run(
-                ["osascript", "-e", engine.terms.ITERM2.run_script(cmd)],
-                capture_output=True, text=True, errors="replace", timeout=deadline)
-        except subprocess.TimeoutExpired:
-            return f"iTerm2 did not answer in {deadline:g}s"
-        except OSError as ex:
-            return f"could not reach iTerm2 ({type(ex).__name__})"
-        if done.returncode:
-            # its code, never its text: osascript's message quotes paths
-            trouble = engine.terms.ITERM2.trouble(done.returncode, done.stderr)
-            return f"could not open a window - {trouble}"
-        return "attached it in a new window"
+            app = runner.window_app((row or {}).get("sessionId", ""))
+        except Exception as ex:                 # a click must never end the list
+            return f"could not pick a terminal app ({type(ex).__name__})"
+        trouble = engine.terms.open_window(app, cmd, deadline)
+        return trouble or "attached it in a new window"
 
     def copy(self, text, deadline=2.0):
         """Onto the clipboard, or what went wrong. pbcopy reads the locale's
@@ -2273,20 +2268,10 @@ class Adapter:
         tty = (row.get("tty") or "").strip()
         if not tty:
             return f"pid {row.get('pid')} has no window - `ccwho show` for its resume line"
-        device = tty if tty.startswith("/dev/") else f"/dev/{tty}"
-        script = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                              "jump.applescript")
-        try:
-            done = subprocess.run(["osascript", script, device],
-                                  capture_output=True, text=True, errors="replace",
-                                  timeout=deadline)
-        except subprocess.TimeoutExpired:
-            return f"iTerm2 did not answer in {deadline:g}s"
-        except OSError as ex:
-            return f"could not reach iTerm2 ({type(ex).__name__})"
-        # what jump.applescript says, or osascript's code - never its text
-        return (done.stdout or "").strip() or (
-            engine.terms.ITERM2.trouble(done.returncode, done.stderr) if done.returncode else "done")
+        app = engine.terms.app_of(row)          # the app whose tab shows it (D9)
+        if app is None:
+            return engine.terms.no_app(tty)
+        return engine.terms.focus(app, tty, deadline)
 
 
 def main():

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 import unittest
 
@@ -306,6 +307,438 @@ class TestAPatchPutsBackWhatItsObjectHeld(unittest.TestCase):
         self.doCleanups()
         self.assertIs(vars(app)["ask"], later)
 
+
+TERMINAL_APP = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+
+
+class TestTerminalAppIsABackend(unittest.TestCase):
+    """Terminal.app, read from ps like iTerm2: its tabs' first process is the
+    `login` it starts. It has no daemon - its shells end with it."""
+
+    ME = os.getuid()
+    procs = TestWhoShowsATty.procs
+    ps = TestWhoShowsATty.ps
+
+    def tables(self, uid=None):
+        uid = self.ME if uid is None else uid
+        p = self.procs((400, "??", uid, "Terminal"), (401, "ttys050", 0, "login"),
+                       (402, "ttys050", uid, "zsh"))
+        out = self.ps((400, 1, TERMINAL_APP), (401, 400, "login -pf me"), (402, 401, "-zsh"))
+        return out, p
+
+    def test_its_tabs_are_its(self):
+        out, p = self.tables()
+        self.assertEqual(terms.TERMINAL.pids(p), [400])
+        self.assertEqual(terms.TERMINAL.owners(out, p), {"ttys050": 401})
+        self.assertEqual(terms.TERMINAL.ttys(out, p), {"ttys050"})
+        self.assertEqual(terms.owners(out, p), {"ttys050": 401})
+
+    def test_another_user_s_terminal_app_is_not_ours(self):              # control
+        out, p = self.tables(uid=self.ME + 1)
+        self.assertEqual(terms.TERMINAL.pids(p), [])
+        self.assertIsNone(terms.TERMINAL.ttys(out, p))
+
+    def test_each_app_s_panes_are_its_own(self):
+        p = self.procs((100, "??", self.ME, "iTerm2"), (300, "ttys024", 0, "login"),
+                       (400, "??", self.ME, "Terminal"), (401, "ttys050", 0, "login"))
+        out = self.ps((100, 1, "iTerm2"), (300, 100, "login"), (400, 1, TERMINAL_APP),
+                      (401, 400, "login"))
+        self.assertEqual(terms.survey(out, p), {"iterm2": ({"ttys024": 300}, True),
+                                                "terminal": ({"ttys050": 401}, True)})
+        self.assertEqual(terms.owners(out, p), {"ttys024": 300, "ttys050": 401})
+
+    def test_it_has_its_own_gate_files(self):
+        self.assertEqual(terms._gate_path(terms.TERMINAL, "lock"),
+                         os.path.join(terms.STATE_DIR, "terminal-ae.lock"))
+        self.assertNotEqual(terms.TERMINAL.gate, terms.ITERM2.gate)
+
+    def test_its_tab_names_come_from_the_custom_title_never_the_screen(self):
+        script = terms.TERMINAL.titles_script()
+        self.assertIn("custom title", script)
+        self.assertNotIn("contents", script)        # a tab's contents is its screen text
+        self.assertIn('tell application "Terminal"', script)
+        self.assertEqual(terms.parse_titles("/dev/ttys050\t\u2733 fixing it\n\n"),
+                         {"ttys050": "\u2733 fixing it"})
+
+
+class TestABackgroundAskChecksTheAppInsideTheScript(unittest.TestCase):
+    """ps says the app runs; quit in the moment after, and `tell application`
+    would start it again - osascript starts an app when it compiles a tell,
+    before any `is running` check in the same script runs (probe 2026-09-29:
+    TextEdit started). So the gate sends the tell inside `run script`, behind
+    the check, and "not running" comes back as a refusal (D13)."""
+
+    INNER = 'tell application "iTerm2"\n  return "a \\"quote\\" and a \\\\"\nend tell\n'
+
+    def test_the_tell_is_inside_run_script_behind_the_check(self):
+        script = terms.guarded(terms.TERMINAL, self.INNER)
+        self.assertTrue(script.startswith('if application "Terminal" is running then\n'))
+        self.assertIn("run script ", script)
+        self.assertNotIn("\ntell application", script, "a tell outside run script")
+
+    def test_the_inner_script_survives_the_quoting(self):
+        script = terms.guarded(terms.ITERM2, self.INNER)
+        lit = script[script.index("run script ") + len("run script "):script.index("\nend if")]
+        self.assertTrue(lit.startswith('"') and lit.endswith('"'), lit)
+        unescaped = re.sub(r'\\(.)', lambda m: {"n": "\n"}.get(m.group(1), m.group(1)), lit[1:-1])
+        self.assertEqual(unescaped, self.INNER)
+
+    def stub(self, text):
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "osascript")
+        with open(path, "w") as fh:
+            fh.write('#!/bin/sh\nprintf "%%s" "$2" > "%s/sent"\n%s\n' % (tmp, text))
+        os.chmod(path, 0o755)
+        saved = (terms.STATE_DIR, terms.OSASCRIPT, terms.app_snapshot)
+        self.addCleanup(lambda: [setattr(terms, n, v) for n, v in
+                                 zip(("STATE_DIR", "OSASCRIPT", "app_snapshot"), saved)])
+        terms.STATE_DIR, terms.OSASCRIPT = os.path.join(tmp, "state"), path
+        terms.app_snapshot = lambda: ("  PID   UID UCOMM\n  100 %d iTerm2\n  400 %d Terminal\n"
+                                      % (self.ME, self.ME))
+        return tmp
+
+    ME = os.getuid()
+
+    def test_the_gate_sends_the_guarded_script(self):
+        tmp = self.stub('echo "ttys050\tname"')
+        why = {}
+        self.assertEqual(REAL_ASK(["-e", self.INNER], app=terms.TERMINAL, why=why), "ttys050\tname\n")
+        with open(os.path.join(tmp, "sent")) as fh:
+            self.assertEqual(fh.read(), terms.guarded(terms.TERMINAL, self.INNER))
+
+    def test_an_app_gone_before_the_script_ran_is_a_refusal(self):
+        self.stub('echo "%s"' % terms.NOT_RUNNING)
+        why = {}
+        self.assertIsNone(REAL_ASK(["-e", self.INNER], app=terms.TERMINAL, why=why))
+        self.assertEqual(why.get("refused"), "not-running")
+        self.assertIs(why.get("asked"), False, "no event reached the app")
+
+    def test_a_quarantine_is_one_app_s(self):
+        # one state dir for both apps: Terminal.app stuck (-1712) stops asks to
+        # it, never to iTerm2 - and iTerm2 answering does not free Terminal.app
+        self.stub('case "$2" in *\'"Terminal"\'*) echo "execution error: AppleEvent timed out.'
+                  ' (-1712)" >&2; exit 1;; *) echo ok;; esac')
+        self.assertIsNone(REAL_ASK(["-e", "x"], app=terms.TERMINAL))
+        why = {}
+        self.assertIsNone(REAL_ASK(["-e", "x"], app=terms.TERMINAL, why=why))
+        self.assertEqual(why.get("refused"), "stuck")
+        self.assertEqual(REAL_ASK(["-e", "x"], app=terms.ITERM2), "ok\n")
+        why = {}
+        self.assertIsNone(REAL_ASK(["-e", "x"], app=terms.TERMINAL, why=why))
+        self.assertEqual(why.get("refused"), "stuck", "iTerm2's answer freed Terminal.app")
+
+    def test_a_malformed_ask_raises_before_the_gate_changes(self):
+        tmp = self.stub("echo ok")
+        with self.assertRaises(ValueError):
+            REAL_ASK(["-e", "a", "-e", "b"], app=terms.ITERM2)
+        state = os.path.join(tmp, "state")
+        self.assertEqual([n for n in os.listdir(state) if not n.endswith(".lock")]
+                         if os.path.isdir(state) else [], [])
+
+    def test_the_guarded_scripts_compile(self):
+        # compiling starts no app in this form (the tell is a string): osacompile
+        # proves the quoting keeps every background script valid AppleScript
+        import tempfile
+        for app, script in ((terms.ITERM2, terms.ITERM2.titles_script()),
+                            (terms.ITERM2, terms.ITERM2.panes_script()),
+                            (terms.TERMINAL, terms.TERMINAL.titles_script())):
+            with self.subTest(app=app.key), tempfile.NamedTemporaryFile(suffix=".scpt") as out:
+                done = subprocess.run(["osacompile", "-o", out.name, "-e", terms.guarded(app, script)],
+                                      capture_output=True, text=True, timeout=20)
+                self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class TestAJumpGoesToTheAppThatShowsTheTty(unittest.TestCase):
+    """Jump asks the app whose tab shows the tty. The tty goes in as an argument
+    of its own - never into the script text - and the script says where focus
+    landed (D9). Terminal.app's script lives in this module: the brew formula
+    ships *.py by pattern, AppleScript files only by name."""
+
+    def test_terminal_app_s_script_takes_the_tty_as_an_argument(self):
+        args = terms.TERMINAL.jump_args("/dev/ttys050")
+        self.assertEqual(args[0], "-e")
+        self.assertEqual(args[-1], "/dev/ttys050")
+        self.assertTrue(args[1].startswith("on run argv"))
+        self.assertNotIn("ttys050", args[1])
+
+    def test_a_tty_with_a_quote_stays_an_argument(self):
+        odd = '/dev/ttys050"; do shell script "echo no'
+        args = terms.TERMINAL.jump_args(odd)
+        self.assertEqual(args[-1], odd)
+        self.assertEqual(args[1], terms.TERMINAL.jump_args("/dev/ttys050")[1])   # the same script
+
+    def test_iterm2_keeps_its_script_file(self):
+        args = terms.ITERM2.jump_args("/dev/ttys024")
+        self.assertEqual(args, [os.path.join(REPO, "jump.applescript"), "/dev/ttys024"])
+        self.assertTrue(os.path.isfile(args[0]))
+
+    def test_terminal_app_s_jump_script_compiles(self):
+        done = testkit.compiles(self, terms.TERMINAL, terms.TERMINAL.jump_args("/dev/x")[1])
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def fake_run(self, answer=None, raises=None):
+        calls = []
+        real = subprocess.run
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if raises:
+                raise raises
+            return subprocess.CompletedProcess(argv, 0, stdout=answer or "", stderr="")
+        subprocess.run = run
+        self.addCleanup(setattr, subprocess, "run", real)
+        return calls
+
+    def test_focus_runs_the_app_s_jump_with_a_deadline(self):
+        calls = self.fake_run("focused /dev/ttys050\n")
+        self.assertEqual(terms.focus(terms.TERMINAL, "ttys050", 5.0), "focused /dev/ttys050")
+        argv, kw = calls[0]
+        self.assertEqual(argv, ["osascript", *terms.TERMINAL.jump_args("/dev/ttys050")])
+        self.assertEqual(kw.get("timeout"), 5.0)
+
+    def test_focus_says_which_app_did_not_answer(self):
+        self.fake_run(raises=subprocess.TimeoutExpired("osascript", 5.0))
+        self.assertEqual(terms.focus(terms.TERMINAL, "ttys050", 5.0), "Terminal.app did not answer in 5s")
+        self.assertEqual(terms.focus(terms.ITERM2, "ttys024", 5.0), "iTerm2 did not answer in 5s")
+
+    def test_a_row_names_its_app(self):
+        self.assertIs(terms.app_of({"terminal": "terminal"}), terms.TERMINAL)
+        self.assertIs(terms.app_of({"terminal": "iterm2"}), terms.ITERM2)
+        self.assertIsNone(terms.app_of({"terminal": ""}))          # no app we know shows it
+        self.assertIsNone(terms.app_of({"terminal": "ghostty"}))   # one this ccwho does not know
+        # a row from an engine before the app was recorded: everything was iTerm2
+        self.assertIs(terms.app_of({"tty": "ttys022"}), terms.ITERM2)
+
+
+class TestTerminalAppOpensNewWindows(unittest.TestCase):
+    """A session opened or restored in Terminal.app gets a new window, running
+    its command (`do script`); a restore does not fill the windows Terminal.app
+    reopens (D8, issue #30). Each script's first event writes nothing, so a
+    refusal there means nothing was sent (AE_PROBE)."""
+
+    def test_one_window_one_command(self):
+        script = terms.TERMINAL.run_script('cd "/x y" && claude --resume abc')
+        self.assertTrue(script.startswith(terms.TERMINAL.head))
+        self.assertIn(terms.AE_PROBE, terms.TERMINAL.head)
+        self.assertIn('do script %s' % terms.applescript_str('cd "/x y" && claude --resume abc'), script)
+
+    def test_a_restore_opens_a_window_each_and_fills_none(self):
+        script = terms.TERMINAL.open_script([("PANE-1", "one"), (None, "two")])
+        self.assertEqual(script.count("do script "), 2)
+        self.assertNotIn("PANE-1", script)
+        self.assertEqual(terms.TERMINAL.open_script([]), "")
+
+    def test_its_scripts_compile(self):
+        for script in (terms.TERMINAL.run_script("claude --resume abc"),
+                       terms.TERMINAL.open_script([(None, "one"), (None, "two")])):
+            done = testkit.compiles(self, terms.TERMINAL, script)
+            self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class TestANewWindowOpensWhereYouAre(unittest.TestCase):
+    """With no record of a session's app (D6): the terminal ccwho runs in; with
+    none (a link click), an app of ours that runs, iTerm2 first; with none
+    running, iTerm2 when it is installed, else Terminal.app. Finding out never
+    asks an app (no AppleScript)."""
+
+    ME = os.getuid()
+
+    def table(self, *names):
+        return "  PID   UID UCOMM\n" + "".join("%5d %5d %s\n" % (100 + i, self.ME, n)
+                                             for i, n in enumerate(names))
+
+    def installed(self, yes):
+        real = terms.ITERM2.installed
+        terms.ITERM2.installed = lambda: yes
+        self.addCleanup(terms.ITERM2.__dict__.pop, "installed", None)
+        return real
+
+    def test_the_terminal_ccwho_runs_in(self):
+        def untouched():
+            raise AssertionError("TERM_PROGRAM decides: no process table is taken")
+        self.assertIs(terms.default_app({"TERM_PROGRAM": "Apple_Terminal"}, untouched), terms.TERMINAL)
+        self.assertIs(terms.default_app({"TERM_PROGRAM": "iTerm.app"}, untouched), terms.ITERM2)
+
+    def test_else_an_app_that_runs_iterm2_first(self):
+        self.assertIs(terms.default_app({}, lambda: self.table("Terminal")), terms.TERMINAL)
+        self.assertIs(terms.default_app({"TERM_PROGRAM": "vscode"},
+                                        lambda: self.table("Terminal", "iTerm2")), terms.ITERM2)
+
+    def test_else_iterm2_when_installed(self):
+        self.installed(True)
+        self.assertIs(terms.default_app({}, lambda: self.table("zsh")), terms.ITERM2)
+
+    def test_else_terminal_app(self):                                           # control
+        self.installed(False)
+        self.assertIs(terms.default_app({}, lambda: self.table("zsh")), terms.TERMINAL)
+
+    def test_not_knowing_picks_the_app_that_is_always_there(self):
+        # None (Spotlight could not answer) is not a reason to pick iTerm2 for a
+        # window nothing else chose: Terminal.app always is (a record that
+        # names iTerm2 keeps it - it was there)
+        none = "  PID UID UCOMM\n1 0 launchd\n"
+        self.assertIs(terms.default_app({}, lambda: none, installed=lambda app: None), terms.TERMINAL)
+        self.assertIs(terms.default_app({}, lambda: none, installed=lambda app: True), terms.ITERM2)
+
+    def test_a_search_that_failed_is_not_knowing(self):
+        # Spotlight that could not answer is not "not installed" (review 2
+        # of slices 2-3): None
+        testkit.patch(self, engine.terms, "APP_PATHS", {"iterm2": ["/nowhere/iTerm.app"]})
+        for outcome in (OSError("gone"), subprocess.TimeoutExpired("mdfind", 5),
+                        subprocess.CompletedProcess(["mdfind"], 1, stdout="", stderr="odd")):
+            def run(cmd, *a, _o=outcome, **k):
+                if isinstance(_o, BaseException):
+                    raise _o
+                return _o
+            undo = testkit.patch(self, subprocess, "run", run)
+            self.assertIsNone(terms.ITERM2.installed(), outcome)
+            undo()
+        undo = testkit.patch(self, subprocess, "run",
+                             lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+        self.assertIs(terms.ITERM2.installed(), False)                          # control: none found
+        undo()
+
+    def test_installed_is_read_from_the_disk_never_asked(self):
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        real_paths, real_run = terms.APP_PATHS, subprocess.run
+        self.addCleanup(setattr, terms, "APP_PATHS", real_paths)
+        self.addCleanup(setattr, subprocess, "run", real_run)
+        ran = []
+        subprocess.run = lambda argv, **k: ran.append(argv) or subprocess.CompletedProcess(
+            argv, 0, stdout="", stderr="")
+        terms.APP_PATHS = {"iterm2": [os.path.join(tmp, "iTerm.app")]}
+        self.assertFalse(terms.ITERM2.installed())
+        self.assertEqual([a[0] for a in ran], ["mdfind"])             # not osascript
+        os.makedirs(os.path.join(tmp, "iTerm.app"))
+        ran.clear()
+        self.assertTrue(terms.ITERM2.installed())
+        self.assertEqual(ran, [])                                    # found on disk: nothing run
+
+
+class TestANewWindowIsOpenedWithADeadline(unittest.TestCase):
+    """open_window: something you do, asked directly, never without a deadline."""
+
+    def test_it_says_which_app_did_not_answer(self):
+        real = subprocess.run
+        self.addCleanup(setattr, subprocess, "run", real)
+        seen = []
+
+        def stuck(argv, **k):
+            seen.append((argv, k))
+            raise subprocess.TimeoutExpired(argv, k.get("timeout"))
+        subprocess.run = stuck
+        self.assertEqual(terms.open_window(terms.TERMINAL, "claude attach x", 5.0),
+                         "Terminal.app did not answer in 5s")
+        self.assertEqual(seen[0][0], ["osascript", "-e", terms.TERMINAL.run_script("claude attach x")])
+        self.assertEqual(seen[0][1].get("timeout"), 5.0)
+
+
+class TestAScanReadsTheTablesOnce(unittest.TestCase):
+    """What every app shows is worked out from one reading of each table, however
+    many apps there are (review of slice 2: each app parsed both again)."""
+
+    def test_one_parse_of_each_table_for_all_apps(self):
+        counts = {"procs": 0, "rows": 0}
+        real_procs, real_rows = terms.parse_procs, terms.procs.ps_rows
+
+        def parse_procs(text):
+            counts["procs"] += 1
+            return real_procs(text)
+
+        def ps_rows(text):
+            counts["rows"] += 1
+            return real_rows(text)
+
+        class Ghost(terms.App):
+            key, label, script_name, gate = "ghost", "Ghost", "Ghost", "ghost-ae"
+
+            def is_app(self, name):
+                return name == "Ghost"
+        apps = terms.APPS
+        terms.APPS = apps + (Ghost(),)
+        terms.parse_procs, terms.procs.ps_rows = parse_procs, ps_rows
+        try:
+            got = terms.survey(TestWhoShowsATty.ps(None, (400, 1, TERMINAL_APP), (401, 400, "login")),
+                               TestWhoShowsATty.procs(None, (400, "??", os.getuid(), "Terminal"),
+                                                      (401, "ttys050", 0, "login")))
+        finally:
+            terms.APPS, terms.parse_procs, terms.procs.ps_rows = apps, real_procs, real_rows
+        self.assertEqual(counts, {"procs": 1, "rows": 1})
+        self.assertEqual(got["terminal"], ({"ttys050": 401}, True))
+        self.assertEqual(got["iterm2"], ({}, False))
+        self.assertEqual(got["ghost"], ({}, False))
+
+
+class TestTabNamesAskOnlyWhatTheCallerNames(unittest.TestCase):
+    """titles_cached asks Terminal.app only when the caller says so (D7):
+    called with no list of apps, it asks the apps that are asked whenever they
+    run - iTerm2 - and never Terminal.app."""
+
+    def test_no_list_never_asks_terminal_app(self):
+        asked = []
+        for app in terms.APPS:
+            setattr(app, "titles", lambda timeout=5.0, _k=app.key, **k: asked.append(_k) or {})
+            self.addCleanup(app.__dict__.pop, "titles", None)
+        terms.titles_cached({})
+        self.assertEqual(asked, ["iterm2"])
+
+
+class TestARestoreAsksForPanesWithoutStartingITerm2(unittest.TestCase):
+    """A restore asks iTerm2 for its panes directly - something you do - but
+    never so that the ask itself starts iTerm2 (D13's form); not running is no
+    panes (review of slices 2-3)."""
+
+    def test_one_that_may_start_it_is_not_guarded(self):
+        # a restore's --open: a window of iTerm2's follows anyway, and its
+        # panes are worth finding as main did (review 2 of slices 2-3)
+        sent = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        testkit.patch(self, subprocess, "run", lambda cmd, *a, **k: sent.append(cmd) or Done())
+        terms.ITERM2.panes(direct=True, may_start=True)
+        self.assertEqual(sent[0][-1], terms.ITERM2.panes_script())
+
+    def test_the_direct_ask_is_guarded(self):
+        sent = []
+
+        class Done:
+            returncode, stdout, stderr = 0, terms.NOT_RUNNING + "\n", ""
+        testkit.patch(self, subprocess, "run", lambda cmd, *a, **k: sent.append(cmd) or Done())
+        self.assertEqual(terms.ITERM2.panes(direct=True), {})
+        self.assertIn('if application "iTerm2" is running then', sent[0][-1])
+        self.assertIn("run script", sent[0][-1])
+
+
+class TestACompileTestStartsNoApp(unittest.TestCase):
+    """Compiling a tell to an app can start it (probe 2026-09-29), so a test
+    compiles one only while a copy of ours already runs (testkit.compiles):
+    else it skips, and osacompile never runs (review of slices 2-3)."""
+
+    def setUp(self):
+        self.ran = []
+        real_run = subprocess.run
+        self.addCleanup(setattr, subprocess, "run", real_run)
+        subprocess.run = lambda cmd, *a, **k: self.ran.append(cmd) or real_run(["/usr/bin/true"])
+
+    def test_not_running_it_skips_and_compiles_nothing(self):
+        testkit.patch(self, engine.terms, "app_snapshot", lambda: "  PID UID UCOMM\n1 0 launchd\n")
+        with self.assertRaises(unittest.SkipTest):
+            testkit.compiles(self, terms.TERMINAL, 'tell application "Terminal" to count windows')
+        self.assertEqual(self.ran, [])
+
+    def test_running_it_compiles(self):                                       # control
+        testkit.patch(self, engine.terms, "app_snapshot",
+                      lambda: "  PID UID UCOMM\n555 %d Terminal\n" % os.getuid())
+        testkit.compiles(self, terms.TERMINAL, 'tell application "Terminal" to count windows')
+        self.assertEqual([c[0] for c in self.ran], ["osacompile"])
+
 REPO = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -390,8 +823,15 @@ suite = unittest.defaultTestLoader.loadTestsFromNames(sys.argv[1:])
 ran = unittest.TextTestRunner(stream=sys.stderr).run(suite)
 import ccwho_engine as engine
 t, bad = engine.terms, []
-if vars(t.ITERM2):
-    bad.append("ITERM2 keeps " + ",".join(sorted(vars(t.ITERM2))))
+for app in ("ITERM2", "TERMINAL"):
+    if vars(getattr(t, app)):
+        bad.append(app + " keeps " + ",".join(sorted(vars(getattr(t, app)))))
+own = engine._load_beside(t)            # what its file makes, beside it
+for name in ("APP_PATHS", "STATE_DIR", "OSASCRIPT", "TITLES_TTL", "PANES_WAIT"):
+    if getattr(t, name) != getattr(own, name):
+        bad.append(name + " is not the file's")
+if [type(a).__name__ for a in t.APPS] != [type(a).__name__ for a in own.APPS]:
+    bad.append("APPS is not the file's")
 for name in ("ask", "app_snapshot"):
     f = getattr(t, name)
     code = getattr(f, "__code__", None)
@@ -422,6 +862,23 @@ class TestAModuleLeavesTheTerminalModuleUntouched(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(home, ".cache", "ccwho")),
                          "a test used the gate's state under HOME")
         self.assertEqual(line, ["RESULT True [] []"], done.stdout[-1000:] + done.stderr[-2000:])
+
+    def test_a_fake_on_any_app_or_a_changed_constant_is_found(self):
+        # every app and the module's constants, not only ITERM2 (review of
+        # slices 4-5)
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "a_leaky_module.py"), "w") as fh:
+            fh.write("import unittest\nimport ccwho_engine as engine\n\nclass T(unittest.TestCase):\n"
+                     "    def test_it_leaves_things(self):\n"
+                     "        engine.terms.TERMINAL.titles = lambda **k: {}\n"
+                     "        engine.terms.APP_PATHS = {}\n")
+        with self.assertRaises(AssertionError) as caught:
+            self.after("a_leaky_module", path=tmp)
+        self.assertIn("TERMINAL keeps titles", str(caught.exception))
+        self.assertIn("APP_PATHS is not the file's", str(caught.exception))
 
     def test_a_child_test_that_fails_is_named(self):
         import shutil

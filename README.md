@@ -730,6 +730,10 @@ module keeps rendering, and the error shows as a banner until you fix it.
 Implication, as with the Ruby version: keep the engine free of long-lived objects.
 Pure functions and plain dicts only.
 
+The runner itself is not reloaded: after an update that changes `ccwho.py`, restart
+every open `ccwho` (list or watch). One left running reads what the new code writes,
+such as a launch claim naming Terminal.app, by its old rules.
+
 ## Design notes
 
 - **Transcripts reach hundreds of MB.** Never read one whole: head for the first

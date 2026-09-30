@@ -118,7 +118,7 @@ class FakeCollector:
 class FakeAdapter:
     def __init__(self, answer="focused s022", hang=False, copy_error=""):
         self.answer, self.hang, self.asked = answer, hang, []
-        self.attached = []
+        self.attached, self.attached_rows = [], []
         self.kept_in_front = 0
         self.copied, self.copy_error = [], copy_error
 
@@ -129,8 +129,9 @@ class FakeAdapter:
     def keep_in_front(self):
         self.kept_in_front += 1
 
-    def attach(self, cmd, deadline=5.0):
+    def attach(self, cmd, deadline=5.0, row=None):
         self.attached.append(cmd)
+        self.attached_rows.append(row)
         if self.hang:
             import time
             time.sleep(deadline + 0.2)
@@ -2771,6 +2772,9 @@ class TestEnterOnABackgroundSessionGivesItAWindow(UiTest):
             # "No job matching" about this very session
             self.assertEqual(adapter.attached, ["claude attach 51fddd61"])
             self.assertEqual(adapter.asked, [], "there is no window to focus yet")
+            # its row goes along: the app it was in is looked up by its id (D6)
+            self.assertEqual([r and r.get("sessionId") for r in adapter.attached_rows],
+                             ["51fddd61-822b-49e0-9aeb-2145e91e1244"])
 
     async def test_it_says_so(self):
         app = self.app(collector=self.fleet())
@@ -4947,11 +4951,60 @@ class TestAnErrorSaysItsTypeOnly(unittest.TestCase):
         self.check(said, "could not reopen (OSError)")
 
     def test_iterm2_and_pbcopy(self):
+        import ccwho as runner
         a = ui.Adapter()
-        with mock.patch.object(subprocess, "run", side_effect=OSError(SECRET)):
+        with mock.patch.object(subprocess, "run", side_effect=OSError(SECRET)), \
+                mock.patch.object(runner, "window_app", return_value=ui.engine.terms.ITERM2):
             self.check(a.attach("claude attach aaaa1111"), "could not reach iTerm2 (OSError)")
             self.check(a.focus({"tty": "ttys022"}), "could not reach iTerm2 (OSError)")
             self.check(a.copy("x"), "could not run pbcopy (OSError)")
+
+
+
+class TestTheListJumpsToTheAppThatShowsTheRow(unittest.TestCase):
+    """Enter on a row asks the app whose tab shows it (terms.focus): a
+    Terminal.app row never asks iTerm2 (D9)."""
+
+    def test_a_terminal_app_row(self):
+        calls = []
+        with mock.patch.object(subprocess, "run", side_effect=lambda argv, **k: calls.append(argv) or
+                               subprocess.CompletedProcess(argv, 0, stdout="focused /dev/ttys050\n")):
+            said = ui.Adapter().focus({"tty": "ttys050", "terminal": "terminal"})
+        self.assertEqual(said, "focused /dev/ttys050")
+        # Terminal.app's own script, the tty its argument: not whatever
+        # jump_args says now, which is what a mistake there would change
+        self.assertEqual(calls, [["osascript", "-e", ui.engine.terms._TERMINAL_JUMP, "/dev/ttys050"]])
+
+    def test_an_iterm2_row(self):                                                  # control
+        calls = []
+        with mock.patch.object(subprocess, "run", side_effect=lambda argv, **k: calls.append(argv) or
+                               subprocess.CompletedProcess(argv, 0, stdout="focused /dev/ttys024\n")):
+            ui.Adapter().focus({"tty": "ttys024", "terminal": "iterm2"})
+        self.assertEqual(calls, [["osascript", ui.engine.terms.HERE + "/jump.applescript", "/dev/ttys024"]])
+
+    def test_a_tty_no_app_shows_asks_no_app(self):
+        with mock.patch.object(subprocess, "run") as run:
+            said = ui.Adapter().focus({"tty": "ttys042", "terminal": ""})
+        run.assert_not_called()
+        self.assertIn("no terminal app", said)
+
+
+
+class TestTheListAttachesInTheAppTheSessionWasIn(unittest.TestCase):
+    """Enter on a running session with no window opens one (`claude attach`)
+    in the app ccwho.window_app picks for its session (D6)."""
+
+    def test_a_terminal_app_window(self):
+        import ccwho as runner
+        calls = []
+        with mock.patch.object(runner, "window_app", return_value=ui.engine.terms.TERMINAL) as pick, \
+                mock.patch.object(subprocess, "run", side_effect=lambda argv, **k: calls.append(argv) or
+                                  subprocess.CompletedProcess(argv, 0, stdout="")):
+            said = ui.Adapter().attach("claude attach aaaa1111", row={"sessionId": "aaaa1111"})
+        pick.assert_called_once_with("aaaa1111")
+        self.assertEqual(calls, [["osascript", "-e",
+                                  ui.engine.terms.TERMINAL.run_script("claude attach aaaa1111")]])
+        self.assertEqual(said, "attached it in a new window")
 
 
 class TestAnErrorOnScreenSaysItsTypeOnly(UiTest):

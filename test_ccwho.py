@@ -95,8 +95,9 @@ class MachinelessCollect(unittest.TestCase):
         ccwho.tty_snapshot = lambda: ""
         # on the app object of now, taken off that same object: a module swapped
         # in the meantime must not get this one's methods
-        self._iterm2 = ccwho.terms.ITERM2
-        self._iterm2.titles = lambda timeout=5.0, **k: {}
+        self._apps = ccwho.terms.APPS
+        for app in self._apps:
+            app.titles = lambda timeout=5.0, **k: {}
         # the session files, the start times and the ports of THIS machine are
         # machine state too
         ccwho.live_file_sessions = lambda *a, **k: ([], 0)
@@ -109,7 +110,8 @@ class MachinelessCollect(unittest.TestCase):
         (ccwho.ps_snapshot, ccwho.tty_snapshot,
          ccwho.live_file_sessions, ccwho.ps_table, ccwho.listen_ports,
          ccwho.stdin_sockets, ccwho.read_codex_threads) = self._saved
-        self._iterm2.__dict__.pop("titles", None)
+        for app in self._apps:
+            app.__dict__.pop("titles", None)
 
 
 class TestParseSessions(unittest.TestCase):
@@ -2531,16 +2533,16 @@ class ItermOpenScript(unittest.TestCase):
                {"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef", "cwd": "/Users/x/p/football"}]
 
     def test_one_window_per_session(self):
-        s = ccwho.iterm_open_script(self.entries)
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries)
         self.assertEqual(s.count("create window with default profile"), 2)
 
     def test_each_window_runs_that_session_s_resume_line(self):
-        s = ccwho.iterm_open_script(self.entries)
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries)
         self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", s)
         self.assertIn("claude --resume a1b2c3d4-1111-4222-8333-abcdefabcdef", s)
 
     def test_a_cwd_with_a_quote_is_escaped_into_the_applescript_literal(self):
-        s = ccwho.iterm_open_script([{"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef",
+        s = ccwho.open_script(ccwho.terms.ITERM2, [{"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef",
                                       "cwd": '/tmp/a"; do shell script "touch /tmp/pwned'}])
         for line in s.splitlines():
             if "write text" in line:
@@ -2548,17 +2550,17 @@ class ItermOpenScript(unittest.TestCase):
                 self.assertNotIn('do shell script "touch', line.replace('\\"', "'"))
 
     def test_a_session_that_cannot_build_a_command_is_dropped_not_emitted_broken(self):
-        s = ccwho.iterm_open_script([{"sessionId": "", "cwd": "/tmp"}] + self.entries)
+        s = ccwho.open_script(ccwho.terms.ITERM2, [{"sessionId": "", "cwd": "/tmp"}] + self.entries)
         self.assertEqual(s.count("create window with default profile"), 2)
 
     def test_nothing_to_open_yields_no_script(self):
-        self.assertEqual(ccwho.iterm_open_script([]), "")
+        self.assertEqual(ccwho.open_script(ccwho.terms.ITERM2, []), "")
 
     def test_each_window_is_written_to_by_name_not_as_the_current_one(self):
         # `current window` is asked for after `create window`, as its own
         # event: a click on another iTerm2 window in between - seconds, when
         # iTerm2 is slow - and the resume line goes into THAT window's pane
-        for s in (ccwho.iterm_open_script(self.entries),
+        for s in (ccwho.open_script(ccwho.terms.ITERM2, self.entries),
                   ccwho.terms.ITERM2.run_script("cd /x && claude --resume y")):
             self.assertNotIn("current window", s)
             self.assertEqual(s.count("set w to (create window with default profile)"),
@@ -2751,18 +2753,18 @@ class ItermOpenScriptFillsPanes(unittest.TestCase):
                {"sessionId": B, "cwd": "/Users/x/p/football"}]
 
     def test_a_filled_session_opens_no_window_and_the_other_does(self):
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A"})
         self.assertEqual(s.count("create window with default profile"), 1)
         self.assertIn('if u is "G-A"', s)
         self.assertIn("claude --resume " + self.A, s)
         self.assertIn("claude --resume " + self.B, s)
 
     def test_the_script_says_which_panes_it_wrote_into(self):
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A"})
         self.assertIn("return done", s)
 
     def test_a_pane_id_cannot_break_out_of_its_literal(self):
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: 'x" then do shell script "id'})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: 'x" then do shell script "id'})
         checked = [l for l in s.splitlines() if " u is " in l]
         self.assertEqual(len(checked), 1)
         for line in checked:
@@ -2771,7 +2773,7 @@ class ItermOpenScriptFillsPanes(unittest.TestCase):
     def test_a_half_typed_line_is_cleared_before_the_resume_line(self):
         # `ps` cannot see "rm -rf " typed at a prompt; the resume line must not
         # be appended to it
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A", self.B: "G-B"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A", self.B: "G-B"})
         for sid in (self.A, self.B):
             at = s.index("claude --resume " + sid)
             branch = s[s.rindex("unique id", 0, at):at]
@@ -2780,37 +2782,36 @@ class ItermOpenScriptFillsPanes(unittest.TestCase):
                           branch)
 
     def test_a_pane_id_is_written_at_most_once(self):
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A"})
         self.assertIn("if done does not contain u then", s)
         self.assertLess(s.index("if done does not contain u then"), s.index('if u is "G-A"'))
 
     def test_one_pane_failing_does_not_lose_what_was_written(self):
         # a pane that closes mid-loop must not abort the script: the ids already
         # written are only reported if the script reaches `return done`
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A"})
         start, end = s.index("      repeat with s in sessions of t"), s.index("    end repeat")
         loop = s[start:end]
         self.assertLess(loop.index("try"), loop.index("set u to unique id of s"))
         self.assertGreater(loop.rindex("end try"), loop.rindex("set done to done"))
 
     def test_each_pane_id_is_read_once(self):
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A", self.B: "G-B"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A", self.B: "G-B"})
         self.assertEqual(s.count("unique id of s"), 1)
 
     def test_the_filled_ids_are_returned_after_the_windows_open(self):
-        s = ccwho.iterm_open_script(self.entries, fill={self.A: "G-A"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill={self.A: "G-A"})
         self.assertGreater(s.index("return done"), s.rindex("create window"))
 
     @unittest.skipUnless(shutil.which("osacompile"), "macOS only")
     def test_the_script_compiles(self):
         for fill in ({self.A: "G-A", self.B: "G-B"}, {self.A: "G-A"}, {}):
-            s = ccwho.iterm_open_script(self.entries, fill=fill)
-            r = subprocess.run(["osacompile", "-o", os.devnull, "-e", s],
-                               capture_output=True, text=True, timeout=20)
+            s = ccwho.open_script(ccwho.terms.ITERM2, self.entries, fill=fill)
+            r = testkit.compiles(self, ccwho.terms.ITERM2, s)
             self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_only_filled_sessions_still_make_a_script(self):
-        s = ccwho.iterm_open_script(self.entries[:1], fill={self.A: "G-A"})
+        s = ccwho.open_script(ccwho.terms.ITERM2, self.entries[:1], fill={self.A: "G-A"})
         self.assertNotIn("create window", s)
         self.assertIn("claude --resume " + self.A, s)
 
@@ -4972,6 +4973,35 @@ class TestOnlyAWindowThatIsSHOWINGItCounts(unittest.TestCase):
         self.assertEqual(ccwho.owning_tty(42, {}, {42: "ttys000"}, self.TITLES),
                          "ttys000")
 
+    def test_an_attach_in_a_window_wins_whatever_the_order(self):
+        # two attaches, one on a tty no app shows (a shell iTerm2's daemon kept):
+        # the one in a window, in whichever order ps lists them (review of slice 2)
+        ttys = {7000: "ttys024", 7001: "ttys000"}
+        for order in ((7000, 7001), (7001, 7000)):
+            cmds = {pid: f"claude attach {self.SID}" for pid in order}
+            self.assertEqual(ccwho.owning_tty(5000, {}, ttys, self.TITLES, commands=cmds,
+                                              session_id=self.SID), "ttys000", order)
+
+    def test_an_ancestor_in_a_window_wins_over_an_attach_in_none(self):
+        parents = {28087: 27713, 27713: 1378}
+        ttys = {28087: "ttys042", 1378: "ttys000", 7000: "ttys024"}
+        cmds = {28087: "claude bg-spare", 27713: "claude daemon run",
+                1378: "claude --resume", 7000: f"claude attach {self.SID}"}
+        self.assertEqual(ccwho.owning_tty(28087, parents, ttys, self.TITLES, commands=cmds,
+                                          session_id=self.SID), "ttys000")
+
+    def test_with_no_viewer_in_a_window_an_attach_is_it(self):          # control
+        # the old order stands when no window shows one: the attach first
+        parents = {28087: 27713, 27713: 1378}
+        ttys = {28087: "ttys042", 1378: "ttys031", 7000: "ttys024"}
+        cmds = {28087: "claude bg-spare", 27713: "claude daemon run",
+                1378: "claude --resume", 7000: f"claude attach {self.SID}"}
+        self.assertEqual(ccwho.owning_tty(28087, parents, ttys, self.TITLES, commands=cmds,
+                                          session_id=self.SID), "ttys024")
+        del cmds[7000]
+        self.assertEqual(ccwho.owning_tty(28087, parents, ttys, self.TITLES, commands=cmds,
+                                          session_id=self.SID), "ttys031")
+
 
 class TestCollectFindsEveryConfigDir(MachinelessCollect):
     """`claude agents --json` lists the sessions of ONE config dir. A session run
@@ -6894,6 +6924,165 @@ class TestCollectTakesWindowsFromPsNotFromTabNames(MachinelessCollect):
         self.assertEqual(seen, [procs(*table)], "the gate got the table collect() took")
 
 
+TERMINAL_APP = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+TAB = [(400, 1, TERMINAL_APP), (401, 400, "login -pf x")]            # a Terminal.app tab: ps
+TAB_PROCS = [(400, "??", ME, "Terminal"), (401, "ttys050", 0, "login")]   # and its ucomm table
+ITERM2_PANE = [(100, 1, APP), (200, 1, DAEMON_CMD), (300, 200, LOGIN)]
+ITERM2_PANE_PROCS = [(100, "??", ME, IT), (200, "??", ME, SERVER), (300, "ttys024", 0, "login")]
+
+
+class TestTerminalAppTabsHaveWindowsToo(MachinelessCollect):
+    """A session in a Terminal.app tab has a window to go to, with iTerm2
+    running or not - and an app that cannot tell never turns another app's
+    rows into "no window" (review O3: availability is per app, never a union
+    of what the apps show)."""
+
+    def setUp(self):
+        super().setUp()
+        real = ccwho.agents_json
+        self.addCleanup(setattr, ccwho, "agents_json", real)
+        ccwho.agents_json = lambda: json.dumps(
+            [{"sessionId": "aaa", "pid": 301, "cwd": "/x", "status": "idle"}])
+
+    def row(self, ps_rows, proc_rows):
+        ccwho.ps_snapshot = lambda: ps(*ps_rows)
+        ccwho.tty_snapshot = lambda: procs(*proc_rows)
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_with_iterm2_closed(self):
+        row = self.row(TAB + [(301, 401, "claude")], TAB_PROCS + [(301, "ttys050", ME, "claude")])
+        self.assertIs(row["windowed"], True)
+        self.assertEqual(row["tty"], "ttys050")
+
+    def test_beside_iterm2(self):
+        row = self.row(ITERM2_PANE + TAB + [(301, 401, "claude")],
+                       ITERM2_PANE_PROCS + TAB_PROCS + [(301, "ttys050", ME, "claude")])
+        self.assertIs(row["windowed"], True)
+
+    def test_iterm2_s_kept_shells_stay_unknown_while_terminal_app_runs(self):
+        # iTerm2 quit, its daemon keeps the shells: nothing is known about their
+        # windows - Terminal.app answering for its own tabs changes nothing there
+        row = self.row([(200, 1, DAEMON_CMD), (300, 200, LOGIN), (301, 300, "claude")] + TAB,
+                       [(200, "??", ME, SERVER), (300, "ttys024", 0, "login"),
+                        (301, "ttys024", ME, "claude")] + TAB_PROCS)
+        self.assertIsNone(row["windowed"])
+
+    def test_a_tty_no_app_shows_has_no_window_while_one_app_can_tell(self):
+        row = self.row(TAB + [(301, 1, "claude")], TAB_PROCS + [(301, "ttys042", ME, "claude")])
+        self.assertIs(row["windowed"], False)
+
+    # an app that runs with no window cannot tell: nothing is known - the rule
+    # main keeps for iTerm2 with no pane, now for every app (review P2-1)
+    def test_terminal_app_running_with_no_window_cannot_tell(self):
+        row = self.row([(400, 1, TERMINAL_APP), (301, 1, "claude")],
+                       [(400, "??", ME, "Terminal"), (301, "ttys042", ME, "claude")])
+        self.assertIsNone(row["windowed"])
+
+    def test_iterm2_running_with_no_pane_cannot_tell(self):
+        row = self.row([(100, 1, APP), (301, 1, "claude")],
+                       [(100, "??", ME, IT), (301, "ttys042", ME, "claude")])
+        self.assertIsNone(row["windowed"])
+
+
+class TestARowSaysWhichAppShowsIt(TestTerminalAppTabsHaveWindowsToo):
+    """Every row records the app whose tab shows it: a jump goes there, and a
+    save keeps it for the restore (D6)."""
+
+    test_with_iterm2_closed = test_beside_iterm2 = None
+    test_iterm2_s_kept_shells_stay_unknown_while_terminal_app_runs = None
+    test_a_tty_no_app_shows_has_no_window_while_one_app_can_tell = None
+    test_terminal_app_running_with_no_window_cannot_tell = None
+    test_iterm2_running_with_no_pane_cannot_tell = None
+
+    def test_a_terminal_app_tab(self):
+        row = self.row(TAB + [(301, 401, "claude")], TAB_PROCS + [(301, "ttys050", ME, "claude")])
+        self.assertEqual(row["terminal"], "terminal")
+
+    def test_an_iterm2_pane(self):
+        row = self.row(ITERM2_PANE + [(301, 300, "claude")],
+                       ITERM2_PANE_PROCS + [(301, "ttys024", ME, "claude")])
+        self.assertEqual(row["terminal"], "iterm2")
+
+    def test_a_shell_iterm2_s_daemon_kept_is_still_iterm2_s(self):
+        row = self.row([(200, 1, DAEMON_CMD), (300, 200, LOGIN), (301, 300, "claude")],
+                       [(200, "??", ME, SERVER), (300, "ttys024", 0, "login"),
+                        (301, "ttys024", ME, "claude")])
+        self.assertEqual(row["terminal"], "iterm2")
+
+    def test_a_tty_no_app_shows(self):                                              # control
+        row = self.row(TAB + [(301, 1, "claude")], TAB_PROCS + [(301, "ttys042", ME, "claude")])
+        self.assertEqual(row["terminal"], "")
+
+    def test_a_save_keeps_it(self):
+        row = self.row(TAB + [(301, 401, "claude")], TAB_PROCS + [(301, "ttys050", ME, "claude")])
+        man = ccwho.manifest_from_rows([dict(row, cwd="/x")])
+        self.assertEqual(man["sessions"][0]["terminal"], "terminal")
+
+
+class TestTerminalAppIsAskedForTabNamesOnlyForItsSessions(MachinelessCollect):
+    """The first Apple Event to Terminal.app makes macOS ask whether ccwho may
+    control it. So the background asks it for tab names only while a session
+    sits in one of its tabs (D7): open Terminal.app for anything else, and no
+    prompt appears, and no event is sent."""
+
+    def setUp(self):
+        super().setUp()
+        real = ccwho.agents_json
+        self.addCleanup(setattr, ccwho, "agents_json", real)
+        ccwho.agents_json = lambda: json.dumps(
+            [{"sessionId": "aaa", "pid": 301, "cwd": "/x", "status": "idle"}])
+        self.asked = []
+        ccwho.terms.TERMINAL.titles = lambda timeout=5.0, **k: (
+            self.asked.append(k) or {"ttys050": "\u2733 fixing it"})
+        self.addCleanup(ccwho.terms.TERMINAL.__dict__.pop, "titles", None)
+
+    def collect(self, ps_rows, proc_rows):
+        ccwho.ps_snapshot = lambda: ps(*ps_rows)
+        ccwho.tty_snapshot = lambda: procs(*proc_rows)
+        rows, _ = ccwho.collect(cache={})
+        return rows
+
+    def test_no_session_in_its_tabs_no_ask(self):
+        self.collect(ITERM2_PANE + TAB + [(301, 300, "claude")],
+                     ITERM2_PANE_PROCS + TAB_PROCS + [(301, "ttys024", ME, "claude")])
+        self.assertEqual(self.asked, [])
+
+    def test_a_session_in_its_tab_asks_once_and_names_the_row(self):             # control
+        rows = self.collect(TAB + [(301, 401, "claude")], TAB_PROCS + [(301, "ttys050", ME, "claude")])
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(rows[0]["tab_title"], "\u2733 fixing it")
+
+    def test_a_scan_that_asks_no_session_app_asks_it_nothing(self):
+        # the autosave job's (save): no Terminal.app prompt from launchd's
+        # python every 15 minutes (review 2 of slices 4-5)
+        ccwho.ps_snapshot = lambda: ps(*TAB, (301, 401, "claude"))
+        ccwho.tty_snapshot = lambda: procs(*TAB_PROCS, (301, "ttys050", ME, "claude"))
+        rows, _ = ccwho.collect(cache={}, session_apps=False)
+        self.assertEqual(self.asked, [])
+        self.assertEqual((rows[0]["tty"], rows[0]["terminal"]), ("ttys050", "terminal"))
+
+    # its tab is the one showing the session, not the session's own tty: the
+    # daemon's bg-spare sits on a tty no window shows (review of slice 2)
+    def assert_shown_in_its_tab(self, rows):
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual((rows[0]["tty"], rows[0]["windowed"], rows[0]["tab_title"]),
+                         ("ttys050", True, "\u2733 fixing it"))
+
+    def test_a_session_attached_in_its_tab(self):
+        self.assert_shown_in_its_tab(self.collect(
+            TAB + [(301, 1, "claude bg-spare"), (402, 401, "claude attach aaa")],
+            TAB_PROCS + [(301, "ttys042", ME, "claude"), (402, "ttys050", ME, "claude")]))
+
+    def test_a_session_its_tab_resumed_under_the_daemon(self):
+        self.assert_shown_in_its_tab(self.collect(
+            TAB + [(402, 401, "claude --resume"), (403, 402, "claude daemon run"),
+                   (301, 403, "claude bg-spare")],
+            TAB_PROCS + [(402, "ttys050", ME, "claude"), (403, "", ME, "claude"),
+                         (301, "ttys042", ME, "claude")]))
+
+
 class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
     """The gate every background Apple Event to iTerm2 goes through.
 
@@ -6988,7 +7177,7 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.assertIsNone(ccwho.terms.ITERM2.ask(["-e", "x"], timeout=3,
                                           procs=apps((1, 0, "launchd")), why=why))
         self.assertEqual(self.launches(), 0)
-        self.assertEqual(why.get("refused"), "no-iterm")
+        self.assertEqual(why.get("refused"), "not-running")
 
     def test_while_one_ask_is_in_flight_no_second_is_sent(self):
         self.stub("sleep 1.5; echo late")
@@ -7632,7 +7821,7 @@ class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
 
     def test_a_timeout_inside_the_fill_is_raised(self):
         sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
-        script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+        script = ccwho.open_script(ccwho.terms.ITERM2, [{"sessionId": sid, "cwd": "/x", "project": "x"}],
                                          fill={sid: "U-1"})
         self.assertIn("on error errMsg number errNum", script)
         self.assertIn("if errNum is not in {-1728, -1719} then error errMsg number errNum", script)
@@ -7640,7 +7829,7 @@ class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
     def test_a_pane_it_cannot_even_read_is_passed_over(self):
         # nothing was written to it: whatever its error, it is not a launch
         sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
-        script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+        script = ccwho.open_script(ccwho.terms.ITERM2, [{"sessionId": sid, "cwd": "/x", "project": "x"}],
                                          fill={sid: "U-1"})
         lines = [l.strip() for l in script.splitlines()]
         read = lines.index("set u to unique id of s")
@@ -7657,7 +7846,7 @@ class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
         # sends no event. -1712 and iTerm2 dying (-609, -600) may come after
         # the resume line was written: raised, never read as a closed pane
         sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
-        script = ccwho.iterm_open_script([{"sessionId": sid, "cwd": "/x", "project": "x"}],
+        script = ccwho.open_script(ccwho.terms.ITERM2, [{"sessionId": sid, "cwd": "/x", "project": "x"}],
                                          fill={sid: "U-1"})
         handler = next(l.strip() for l in script.splitlines() if l.strip().startswith("if errNum"))
         for code, raised in ((-1712, True), (-609, True), (-600, True), (-10000, True),
@@ -7707,16 +7896,17 @@ class TestCollectDropsTheNameOfAReplacedPane(MachinelessCollect):
 
 class TestOneScanFindsThePanesOnce(MachinelessCollect):
     def test_collect_works_out_the_panes_once(self):
-        # counted on the app's own pass (App.owners): terms.owners() reaches it,
-        # and so does App.ttys() when it is not handed the panes (review 2)
-        calls, iterm = [], ccwho.terms.ITERM2
-        real = iterm.owners
-        iterm.owners = lambda *a: calls.append(1) or real(*a)
-        self.addCleanup(iterm.__dict__.pop, "owners", None)
+        # counted on each app's own pass (App.owners_in): survey() reaches it,
+        # and so do App.owners, App.ttys and terms.owners() - once an app a scan
+        calls = []
+        for app in ccwho.terms.APPS:
+            setattr(app, "owners_in", lambda *a, _k=app.key, _r=app.owners_in:
+                    calls.append(_k) or _r(*a))
+            self.addCleanup(app.__dict__.pop, "owners_in", None)
         ccwho.tty_snapshot = lambda: procs((100, "??", ME, IT))
         ccwho.ps_snapshot = lambda: ps((100, 1, APP))
         ccwho.collect(cache={})
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(sorted(calls), sorted(app.key for app in ccwho.terms.APPS))
 
 
 class TestACarriedPaneIsText(unittest.TestCase):
@@ -7728,6 +7918,27 @@ class TestACarriedPaneIsText(unittest.TestCase):
     def test_a_pane_that_is_not_text_is_not_carried(self):
         man = ccwho.manifest_from_rows([self.ROW], panes=None, known={"s1": {"pane": ["G"], "tabTitle": 5}})
         self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]), ("", ""))
+
+
+class TestOnlyAnITerm2RowCarriesAPane(unittest.TestCase):
+    """A pane id is iTerm2's. A save that could not ask iTerm2 carries the pane
+    the last save knew - never onto a row another app shows (review of
+    slices 2-3)."""
+
+    KNOWN = {"s1": {"pane": "G-OLD", "tabTitle": "t"}}
+
+    def pane(self, terminal):
+        row = dict(TestACarriedPaneIsText.ROW, terminal=terminal)
+        return ccwho.manifest_from_rows([row], panes=None, known=self.KNOWN)["sessions"][0]["pane"]
+
+    def test_a_terminal_app_row(self):
+        self.assertEqual(self.pane("terminal"), "")
+
+    def test_an_iterm2_row(self):                                           # control
+        self.assertEqual(self.pane("iterm2"), "G-OLD")
+
+    def test_a_row_no_app_shows_carries_it_as_before(self):                 # control
+        self.assertEqual(self.pane(""), "G-OLD")
 
 
 class TestATableFromAPsThatFailedIsNone(unittest.TestCase):
@@ -7797,7 +8008,7 @@ class TestTheGateSaysAnUnreadableTableAsOne(unittest.TestCase):
         self.stub("echo ok")
         why = {}
         self.assertIsNone(ccwho.terms.ITERM2.ask(["-e", "whatever"], procs=apps((1, 0, "launchd")), why=why))
-        self.assertEqual(why.get("refused"), "no-iterm")
+        self.assertEqual(why.get("refused"), "not-running")
 
     def test_a_lock_that_cannot_work(self):
         # flock failing for no other holder: not "busy", and no wait

@@ -167,6 +167,21 @@ def patch(test, obj, name, value):
     return undo
 
 
+def compiles(test, app, script):
+    """osacompile's result for `script`, which tells `app` (a terms.App) in the
+    open. Compiling such a tell can start the app (probe 2026-09-29: TextEdit
+    started), so it is compiled only while a copy of ours already runs - the
+    test is skipped otherwise: no test starts an app (review of the
+    terminal-app slices 2-3). Only the moment between the check and the
+    compile is left."""
+    import sys
+    live = sys.modules[type(app).__module__]
+    if not app.pids(live.app_snapshot()):
+        test.skipTest(f"{app.label} is not running: compiling a tell to it could start it")
+    return subprocess.run(["osacompile", "-o", os.devnull, "-e", script],
+                          capture_output=True, text=True, timeout=20)
+
+
 def fresh_terms(engine):
     """ccwho_terms loaded new from its file - its own functions, nothing a test
     put on it - and made the engine's and sys.modules'. Returns it.

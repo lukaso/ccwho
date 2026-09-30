@@ -1367,7 +1367,7 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
         self.assertIn("~/.cache/ccwho", " ".join(str(v) for v in check.values()))
 
     def test_no_iterm2_is_a_no(self):                                   # control
-        self.fake(None, refused="no-iterm")
+        self.fake(None, refused="not-running")
         self.assertIs(setup.iterm_scriptable(), False)
 
     def test_it_waits_a_moment_for_a_busy_gate(self):

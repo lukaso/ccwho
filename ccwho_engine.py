@@ -2205,7 +2205,7 @@ _SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}\Z")
 _MANIFEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}\.json\Z")
 
 _MANIFEST_KEYS = ("sessionId", "cwd", "project", "topic", "first", "ask",
-                  "attention", "status", "tty", "pid", "since", "configDir")
+                  "attention", "status", "tty", "pid", "since", "configDir", "terminal")
 
 
 def in_temp_dir(path, temp_roots):
@@ -2261,9 +2261,11 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None):
             # - five hours of such saves would push every good one out
             was = known.get(r.get("sessionId")) or {}
             # read off disk: only text is carried - anything else would ride
-            # into every save and break the restore that reads it
+            # into every save and break the restore that reads it. A pane is
+            # iTerm2's: never carried onto a row another app shows
             pane, title = was.get("pane"), was.get("tabTitle")
-            kept[-1]["pane"] = pane if isinstance(pane, str) else ""
+            ours = r.get("terminal", "") in ("", terms.ITERM2.key)
+            kept[-1]["pane"] = pane if isinstance(pane, str) and ours else ""
             kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or (title if isinstance(title, str) else "")
     return {"version": MANIFEST_VERSION, "savedAt": now, "count": len(kept),
             "skipped": sum(why_count.values()), "skippedWhy": why_count,
@@ -2543,10 +2545,10 @@ def match_panes(entries, panes, idle, saved=None):
     return got
 
 
-def iterm_open_script(entries, fill=None):
-    """AppleScript that reopens each restorable session in iTerm2: in the pane
-    `fill` names for it (sessionId -> pane unique id), else in a new window
-    (terms.ITerm2.open_script, which says how a pane is written into).
+def open_script(app, entries, fill=None):
+    """AppleScript that reopens each restorable session in `app` (a terms.App):
+    in the pane `fill` names for it (sessionId -> pane unique id; iTerm2 only),
+    else in a new window (App.open_script, which says how).
 
     An entry whose resume line cannot be built is DROPPED rather than emitted
     broken: a window that opens onto a failed command is worse than no window.
@@ -2554,7 +2556,7 @@ def iterm_open_script(entries, fill=None):
     fill = fill or {}
     items = [(fill.get(e_.get("sessionId", "")), cmd)
              for e_ in entries or [] for cmd in [restore_command(e_)] if cmd]
-    return terms.ITERM2.open_script(items)
+    return app.open_script(items)
 
 
 # -------------------------------------------------------------------- assemble
@@ -2603,20 +2605,16 @@ def is_viewer(command, session_id=""):
     return head == "claude"
 
 
-def attached_tty(session_id, ttys, commands):
-    """The terminal running `claude attach <id>`, if one is.
+def attached_ttys(session_id, ttys, commands):
+    """The terminals running `claude attach <id>`, in ps order.
 
     An attach can be anywhere - it is not an ancestor of the session it shows -
     so it is looked for by name rather than walked to.
     """
     if not session_id:
-        return ""
-    for pid, cmd in (commands or {}).items():
-        if is_attach_to(cmd, session_id):
-            tty = ttys.get(pid, "")
-            if tty:
-                return tty
-    return ""
+        return []
+    return [ttys[pid] for pid, cmd in (commands or {}).items()
+            if is_attach_to(cmd, session_id) and ttys.get(pid)]
 
 
 def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
@@ -2632,41 +2630,46 @@ def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
 
     The feed names a background process on a tty no window owns, while the
     session is plainly in front of you. Its ancestor is the terminal showing
-    it, so walk up until a tty iTerm2 knows appears.
+    it, so walk up to a tty a terminal app shows. A `claude attach` shows it
+    too, from anywhere.
 
-    `titles` is the set of ttys iTerm2 shows - collect() passes ITERM2.ttys(),
-    from ps. Without iTerm2 running, nothing is known about windows and the
-    session's own tty stands - never a guess dressed as an answer.
+    `titles` is the set of ttys the terminal apps show - collect() passes what
+    survey() says of the running ones, from ps. With none, nothing is known
+    about windows and the session's own tty stands - never a guess dressed as
+    an answer.
+
+    Of the terminals showing it, the first in a window: an attach before an
+    ancestor, in ps order. With none in a window, the first there is.
     """
-    shown = attached_tty(session_id, ttys, commands)
-    if shown:
-        return shown
-    seen, own = set(), ""
+    viewers = attached_ttys(session_id, ttys, commands)
+    seen = set()
     while pid and pid not in seen and depth > 0:
         seen.add(pid)
         depth -= 1
         tty = ttys.get(pid, "")
-        if tty:
-            # Only a process that SHOWS the session counts. Without commands to
-            # look at, the old rule stands rather than reporting no window.
-            viewing = commands is None or is_viewer(commands.get(pid, ""), session_id)
-            if viewing:
-                own = own or tty
-                if not titles or terms.short_tty_full(tty) in titles:
-                    return tty
+        # Only a process that SHOWS the session counts. Without commands to
+        # look at, the old rule stands rather than reporting no window.
+        if tty and (commands is None or is_viewer(commands.get(pid, ""), session_id)):
+            viewers.append(tty)
         pid = parents.get(pid)
-    return own
+    return next((tty for tty in viewers if not titles or terms.short_tty_full(tty) in titles),
+                viewers[0] if viewers else "")
 
 
-def windowed(tty, titles):
+def windowed(tty, titles, blind=()):
     """Is there a terminal window to go to?
 
     True, False, or None for "we could not tell". The third matters: iTerm2 shut
     is not every session losing its window, and saying so would put "no window"
     on every row at the moment the answer is least reliable.
 
-    `titles` is any collection of the ttys iTerm2 shows - collect() passes
-    terms.ITERM2.ttys(), from ps; the tab names are only a label now.
+    `titles` is any collection of the ttys the terminal apps show - collect()
+    passes what survey() says of the running ones, from ps; the tab names are
+    only a label now. None of them showing a window is not knowing: an app that
+    runs with no window cannot tell (so iTerm2 with no pane, and Terminal.app,
+    which runs on with its last window closed). `blind`: ttys an app that is
+    not running keeps (iTerm2's daemon keeps its shells) - not known, whatever
+    the other apps show.
 
     Found by a session running as `claude bg-spare` - alive, with a tty, and no
     window anywhere. Clicking it did nothing and said nothing.
@@ -2675,6 +2678,8 @@ def windowed(tty, titles):
         return None
     if not tty:
         return False
+    if terms.short_tty_full(tty) in blind:
+        return None
     return terms.short_tty_full(tty) in titles
 
 
@@ -2716,7 +2721,7 @@ def no_window_note(row):
 
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
-              tab_title="", reviewed=None, windowed=None, dead_loops=()):
+              tab_title="", reviewed=None, windowed=None, dead_loops=(), terminal=""):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -2796,6 +2801,8 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "work": work,
         "tty": tty,
         "tab_title": tab_title,
+        # the app whose tab shows it (terms.App.key), "" when no app ccwho knows does
+        "terminal": terminal,
         "parked": [],           # collect fills it: terminals that parked this job
         "recap": r["text"],
         "recap_ts": r["ts"],
@@ -2923,10 +2930,12 @@ def mark_reviewed(session_id, ts, path=None):
     return seen
 
 
-def collect(cache=None, status=None):
+def collect(cache=None, status=None, session_apps=True):
     """`status` is a caller-owned dict, same idiom as `cache`. It carries out the
     one fact a caller cannot recover from the rows: whether the session source
-    could be reached at all. An empty row list means nothing without it."""
+    could be reached at all. An empty row list means nothing without it.
+    `session_apps` False: no app asked for tab names only for its sessions
+    (Terminal.app, D7) is asked at all - the autosave job's scan."""
     raw = agents_json()
     parsed = parse_sessions(raw) if raw is not None else None
     source_ok = parsed is not None and read_is_complete(raw)
@@ -2953,10 +2962,19 @@ def collect(cache=None, status=None):
     ps_out = ps_snapshot()
     procs_out = tty_snapshot()
     ttys = parse_tty_map(procs_out)
-    owners = terms.owners(ps_out, procs_out)
-    titles = terms.titles_cached(cache, procs=procs_out, owners=owners)
-    # what has a window comes from ps; the tab names are only the label
-    shown = terms.ITERM2.ttys(ps_out, procs_out, owners=owners) or set()
+    seen = terms.survey(ps_out, procs_out)
+    panes = {key: app_panes for key, (app_panes, _running) in seen.items()}
+    owners = {tty: pid for app_panes in panes.values() for tty, pid in app_panes.items()}
+    # what has a window comes from ps, one app at a time: an app that is not
+    # running cannot tell about the ttys its daemon keeps (blind) - never "no
+    # window" because another app answered for its own (review O3)
+    app_of_tty = {tty: key for key, app_panes in panes.items() for tty in app_panes}
+    shown, blind = set(), set()
+    for app_panes, running in seen.values():
+        if running:
+            shown |= set(app_panes)
+        else:
+            blind |= set(app_panes)
     ids = [s.get("sessionId", "") for s in sessions]
     # who started what: the env mark, which survives the process being orphaned;
     # built from the ps snapshot and start times this scan already has
@@ -2995,13 +3013,21 @@ def collect(cache=None, status=None):
     # the spare and the parked terminal still count above - as live claude
     # processes, and as owners of what they started - but are not rows
     parked = procs.parked_terminals(sessions)
-    for s in procs.shown_sessions(sessions):
+    # not ttys[pid]: a session served by the daemon reports a background
+    # process, and the window showing it belongs to an ancestor
+    listed = [(s, owning_tty(s.get("pid"), parents, ttys, shown, commands=commands,
+                             session_id=s.get("sessionId", "")))
+              for s in procs.shown_sessions(sessions)]
+    # tab names: an app that asks for them only for its sessions (Terminal.app,
+    # D7) is asked while one sits in its tabs - and never when the caller
+    # says not (session_apps: the autosave job's save)
+    in_use = {terms.short_tty_full(tty) for _s, tty in listed if tty}
+    asked = [app for app in terms.APPS
+             if not app.ask_only_for_sessions or (session_apps and set(panes[app.key]) & in_use)]
+    titles = terms.titles_cached(cache, procs=procs_out, owners=owners, apps=asked)
+    for s, tty in listed:
         sid = s.get("sessionId", "")
         head, tail, mtime = read_windows(sid, cache=cache)
-        # not ttys[pid]: a session served by the daemon reports a background
-        # process, and the window showing it belongs to an ancestor
-        tty = owning_tty(s.get("pid"), parents, ttys, shown,
-                         commands=commands, session_id=sid)
         mine = att["sessions"].get(sid, [])
         summary = procs.row_summary(mine)
         dead = (find_dead_loops(s.get("pid"), ptable, cache=cache)
@@ -3010,7 +3036,8 @@ def collect(cache=None, status=None):
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
                               reviewed=reviewed,
-                              windowed=windowed(tty, shown),
+                              windowed=windowed(tty, shown, blind=blind),
+                              terminal=app_of_tty.get(terms.short_tty_full(tty), "") if tty else "",
                               dead_loops=dead))
         rows[-1]["procs"] = summary["procs"]
         rows[-1]["parked"] = sorted(t for t, job in parked.items() if job == sid)

@@ -35,6 +35,8 @@ ROW_KEYS = {
     "entrypoint",         # added 2026-09-26: who started it - cli, or a program (sdk-*)
     "parked",             # added 2026-09-26: ids of terminals that parked this job
                           # (ctrl+b) - they show it, and have no row of their own
+    "terminal",           # added 2026-09-30: the app whose tab shows it (iterm2,
+                          # terminal), "" when no app ccwho knows does
 }
 
 # Every key a manifest session entry has ever carried. Append only.
@@ -46,6 +48,8 @@ MANIFEST_SESSION_KEYS = {
     "pane", "tabTitle",   # added 2026-09-26: the iTerm2 pane and its title, so
                           # a restore resumes in the pane iTerm2 brought back;
                           # older manifests lack them and open new windows
+    "terminal",           # added 2026-09-30: the app it was in; older manifests
+                          # lack it: a pane id means iTerm2, else the default app
 }
 
 MANIFEST_TOP_KEYS = {"version", "savedAt", "count", "skipped", "skippedWhy", "sessions"}

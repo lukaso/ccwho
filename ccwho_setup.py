@@ -348,7 +348,7 @@ def iterm_scriptable(timeout=5.0, why=None):
         return out.strip().isdigit()
     if why.get("error") == engine.AE_NOT_PERMITTED or why.get("refused") == "no-iterm":
         return False
-    return None         # stuck, silent, busy, waiting, or its state dir unwritable
+    return None         # stuck, silent, busy, waiting, its state dir unwritable, or no process list
 
 
 def handler_candidates(app_path=None):

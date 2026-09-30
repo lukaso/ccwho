@@ -7767,16 +7767,3 @@ class TestTheGateWritesOneIterm2AsOnePid(unittest.TestCase):
 
     def test_two(self):                                                          # control
         self.assertEqual(self.asked(apps((100, ME, IT), (200, ME, IT))), [100, 200])
-
-
-class TestTheGateSaysAPsThatFailedAsOne(unittest.TestCase):
-    _F = TestBackgroundAsksNeverPileUpInITerm2
-    stub, launches, table, state, ask, until, ended = (
-        _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended)
-    setUp = TestTheGateAfterASlowOrFailedAsk.setUp
-
-    def test_no_table(self):
-        self.stub("echo ok")
-        why = {}
-        self.assertIsNone(ccwho.iterm_ask(["-e", "whatever"], procs="", why=why))
-        self.assertEqual(why.get("refused"), "no-table")

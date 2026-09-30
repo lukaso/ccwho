@@ -789,6 +789,25 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
                         setup.engine.live_file_sessions)
         setup.engine.live_file_sessions = lambda *a, **k: ([], 0)
 
+    def test_the_gates_reason_reaches_doctor(self):
+        def refused(timeout=5.0, why=None):
+            why["refused"] = "no-table"
+        setup.iterm_scriptable = refused
+        facts = setup.gather(ccwho_dir=self.tmp)
+        self.assertEqual(facts.get("iterm_why"), "no-table")
+        check = next(c for c in setup.doctor_checks(facts) if c["name"] == "iterm2")
+        text = " ".join(map(str, check.values()))
+        self.assertIn("process list", text)
+        self.assertNotIn("restart iTerm2", text)
+
+    def test_a_stuck_one_still_says_restart(self):                          # control
+        def refused(timeout=5.0, why=None):
+            why["refused"] = "stuck"
+        setup.iterm_scriptable = refused
+        check = next(c for c in setup.doctor_checks(setup.gather(ccwho_dir=self.tmp))
+                     if c["name"] == "iterm2")
+        self.assertIn("restart iTerm2", " ".join(map(str, check.values())))
+
     def test_claude_is_found_where_it_installs_itself(self):
         real = setup.engine.find_tool
         self.addCleanup(setattr, setup.engine, "find_tool", real)

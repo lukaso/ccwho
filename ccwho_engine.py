@@ -1448,7 +1448,9 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     long to queue behind an ask in flight; a scan queues for nothing.
 
     `why`, a dict, is told what happened: "asked" (an event was sent),
-    "refused" (no-iterm, io, busy, stuck, waiting) and "error" (the Apple Event
+    "refused" (no-iterm, no-table - the process list could not be read -,
+    io - its state, lock or spawn failed -, busy, stuck, waiting) and
+    "error" (the Apple Event
     error code that ended osascript's message, "timeout", or "failed" when it
     ended with none).
     """

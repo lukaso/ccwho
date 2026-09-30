@@ -300,6 +300,23 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
             ui.engine.collect = real
         return runner._reason(runner._read_claim(self.SID), time.time(), None)[0] == "unresolved"
 
+    def test_a_ccwho_that_will_not_import_keeps_the_list_up(self):
+        import sys
+        collector = ui.Collector()
+        collector.reload = lambda: None
+        collector.secure_input = lambda: ""
+        collector.usage = lambda rows: {"state": "unknown"}
+        real, saved = ui.engine.collect, sys.modules.get("ccwho")
+        ui.engine.collect = lambda cache=None, status=None: (
+            status.update(source_ok=True) or ([row(self.SID)], {}))
+        sys.modules["ccwho"] = None
+        try:
+            fleet = collector.fleet()
+        finally:
+            ui.engine.collect = real
+            sys.modules["ccwho"] = saved
+        self.assertEqual([r["sessionId"] for r in fleet.rows], [self.SID])
+
     def test_a_session_on_the_list_lets_go_of_its_claim(self):
         self.assertFalse(self.claim_after([row(self.SID)]))
 

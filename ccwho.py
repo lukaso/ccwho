@@ -1092,6 +1092,16 @@ def _uptime():
     return time.clock_gettime(time.CLOCK_UPTIME_RAW)
 
 
+def _clock_now():
+    """(the wall clock, "clock": [boot, monotonic, uptime]) read at one
+    instant - the boot id first, its first call is slow. What a record whose
+    time is "now" is written with, in the lock it is written under (_mark,
+    _take, _see, _dated): a step or a sleep while its writer waited for the
+    lock can then neither age it nor date it back."""
+    boot = _boot_id()
+    return time.time(), [boot, _mono(), _uptime()]
+
+
 def _stamped(record):
     """The record with its "clock": [boot, monotonic, uptime] at its main time
     - a sighting's until, else its since - kept when it has one. By it a
@@ -1100,8 +1110,9 @@ def _stamped(record):
     sleep, moves neither its order against a decision nor its hold."""
     if "clock" in record:
         return record
-    boot = _boot_id()           # first: its first call is slow, and must not come between the clocks
-    wall, mono, up = time.time(), _mono(), _uptime()
+    # one written with a time of its own (a test's; an older record): its
+    # clocks as far back as that time is from the wall clock now
+    wall, (boot, mono, up) = _clock_now()
     ago = wall - float(record["until"] if record.get("seen") is True else record["since"])
     return dict(record, clock=[boot, mono - ago, up - ago])
 
@@ -1121,14 +1132,14 @@ def _this_boot(rec):
     return c if c is not None and c[0] is not None and c[0] == _boot_id() else None
 
 
-def _age(rec, now, lead=0.0):
+def _age(rec, now, lead=None):
     """Seconds since a claim's since, awake - by uptime in the boot it was
     made in (a Mac asleep does not age a launch whose sessions start only
     when it wakes; no wall clock step moves it), else by the wall clock.
     `lead`: how far a test's `now` runs ahead - none in use."""
     c = _this_boot(rec)
     if c is not None:
-        return _uptime() + lead - c[2]
+        return _uptime() + (lead or 0.0) - c[2]
     return now - float(rec["since"])
 
 
@@ -1237,20 +1248,15 @@ def _claims_locked(wait=None):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
             raise OSError(f"{path} is not a lock of this user's own - remove it")
-        end = time.monotonic() + wait
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:     # another holds it
-                if time.monotonic() >= end:
-                    if launch and wait:
-                        _LOCAL.lock_gave_up = time.monotonic()
-                    raise BlockingIOError(errno.EWOULDBLOCK, "another ccwho holds the claims lock"
-                                          " - a stopped job? (resume or quit it)")
-                time.sleep(0.02)
-            except OSError as ex:       # no other holder: no lock can be had here at all
-                raise OSError(ex.errno, ex.strerror, path) from ex
+        try:
+            had = engine._take_lock(fd, wait)       # waits only while another holds it
+        except OSError as ex:                       # no lock can be had here at all
+            raise OSError(ex.errno, ex.strerror, path) from ex
+        if not had:
+            if launch and wait:
+                _LOCAL.lock_gave_up = time.monotonic()
+            raise BlockingIOError(errno.EWOULDBLOCK, "another ccwho holds the claims lock"
+                                  " - a stopped job? (resume or quit it)")
         _LOCAL.lock_gave_up = None
         _LOCAL.skew = time.time() - _mono()     # one reading of the clocks for this judgement
         try:
@@ -1377,6 +1383,9 @@ def _read_claim(session_id):
                 raise ValueError("not a clock")
         except OverflowError:
             raise ValueError("not a clock")
+    if _this_boot(rec) is not None and (float(clock[1]) > _mono() + FAR_FUTURE_SECONDS
+                                        or float(clock[2]) > _uptime() + FAR_FUTURE_SECONDS):
+        raise ValueError("a clock ahead of this boot's")    # it would never age
     if math.isfinite(since) and math.isfinite(until) and _this_boot(rec) is not None:
         # on the wall clock now: moved by any step the clock took since
         shift = (clock[1] + _skew()) - (until if rec.get("seen") is True else since)
@@ -1433,21 +1442,21 @@ def _dated(session_id, rec):
     iTerm2 gone - never one taken while it was being sent, before its
     osascript had started iTerm2. A sighting or a launch keeps its times
     (FAR_FUTURE_SECONDS). The caller holds the lock."""
-    at = time.time()
+    at, clock = _clock_now()
     if rec.get("unresolved") is not True:
         return rec
     if rec.get("send") is not None and not _sending(rec):
-        _redate_send(rec["send"], at)
-        rec = dict({k: v for k, v in rec.items() if k not in ("until", "send", "clock")}, since=at)
+        _redate_send(rec["send"], at, clock)
+        rec = dict({k: v for k, v in rec.items() if k not in ("until", "send")}, since=at, clock=clock)
         _write_claim(session_id, rec)
     elif float(rec["since"]) > at + CLOCK_STEP_SECONDS:
         # a send still under way keeps its lock named: it holds by that
-        rec = dict({k: v for k, v in rec.items() if k not in ("until", "clock")}, since=at)
+        rec = dict({k: v for k, v in rec.items() if k != "until"}, since=at, clock=clock)
         _write_claim(session_id, rec)
     return rec
 
 
-def _redate_send(token, at):
+def _redate_send(token, at, clock):
     """Every unresolved claim naming this send lock, dated `at` - its send is
     over. Under the lock."""
     try:
@@ -1463,8 +1472,8 @@ def _redate_send(token, at):
         except (OSError, ValueError):
             continue
         if rec.get("unresolved") is True and rec.get("send") == token:
-            _write_claim(m.group(1), dict({k: v for k, v in rec.items()
-                                           if k not in ("until", "send", "clock")}, since=at))
+            _write_claim(m.group(1), dict({k: v for k, v in rec.items() if k not in ("until", "send")},
+                                          since=at, clock=clock))
 
 
 def _mine(session_id):
@@ -1499,6 +1508,9 @@ def _mark(session_ids, record):
     ok = True
     try:
         with _claims_locked():
+            if record.get("since") is None:     # "now": read here, with its clocks
+                wall, clock = _clock_now()
+                record = dict(record, since=wall, clock=clock)
             for sid in session_ids:
                 ok = _mine(sid) and _write_claim(sid, dict(record, sessionId=sid,
                                                            owner=_tokens()[sid])) and ok
@@ -1517,7 +1529,6 @@ def claim_unresolved(session_id, iterm_pid, now=None, send=None):
     iTerm2s of ours it may have reached, any of which holds it
     (_iterm_holds) - until the session is seen running. False when it could
     not be written, or the claim is not ours any more (_mark)."""
-    now = time.time() if now is None else now
     record = {"pid": os.getpid(), "since": now, "unresolved": True,
               "iterm_pid": iterm_pid, "boot": _boot_id()}
     return _mark([session_id], dict(record, send=send) if send else record)
@@ -1528,11 +1539,11 @@ def claim_launched(session_ids, cut_off=False):
     LAUNCH_CLAIM_SECONDS - a session takes a moment to appear in `claude
     agents`, and the ccwho a click started has exited by then. `cut_off`:
     iTerm2 quit during it - what it opened may start, for the same time."""
-    record = {"pid": os.getpid(), "since": time.time(), "launched": True}
+    record = {"pid": os.getpid(), "since": None, "launched": True}      # dated in _mark
     return _mark(session_ids, dict(record, cut_off=True) if cut_off else record)
 
 
-def _reason(rec, now, decided_at, lead=0.0):
+def _reason(rec, now, decided_at, lead=None):
     """Why a claim that holds holds, for the one who asked (why_held)."""
     since = float(rec["since"])
     if rec.get("seen") is True:
@@ -1551,8 +1562,9 @@ def _reason(rec, now, decided_at, lead=0.0):
 def why_held(session_id):
     """Why this thread's last claim_launch on it said no: (reason, seconds
     left), recorded by the read that said no (_refusals). "old list": decided
-    on a scan older than any sighting kept, or stamped more than
-    CLOCK_SLACK_SECONDS after the clock (set back since); "unreadable": a claim file there
+    on a scan older than any sighting kept (by the monotonic clock; a
+    decision given on the wall clock alone also when stamped more than
+    CLOCK_SLACK_SECONDS after it); "unreadable": a claim file there
     that cannot be read; "newer": launched or seen running after the list was
     read - it has changed; "unresolved": an earlier launch did not finish and
     may still run; "cut off": iTerm2 quit during an earlier launch; else
@@ -1635,8 +1647,9 @@ def _see(sid, seen_at):
     elif rec.get("seen") is not True and (
             float(rec.get("since", 0)) < seen_at
             or (rec.get("unresolved") is True and float(rec["since"]) > time.time() + CLOCK_STEP_SECONDS)):
-        _write_claim(sid, {"sessionId": sid, "seen": True, "since": seen_at,
-                           "until": max(seen_at, time.time())})
+        wall, clock = _clock_now()
+        sighting = {"sessionId": sid, "seen": True, "since": seen_at, "until": max(seen_at, wall)}
+        _write_claim(sid, dict(sighting, clock=clock) if sighting["until"] == wall else sighting)
 
 
 # <session id>.json, its temp files, and a launch's send lock (<token>.send)
@@ -1721,7 +1734,7 @@ def _sweep_send(path):
         os.close(fd)
 
 
-def _held(rec, now, alive, table, taken, decided_at, lead=0.0):
+def _held(rec, now, alive, table, taken, decided_at, lead=None):
     """Does this claim still hold? (held, the record to keep in its place), or
     None when that cannot be told on `table` (taken at `taken`; None: no
     table) - it may be older than the iTerm2 it would have to show.
@@ -1782,7 +1795,7 @@ def _iterm_holds(rec, alive, table, taken):
     return (False, rec) if fresh else None
 
 
-def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=None, lead=0.0,
+def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=None, lead=None,
           taken_mono=None):
     """claim_launch's judgement, under the lock: True taken, False held, or
     the claim's since (a float) when it needs a process table taken after
@@ -1791,17 +1804,21 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
     does an error while judging one - the guard fails closed (the list
     reloads the engine, never this file). A decision older than
     SIGHTING_SECONDS is refused - judged here, by the clock after any wait
-    for the lock - and so is one more than CLOCK_SLACK_SECONDS later than
-    the clock now, under the lock: the clock was set back since, and its
-    order against what was written since is unknown. Why it said no is kept
-    for why_held."""
+    for the lock, by the monotonic clock (decided_mono); a decision given on
+    the wall clock alone is also refused when more than CLOCK_SLACK_SECONDS
+    later than the clock now - set back since, its order against what was
+    written since is unknown. Why it said no is kept for why_held."""
     clock = time.time()
-    if decided_mono is not None:
-        decided_at = decided_mono + _skew()           # the scan's start, on the clock now
     if taken_mono is not None:
-        taken = taken_mono + _skew()                  # the table's time, likewise
-    if decided_at is not None and not (max(now, clock) - SIGHTING_SECONDS <= decided_at
-                                       <= clock + CLOCK_SLACK_SECONDS):
+        taken = taken_mono + _skew()                  # the table's time, on the clock now
+    if decided_mono is not None:
+        # its age on the monotonic clock: no wall clock step makes it old
+        old = _mono() + (lead or 0.0) - decided_mono > SIGHTING_SECONDS
+        decided_at = decided_mono + _skew()           # the scan's start, on the clock now
+    else:
+        old = decided_at is not None and not (max(now, clock) - SIGHTING_SECONDS <= decided_at
+                                              <= clock + CLOCK_SLACK_SECONDS)
+    if old:
         _refusals()[session_id] = ("old list", 0)
         return False
     try:
@@ -1827,7 +1844,11 @@ def _take(session_id, pid, now, alive, table, taken, decided_at, decided_mono=No
             _refusals()[session_id] = ("starting", 0)
         return False
     token = uuid.uuid4().hex
-    if _write_claim(session_id, {"pid": pid, "owner": token, "since": now, "sessionId": session_id}):
+    claim = {"pid": pid, "owner": token, "since": now, "sessionId": session_id}
+    if lead is None:                    # now: read here, with its clocks
+        wall, clock = _clock_now()
+        claim.update(since=wall, clock=clock)
+    if _write_claim(session_id, claim):
         _unrecorded().pop(session_id, None)
         if pid == os.getpid():
             _tokens()[session_id] = token
@@ -1887,7 +1908,7 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive, decided_at=No
     be had at all:
     launch_in_iterm then cannot record the launch, and does not send it.
     """
-    lead = 0.0 if now is None else now - time.time()   # a test's now; none in use
+    lead = None if now is None else now - time.time()  # a test's now; None: the clocks now
     now = time.time() if now is None else now
     pid = os.getpid() if pid is None else pid
     _refusals().pop(session_id, None)
@@ -1906,7 +1927,9 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive, decided_at=No
             return got
         got = refresh(got)
         table, taken = got[0], got[1]
-        taken_mono = got[2] if len(got) > 2 else None   # _tables': put on the clock under the lock
+        # _tables' (table, taken, monotonic time), put on the clock under the
+        # lock; a (table, taken) - tests' - is taken on the wall clock as it is
+        taken_mono = got[2] if len(got) > 2 else None
     # its table could not tell either: it holds - an unresolved launch, the
     # only record a table is needed for
     _refusals()[session_id] = ("unresolved", 0)

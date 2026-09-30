@@ -1284,7 +1284,7 @@ def boot_id():
         libc = ctypes.CDLL(ctypes.util.find_library("c"))
         buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
         ok = libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, 0) == 0
-    except (OSError, AttributeError, ValueError):
+    except (ImportError, OSError, AttributeError, ValueError):
         return None
     return buf.value.decode() if ok and buf.value else None
 
@@ -1376,8 +1376,10 @@ def _settle(state, now):
     else:
         state["last_error"] = ae_error_code(err) or "failed"
         if state["last_error"] == AE_TIMED_OUT:
+            # of the boot the ask was sent in: settled after a reboot, the
+            # quarantine is dropped by iterm_ask - its pid is nobody's now
             state["quarantine"] = state.get("asked_pid")
-            state["boot"] = boot_id()         # a pid names a process only within a boot
+            state["boot"] = state.get("boot") or boot_id()
         else:
             state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     if not _write_gate(state):
@@ -1457,9 +1459,10 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         if not saved:
             why["refused"] = "io"           # cannot record what happens next: do not send
             return None
-        if state.get("quarantine") is not None and state.get("boot") not in (None, boot_id()):
+        if (state.get("quarantine") is not None and state.get("boot") is not None
+                and boot_id() is not None and state["boot"] != boot_id()):
             state.pop("quarantine")         # of an iTerm2 before a reboot: its pid is nobody's now
-                                            # (none recorded: written before boots were)
+                                            # (a boot not recorded, or not readable: it holds)
             state.pop("last_error", None)
         if state.get("quarantine") not in (None, pid):
             state.pop("quarantine")         # a restarted iTerm2
@@ -1470,7 +1473,7 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         elif now < state.get("wait_until", 0):
             why.update(refused="waiting", error=state.get("last_error"))
             return None
-        state.update(asked_pid=pid, pending=True)
+        state.update(asked_pid=pid, pending=True, boot=boot_id())
         if not _write_gate(state):
             why["refused"] = "io"
             return None

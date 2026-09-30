@@ -474,7 +474,7 @@ def accessibility_ok(timeout=10.0):
     """
     try:
         done = subprocess.run(["osascript", "-e", _AX_PROBE],
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode == 0:

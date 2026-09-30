@@ -2223,7 +2223,7 @@ class Adapter:
         try:
             done = subprocess.run(
                 ["osascript", "-e", engine.iterm_run_script(cmd)],
-                capture_output=True, text=True, timeout=deadline)
+                capture_output=True, text=True, errors="replace", timeout=deadline)
         except subprocess.TimeoutExpired:
             return f"iTerm2 did not answer in {deadline:g}s"
         except OSError as ex:
@@ -2266,7 +2266,8 @@ class Adapter:
                               "jump.applescript")
         try:
             done = subprocess.run(["osascript", script, device],
-                                  capture_output=True, text=True, timeout=deadline)
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=deadline)
         except subprocess.TimeoutExpired:
             return f"iTerm2 did not answer in {deadline:g}s"
         except OSError as ex:

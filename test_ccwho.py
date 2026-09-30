@@ -7464,6 +7464,37 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
         self.assertIsNone(self.ask(pid=100, why=why))
         self.assertEqual(why.get("refused"), "stuck")
 
+    def test_a_boot_that_cannot_be_read_drops_nothing(self):
+        # like the claims: not knowing this boot is no proof of another
+        self.quarantined("ANOTHER-BOOT")
+        real = ccwho.boot_id
+        self.addCleanup(setattr, ccwho, "boot_id", real)
+        ccwho.boot_id = lambda: None
+        why = {}
+        self.assertIsNone(self.ask(pid=100, why=why))
+        self.assertEqual(why.get("refused"), "stuck")
+
+    def test_the_boot_is_recorded_when_the_ask_is_sent(self):
+        # settled later - maybe after a reboot - it must still say which boot
+        # its iTerm2 was of
+        self.stub("sleep 1; echo late")
+        self.assertIsNone(self.ask(pid=100, timeout=0.2))
+        with open(self.state("json")) as f:
+            self.assertEqual(json.load(f).get("boot"), ccwho.boot_id())
+        self.assertTrue(self.ended())
+
+    def test_a_timeout_that_came_in_before_a_reboot_quarantines_nothing(self):
+        # the ask went to an iTerm2 of the boot before: settled after a
+        # reboot, its -1712 must not quarantine the new iTerm2 with that pid
+        os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
+        with open(self.state("json"), "w") as f:
+            json.dump({"pending": True, "asked_pid": 100, "boot": "ANOTHER-BOOT"}, f)
+        for name, text in (("status", "1\n"), ("err", "AppleEvent timed out. (-1712)"), ("out", "")):
+            with open(self.state(name), "w") as f:
+                f.write(text)
+        self.stub("echo ok")
+        self.assertEqual(self.ask(pid=100, now=time.time() + 60), "ok\n")
+
     def test_one_from_this_boot_holds(self):                                   # control
         self.quarantined(ccwho.boot_id())
         why = {}

@@ -201,6 +201,10 @@ def launch_in_iterm(script, deadline, sids):
         drop_claims(sids)                  # nothing was sent: none of them may hold
         return None, ("a session in it is running now, or another ccwho is opening it"
                       " - not sending it" if elsewhere else _not_recorded(sids))
+    # from here a Ctrl-C - in the send, or in what records it, or later in
+    # the same command - may leave a launch running: _interruptible says so.
+    # Never cleared: an earlier send of the command may have run
+    _LOCAL.send_began = True
     try:
         return _send(script, deadline, sids, send[1])
     finally:
@@ -252,16 +256,17 @@ def _popen_in(ex):
 
 
 def _interrupted(ex):
-    """Was `ex` raised while an interrupt (Ctrl-C) was being handled - one in
-    its chain (__context__, __cause__) that is no Exception? It may then hide
-    a Ctrl-C that landed between Popen's fork and its note of the child."""
+    """The interrupt (Ctrl-C) `ex` was raised while handling - one in its
+    chain (__context__, __cause__) that is no Exception - else None. It may
+    hide a Ctrl-C that landed between Popen's fork and its note of the
+    child; and the command it would have stopped must still stop."""
     seen, e = set(), ex.__context__ or ex.__cause__
     while e is not None and id(e) not in seen:
         if not isinstance(e, Exception):
-            return True
+            return e
         seen.add(id(e))
         e = e.__context__ or e.__cause__
-    return False
+    return None
 
 
 def _ended(p):
@@ -298,7 +303,8 @@ def _send(script, deadline, sids, lock):
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
         p = _being_made(ex)
-        if _never_ran(p) and not _interrupted(ex):
+        stop = _interrupted(ex)
+        if _never_ran(p) and stop is None:
             # no process was made, or exec reported it could not run (and it
             # was reaped): osascript never ran, nothing was sent. (_never_ran
             # reads "no child noted" as none made: an error of these kinds
@@ -310,6 +316,8 @@ def _send(script, deadline, sids, lock):
             return None, f"could not drive iTerm2 ({type(ex).__name__})"
         if _ended(p):
             _sent(sids)                         # it may have run: its event may be out
+        if stop is not None:
+            raise stop                          # the Ctrl-C it hid: the command stops
         return None, f"could not drive iTerm2 ({type(ex).__name__}) - {MAY_STILL_RUN}"
     except BaseException as ex:
         # Ctrl-C: it may still run. (A closed terminal kills us without a
@@ -322,7 +330,6 @@ def _send(script, deadline, sids, lock):
         # (_sending), dated when it is let go (_dated). (Shown ended: a
         # returncode, which only reaping a child sets - one whose fork was
         # never noted has no pid to kill or reap.)
-        _LOCAL.stopped_send = True              # _interruptible says it may still run
         p = _popen_in(ex)
         if p is not None and _ended(p):
             _sent(sids)
@@ -1199,6 +1206,7 @@ def _pid_alive(pid):
 
 
 _boot_id = engine.boot_id
+_above_std = engine._above_std          # bound at import: the list reloads the engine, never ccwho
 
 
 def _mono():
@@ -1412,19 +1420,6 @@ def _claims_locked(wait=None):
 
 # a send lock's name: what a claim may name, and nothing else
 _SEND_TOKEN = re.compile(r"[0-9a-f]{32}")
-
-
-def _above_std(fd):
-    """fd as a descriptor above stdin, stdout and stderr (the original
-    closed): a ccwho started with one of them closed gets that number from
-    os.open, and a child it passes a lock to (pass_fds) has those replaced -
-    its pipes, its DEVNULL - before it runs: that child would hold no lock."""
-    if fd > 2:
-        return fd
-    try:
-        return fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
-    finally:
-        os.close(fd)
 
 
 def _hold_send():
@@ -1739,8 +1734,9 @@ def why_held(session_id):
     CLOCK_SLACK_SECONDS after it); "unreadable": a claim file there
     that cannot be read; "newer": launched or seen running after the list was
     read - it has changed; "unresolved": an earlier launch did not finish and
-    may still run; "cut off": iTerm2 quit during an earlier launch; else
-    "starting"."""
+    may still run; "sending": its send lock is held by an osascript whose
+    ccwho is gone; "cut off": iTerm2 quit during an earlier launch; else
+    "starting" (its launcher alive: another ccwho is opening it)."""
     return _refusals().pop(session_id, ("starting", 0))
 
 
@@ -2159,7 +2155,7 @@ def _why_text(reason, session_id, left):
                        " Remove it if no ccwho is launching it"),
         "unresolved": f"an earlier launch did not finish inside iTerm2; {MAY_STILL_RUN}",
         "sending": ("an earlier launch is still being sent - its ccwho is gone, its osascript"
-                    " runs on; try again when it ends, or restart iTerm2"),
+                    f" runs on; {MAY_STILL_RUN}"),
         "cut off": f"an earlier launch was {CUT_OFF}; try again in {left} s",
     }.get(reason, "it is already starting in another window")
 
@@ -2182,6 +2178,7 @@ def open_session(argv):
     if action == "attach":
         # Running, with no window: give it one. `claude attach` opens a session
         # that is already running; reopening it would fork the conversation.
+        _LOCAL.send_began = True                # a window may still open (_interruptible)
         try:
             res = subprocess.run(["osascript", "-e", engine.iterm_run_script(value)],
                                  capture_output=True, text=True, errors="replace",
@@ -3684,14 +3681,16 @@ def _arg(argv, flag, default):
 
 def _interruptible(command, args):
     """A command that may send a launch (open, restore): Ctrl-C ends it with
-    exit 130 and a line, no traceback - one that came during a send says the
-    launch may still run (a user who read only a traceback would take it as
+    exit 130 and a line, no traceback - one that came once a send began (in
+    it, in what records it, or after it) says the launch may still run (a
+    user who read only a traceback, or "nothing was sent", would take it as
     cancelled, and start the session by hand)."""
-    _LOCAL.stopped_send = False
+    _LOCAL.send_began = False
     try:
         return command(args)
     except KeyboardInterrupt:
-        if _LOCAL.__dict__.pop("stopped_send", False):
+        _LOCAL.interrupted = True               # _exit: dies of SIGINT
+        if _LOCAL.__dict__.pop("send_began", False):
             print(f"ccwho: stopped - {MAY_STILL_RUN}", file=sys.stderr)
         else:
             print("ccwho: stopped - nothing was sent", file=sys.stderr)
@@ -3832,5 +3831,15 @@ def main(argv=None):
         return 0
 
 
+def _exit(rc):
+    """The process's end: one whose command was stopped by Ctrl-C
+    (_interruptible) dies of SIGINT, as an uncaught one does - bash ends a
+    loop around it only when its child died of SIGINT; else rc."""
+    if _LOCAL.__dict__.pop("interrupted", False):
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+    raise SystemExit(rc)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit(main())

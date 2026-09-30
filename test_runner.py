@@ -10524,6 +10524,7 @@ class TestAnErrorThatHidesACtrlCJustAfterTheFork(unittest.TestCase):
             except KeyboardInterrupt:
                 raise OSError(errno.EBADF, "Bad file descriptor")
         self.addCleanup(lambda: [(os.kill(pid, 9), os.waitpid(pid, 0)) for pid in forked])
+        self.forked = forked
 
         def run(cmd, **kw):
             with mock.patch.object(*testkit.FORK_POINT, side_effect=fork):
@@ -10532,8 +10533,9 @@ class TestAnErrorThatHidesACtrlCJustAfterTheFork(unittest.TestCase):
         return runner.launch_in_iterm("script", 1.0, self.SIDS)[1], forked
 
     def test_it_is_no_proof(self):
-        why, forked = self.launched(interrupted=True)
-        self.assertIn(runner.MAY_STILL_RUN, why)
+        with self.assertRaises(KeyboardInterrupt):      # the Ctrl-C it hid: the command stops
+            self.launched(interrupted=True)
+        forked = self.forked
         rec = runner._read_claim(self.SIDS[0])
         self.assertIsNotNone(rec.get("send"))
         runner.engine.app_snapshot = lambda: NO_ITERM
@@ -10574,6 +10576,45 @@ class TestACtrlCSaysWhatItStopped(unittest.TestCase):
         self.assertEqual(rc, 130)
         self.assertIn(runner.MAY_STILL_RUN, said)
         self.assertNotIn("Traceback", said)
+
+    def test_in_the_ps_after_a_timeout(self):
+        def stuck(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 1.0)
+        runner.subprocess.run = stuck
+
+        def ps():
+            raise KeyboardInterrupt
+        runner.engine.app_snapshot = ps
+        rc, said = self.stopped(lambda args: runner.launch_in_iterm("script", 1.0, self.SIDS))
+        self.assertEqual(rc, 130)
+        self.assertIn(runner.MAY_STILL_RUN, said)
+        self.assertNotIn("nothing was sent", said)
+
+    def test_in_its_record_after_it_ran(self):
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        runner.subprocess.run = lambda cmd, **kw: Done()
+        with mock.patch.object(runner, "claim_launched", side_effect=KeyboardInterrupt):
+            rc, said = self.stopped(lambda args: runner.launch_in_iterm("script", 1.0, self.SIDS))
+        self.assertIn(runner.MAY_STILL_RUN, said)
+
+    def test_after_a_send_that_finished(self):
+        # restore: its send done, a Ctrl-C before the next
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        runner.subprocess.run = lambda cmd, **kw: Done()
+
+        def then_stopped(args):
+            runner.launch_in_iterm("script", 1.0, self.SIDS)
+            raise KeyboardInterrupt
+        rc, said = self.stopped(then_stopped)
+        self.assertIn(runner.MAY_STILL_RUN, said)
+
+    def test_while_marking(self):                                               # control
+        with mock.patch.object(runner, "claim_unresolved", side_effect=KeyboardInterrupt):
+            rc, said = self.stopped(lambda args: runner.launch_in_iterm("script", 1.0, self.SIDS))
+        self.assertEqual(rc, 130)
+        self.assertIn("nothing was sent", said)
 
     def test_before_any_send(self):                                             # control
         def before(args):
@@ -10633,23 +10674,37 @@ STD_CLOSED_PROBE = r"""
 import os, subprocess, sys
 repo, result, mode = sys.argv[1:4]
 out = os.open(result, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-if mode == "closed":
+if mode.startswith("closed"):
     for fd in (0, 1, 2):
         os.close(fd)
 sys.path.insert(0, repo)
 import ccwho as r
 import ccwho_engine as e
+if mode == "closed-unguarded":          # the locks opened as they come
+    r._above_std = e._above_std = lambda fd: fd
+import fcntl
 held = r._hold_send()
 # as _send runs osascript: its output piped, the lock passed
 child = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, pass_fds=(held[1],))
-os.close(held[1])                       # the launcher gone: only the child may hold it
+high = held[1] > 2
+r._let_go_send(held)                    # the launcher lets go: only the child may hold it
 sending = r._sending({"send": held[0]})
 child.kill()
 child.wait()
+freed = not r._sending({"send": held[0]})       # and once it ends, no one
 os.makedirs(e.ITERM_STATE_DIR, exist_ok=True)
 gate = e._gate_lock()
-os.write(out, f"{held[1] > 2} {sending} {gate > 2}".encode())
+gate_high = gate > 2
+fcntl.flock(gate, fcntl.LOCK_EX)
+os.close(gate)                          # let go: another can have it
+again = os.open(e._gate_path("lock"), os.O_RDWR)
+try:
+    fcntl.flock(again, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    gate_freed = True
+except BlockingIOError:
+    gate_freed = False
+os.write(out, f"{high} {sending} {freed} {gate_high} {gate_freed}".encode())
 """
 
 
@@ -10670,10 +10725,14 @@ class TestALockPassedToAChildIsAboveStdio(unittest.TestCase):
             return fh.read().split()
 
     def test_started_with_them_closed(self):
-        self.assertEqual(self.probe("closed"), ["True", "True", "True"])
+        self.assertEqual(self.probe("closed"), ["True"] * 5)
 
-    def test_started_with_them_open(self):                                     # control
-        self.assertEqual(self.probe("open"), ["True", "True", "True"])
+    def test_started_with_them_open(self):
+        self.assertEqual(self.probe("open"), ["True"] * 5)
+
+    def test_closed_and_the_locks_left_low(self):                               # control
+        # the probe sees the defect: a low lock, replaced in the child
+        self.assertEqual(self.probe("closed-unguarded"), ["False", "False", "True", "False", "True"])
 
 
 class TestARestoreHeldOnALauncherlessSendSaysSo(unittest.TestCase):
@@ -10697,3 +10756,97 @@ class TestARestoreHeldOnALauncherlessSendSaysSo(unittest.TestCase):
         self.assertNotIn("another ccwho is opening it", out)
         self.assertEqual(self.runs, [])
         self.assertNotEqual(rc, 0)
+        said = runner.reopen_saved(self.man)             # the list's `o`: not a failure
+        self.assertFalse(said.startswith("could not reopen"), said)
+        self.assertIn(runner.MAY_STILL_RUN, said)
+
+
+class TestAHiddenCtrlCEndsTheCommand(unittest.TestCase):
+    """The Ctrl-C an error hid still stops open or restore: exit 130 and the
+    launch may still run - not a normal refusal that goes on."""
+
+    _A = TestAnErrorThatHidesACtrlCJustAfterTheFork
+    SIDS, setUp, launched = _A.SIDS, _A.setUp, _A.launched
+
+    def test_it(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = runner._interruptible(lambda args: self.launched(interrupted=True), [])
+        self.assertEqual(rc, 130)
+        self.assertIn(runner.MAY_STILL_RUN, err.getvalue())
+
+
+class TestAStoppedCommandDiesOfSigint(unittest.TestCase):
+    """A command stopped by Ctrl-C ends the process by SIGINT, as an uncaught
+    Ctrl-C does: bash ends a loop around `ccwho open` only when its child died
+    of SIGINT - an exit 130 lets it launch the next."""
+
+    def ended(self, flagged):
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import ccwho; "
+                + ("ccwho._LOCAL.interrupted = True; " if flagged else "")
+                + "ccwho._exit(130)")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return REAL_RUN([sys.executable, "-c", code, os.path.dirname(os.path.abspath(runner.__file__))],
+                        capture_output=True, timeout=60,
+                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", HOME=tmp, CCWHO_DIR=tmp)).returncode
+
+    def test_after_a_ctrl_c(self):
+        self.assertEqual(self.ended(True), -signal.SIGINT)
+
+    def test_otherwise(self):                                                   # control
+        self.assertEqual(self.ended(False), 130)
+
+    def test_interruptible_marks_it(self):
+        def before(args):
+            raise KeyboardInterrupt
+        with contextlib.redirect_stderr(io.StringIO()):
+            runner._interruptible(before, [])
+        self.assertIs(runner._LOCAL.__dict__.get("interrupted"), True)
+
+
+class TestACtrlCInOpensAttach(unittest.TestCase):
+    """open's attach runs its own osascript: a Ctrl-C in it may still leave a
+    window opening - not "nothing was sent"."""
+
+    setUp = TestAClaimOutlivesALaunchThatMayStillHappen.setUp
+
+    def test_it(self):
+        self.addCleanup(setattr, runner.engine, "resolve_open", runner.engine.resolve_open)
+        runner.engine.resolve_open = lambda *a, **k: ("attach", "4f2b91ac-1111-4222-8333-abcdefabcdef")
+
+        class Nothing:
+            returncode, stdout, stderr = 0, "", ""
+
+        def interrupted(cmd, **kw):
+            if cmd and cmd[0] == "osascript":           # the attach's own run: Ctrl-C there
+                raise KeyboardInterrupt
+            return Nothing()                            # the scan before it: nothing runs
+        runner.subprocess.run = interrupted
+        err = io.StringIO()
+        with mock.patch.object(runner, "scan", return_value=([], 0)), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = runner._interruptible(runner.open_session, ["4f2b91ac-1111-4222-8333-abcdefabcdef"])
+        self.assertEqual(rc, 130)
+        self.assertIn(runner.MAY_STILL_RUN, err.getvalue())
+
+
+class TestARestoreWithALauncherlessSendBesideAnOpenOne(unittest.TestCase):
+    """A session held "sending" beside one that is open: still waited on -
+    not "all of them are already running"."""
+
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    setUp, tearDown, write_manifest, _restore_open = _F.setUp, _F.tearDown, _F.write_manifest, _F._restore_open
+
+    def test_it(self):
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7}]
+        held = runner._hold_send()
+        self.addCleanup(runner._let_go_send, held)
+        runner._write_claim(self.DEAD_SID, {"pid": DEAD, "owner": "x", "since": time.time(),
+                                            "sessionId": self.DEAD_SID, "unresolved": True,
+                                            "iterm_pid": None, "send": held[0]})
+        rc, out = self._restore_open()
+        self.assertIn("still waiting on b", out)
+        self.assertNotIn("already running or starting", out)
+        self.assertEqual(rc, 1)

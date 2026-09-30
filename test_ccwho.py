@@ -7163,6 +7163,40 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.assertIsNone(self.ask(wait=0), "no wait: busy is no")          # control
         self.assertEqual(self.ask(wait=5), "ok\n")
 
+    def gate_held_with_stdio_closed(self, guarded):
+        self.stub("sleep 1.5; echo late")
+        result = os.path.join(self.tmp, "gate-held")
+        code = f"""
+import fcntl, os, sys
+out = os.open({result!r}, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+for fd in (0, 1, 2):
+    os.close(fd)
+import ccwho_engine as e
+e.ITERM_STATE_DIR, e.OSASCRIPT = {ccwho.ITERM_STATE_DIR!r}, {ccwho.OSASCRIPT!r}
+if not {guarded!r}:
+    e._above_std = lambda fd: fd
+e.iterm_ask(["-e", "x"], timeout=0.3, procs={self.table()!r})
+again = os.open(e._gate_path("lock"), os.O_RDWR)
+try:
+    fcntl.flock(again, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.write(out, b"free")
+except BlockingIOError:
+    os.write(out, b"held")
+"""
+        subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, timeout=30,
+                       cwd=os.path.dirname(os.path.abspath(__file__)))
+        self.assertTrue(self.until(self.ended))
+        with open(result) as fh:
+            return fh.read()
+
+    def test_a_ccwho_started_with_stdio_closed_still_holds_the_gate(self):
+        # the gate lock opened as fd 0 is the wrapper's DEVNULL stdin there:
+        # it would hold no lock, and the next ask would go beside a stuck one
+        self.assertEqual(self.gate_held_with_stdio_closed(guarded=True), "held")
+
+    def test_the_same_with_the_lock_left_low(self):                            # control
+        self.assertEqual(self.gate_held_with_stdio_closed(guarded=False), "free")
+
     def test_the_lock_is_shared_between_processes(self):
         self.stub("sleep 1.5; echo late")
         self.assertIsNone(self.ask(timeout=0.2))

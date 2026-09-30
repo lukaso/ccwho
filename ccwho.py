@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -144,8 +145,10 @@ def launch_in_iterm(script, deadline, sids):
     iterm = engine.iterm_app_pid(engine.app_snapshot())
     now = time.time()
     until = now + deadline + SEND_GRACE
-    if not all([claim_unresolved(sid, iterm, now=now, until=until) for sid in sids]):
-        elsewhere = any(_theirs(sid) for sid in sids)
+    # no iTerm2 named yet: until _sent names the one that got it, any iTerm2
+    # of ours holds it - so a record _sent cannot rewrite is still safe
+    if not all([claim_unresolved(sid, None, now=now, until=until) for sid in sids]):
+        elsewhere = not (_unrecorded() & set(sids)) and any(_theirs(sid) for sid in sids)
         drop_claims(sids)                  # nothing was sent: none of them may hold
         return None, ("a session in it is running now, or another ccwho is opening it"
                       " - not sending it" if elsewhere else
@@ -156,8 +159,10 @@ def launch_in_iterm(script, deadline, sids):
     except subprocess.TimeoutExpired:
         _sent(sids, iterm)
         return None, f"iTerm2 did not answer in {deadline:g}s - {MAY_STILL_RUN}"
-    except OSError as ex:
-        drop_claims(sids)                  # nothing was sent
+    except (OSError, ValueError, TypeError) as ex:
+        # nothing was sent: osascript did not start, or refused an argument
+        # before it could (a NUL byte)
+        drop_claims(sids)
         # the type only: the list's `o` shows this line, and an error's text
         # can hold a path
         return None, f"could not drive iTerm2 ({type(ex).__name__})"
@@ -175,7 +180,12 @@ def launch_in_iterm(script, deadline, sids):
     if code == engine.AE_NOT_PERMITTED:
         drop_claims(sids)
         return None, f"iTerm2 refused ({code})"
-    _sent(sids, iterm, rebind=code not in RECEIVER_GONE)
+    if code in RECEIVER_GONE:
+        # the event died with its receiver; windows opened before may run:
+        # held the usual short time, and never on an iTerm2 started since
+        claim_launched(sids)
+    else:
+        _sent(sids, iterm)
     if code == engine.AE_TIMED_OUT:
         return None, f"iTerm2 did not answer ({code}) - {MAY_STILL_RUN}"
     # killed by a signal, failed with no code, or failed after a write
@@ -183,14 +193,12 @@ def launch_in_iterm(script, deadline, sids):
     return None, f"iTerm2 did not finish ({how}) - {MAY_STILL_RUN}"
 
 
-def _sent(sids, iterm, rebind=True):
+def _sent(sids, iterm):
     """The send is over and its launch may still run. It is no longer "being
     sent" (until: now) - a retry after an iTerm2 restart is not "starting" -
-    and it holds on the iTerm2 that got the event: one restarted after the
-    lookup, when the one recorded is gone and another runs. Not when osascript
-    said its receiver died (`rebind` False): the event died with it, and the
-    iTerm2 running now is one started since."""
-    table = engine.app_snapshot() if rebind else ""
+    and it holds on the iTerm2 that got the event: the one looked up, or one
+    restarted after the lookup, when that one is gone and another runs."""
+    table = engine.app_snapshot()
     current = engine.iterm_app_pid(table)
     if current is not None and not (type(iterm) is int and engine.is_iterm_app(table, iterm)):
         iterm = current
@@ -988,7 +996,7 @@ def known_entries():
 
 
 LAUNCH_CLAIM_SECONDS = 90.0       # long enough for a session to appear in the feed
-SEND_GRACE = 30.0                 # osascript starting, and _sent's ps after it (up to 20 s)
+SEND_GRACE = engine.APP_SNAPSHOT_SECONDS + 10.0   # osascript starting, and _sent's ps after it
 MAX_SEND_SECONDS = 3600.0         # longer than any restore's deadline
 CLOCK_STEP_SECONDS = 3600.0       # a wall clock set back by up to this voids no claim
 SIGHTING_SECONDS = 600.0          # longer than any caller takes from its scan to its claim
@@ -1002,19 +1010,17 @@ def _pid_alive(pid):
     return True
 
 
-@functools.cache
-def _boot_id():
-    """This boot's id (kern.bootsessionuuid), or None. An id, not a time: a
-    wall clock stepped after the boot moves every time compared with it."""
-    try:
-        import ctypes
-        import ctypes.util
-        libc = ctypes.CDLL(ctypes.util.find_library("c"))
-        buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
-        ok = libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, 0) == 0
-    except (OSError, AttributeError, ValueError):
-        return None
-    return buf.value.decode() if ok and buf.value else None
+_boot_id = engine.boot_id
+
+
+_LOCAL = threading.local()
+
+
+def _unrecorded():
+    """The sessions this thread's claim_launch could not write a claim for:
+    the reason a launch is not recorded is then the disk, whatever else is
+    on it."""
+    return _LOCAL.__dict__.setdefault("unrecorded", set())
 
 
 def _me():
@@ -1065,7 +1071,7 @@ def _read_claim(session_id):
     # a sighting's until is when its scan ended - across a sleep, hours
     # after it started; any other until is the end of a send
     long = (until > time.time() + CLOCK_STEP_SECONDS if rec.get("seen") is True
-            else until - since > MAX_SEND_SECONDS)
+            else until - since > MAX_SEND_SECONDS or ("until" in rec and until < since))
     if (not (math.isfinite(since) and math.isfinite(until))
             or since > time.time() + CLOCK_STEP_SECONDS or long):
         raise ValueError("not a claim ccwho wrote")
@@ -1110,10 +1116,16 @@ def _theirs(session_id):
         rec = _read_claim(session_id)
         if rec.get("seen") is True:
             return True
-        verdict = _held(rec, time.time(), _pid_alive, None, False, None)
+        verdict = _held(rec, time.time(), _pid_alive, None, None, None)
     except (OSError, ValueError, TypeError):
         return False
     return rec.get("owner") != _me() and (verdict is None or verdict[0])
+
+
+def too_old(status):
+    """Is the scan these rows came from older than any sighting kept? A
+    decision from it cannot be checked any more (the Mac slept, say)."""
+    return time.time() - status.get("seen_at", time.time()) > SIGHTING_SECONDS
 
 
 def _mark(session_ids, record):
@@ -1178,18 +1190,16 @@ def release_claims(session_ids, seen_at):
     running" before it, and decides only now, must not find the claim free
     (claim_launch's decided_at). Its `until` is when this scan ended: scans
     overlap, and one that started earlier may have read the session later
-    than another's "not running". A sighting goes after SIGHTING_SECONDS
-    (_sweep); a record no ccwho wrote goes at once."""
+    than another's "not running". A sighting goes SIGHTING_SECONDS after its
+    scan ended; a record no ccwho wrote goes at once. The sweep runs after:
+    what this scan saw has its sighting by then."""
     d = os.path.join(ccwho_dir(), "launching")
     try:
         names = set(os.listdir(d))
     except OSError:
         return                                  # no claims at all
-    _sweep(d, seen_at)
     sids = [sid for sid in session_ids
             if sid and engine._SESSION_ID.match(str(sid)) and f"{sid}.json" in names]
-    if not sids:
-        return
     with contextlib.suppress(OSError), _claims_locked():
         for sid in sids:
             try:
@@ -1199,7 +1209,7 @@ def release_claims(session_ids, seen_at):
             except OSError:
                 continue
             if rec is not None and rec.get("seen") is True:
-                if float(rec["since"]) > seen_at - SIGHTING_SECONDS:
+                if float(rec.get("until", rec["since"])) > seen_at - SIGHTING_SECONDS:
                     continue
                 rec = None                      # an old sighting: its work is done
             elif rec is not None:
@@ -1210,6 +1220,10 @@ def release_claims(session_ids, seen_at):
                     continue
             with contextlib.suppress(OSError):
                 os.remove(_claim_path(sid))
+    _sweep(d, seen_at)
+
+
+_CLAIM_FILE = re.compile(r"(.+)\.json(\.\d+\.tmp)?")     # <session id>.json, and its temp files
 
 
 def _sweep(d, now):
@@ -1217,7 +1231,10 @@ def _sweep(d, now):
     time whose session is not seen any more - each such launch would leave a
     file for good, in a dir every scan lists. Once per SIGHTING_SECONDS, by a
     marker's time, across processes; only files that old are read. A launch
-    that may still run stays: its iTerm2 may still hold it."""
+    that may still run stays - unless it cannot hold without a ps: made in
+    another boot, or on an iTerm2 that is gone. Only files ccwho writes
+    (_CLAIM_FILE, a session id), only regular ones - never through a symlink;
+    one entry it cannot read does not stop the rest."""
     mark = os.path.join(d, ".swept")
     try:
         if os.stat(mark).st_mtime > now - SIGHTING_SECONDS:
@@ -1228,24 +1245,32 @@ def _sweep(d, now):
         open(mark, "a").close()
         os.utime(mark, (now, now))
         for e in os.scandir(d):
-            if e.name.startswith(".") or e.stat().st_mtime > now - SIGHTING_SECONDS:
-                continue
-            if e.name.endswith(".json"):
-                try:
-                    if _read_claim(e.name[:-len(".json")]).get("unresolved") is True:
-                        continue
-                except ValueError:
-                    pass
-                except OSError:
+            m = _CLAIM_FILE.fullmatch(e.name)
+            if not m or not engine._SESSION_ID.match(m.group(1)):
+                continue                         # not a file ccwho writes
+            try:
+                st = e.stat(follow_symlinks=False)
+                if not stat.S_ISREG(st.st_mode) or st.st_mtime > now - SIGHTING_SECONDS:
                     continue
-            with contextlib.suppress(OSError):
+                if not m.group(2):
+                    try:
+                        rec = _read_claim(m.group(1))
+                        if rec.get("unresolved") is True:
+                            verdict = _held(rec, now, _pid_alive, None, None, None)
+                            if verdict is None or verdict[0]:
+                                continue         # it may still run: its iTerm2 may hold it
+                    except ValueError:
+                        pass                     # no claim ccwho wrote: goes too
                 os.remove(e.path)                # a sighting, an old claim, a leftover .tmp
+            except OSError:
+                continue
 
 
-def _held(rec, now, alive, table, fresh, decided_at):
+def _held(rec, now, alive, table, taken, decided_at):
     """Does this claim still hold? (held, the record to keep in its place), or
-    None when that cannot be told on `table` - it may be older than the
-    iTerm2 it would have to show.
+    None when that cannot be told on `table`, taken at `taken` (None: a table
+    of the caller's, of unknown age) - it may be older than the iTerm2 it
+    would have to show.
 
     A sighting: against a decision made before its scan ended. Claimed and not yet sent:
     while its launcher lives, for the usual time. Launched: for the usual time
@@ -1264,17 +1289,17 @@ def _held(rec, now, alive, table, fresh, decided_at):
         return False, rec
     if now < float(rec.get("until", 0)):
         return True, rec
-    return _iterm_holds(rec, alive, table, fresh)
+    return _iterm_holds(rec, alive, table, taken)
 
 
-def _iterm_holds(rec, alive, table, fresh):
+def _iterm_holds(rec, alive, table, taken):
     """An unresolved launch no longer being sent: its event may still be
     queued in the iTerm2 it went to, so the claim holds while THAT iTerm2 runs
     - by its own entry in the table (our uid, iTerm2's executable), not a
     process that reused its pid. One sent while no iTerm2 ran went to the
     iTerm2 it started: bound to the first of ours seen, so restarting iTerm2
     still clears it. A ps that could not be read is "could not tell", and
-    holds; "gone" is said only on a `fresh` table, taken for this judgement.
+    holds; "gone" is said only on a table taken after the claim was written.
     (Owner, 2026-09-29: a fork is worse than a block you can clear by
     restarting iTerm2 - no timing rule releases it.)"""
     iterm = rec.get("iterm_pid")
@@ -1290,17 +1315,22 @@ def _iterm_holds(rec, alive, table, fresh):
             return True, dict(rec, iterm_pid=iterm)
     elif engine.is_iterm_app(table, iterm):
         return True, rec
-    return (False, rec) if fresh else None
+    return (False, rec) if taken is not None and taken > float(rec.get("since", 0)) else None
 
 
-def _take(session_id, pid, now, alive, table, fresh, decided_at):
+def _take(session_id, pid, now, alive, table, taken, decided_at):
     """claim_launch's judgement, under the lock: True taken, False held, None
-    when it needs a new process table."""
+    when it needs a process table taken after the claim. Only a record
+    that cannot be read is no claim: an error while judging one holds it -
+    the guard fails closed (the list reloads the engine, never this file)."""
     try:
         rec = _read_claim(session_id)
-        verdict = _held(rec, now, alive, table, fresh, decided_at)
-    except (OSError, ValueError, TypeError, AttributeError):
-        rec, verdict = None, (False, None)     # no claim, or one no ccwho wrote
+    except (OSError, ValueError):
+        rec = None                             # no claim, or one no ccwho wrote
+    try:
+        verdict = (False, None) if rec is None else _held(rec, now, alive, table, taken, decided_at)
+    except Exception:
+        verdict = (True, rec)
     if verdict is None:
         return None
     held, keep = verdict
@@ -1308,13 +1338,32 @@ def _take(session_id, pid, now, alive, table, fresh, decided_at):
         if keep is not rec:
             _write_claim(session_id, keep)
         return False
-    if not _write_claim(session_id, {"pid": pid, "owner": f"{pid}:{threading.get_ident()}",
-                                     "since": now, "sessionId": session_id}):
-        # not written (a full disk): take away what no longer holds - it is
-        # not another ccwho's claim, and must not be reported as one
+    if _write_claim(session_id, {"pid": pid, "owner": f"{pid}:{threading.get_ident()}",
+                                 "since": now, "sessionId": session_id}):
+        _unrecorded().discard(session_id)
+        return True
+    # not written (a full disk): launch_in_iterm will say so. What no longer
+    # holds for anyone goes; a sighting or a launch still refuses decisions
+    # older than it, and stays
+    _unrecorded().add(session_id)
+    if rec is None or not (rec.get("seen") is True or rec.get("launched") is True):
         with contextlib.suppress(OSError):
             os.remove(_claim_path(session_id))
     return True
+
+
+def _tables():
+    """One process table for a batch of claims, taken when first needed:
+    get() -> (table, when it was taken). A claim written after it is not
+    judged gone on it (_iterm_holds) - it holds."""
+    cache = []
+
+    def get():
+        if not cache:
+            taken = time.time()
+            cache.append((engine.app_snapshot(), taken))
+        return cache[0]
+    return get
 
 
 def claim_launch(session_id, pid=None, now=None, alive=_pid_alive, procs=None, decided_at=None,
@@ -1334,23 +1383,28 @@ def claim_launch(session_id, pid=None, now=None, alive=_pid_alive, procs=None, d
     no daemon. A claim that no longer holds (_held) or that no ccwho wrote is
     taken over - a crashed launcher must not lock a session out forever.
     `procs` is a process table the caller already has; a new one is taken
-    when the judgement needs it, never under the lock - by `refresh`, which a
-    batch shares so that it takes one, not one a session. True also when the
+    when the judgement needs it, never under the lock - by `refresh`
+    (_tables), which a batch shares so that it takes one, not one a session.
+    A decision older than SIGHTING_SECONDS is refused. True also when the
     lock cannot be had at all: launch_in_iterm then cannot record the launch,
     and does not send it.
     """
     now = time.time() if now is None else now
     pid = os.getpid() if pid is None else pid
-    table, fresh = procs, False
-    while True:
+    if decided_at is not None and now - decided_at > SIGHTING_SECONDS:
+        return False              # older than any sighting kept: nothing can vouch for it
+    refresh = refresh or _tables()
+    table, taken = procs, None
+    for _ in range(2):
         try:
             with _claims_locked():
-                got = _take(session_id, pid, now, alive, table, fresh, decided_at)
+                got = _take(session_id, pid, now, alive, table, taken, decided_at)
         except OSError:
             return True
         if got is not None:
             return got
-        table, fresh = (refresh or engine.app_snapshot)(), True
+        table, taken = refresh()
+    return False                  # its table could not tell either: it holds
 
 
 def resume_problem(entry):
@@ -1411,7 +1465,10 @@ def open_session(argv):
             print(f"ccwho open: not reopening {sid} - {why}", file=sys.stderr)
             return 1
         if not claim_launch(sid, decided_at=status.get("seen_at")):
-            if claim_is_unresolved(sid):
+            if too_old(status):
+                print("ccwho open: the session list it read is too old to act on (the Mac"
+                      " slept?) - run it again.", file=sys.stderr)
+            elif claim_is_unresolved(sid):
                 print(f"ccwho open: not launching {sid} again - an earlier launch did not"
                       f" finish inside iTerm2; {MAY_STILL_RUN}", file=sys.stderr)
             else:
@@ -2748,9 +2805,8 @@ def restore(argv):
                   " and here it would be every one of them.", file=sys.stderr)
             return 1
         openable, running, unusable, starting, seen = [], [], [], [], set()
-        gone, stuck = [], []
-        table = engine.app_snapshot()        # one process table for every claim below,
-        refresh = functools.cache(engine.app_snapshot)   # and one new one if a claim needs it
+        gone, stuck, stale = [], [], []
+        tables = _tables()           # one process table for the claims, when one needs it
         for e_ in entries:
             sid = e_.get("sessionId", "")
             if sid in seen:
@@ -2763,8 +2819,10 @@ def restore(argv):
                 why = resume_problem(e_)
                 if why:
                     gone.append((e_, why))    # checked BEFORE the claim: not opening it
-                elif claim_launch(sid, procs=table, decided_at=status.get("seen_at"), refresh=refresh):
+                elif claim_launch(sid, decided_at=status.get("seen_at"), refresh=tables):
                     openable.append(e_)
+                elif too_old(status):
+                    stale.append(e_)      # the list it read is older than any sighting
                 elif claim_is_unresolved(sid):
                     stuck.append(e_)      # an earlier launch did not finish: it may still run
                 else:
@@ -2790,6 +2848,10 @@ def restore(argv):
             print(f"ccwho restore: still waiting on {e_.get('project') or e_.get('sessionId')}"
                   f" - an earlier launch did not finish inside iTerm2; {MAY_STILL_RUN}",
                   file=sys.stderr)
+        if stale:
+            print("ccwho restore: the session list it read is too old to act on (the Mac"
+                  " slept?) - run `ccwho restore --open` again.", file=sys.stderr)
+            return 1
         fill = {}
         if openable and any(e_.get("pane") or e_.get("tabTitle") for e_ in openable):
             # the panes iTerm2 restored: resume each session where it was

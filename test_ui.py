@@ -286,7 +286,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
         runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time() - 5,
                                        "sessionId": self.SID, "unresolved": True,
-                                       "iterm_pid": 4_000_000, "until": 0})
+                                       "iterm_pid": 4_000_000, "until": time.time()})
         collector = ui.Collector()
         collector.reload = lambda: None
         collector.secure_input = lambda: ""
@@ -319,7 +319,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         def collect(cache=None, status=None):
             time.sleep(0.02)
             runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time(), "sessionId": self.SID,
-                                           "unresolved": True, "iterm_pid": 4_000_000, "until": 0})
+                                           "unresolved": True, "iterm_pid": 4_000_000, "until": time.time()})
             time.sleep(0.02)
             status.update(source_ok=True)
             return [row(self.SID)], {}

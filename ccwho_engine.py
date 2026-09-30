@@ -20,6 +20,7 @@ import json
 import os
 import datetime
 import fcntl
+import functools
 import re
 import shlex
 import shutil
@@ -1260,14 +1261,32 @@ def is_iterm_app(procs_output, pid):
     return uid == os.getuid() and _is_iterm_app(name)
 
 
+APP_SNAPSHOT_SECONDS = 20.0       # the longest app_snapshot() waits for ps
+
+
 def app_snapshot():
     """The cheap process table: no tty column (0.03 s of ps, where the tty
     column costs 0.2 s) - enough to find iTerm2 outside a scan."""
     try:
         return subprocess.run(["ps", "-eo", "pid,uid,ucomm"], capture_output=True,
-                              text=True, errors="replace", timeout=20).stdout
+                              text=True, errors="replace", timeout=APP_SNAPSHOT_SECONDS).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+@functools.cache
+def boot_id():
+    """This boot's id (kern.bootsessionuuid), or None. An id, not a time: a
+    wall clock stepped after the boot moves every time compared with it."""
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        buf, size = ctypes.create_string_buffer(64), ctypes.c_size_t(64)
+        ok = libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, 0) == 0
+    except (OSError, AttributeError, ValueError):
+        return None
+    return buf.value.decode() if ok and buf.value else None
 
 
 def _gate_path(name):
@@ -1317,6 +1336,8 @@ def _read_gate(now):
         clean["wait_until"] = wait
     if isinstance(state.get("last_error"), str) and re.fullmatch(r"-?\w{1,12}", state["last_error"]):
         clean["last_error"] = state["last_error"]
+    if isinstance(state.get("boot"), str) and len(state["boot"]) <= 64:
+        clean["boot"] = state["boot"]
     return clean
 
 
@@ -1356,6 +1377,7 @@ def _settle(state, now):
         state["last_error"] = ae_error_code(err) or "failed"
         if state["last_error"] == AE_TIMED_OUT:
             state["quarantine"] = state.get("asked_pid")
+            state["boot"] = boot_id()         # a pid names a process only within a boot
         else:
             state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     if not _write_gate(state):
@@ -1435,6 +1457,10 @@ def iterm_ask(args, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
         if not saved:
             why["refused"] = "io"           # cannot record what happens next: do not send
             return None
+        if state.get("quarantine") is not None and state.get("boot") not in (None, boot_id()):
+            state.pop("quarantine")         # of an iTerm2 before a reboot: its pid is nobody's now
+                                            # (none recorded: written before boots were)
+            state.pop("last_error", None)
         if state.get("quarantine") not in (None, pid):
             state.pop("quarantine")         # a restarted iTerm2
             state.pop("last_error", None)

@@ -7444,6 +7444,38 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
         self.assertEqual(why.get("refused"), "stuck")
         self.assert_launches(1)
 
+    def quarantined(self, boot):
+        os.makedirs(ccwho.ITERM_STATE_DIR, exist_ok=True)
+        with open(self.state("json"), "w") as f:
+            json.dump({"quarantine": 100, "asked_pid": 100, "last_error": "-1712", "boot": boot}, f)
+        self.stub("echo ok")
+
+    def test_a_quarantine_from_before_a_reboot_is_dropped(self):
+        # a pid names a process only within a boot: after one, an iTerm2 with
+        # the old one's pid is a new iTerm2
+        self.quarantined("ANOTHER-BOOT")
+        self.assertEqual(self.ask(pid=100), "ok\n")
+
+    def test_one_from_before_the_boot_was_recorded_holds(self):
+        # written by the gate before it recorded boots: not a reason to ask a
+        # stuck iTerm2 again
+        self.quarantined(None)
+        why = {}
+        self.assertIsNone(self.ask(pid=100, why=why))
+        self.assertEqual(why.get("refused"), "stuck")
+
+    def test_one_from_this_boot_holds(self):                                   # control
+        self.quarantined(ccwho.boot_id())
+        why = {}
+        self.assertIsNone(self.ask(pid=100, why=why))
+        self.assertEqual(why.get("refused"), "stuck")
+
+    def test_a_timeout_inside_iterm2_records_the_boot(self):
+        self.stub('echo "AppleEvent timed out. (-1712)" >&2; exit 1')
+        self.assertIsNone(self.ask(pid=100))
+        with open(self.state("json")) as f:
+            self.assertEqual(json.load(f).get("boot"), ccwho.boot_id())
+
     def test_an_error_pauses_from_when_it_came_back(self):
         self.stub('sleep 0.5; echo "Not authorized (-1743)" >&2; exit 1')
         start = time.time()

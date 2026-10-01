@@ -1436,7 +1436,7 @@ class CcwhoUi(App):
                 choices.append(("p", f"kill its processes{held}"))
         if row.get("kind") == "codex":
             # no stop: it lives in its app (D16)
-            notes.append(f"it runs in {row.get('where') or 'Codex'}: to end it, end it there")
+            notes.append(engine.codex_there(row, "end"))
         elif row.get("kind") == "background":
             choices.append(("s", "stop the session - its conversation is kept"))
         else:
@@ -1469,8 +1469,8 @@ class CcwhoUi(App):
             return
         # a Codex row's own short id (its random end); a Claude session's prefix
         short = row.get("short") or engine.brief.short_id(row.get("sessionId", ""))
-        title = f"{short}  {row.get('name') or ''}  " \
-                f"{row.get('title') or ''}".rstrip()
+        # its id, handle and title, as the row shows them
+        title = "  ".join(t for t in (short, engine.session_handle(row), row.get("title")) if t)
         self.push_screen(ChoiceBox(title, choices, notes),
                          callback=lambda key, row=row: self.row_chosen(row, key))
 
@@ -1480,8 +1480,7 @@ class CcwhoUi(App):
             return
         row = self.selected_row()
         if row and row.get("kind") == "codex":
-            self.said(f"nothing to kill here - it runs in {row.get('where') or 'Codex'}:"
-                      f" to end it, end it there")
+            self.said(f"nothing to kill here: {engine.codex_there(row, 'end')}")
         elif row:
             self.said("nothing to kill or stop here - an interactive session: end it in its"
                       " window (/exit)")
@@ -1823,7 +1822,10 @@ class CcwhoUi(App):
         if row.get("kind") == "codex":
             # it lives in its app: nothing here can bring that forward - but
             # you have seen its finished turn
-            self.said(f"it runs in {row.get('where') or 'Codex'} - open it there")
+            # named as a jump names a Claude row: "went to aaaa  ✳ Title (claude)"
+            self.said(f"{row.get('short')}"
+                      f"  {engine.cut_codex_title(row.get('tab_title'), 40)}:"
+                      f" {engine.codex_there(row, 'open')}")
             self.looked_at(row, row.get("ts"))
             return
         # Name it the way you picked it. "going to daf9..." is not something

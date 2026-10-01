@@ -56,8 +56,8 @@ class TestTheCodexRows(UiTest):
             await pilot.pause()
             text = self.screen_text(app)
             self.assertNotIn("CODEX", text)
-            self.assertIn("fix the navbar", text)
-            self.assertIn("Codex · VS Code", text)
+            self.assertIn("fix the navbar (codex)", text)
+            self.assertIn("· VS Code", text)
             self.assertIn("STOPPED", text)                    # no turn read: stopped
 
     async def test_the_header_counts_sessions_and_codex_apart(self):
@@ -84,6 +84,40 @@ class TestTheCodexRows(UiTest):
             self.assertEqual((adapter.asked, adapter.attached), ([], []))
             self.assertIn("VS Code", app.status)
             self.assertIn("open it there", app.status)
+            # named as Enter on a Claude row names it: "went to aaaa  ✳ Title (claude)"
+            self.assertIn(f"{T[-4:]}  fix the navbar (codex)", app.status)
+
+    async def test_enter_on_a_long_title_keeps_its_codex_word(self):
+        long = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0],
+                                               name="Refactor the session index parser for speed")])
+        app = self.app(collector=CodexCollector(procs=long))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            app.selected = T
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertIn(f"{T[-4:]}  Refactor the", app.status)
+            self.assertIn("\u2026 (codex): it runs in VS Code", app.status)
+
+    async def test_enter_on_a_programs_thread_says_nothing_to_open(self):
+        # D22: `codex exec` - a program runs it, no app to open it in
+        prog = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0], source="exec")])
+        adapter = FakeAdapter()
+        app = self.app(collector=CodexCollector(procs=prog), adapter=adapter)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertIn("PROGRAMS", self.screen_text(app))
+            app.selected = T
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertEqual((adapter.asked, adapter.attached), ([], []))
+            self.assertIn("a program runs it", app.status)
+            self.assertIn("nothing to open", app.status)
+            self.assertNotIn("open it there", app.status)
 
     async def test_enter_on_a_finished_thread_counts_as_looked_at(self):
         done = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0], turn="done", ask="",
@@ -127,6 +161,8 @@ class TestXOnACodexRow(RowBoxTest):
             text = self.choice_text(app)
             self.assertIn(T[-4:], app.screen.title_text)         # the row's own id
             self.assertNotIn(T[:4], app.screen.title_text)
+            # its id, handle and title, as the row shows them
+            self.assertEqual(app.screen.title_text, f"{T[-4:]}  liveapp  fix the navbar")
             self.assertIn("p  kill its processes  :5173", text)
             self.assertNotIn("stop the session", text)
             self.assertIn("end it there", text)
@@ -146,6 +182,34 @@ class TestXOnACodexRow(RowBoxTest):
             self.assertNotIn("/exit", app.status)
             self.assertNotIn("interactive session", app.status)
             self.assertEqual(c.prepared, [])
+
+    async def test_x_on_a_programs_thread_says_a_program_runs_it(self):
+        idle = dict(PROCS, codex=[], codex_threads=[dict(PROCS["codex_threads"][0], source="exec",
+                                                          procs=0, ports=[], pids=[])])
+        app = self.app(collector=CodexCollector(procs=idle))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            app.selected = T
+            app.restore_selection()
+            await pilot.pause()
+            await self.open_choices(app, pilot)
+            self.assertIsNone(self.choices(app))
+            self.assertIn("a program runs it (codex exec)", app.status)
+            self.assertNotIn("end it there", app.status)
+
+    async def test_x_box_on_a_programs_thread_says_a_program_runs_it(self):
+        prog = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0], source="exec")])
+        app = self.app(collector=CodexCollector(procs=prog))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            app.selected = T
+            app.restore_selection()
+            await pilot.pause()
+            await self.open_choices(app, pilot)
+            text = self.choice_text(app)
+            self.assertIn("p  kill its processes  :5173", text)
+            self.assertIn("a program runs it (codex exec)", text)
+            self.assertNotIn("end it there", text)
 
     async def test_p_asks_about_the_threads_processes(self):
         c = CodexCollector()
@@ -176,6 +240,9 @@ class TestXOnACodexRow(RowBoxTest):
             self.assertIs(app.focused, brief)
             procs_ = [p for p, f in brief.fields.items() if f == "proc"]
             self.assertTrue(procs_)
+            # as a Claude brief's: the title, folder and whole id can be copied
+            self.assertEqual(sorted(set(brief.fields.values())),
+                             ["cwd", "proc", "session_id", "title"])
             brief.lit = procs_[0]
             brief.paint()
             await pilot.press("x")

@@ -16,6 +16,9 @@ import ccwho_procs as procs
 A = "01a0eca7-7b42-72f0-b19a-ff0ae32db6a3"
 B = "01a0eca7-7be2-7d71-9d22-2515b52c97c4"
 C = "01a0eca7-0000-7000-8000-00000000000c"
+# twenty CJK characters: forty cells, twenty characters
+WIDE = ("\u4fee\u590d\u5bfc\u822a\u680f\u5e76\u4e14\u6d4b\u8bd5\u5b83"
+        "\u4eec\u7684\u6240\u6709\u529f\u80fd\u548c\u6027\u80fd\u95ee\u9898")
 
 
 def lsof_text(held, home):
@@ -482,7 +485,7 @@ class TestACodexThreadIsARow(unittest.TestCase):
     def test_its_row_says_codex_and_where_not_a_window(self):
         r = engine.codex_rows(self.FLEET)[0]
         text = "".join(t for t, _ in engine.ui_row_cells(r, width=140)[0])
-        self.assertIn("Codex · VS Code", text)
+        self.assertIn(" · VS Code", text)
         self.assertIn(":5173", text)
         self.assertNotIn("no window", text)
         second = "".join(t for t, _ in engine.ui_row_cells(r, width=140)[1])
@@ -518,8 +521,100 @@ class TestTheCodexLineIsWhatNoRowShows(unittest.TestCase):
     def test_threads_not_known_count_them_all(self):                     # control
         self.assertEqual(engine.bottom_lines(self.fleet(None)), ["codex: 2 processes - ccwho ps"])
 
+    def test_helpers_are_not_counted_as_ccwho_ps_hides_them(self):
+        f = self.fleet(None)
+        f["codex"].append({"pid": 50, "ports": [], "session": C, "helper": True})
+        self.assertEqual(engine.bottom_lines(f), ["codex: 2 processes - ccwho ps"])
+
+
+class TestACodexRowIsOrderedAsAClaudeRow(unittest.TestCase):
+    """Its age is on the row: it is placed by it, as a Claude row by its last entry."""
+    NOW = 1790000000.0
+
+    def claude(self, sid, ago, attention="stopped"):
+        return {"sessionId": sid, "project": "liveapp", "attention": attention,
+                "ts": self.NOW - ago, "name": sid[:4], "title": "t"}
+
+    def codex(self, ago, **kw):
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], mtime=self.NOW - ago, **kw)
+        return engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+
+    def test_newest_first_among_claude_rows(self):
+        old, new = (self.claude("aaaa1111", 5 * 3600), self.claude("bbbb2222", 60))
+        rows = engine.ui_groups([new, old, self.codex(120)])[0]["rows"]
+        self.assertEqual([r["sessionId"][:4] for r in rows], ["bbbb", A[:4], "aaaa"])
+
+    def test_needs_you_stays_oldest_first(self):                         # control
+        old = self.claude("aaaa1111", 5 * 3600, attention="asks")
+        mine = self.codex(120, turn="done", ask="Go?", ts=self.NOW - 100)
+        rows = engine.ui_groups([mine, old])[0]["rows"]
+        self.assertEqual([r["sessionId"][:4] for r in rows], ["aaaa", A[:4]])
+
 
 class TestTheCodexDetail(unittest.TestCase):
+    def test_its_title_and_folder_are_whole_and_can_be_copied(self):
+        # as a Claude brief's: read whole - wrapped, never cut - and copied whole
+        long = "Refactor the session index parser so large histories load fast"
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], name=long,
+                 cwd="/Users/x/projects/liveapp/packages/engine-ts/src/governors")
+        row = engine.codex_rows({"codex_threads": [t]})[0]
+        parts = engine.codex_detail_parts(row, {}, width=30)
+        fields = {f: v for _, v, f in parts if v}
+        self.assertEqual(fields["title"], long)
+        self.assertEqual(fields["cwd"], t["cwd"])
+        title = next(line for line, _, f in parts if f == "title")
+        self.assertEqual(" ".join(title.split("\n")), long)
+        self.assertFalse([l for l in title.split("\n") if l.startswith(" ")], title)
+        folder = next(line for line, _, f in parts if f == "cwd")
+        self.assertEqual("".join(folder.split("\n")), t["cwd"])
+        for line, _, _ in parts:
+            for piece in line.split("\n"):
+                self.assertLessEqual(engine._cells(piece), 30, piece)
+
+    def test_an_unnamed_threads_title_is_no_part(self):
+        # "a new thread" is ccwho's word, not the thread's name: nothing to copy,
+        # as a Claude brief with no title has no title part
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], name="")
+        row = engine.codex_rows({"codex_threads": [t]})[0]
+        parts = engine.codex_detail_parts(row, {}, width=80)
+        self.assertIn("a new thread", [line for line, _, _ in parts])
+        self.assertFalse([p for p in parts if p[2] == "title" or p[1] == "a new thread"], parts)
+
+    def test_every_line_fits_the_pane_in_cells(self):
+        # a CJK title and command: the pane crops in cells, so a cut in
+        # characters never shows its "…"
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], name=WIDE)
+        t["cwd"] = "/Users/x/" + t["name"]           # its project too: the head line
+        row = engine.codex_rows({"codex_threads": [t]})[0]
+        fleet = {"codex": [{"pid": 30, "ports": [5173], "session": A,
+                             "command": "node " + WIDE + ".js --port 5173"}]}
+        parts = engine.codex_detail_parts(row, fleet, width=48)
+        for line, _, _ in parts:
+            for piece in line.split("\n"):
+                self.assertLessEqual(engine._cells(piece), 48, piece)
+        proc = next(line for line, _, f in parts if f == "proc")
+        self.assertTrue(proc.endswith("\u2026"), proc)
+
+    def test_its_processes_read_as_a_claude_briefs(self):
+        row = engine.codex_rows(TestACodexThreadIsARow.FLEET)[0]
+        proc = {"pid": 30, "ports": [5173], "command": "vite --port 5173", "session": A}
+        lines = lambda fleet: [l for l, _, _ in engine.codex_detail_parts(row, fleet, width=100)]
+        self.assertIn(f"{'30':<7} {':5173':<13} vite --port 5173", lines({"codex": [proc]}))
+        self.assertIn(f"{'30':<7} {'?':<13} vite --port 5173",
+                      lines({"codex": [proc], "ports_ok": False}))
+        unknown = lines({"codex": [], "procs_ok": False})
+        self.assertIn("processes unknown - this list may be incomplete", unknown)
+        self.assertNotIn("no processes of its own", unknown)
+        self.assertIn("no processes of its own", lines({"codex": []}))    # control
+
+    def test_it_starts_as_a_claude_brief_does(self):
+        # "7d37  ccwho  ASKED YOU", then the title: its id, project and state
+        row = engine.codex_rows(TestACodexThreadIsARow.FLEET)[0]
+        lines = [line for line, _, _ in engine.codex_detail_parts(row, {}, width=100)]
+        self.assertEqual(lines[0], f"{A[-4:]}  liveapp  STOPPED")
+        # the title with no indent: a lit part lights its own words, not two spaces
+        self.assertEqual(lines[1], "fix the navbar")
+
     def test_it_lists_its_own_work_only_each_a_process_part(self):
         row = engine.codex_rows(TestACodexThreadIsARow.FLEET)[0]
         fleet = {"codex": [{"pid": 30, "ports": [5173], "command": "vite", "session": A},
@@ -530,7 +625,9 @@ class TestTheCodexDetail(unittest.TestCase):
         text = "\n".join(line for line, _, _ in parts)
         self.assertIn("fix the navbar", text)
         self.assertIn("VS Code", text)
-        self.assertEqual([(v, f) for _, v, f in parts if v], [("30", "proc")])
+        self.assertEqual([(v, f) for _, v, f in parts if v],
+                         [("fix the navbar", "title"), ("/Users/x/projects/liveapp", "cwd"),
+                          (A, "session_id"), ("30", "proc")])
         self.assertNotIn("workerd", text)
         self.assertNotIn("npx mcp", text)
 
@@ -551,6 +648,12 @@ class TestACodexRowIsPlainText(unittest.TestCase):
                 text = "".join(t for t, _ in line)
                 self.assertFalse([c for c in text if unicodedata.category(c)
                                   in ("Cc", "Cf", "Zl", "Zp")], (width, text))
+        # and its detail: every line, its processes' commands too
+        fleet = {"codex": [{"pid": 30, "ports": [], "session": A,
+                            "command": "vite \x1b[31m--port\u202e 5173\nrm -rf"}]}
+        for line, _, _ in engine.codex_detail_parts(row, fleet, width=100):
+            self.assertFalse([c for c in line if unicodedata.category(c)
+                              in ("Cc", "Cf", "Zl", "Zp")], line)
 
 
 class TestTheCodexLineCountsHelpersOnTheirRow(unittest.TestCase):
@@ -968,6 +1071,136 @@ class TestEveryWayOfReadingAgrees(unittest.TestCase):
                 self.assertEqual({k: cold[k] for k in keys}, full, (seed, step))
 
 
+class TestTheProcessScreenNamesAnOpenThread(unittest.TestCase):
+    """An open thread's processes are its row's, as a session's are - under its
+    name, not "whether its session still runs is not known" (review 2026-09-30)."""
+
+    def test_an_open_threads_work_is_under_its_rows_name(self):
+        fleet = dict(TestACodexThreadIsARow.FLEET, codex=[
+            {"pid": 30, "ports": [5173], "command": "vite", "session": A, "harness": "codex"},
+            {"pid": 40, "ports": [8787], "command": "workerd", "session": B, "harness": "codex"}])
+        listing = engine.ps_listing([], fleet)
+        by = {p["pid"]: p for p in listing}
+        self.assertEqual((by[30]["group"], by[30]["harness"]), ("session", "codex"))
+        self.assertEqual(by[30]["who"], f"{A[-4:]} liveapp · fix the navbar (codex)")
+        self.assertEqual(by[40]["group"], "codex")               # control: B is not open
+        lines = engine.render_ps_screen(listing, fleet).splitlines()
+        self.assertEqual(lines[0], f"{A[-4:]} liveapp · fix the navbar (codex)")
+        self.assertIn("30", lines[1])
+        self.assertIn("CODEX - whether its session still runs is not known", lines)
+        self.assertIn("40", lines[-1])
+
+
+    def test_each_open_thread_is_one_heading_told_apart_by_its_id(self):
+        # A holds 100 and 300, C holds 200: A's work stays under one heading
+        fleet = dict(TestACodexThreadIsARow.FLEET, codex=[
+            {"pid": 100, "ports": [], "command": "vite", "session": A, "harness": "codex"},
+            {"pid": 200, "ports": [], "command": "node", "session": C, "harness": "codex"},
+            {"pid": 300, "ports": [], "command": "tsc", "session": A, "harness": "codex"}])
+        lines = engine.render_ps_screen(engine.ps_listing([], fleet), fleet).splitlines()
+        head = f"{A[-4:]} liveapp · fix the navbar (codex)"
+        self.assertEqual(lines.count(head), 1)
+        at = lines.index(head)
+        self.assertIn("100", lines[at + 1])
+        self.assertIn("300", lines[at + 2])
+        # two unnamed threads in one folder: two headings, as the rows' ids
+        both = [dict(t, name="", cwd="/Users/x/projects/liveapp")
+                for t in TestACodexThreadIsARow.FLEET["codex_threads"]]
+        fleet = dict(fleet, codex_threads=both)
+        lines = engine.render_ps_screen(engine.ps_listing([], fleet), fleet).splitlines()
+        for thread in (A, C):
+            self.assertIn(f"{thread[-4:]} liveapp · a new thread (codex)", lines)
+
+    def test_a_long_title_keeps_its_codex_word_in_a_narrow_pane(self):
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0],
+                 name="Refactor the session index parser for speed")
+        fleet = {"codex_threads": [t], "codex": [
+            {"pid": 30, "ports": [], "command": "vite", "session": A, "harness": "codex"}]}
+        head = engine.render_ps_screen(engine.ps_listing([], fleet), fleet,
+                                       width=55).splitlines()[0]
+        self.assertTrue(head.startswith(f"{A[-4:]} liveapp · Refactor"), head)
+        self.assertTrue(head.endswith("\u2026 (codex)"), head)
+        self.assertLessEqual(len(head), 55)
+
+    def test_a_wide_title_is_cut_in_cells_on_the_screen(self):
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0],
+                 name=WIDE)
+        fleet = {"codex_threads": [t], "codex": [
+            {"pid": 30, "ports": [], "command": "vite", "session": A, "harness": "codex"}]}
+        for width in (40, 50):
+            head = engine.render_ps_screen(engine.ps_listing([], fleet), fleet,
+                                           width=width).splitlines()[0]
+            self.assertLessEqual(engine._cells(head), width, (width, head))
+            self.assertTrue(head.endswith(" (codex)"), (width, head))
+
+    def test_a_bad_thread_entry_leaves_the_rest_whole(self):
+        # one odd item must not make the whole screen "processes unknown"
+        good = TestACodexThreadIsARow.FLEET["codex_threads"][0]
+        fleet = {"by_session": {B: [{"pid": 12, "ports": [], "command": "next dev"}]},
+                 "codex": [{"pid": 30, "ports": [], "command": "vite", "session": A,
+                            "harness": "codex"}],
+                 "codex_threads": [None, {"name": "x"}, {"thread": 123}, good]}
+        self.assertEqual([r["sessionId"] for r in engine.codex_rows(fleet)], [A])
+        by = {p["pid"]: p for p in engine.ps_listing([], fleet)}
+        self.assertEqual(set(by), {12, 30})
+        self.assertEqual(by[30]["group"], "session")
+
+    def test_an_open_threads_port_is_named_by_its_folder(self):
+        # as a session's port is by its project: ":5173 liveapp", not ":5173 codex"
+        fleet = dict(TestACodexThreadIsARow.FLEET, ports_ok=True, procs_ok=True,
+                     codex=[{"pid": 30, "ports": [5173], "session": A},
+                            {"pid": 40, "ports": [8787], "session": B}],
+                     agent_ports=[{"port": 5173, "pid": 30, "who": "codex"},
+                                  {"port": 8787, "pid": 40, "who": "codex"}])
+        line = engine.ports_line(fleet)
+        self.assertIn(":5173 liveapp (codex)", line)
+        self.assertIn(":8787 codex", line)                        # control: B is not open
+        # the table (`ccwho ls`) lists Claude sessions only: the Claude session in
+        # the same folder must not read as the port's holder
+        claude = {"sessionId": "aaaa1111-0000-4000-8000-000000000001", "project": "liveapp",
+                  "attention": "stopped", "status": "idle", "name": "liveapp-b2",
+                  "title": "Issue 362", "tab_title": "", "since": "5h", "tty": "ttys022",
+                  "ts": None, "pid": 2, "doing": "", "recap": "", "recap_age": "",
+                  "turns_since_recap": 0, "ask": "", "topic": "", "cwd": "/Users/x/liveapp",
+                  "first": "", "orphans": 0, "work": 0, "windowed": None}
+        table = engine.render([claude], dict(fleet, agent_ports=fleet["agent_ports"] + [
+            {"port": 3000, "pid": 12, "who": "liveapp"}]), color=False)
+        self.assertIn(":5173 liveapp (codex)", table)
+        held = next(l for l in table.splitlines() if l.startswith("agents hold"))
+        self.assertIn(":3000 liveapp", held)                       # control: a session's port
+        self.assertNotIn(":3000 liveapp (codex)", held)
+
+    def test_the_ports_line_fits_in_cells(self):
+        base = TestACodexThreadIsARow.FLEET["codex_threads"][0]
+        threads = [dict(base, thread=A[:-1] + str(i), cwd=f"/Users/x/\u9879\u76ee\u7f51\u7ad9{i}")
+                   for i in range(3)]
+        fleet = {"ports_ok": True, "procs_ok": True, "codex_threads": threads,
+                 "codex": [{"pid": 30 + i, "ports": [5170 + i], "session": threads[i]["thread"]}
+                           for i in range(3)],
+                 "agent_ports": [{"port": 5170 + i, "pid": 30 + i, "who": "codex"}
+                                 for i in range(3)]}
+        for width in (31, 32, 33, 60, 78):
+            line = engine.ports_line(fleet, width)
+            self.assertLessEqual(engine._cells(line), width, (width, line))
+            self.assertEqual(line.count("(co"), line.count("(codex)"), (width, line))
+        self.assertEqual(engine.ports_line(fleet, 78),
+                         "agents hold :5170 \u9879\u76ee\u7f51\u7ad90 (codex)"
+                         " · :5171 \u9879\u76ee\u7f51\u7ad91 (codex) · +1")
+
+    def test_the_kill_list_names_a_thread_by_its_rows_id(self):
+        # a UUIDv7 starts with its time: the same eight hex for every thread of
+        # those weeks - the row's id is its random end
+        claude = "aaaa1111-0000-4000-8000-000000000001"
+        plan = {"kill": [{"pid": 30, "ports": [5173], "command": "vite", "session": A,
+                          "harness": "codex"},
+                         {"pid": 12, "ports": [], "command": "next dev", "session": claude,
+                          "harness": "claude"}]}
+        text = "\n".join(engine.kill_list_lines(plan))
+        self.assertIn(f"Codex thread {A[-4:]}", text)
+        self.assertNotIn(A[:8], text)
+        self.assertIn("session aaaa1111", text)                   # control
+
+
 class TestACodexRowsState(unittest.TestCase):
     NOW = 1790000000.0
 
@@ -1002,9 +1235,136 @@ class TestACodexRowsState(unittest.TestCase):
         self.assertIn("Shall I land it?", line(self.row("done", ask="Shall I land it?")))
         self.assertIn("liveapp", line(self.row("done")))                  # else its folder
 
-    def test_the_row_still_says_codex(self):
-        first = "".join(t for t, _ in engine.ui_row_cells(self.row("done", ask="Go?"), 140)[0])
-        self.assertIn("Codex · VS Code", first)
+    def test_the_row_mirrors_a_claude_row(self):
+        # the owner's D21: "Title (codex) · <age> · <where>", as iTerm2 shows a
+        # Claude session "✳ Title (claude)" with "· <age> · <tty>"
+        parts = engine.ui_row_cells(self.row("done", ask="Go?", quiet=180), 140)[0]
+        name = "".join(t for t, role in parts if role == "name")
+        meta = "".join(t for t, role in parts if role == "meta")
+        self.assertEqual(name.strip(), "fix the navbar (codex)")
+        self.assertTrue(meta.startswith(" · 3m · VS Code"), meta)
+        self.assertNotIn("Codex ·", meta)
+
+    def test_a_codex_exec_thread_is_a_programs(self):
+        # the owner's D22: started by a program, as `claude -p` - PROGRAMS, and
+        # never NEEDS YOU, whatever its turn says
+        for turn, quiet in (("done", 0), ("open", engine.CODEX_QUIET + 1), ("open", 5)):
+            t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], source="exec",
+                     turn=turn, ask="Go?" if turn == "done" else "", ts=1,
+                     mtime=self.NOW - quiet, seen_ts=None, pending_tool=True)
+            r = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+            self.assertEqual(r["attention"], "program", turn)
+            self.assertEqual([g["heading"] for g in engine.ui_groups([r])], ["PROGRAMS"])
+            # the source it was started with decides (D22), not what holds it
+            # now: Codex writes no record when a thread is resumed, and a shared
+            # app-server can hold a thread a person typed
+            other = engine.codex_rows({"codex_threads": [dict(t, source="vscode")]},
+                                      now=self.NOW)[0]
+            self.assertNotEqual(other["attention"], "program", turn)       # control
+
+    def test_an_unnamed_thread_says_codex_once(self):
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], name="")
+        r = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+        self.assertEqual(r["tab_title"], "a new thread (codex)")
+        self.assertEqual(r["title"], "a new thread")      # the detail and boxes say it so
+
+    def test_a_programs_line_two_is_its_folder_not_its_question(self):
+        # D22: its question is the program's to answer - never a line that
+        # reads as a question to you
+        line = lambda r: "".join(t for t, _ in engine.ui_row_cells(r, width=140)[1])
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], source="exec", turn="done",
+                 ask="Shall I land it?", ts=1, mtime=self.NOW)
+        prog = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+        self.assertNotIn("Shall I land it?", line(prog))
+        self.assertIn("liveapp", line(prog))
+        self.assertIn("Shall I land it?", line(self.row("done", ask="Shall I land it?")))  # control
+
+    def test_a_cut_title_keeps_its_codex_mark(self):
+        # "(codex)" is the one word on the row that says Codex: the title gives
+        # way before it, as a name that does not fit is cut
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], turn="done", ts=1,
+                 name="Refactor the session index parser for speed", mtime=self.NOW - 180)
+        r = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+        for width in (60, 80):
+            parts = engine.ui_row_cells(r, width)[0]
+            name = "".join(t for t, role in parts if role == "name")
+            meta = "".join(t for t, role in parts if role == "meta")
+            self.assertTrue(name.startswith("Refactor the"), (width, name))
+            self.assertTrue(name.endswith("\u2026 (codex)"), (width, name))
+            self.assertTrue(meta.startswith(" · 3m · VS Code"), (width, meta))
+        wide = "".join(t for t, role in engine.ui_row_cells(r, 200)[0] if role == "name")
+        self.assertEqual(wide.strip(), "Refactor the session index parser for speed (codex)")
+        # too narrow for 8 cells of title beside it: the title, as any row's -
+        # "Ref… (codex)" says nothing of which thread
+        narrow = "".join(t for t, role in engine.ui_row_cells(r, 48)[0] if role == "name")
+        self.assertTrue(narrow.startswith("Refactor th"), narrow)
+        self.assertNotIn("(codex)", narrow)
+        fits = engine.codex_rows({"codex_threads": [dict(t, name="fix")]}, now=self.NOW)[0]
+        self.assertEqual("".join(x for x, role in engine.ui_row_cells(fits, 100)[0]
+                                 if role == "name").strip(), "fix (codex)")
+        # in cells, whatever the characters: an accent typed as its own mark is
+        # no cell, a CJK character is two
+        for title in ("cafe\u0301 cre\u0300me bru\u0302le\u0301e with a long tail",
+                      WIDE):
+            for room in range(4, 60):
+                got = engine.cut_codex_title(title + " (codex)", room)
+                self.assertLessEqual(engine._cells(got), room, (room, got))
+                self.assertTrue(got.endswith(" (codex)") or "(co" not in got, (room, got))
+        # whole wherever the whole fits, however narrow; else the title alone
+        self.assertEqual(engine.cut_codex_title("fix (codex)", 11), "fix (codex)")
+        self.assertEqual(engine.cut_codex_title("fix (codex)", 10), "fix")
+        # never half the word: "fix (co…" - whole, or the title alone
+        for title in ("fix", "Refactor the session index parser for speed"):
+            short = engine.codex_rows({"codex_threads": [dict(t, name=title)]}, now=self.NOW)[0]
+            for width in range(36, 90):
+                name = "".join(x for x, role in engine.ui_row_cells(short, width)[0]
+                               if role == "name")
+                self.assertTrue(name.endswith(" (codex)") or "(co" not in name, (width, name))
+        # a Claude title that ends so is a title: cut as any other
+        claude = {"sessionId": "aaaa1111-0000-4000-8000-000000000001", "project": "liveapp",
+                  "attention": "stopped", "name": "liveapp-b2", "since": "5h",
+                  "tty": "ttys022", "title": "Refactor the session index parser for speed",
+                  "tab_title": "Refactor the session index parser for speed (codex)"}
+        cut = "".join(t for t, role in engine.ui_row_cells(claude, 70)[0] if role == "name")
+        self.assertTrue(cut.startswith("Refactor the"), cut)
+        self.assertTrue(cut.endswith("\u2026"), cut)
+
+    def test_where_it_runs_and_its_folder_find_it(self):
+        find = lambda rows, q: len(engine.ui_filter(rows, q))
+        app = self.row("done")
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], source="exec")
+        prog = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+        self.assertEqual(find([app], "VS Code"), 1)
+        self.assertEqual(find([prog], "codex exec"), 1)
+        self.assertEqual(find([app], "projects/liveapp"), 1)
+        self.assertEqual(find([app], "codex exec"), 0)                    # control
+        home = os.path.expanduser("~")
+        claude = {"sessionId": "aaaa1111-0000-4000-8000-000000000001", "project": "liveapp",
+                  "title": "Issue 362", "cwd": home + "/projects/liveapp"}
+        mine = dict(app, cwd=home + "/projects/liveapp", folder="~/projects/liveapp")
+        self.assertEqual(find([claude, mine], "projects/liveapp"), 2)
+        self.assertEqual(find([claude, mine], "~/projects/liveapp"), 2)
+        self.assertEqual(find([claude, mine], os.path.basename(home)), 0)  # not every row
+
+    def test_a_programs_thread_has_nothing_to_open(self):
+        # D22: a program runs `codex exec` - there is no app to open or end it in
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], source="exec")
+        prog = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+        for verb in ("open", "end"):
+            said = engine.codex_there(prog, verb)
+            self.assertIn("a program runs it (codex exec)", said)
+            self.assertNotIn(f"{verb} it there", said)
+        self.assertIn("nothing to open", engine.codex_there(prog, "open"))
+        self.assertIn("it ends when that program does", engine.codex_there(prog, "end"))
+        detail = "\n".join(line for line, _, _ in engine.codex_detail_parts(prog, {}, 200))
+        self.assertIn("nothing to open", detail)
+        self.assertNotIn("open it there", detail)
+        self.assertNotIn("bring it forward", detail)           # nothing to bring
+        app = self.row("done")                                            # control
+        self.assertEqual(engine.codex_there(app, "open"), "it runs in VS Code - open it there")
+        self.assertEqual(engine.codex_there(app, "end"), "it runs in VS Code - end it there")
+        self.assertIn("open it there",
+                      "\n".join(line for line, _, _ in engine.codex_detail_parts(app, {}, 200)))
 
 
 class TestTheStateReachesTheFleet(unittest.TestCase):

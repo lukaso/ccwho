@@ -1664,7 +1664,10 @@ def codex_turn(path, cache=None):
 
 
 def codex_attention(t, now):
-    """A Codex thread's row state: asks / review / stopped / busy / waiting."""
+    """A Codex thread's row state: asks / review / stopped / busy / waiting -
+    or program: `codex exec` is started by a program, as `claude -p` (D22)."""
+    if t.get("source") == "exec":
+        return "program"
     turn = t.get("turn")
     if turn == "done":
         if t.get("ask"):
@@ -1687,19 +1690,77 @@ def codex_where(thread):
     return "the ChatGPT app" if thread.get("originator") == "Codex Desktop" else "Codex"
 
 
+def codex_there(row, verb):
+    """Where a Codex row's thread runs, and that you `verb` ("open", "end") it
+    there - ccwho can do neither. A `codex exec` thread is a program's (D22):
+    there is nothing to open, and it ends when that program does."""
+    where = row.get("where") or "Codex"
+    if row.get("attention") == "program":
+        return f"a program runs it ({where}) - " + (
+            "nothing to open" if verb == "open" else "it ends when that program does")
+    return f"it runs in {where} - {verb} it there"
+
+
+def _tilde(path):
+    """A path as a person reads it: ~ for the home folder."""
+    home, path = os.path.expanduser("~"), path or ""
+    return ("~" + path[len(home):]) if path == home or path.startswith(home + "/") else path
+
+
+_CODEX_WORD = " (codex)"
+
+
+def cut_codex_title(text, room):
+    """`text` in `room` cells, its closing " (codex)" whole or not at all: the one
+    word that says a line is a Codex thread's, and "(co…" says nothing. The title
+    gives way first, while 8 cells of it still fit beside the word. In cells, as
+    a screen is: a CJK character is two, an accent typed as its own mark none."""
+    cut, text = _cut, text or ""
+    if not text.endswith(_CODEX_WORD) or _cells(text) <= room:
+        return cut(text, room)
+    title = text[:-len(_CODEX_WORD)]
+    if room - _cells(_CODEX_WORD) >= 8:
+        return cut(title, room - _cells(_CODEX_WORD)) + _CODEX_WORD
+    return cut(title, room)
+
+
+def _wrap_cells(text, width):
+    """`text` in lines of at most `width` cells: broken at spaces where it can be,
+    inside a word only where one is wider than a line (a path, a CJK title)."""
+    width, out, line = max(1, width), [], ""
+    for word in text.split(" "):
+        if _cells(f"{line} {word}" if line else word) <= width:
+            line = f"{line} {word}" if line else word
+            continue
+        if line:
+            out.append(line)
+        while _cells(word) > width:
+            n, used = 0, 0
+            while n < len(word) and used + _cells(word[n]) <= width:
+                used, n = used + _cells(word[n]), n + 1
+            out.append(word[:max(n, 1)])
+            word = word[max(n, 1):]
+        line = word
+    if line or not out:
+        out.append(line)
+    return out
+
+
 def codex_rows(fleet, now=None):
     """The list's rows for the open Codex threads (D16), from collect()'s fleet.
     Never collect()'s own rows: those are Claude sessions to everything that
     reads them (--json, jump, show)."""
     threads = (fleet or {}).get("codex_threads") if isinstance(fleet, dict) else None
-    home = os.path.expanduser("~")
     now = time.time() if now is None else now
     out = []
     for t in threads or []:
+        if not isinstance(t, dict) or not isinstance(t.get("thread"), str):
+            continue            # an odd item is no row - and never the end of the others
         cwd = t.get("cwd") or ""
         # one line, and no mark that reorders what is read (U+202E): a name is text
-        name = procs._shown_line(_one_line(t.get("name") or "")) or "a new Codex thread"
-        folder = ("~" + cwd[len(home):]) if cwd == home or cwd.startswith(home + "/") else cwd
+        named = procs._shown_line(_one_line(t.get("name") or ""))
+        name = named or "a new thread"
+        folder = _tilde(cwd)
         # what is drawn: one line, no mark that reorders it (U+202E) or hides in it
         clean = (lambda text: procs._shown_line(_one_line(text)))
         # a UUIDv7 starts with its time (the same four hex for weeks): the short
@@ -1708,8 +1769,14 @@ def codex_rows(fleet, now=None):
                     "kind": "codex", "attention": codex_attention(t, now),
                     "ask": clean(t.get("ask") or ""), "ts": t.get("ts"),
                     "project": clean(os.path.basename(cwd.rstrip("/"))) or "codex",
-                    "name": "", "title": name, "tab_title": name, "since": "",
+                    # "Title (codex)", as iTerm2 shows a Claude session's tab
+                    # "✳ Title (claude)" (D21); its age as a Claude row's
+                    "name": "", "title": name, "tab_title": f"{name} (codex)",
+                    # "a new thread" is ccwho's word: shown, never copied as a name
+                    "named": bool(named),
+                    "since": since(t.get("mtime"), now=now),
                     "where": codex_where(t), "folder": clean(folder), "cwd": cwd,
+                    "mtime": t.get("mtime"),
                     "host_pid": t.get("host_pid"), "procs": t.get("procs") or 0,
                     "ports": t.get("ports"), "pids": list(t.get("pids") or [])})
     return out
@@ -1720,20 +1787,43 @@ def codex_detail_parts(row, fleet, width=80):
     each a part the keys can be on (`x` kills it, Enter copies its pid), as on
     the process screen. [(line, value, field)]."""
     fleet = fleet if isinstance(fleet, dict) else {}
-    one = (lambda text: truncate(procs._shown_line(_one_line(text)), width))
-    out = [(one(row.get("title") or "a Codex thread"), None, None),
-           (one(row.get("cwd") or "(no folder yet)"), None, None),
-           (one(f"Codex, open in {row.get('where') or 'Codex'} - open it there;"
-                f" ccwho cannot bring it forward"), None, None), ("", None, None)]
+    # in cells, as the pane crops: a cut in characters never shows its "…"
+    one = (lambda text: _cut(procs._shown_line(_one_line(text)), width))
+    clean = (lambda text: procs._shown_line(_one_line(text)))
+    att = row.get("attention", "")
+    # as a Claude brief starts: its id, project and state, then its title
+    head = "  ".join(clean(t) for t in (row.get("short") or "?", row.get("project") or "?",
+                                        _LABEL.get(att, att)))
+    title, cwd = clean(row.get("title") or "a new thread"), clean(row.get("cwd") or "")
+    out = [(_cut(head, width), None, None),
+           # the title and the folder whole - wrapped, never cut - and copied
+           # whole, as a Claude brief's: one part over as many lines as it takes.
+           # No indent: a lit part lights its own words. An unnamed thread's
+           # "a new thread" is no name to copy
+           ("\n".join(_wrap_cells(title, width)),
+            *((title, "title") if row.get("named", True) else (None, None))),
+           ("\n".join(_wrap_cells(cwd, width)), cwd, "cwd") if cwd
+           else ("(no folder yet)", None, None),
+           (one(f"thread {row.get('sessionId') or '?'}"), row.get("sessionId") or None,
+            "session_id"),
+           (one(f"Codex: {codex_there(row, 'open')}"
+                + ("" if row.get("attention") == "program"
+                   else "; ccwho cannot bring it forward")), None, None), ("", None, None)]
     mine = [p for p in fleet.get("codex") or []
             if p.get("session") == row.get("sessionId") and not p.get("helper")]
-    if not mine:
+    # as a Claude brief's (session_procs_lines): unknown is said - an empty list
+    # reads as "it started nothing" - and the columns line up
+    known = fleet.get("ports_ok", True)
+    if not fleet.get("procs_ok", True):
+        out.append(("processes unknown - this list may be incomplete", None, None))
+    elif not mine:
         out.append(("no processes of its own", None, None))
     for p in mine:
-        ports = " ".join(f":{n}" for n in p.get("ports") or []) or "-"
+        ports = (" ".join(f":{n}" for n in _held(p)) or "-") if known else "?"
         pid = p.get("pid")
-        line = f"{pid:<7} {ports:<12} {p.get('command') or ''}"
-        out.append((one(line), str(pid), "proc") if isinstance(pid, int) else (one(line), None, None))
+        command = clean(p.get("command") or "")
+        line = _cut(f"{'?' if pid is None else pid!s:<7} {ports:<13} {command}", width)
+        out.append((line, str(pid), "proc") if isinstance(pid, int) else (line, None, None))
     return out
 
 
@@ -3304,6 +3394,14 @@ def _oldest_first(ts):
     return (not known, ts if known else 0)
 
 
+def _newest_first(row):
+    """Sort key: when a row last moved, newest first - a Claude session's last
+    entry (collect() orders them so), a Codex thread's last write (its age)."""
+    ts = row.get("mtime") if row.get("kind") == "codex" else row.get("ts")
+    known = isinstance(ts, (int, float)) and not isinstance(ts, bool)
+    return -ts if known else 0
+
+
 def ui_groups(rows):
     """Rows under the heading that says what each one needs from you.
 
@@ -3322,7 +3420,10 @@ def ui_groups(rows):
                 _RANK.get(r.get("attention", ""), _UNKNOWN_RANK),
                 _oldest_first(r.get("ts"))))
         else:
-            members.sort(key=lambda r: _RANK.get(r.get("attention", ""), _UNKNOWN_RANK))
+            # then newest first, as collect() orders a session's rows - a Codex
+            # row among them by its age, not after them all
+            members.sort(key=lambda r: (_RANK.get(r.get("attention", ""), _UNKNOWN_RANK),
+                                        _newest_first(r)))
         if members:
             # a group needs you when its marks are amber: a heading drawn like
             # NEEDS YOU over rows that do not is read, at a glance, as a question
@@ -3388,8 +3489,9 @@ def ui_row_cells(row, width=100, tag=""):
     sid = row.get("short") or brief.short_id(row.get("sessionId", ""))
     tail = f" · {row.get('since', '')}"
     if row.get("kind") == "codex":
-        # a Codex thread lives in its app: say which, never "no window"
-        tail = f" · Codex · {_printable(row.get('where') or 'Codex')}"
+        # a Claude row's shape (the owner's D21): its age, then where it runs -
+        # its app in place of a tty, never "no window"
+        tail = f" · {row.get('since') or '?'} · {_printable(row.get('where') or 'Codex')}"
     elif row.get("kind") == "background" and row.get("windowed") is False:
         # not "no window", which reads as broken: this is a session you can
         # open, with `claude attach`
@@ -3439,7 +3541,8 @@ def ui_row_cells(row, width=100, tag=""):
     # the title is what gives way, down to nothing: the name says which session
     # this is, and a title of two letters and a … says nothing
     room = room_for_title(tail)
-    shown = _cut(name, room) if room >= 8 else ""
+    shown = ((cut_codex_title(name, room) if row.get("kind") == "codex" else _cut(name, room))
+             if room >= 8 else "")
     gap = 2 if shown else 1
     if room_for_title(tail, gap) < _cells(shown):
         account = []            # whole or not at all: "· 1…" is no account
@@ -3460,10 +3563,13 @@ def ui_row_cells(row, width=100, tag=""):
     # truncation eats, and a recap whose age you cannot see reads as the current
     # state of the work - which is exactly the mistake the age exists to prevent.
     if row.get("kind") == "codex":
-        # what it waits for, when it waits; else where it works
+        # what it waits for, when it waits; else where it works. A program's
+        # question is the program's to answer (D22): never a line that reads
+        # as a question to you
         mark = ""
+        ask = "" if row.get("attention") == "program" else row.get("ask")
         body = ("waiting? (maybe an approval)" if row.get("attention") == "waiting"
-                else row.get("ask") or row.get("folder") or "(no folder yet)")
+                else ask or row.get("folder") or "(no folder yet)")
     elif row.get("recap"):
         age = row.get("recap_age") or "?"
         turns = row.get("turns_since_recap") or 0
@@ -3539,7 +3645,7 @@ def ui_row_lines(row, width=100):
 
 
 _UI_SEARCHED = ("tab_title", "title", "name", "project", "recap", "doing", "ask",
-                "topic", "sessionId", "tty")
+                "topic", "sessionId", "tty", "where")
 
 
 def ui_filter(rows, query):
@@ -3553,7 +3659,10 @@ def ui_filter(rows, query):
         return list(rows)
     out = []
     for r in rows:
-        hay = " ".join(str(r.get(f, "")) for f in _UI_SEARCHED).lower()
+        # the folder as ~ reads it, a Claude row's as a Codex row's: "projects/x"
+        # finds both, and the home folder's name does not find every row
+        hay = " ".join([*(str(r.get(f, "")) for f in _UI_SEARCHED),
+                        _tilde(str(r.get("cwd") or ""))]).lower()
         hay += " " + short_tty(r.get("tty", "")).lower() + " " + str(r.get("pid", ""))
         held = {str(p) for p in r.get("ports") or [] if isinstance(p, int)} \
             if isinstance(r.get("ports"), list) else set()
@@ -3674,11 +3783,22 @@ def ports_line(fleet, width=None):
     held = [a for a in fleet.get("agent_ports") or [] if isinstance(a, dict)]
     if not held:
         return lead.rstrip(" ·") if width is None or len(lead) - 3 <= width else ""
-    parts = [f":{a.get('port', '?')} {_one_line(a.get('who', '?'))}" for a in held]
+    # an open Codex thread's port is its row's, by its folder, as a session's is
+    # by its project - and says Codex: `ccwho ls` lists no Codex row, and a bare
+    # folder reads as a Claude session's there. "codex" alone: a thread not open
+    folders = {r["sessionId"]: f"{r['project']} (codex)" for r in codex_rows(fleet)}
+    owner = {p.get("pid"): folders[p["session"]] for p in fleet.get("codex") or []
+             if isinstance(p, dict) and isinstance(p.get("session"), str)
+             and p["session"] in folders}
+    named = (lambda a: (isinstance(a.get("pid"), int) and owner.get(a["pid"]))
+             or a.get("who", "?"))
+    parts = [f":{a.get('port', '?')} {_one_line(named(a))}" for a in held]
     for n in range(min(len(parts), 6), 0, -1):
         more = f" · +{len(parts) - n}" if len(parts) > n else ""
         line = lead + "agents hold " + " · ".join(parts[:n]) + more
-        if width is None or len(line) <= width:
+        # in cells, as the screen crops: a wide folder name counted in
+        # characters overran the line and lost its end - "(codex)" first
+        if width is None or _cells(line) <= width:
             return line
     for line in (lead + f"agents hold {_plural(len(parts), 'port')}", lead.rstrip(" ·")):
         if line and len(line) <= width:
@@ -3701,7 +3821,7 @@ def bottom_lines(fleet, hint="ccwho ps", width=None):
     # the Codex processes whose thread is not open, state unknown (D17)
     # by the thread its mark names - its helpers too: they are that open thread's
     open_ = {t.get("thread") for t in fleet.get("codex_threads") or [] if isinstance(t, dict)}
-    codex = [p for p in codex if p.get("session") not in open_]
+    codex = [p for p in codex if p.get("session") not in open_ and not p.get("helper")]
     sep = " · " if len(hint) <= 2 else " - "
     see = f"{sep}{hint} to see" if len(hint) <= 2 else f"{sep}{hint}"
     out = []
@@ -3726,9 +3846,20 @@ def ps_listing(rows, fleet, show_all=False):
     for sid, mine in (fleet.get("by_session") or {}).items():
         who = _one_line(f"{project.get(sid, '?')} · {titles.get(sid, '?')}")
         listed += [dict(p, group="session", who=who) for p in mine]
+    # an open Codex thread's work is its row's, as a session's is: together,
+    # under the row's id and words - two unnamed threads in one folder differ
+    # only by the id. Only a thread that is not open leaves its processes
+    # "not known" (D17)
+    codex, threads = fleet.get("codex") or [], set()
+    for r in codex_rows(fleet):
+        threads.add(r["sessionId"])
+        who = _one_line(f"{r['short']} {r['project']} · {r['tab_title']}")
+        listed += [dict(p, group="session", who=who) for p in codex
+                   if p.get("session") == r["sessionId"]]
     listed += [dict(p, group="left behind", who="left behind")
                for p in fleet.get("left_behind") or []]
-    listed += [dict(p, group="codex", who="codex") for p in fleet.get("codex") or []]
+    listed += [dict(p, group="codex", who="codex") for p in codex
+               if p.get("session") not in threads]
     # doubt about whose it is (the list is incomplete, a claude ccwho does not
     # list runs it, or it is an app): never offered as litter
     listed += [dict(p, group="unsure", who=f"not sure: {p.get('why', '?')}")
@@ -3736,6 +3867,13 @@ def ps_listing(rows, fleet, show_all=False):
     if not show_all:
         listed = [p for p in listed if not p.get("helper") or p["group"] == "left behind"]
     return listed
+
+
+def ps_who(p, width):
+    """Whose a process is, in `width` - an open Codex thread's " (codex)" whole."""
+    who = " ".join(str(p.get("who") or "").splitlines())
+    return (cut_codex_title(who, width) if p.get("harness") == "codex"
+            else truncate(who, width))
 
 
 _PS_HEADING = {"left behind": "LEFT BEHIND - their session ended",
@@ -3772,6 +3910,7 @@ def ps_screen_parts(listing, fleet, width=100):
             if out:
                 out.append(("", None, None))
             out.append((one(head), "ccwho clean", "clean") if p["group"] == "left behind"
+                       else (ps_who(p, width), None, None) if p["group"] == "session"
                        else (one(head), None, None))
             heading = head
         ports = (" ".join(f":{n}" for n in _held(p)) or "-") if known else "?"
@@ -3821,9 +3960,12 @@ def _kill_line(e):
     """One process of a kill list: pid, ports, command, who started it."""
     ports = " ".join(f":{p}" for p in e.get("ports") or []) or "-"
     sid = e.get("session")
-    # the mark is text from another process's environment: shown only as a session id
-    who = ("no agent started it" if not sid else f"session {sid[:8]}"
-           if procs._UUID.match(sid) else "a session ccwho does not know")
+    # the mark is text from another process's environment: shown only as a
+    # session id - a Codex thread's as its row's: a UUIDv7 starts with its time
+    who = ("no agent started it" if not sid
+           else "a session ccwho does not know" if not procs._UUID.match(sid)
+           else f"Codex thread {sid[-4:]}" if e.get("harness") == "codex"
+           else f"session {sid[:8]}")
     return f"  {e['pid']:<7} {ports:<12} {truncate(e.get('command') or '', 50):<50}  {who}"
 
 

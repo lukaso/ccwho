@@ -3633,6 +3633,20 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         for text in ("fix the navbar", ":5173", "left behind", ":3000", "codex", ":60805"):
             self.assertIn(text, out)
 
+    def test_an_open_codex_thread_is_named_with_its_codex_word(self):
+        thread = "01a0eca7-7b42-72f0-b19a-ff0ae32db6a3"
+        _rows, fleet = runner.engine.collect()
+        fleet = dict(fleet, codex=[dict(fleet["codex"][0], session=thread)],
+                     codex_threads=[{"thread": thread, "cwd": "/Users/x/projects/liveapp",
+                                     "name": "Refactor the session index parser for speed",
+                                     "source": "vscode"}])
+        runner.engine.collect = lambda cache=None, status=None: (_rows, fleet)
+        rc, out, _ = self.run_ps()
+        self.assertEqual(rc, 0)
+        line = next(l for l in out.splitlines() if l.startswith("30 "))
+        self.assertIn("b6a3 liveapp · Refactor", line)
+        self.assertIn("\u2026 (codex)", line)
+
     def test_helpers_only_with_all(self):
         _, out, _ = self.run_ps()
         self.assertNotIn("some-mcp", out)

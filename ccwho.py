@@ -2436,7 +2436,7 @@ def ps(argv):
         return 0
     for p in listed:
         ports = (" ".join(f":{n}" for n in p.get("ports", [])) or "-") if known else "?"
-        print(f"{p['pid']:<7} {ports:<14} {engine.truncate(p['who'], 40):<40} "
+        print(f"{p['pid']:<7} {ports:<14} {engine.ps_who(p, 40):<40} "
               + (p.get("command_full", "") if full
                  else engine.truncate(p.get("command", ""), 60)))
     return 0

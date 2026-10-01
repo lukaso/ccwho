@@ -919,6 +919,9 @@ class TestXOnARow(RowBoxTest):
             self.assertNotIn("stop the session", text)          # interactive
             self.assertIn("end it there", text)
             self.assertNotIn("kill the stuck loop", text)
+            # its id, name and title (a Codex row's box names it the same way)
+            self.assertEqual(app.screen.title_text,
+                             f"{HOLDING['sessionId'][:4]}  liveapp-b2  Issue 362")
 
     async def test_p_asks_about_the_sessions_processes(self):
         c = RowCollector()

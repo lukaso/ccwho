@@ -127,7 +127,7 @@ ccwho                         # on a terminal
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
-| `p` | every process agents started, grouped: each session, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
+| `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `x` | on a process (after `p`): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
 | `o` | a menu of every save, newest first, with how many of its sessions run now; the last save before the restart is marked. Running sessions are left alone |
@@ -299,8 +299,9 @@ ccwho ps --full             # the whole command line, not the short form
 The live list and the table (`ccwho ls`, `ccwho --watch`) say it in one dim line
 each, never louder than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
 ports on each row, and at the bottom `left behind: N processes` (sessions that have
-ended) and `codex: N processes` (Codex's own group: whether a Codex session is still
-running cannot be told cheaply, so its processes are never called left behind). A
+ended) and `codex: N processes` (processes of a Codex thread that is not open: whether
+it still runs cannot be told cheaply, so they are never called left behind). An open
+Codex thread is a row, and its processes and ports are its own: `:5173 app (codex)`. A
 row's `+N detached` counts its processes that were orphaned (`&`, `nohup`) - the
 ones the session reports `idle` over while they run on. In the live list, the bottom
 line says `· p to see`, and `p` shows the same list `ccwho ps` prints.

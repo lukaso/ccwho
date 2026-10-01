@@ -291,7 +291,9 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         collector = ui.Collector()
         collector.reload = lambda: None
         collector.secure_input = lambda: ""
-        collector.usage = lambda rows: {"state": "unknown"}
+        asked = []
+        collector.usage = lambda rows, procs=None: asked.append(procs) or {"state": "unknown"}
+        self.addCleanup(lambda: self.assertEqual(asked, [{}]))   # collect's own procs
         real = ui.engine.collect
         ui.engine.collect = lambda cache=None, status=None: (
             status.update(source_ok=True) or (list(rows), {}))
@@ -306,7 +308,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         collector = ui.Collector()
         collector.reload = lambda: None
         collector.secure_input = lambda: ""
-        collector.usage = lambda rows: {"state": "unknown"}
+        collector.usage = lambda rows, procs=None: {"state": "unknown"}
         real, saved = ui.engine.collect, sys.modules.get("ccwho")
         ui.engine.collect = lambda cache=None, status=None: (
             status.update(source_ok=True) or ([row(self.SID)], {}))
@@ -344,7 +346,7 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         collector = ui.Collector()
         collector.reload = lambda: None
         collector.secure_input = lambda: ""
-        collector.usage = lambda rows: {"state": "unknown"}
+        collector.usage = lambda rows, procs=None: {"state": "unknown"}
         real = ui.engine.collect
         ui.engine.collect = collect
         try:
@@ -3894,6 +3896,24 @@ def usage_snap(two=True):
             "sessions": sessions, "now": NOW}
 
 
+class TestTheCollectorAsksForCodexUsage(unittest.TestCase):
+    """D23: the list asks for the Codex entry only while its fleet holds an open
+    Codex thread."""
+
+    def test_codex_usage_follows_an_open_thread(self):
+        import ccwho as runner
+        seen = []
+        real = runner.usage_snapshot
+        runner.usage_snapshot = (lambda rows, *a, **kw:
+                                 seen.append(kw.get("codex_threads")) or {"state": "ok"})
+        self.addCleanup(setattr, runner, "usage_snapshot", real)
+        c = ui.Collector()
+        c.usage([], {"codex_threads": [{"thread": "x"}, {"name": "no id"}, None]})
+        c.usage([], {"codex_threads": []})
+        c.usage([], None)
+        self.assertEqual(seen, [["x"], [], []])
+
+
 class TestUsageLine(UiTest):
     def app_with(self, snap):
         fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage=snap)
@@ -3976,11 +3996,12 @@ class TestUsageLine(UiTest):
 
 
 class TestTheCollectorReadsUsage(unittest.TestCase):
-    def collect(self, snapshot):
+    def collect(self, snapshot, procs=None):
         import ccwho as runner
         real = (ui.engine.collect, runner.usage_snapshot)
+        procs = {"collected": True} if procs is None else procs
         ui.engine.collect = lambda cache=None, status=None: (
-            status.update(source_ok=True) or ([LIVE], {"collected": True}))
+            status.update(source_ok=True) or ([LIVE], procs))
         runner.usage_snapshot = snapshot
         try:
             c = ui.Collector()
@@ -3991,11 +4012,20 @@ class TestTheCollectorReadsUsage(unittest.TestCase):
             ui.engine.collect, runner.usage_snapshot = real
 
     def test_the_fleet_carries_the_snapshot(self):
-        fleet = self.collect(lambda rows: {"state": "waiting", "rows": len(rows)})
+        fleet = self.collect(lambda rows, codex_threads=(): {"state": "waiting",
+                                                             "rows": len(rows)})
         self.assertEqual(fleet.usage, {"state": "waiting", "rows": 1})
 
+    def test_an_open_thread_reaches_the_usage_read(self):
+        # the list's own scan says which threads are open (D23)
+        seen = []
+        snap = lambda rows, codex_threads=(): seen.append(codex_threads) or {"state": "ok"}
+        self.collect(snap, {"collected": True, "codex_threads": [{"thread": "t1"}]})
+        self.collect(snap, {"collected": True, "codex_threads": []})          # control
+        self.assertEqual(seen, [["t1"], []])
+
     def test_a_usage_failure_is_unknown_and_the_rows_survive(self):
-        def boom(rows):
+        def boom(rows, codex_threads=()):
             raise ValueError("bad reading")
         fleet = self.collect(boom)
         self.assertEqual(fleet.usage, {"state": "unknown"})

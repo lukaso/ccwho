@@ -94,6 +94,7 @@ def setUpModule():
     _TERM_PROGRAM.append(os.environ.pop("TERM_PROGRAM", None))
     install_guards()
     _UNPIN.append(testkit.pin_ccwho_dir(runner))
+    _UNPIN.append(testkit.pin_codex_home())
     _fresh_claim_state()
 
 
@@ -5102,7 +5103,7 @@ class TestUsageInTheTable(unittest.TestCase):
         self.real = (runner.engine.collect, runner.usage_snapshot)
         runner.engine.collect = lambda cache=None, status=None: (list(self.ROWS), {})
         self.snap = {"state": "waiting"}
-        runner.usage_snapshot = lambda rows, now=None, record=True: self.snap
+        runner.usage_snapshot = lambda rows, now=None, record=True, codex_threads=(): self.snap
 
     def tearDown(self):
         runner.engine.collect, runner.usage_snapshot = self.real
@@ -5112,7 +5113,7 @@ class TestUsageInTheTable(unittest.TestCase):
         self.assertIn("usage  waiting", out)
 
     def test_a_usage_failure_is_unknown_and_the_rows_survive(self):
-        def boom(rows, now=None, record=True):
+        def boom(rows, now=None, record=True, codex_threads=()):
             raise OSError("disk")
         runner.usage_snapshot = boom
         out, rows = runner.tick({"watch": False, "ticks": 0}, [], False)
@@ -5173,6 +5174,114 @@ class TestReloadRebindsUsage(unittest.TestCase):
         self.assertEqual(state["engine_error"], "")
         self.assertIs(runner.usage, sys.modules["ccwho_usage"])
         self.assertIs(runner.engine.ccwho_usage, sys.modules["ccwho_usage"])
+
+
+class TestCodexUsageInTheSnapshot(unittest.TestCase):
+    THREAD = "019a8f2c-0000-7000-8000-00000000000a"
+    """D20/D23: the Codex entry is read and shown only while a Codex thread is
+    open - the list's own fleet says so, and so does `ccwho ls`'s."""
+
+    def setUp(self):
+        import ccwho_usage
+        import datetime
+        # the real clock: `ccwho accounts` reads it, and a reading is placed by it
+        self.now = time.time()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for key, value in (("CODEX_HOME", os.path.join(self.tmp, "codex")),
+                           ("CCWHO_DIR", os.path.join(self.tmp, "ccwho"))):
+            old = os.environ.get(key)
+            os.environ[key] = value
+            self.addCleanup(lambda k=key, o=old: os.environ.pop(k, None) if o is None
+                            else os.environ.__setitem__(k, o))
+        t = time.localtime(self.now - 60)
+        d = os.path.join(self.tmp, "codex", "sessions", time.strftime("%Y/%m/%d", t))
+        os.makedirs(d)
+        path = os.path.join(d, f"rollout-x-{self.THREAD}.jsonl")
+        rl = {"limit_id": "codex", "plan_type": "prolite", "secondary": None,
+              "primary": {"used_percent": 65.0, "window_minutes": 10080,
+                          "resets_at": self.now + 3600}}
+        with open(path, "w") as fh:
+            stamp = datetime.datetime.fromtimestamp(self.now - 60, datetime.timezone.utc)
+            fh.write(json.dumps({"timestamp": stamp.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                                 "type": "event_msg",
+                                 "payload": {"type": "token_count", "rate_limits": rl}}) + "\n")
+        os.utime(path, (self.now - 60, self.now - 60))
+        self.usage = ccwho_usage
+
+    def ids(self, snap):
+        return [a["id"] for a in (snap or {}).get("accounts") or []]
+
+    def test_only_while_a_thread_is_open(self):
+        off = runner.usage_snapshot([], self.now, record=False)
+        on = runner.usage_snapshot([], self.now, record=False, codex_threads=[self.THREAD])
+        self.assertNotIn("codex:codex", self.ids(off))
+        self.assertEqual(self.ids(on), ["codex:codex"])
+
+    def test_accounts_lists_it_open_or_not(self):
+        # the whole listing: every account with a reading, Codex's limit too
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(runner.main(["accounts"]), 0)
+        line = next(l for l in out.getvalue().splitlines() if l.startswith("codex"))
+        self.assertIn("7d 65%", line)
+        self.assertIn("1 session", line)                  # the rollouts that said so
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["accounts", "--json"])
+        self.assertIn("codex:codex", [r["id"] for r in json.loads(out.getvalue())])
+        # a label names it there too
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["accounts", "name", "oai:codex", "chatgpt"]), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["accounts"])
+        self.assertTrue(any(l.startswith("chatgpt ") for l in out.getvalue().splitlines()),
+                        out.getvalue())
+
+    def test_a_codex_read_that_fails_costs_only_codex(self):
+        # the Claude entries stay on the line, and `ccwho accounts` still lists
+        mod = sys.modules["ccwho_usage"]
+        real = mod.codex_rows
+        def boom(*a, **k):
+            raise ValueError("odd rollout")
+        mod.codex_rows = boom
+        self.addCleanup(setattr, mod, "codex_rows", real)
+        on = runner.usage_snapshot([], self.now, record=False, codex_threads=[self.THREAD])
+        off = runner.usage_snapshot([], self.now, record=False)
+        self.assertEqual(on["state"], off["state"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(runner.main(["accounts"]), 0)
+
+    def test_accounts_finds_a_resumed_thread_in_an_old_folder(self):
+        # the list finds an open thread's rollout by its id; `ccwho accounts`,
+        # one-shot, reads every rollout by when it was written
+        src = next(os.path.join(d, f) for d, _, fs in os.walk(os.path.join(self.tmp, "codex"))
+                   for f in fs if f.endswith(".jsonl"))
+        old = os.path.join(self.tmp, "codex", "sessions",
+                           time.strftime("%Y/%m/%d", time.localtime(self.now - 15 * 86400)))
+        os.makedirs(old, exist_ok=True)
+        moved = os.path.join(old, os.path.basename(src))
+        os.replace(src, moved)
+        listed = lambda: [r["id"] for r in json.loads(self.accounts_json())]
+        os.utime(moved, (self.now - 60, self.now - 60))
+        self.assertIn("codex:codex", listed())
+        os.utime(moved, (self.now - 9 * 86400, self.now - 9 * 86400))     # control
+        self.assertNotIn("codex:codex", listed())
+
+    def accounts_json(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["accounts", "--json"])
+        return out.getvalue()
+
+    def test_ls_asks_for_it_from_its_own_fleet(self):
+        open_ = runner.with_usage([], {"codex_threads": [{"thread": self.THREAD}]},
+                                  record=False)
+        closed = runner.with_usage([], {"codex_threads": []}, record=False)
+        self.assertEqual(self.ids(open_["usage"]), ["codex:codex"])
+        self.assertNotIn("codex:codex", self.ids(closed["usage"]))
 
 
 class TestUsageWords(unittest.TestCase):
@@ -6753,7 +6862,8 @@ class TestTheWatchLoopLetsGoOfWhatItSeesRunning(unittest.TestCase):
 
     def tick(self):
         real = runner.usage_snapshot
-        runner.usage_snapshot = lambda rows, now=None, record=True: {"state": "unknown"}
+        runner.usage_snapshot = (lambda rows, now=None, record=True, codex_threads=():
+                                 {"state": "unknown"})
         try:
             return runner.tick({"watch": False, "ticks": 0}, [], False)
         finally:

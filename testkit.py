@@ -31,6 +31,24 @@ def pin_ccwho_dir(runner):
     return undo
 
 
+def pin_codex_home():
+    """Point CODEX_HOME at an empty temp dir for the module. `ccwho accounts`
+    reads Codex's transcripts (D20): a test that set no CODEX_HOME read the
+    user's own ~/.codex (2026-10-01). One the shell exported is put back after.
+    Returns the undo, for tearDownModule."""
+    tmp = tempfile.mkdtemp(prefix="ccwho-test-codex-")
+    inherited = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = tmp
+
+    def undo():
+        shutil.rmtree(tmp, True)
+        if inherited is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = inherited
+    return undo
+
+
 # where Popen makes its process: subprocess._fork_exec from 3.11,
 # _posixsubprocess.fork_exec before
 FORK_POINT = ((subprocess, "_fork_exec") if hasattr(subprocess, "_fork_exec")

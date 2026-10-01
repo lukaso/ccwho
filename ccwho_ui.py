@@ -2137,7 +2137,7 @@ class Collector:
         self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble, procs=procs,
-                     secure=self.secure_input(), usage=self.usage(rows))
+                     secure=self.secure_input(), usage=self.usage(rows, procs))
 
     def release(self, rows, seen_at, seen_mono=None):
         """The sessions on the list let go of their launch claims (ccwho's
@@ -2149,12 +2149,13 @@ class Collector:
         except Exception:
             pass
 
-    def usage(self, rows):
+    def usage(self, rows, procs=None):
         """The usage snapshot, on this collecting thread; "unknown" when it
-        cannot be read. Never the reason the list goes down."""
+        cannot be read. Never the reason the list goes down. Codex's usage only
+        while a Codex thread is open (the owner's D23)."""
         try:
             import ccwho as runner
-            return runner.usage_snapshot(rows)
+            return runner.usage_snapshot(rows, codex_threads=runner.open_codex_threads(procs))
         except Exception:
             return {"state": "unknown"}
 

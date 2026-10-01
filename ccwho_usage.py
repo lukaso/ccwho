@@ -31,6 +31,7 @@ is pointed at. The runner owns stdin, the environment and every write.
 from __future__ import annotations
 
 import datetime
+import glob
 import json
 import os
 import re
@@ -225,6 +226,150 @@ def record(payload, env, home, now, previous=None, claude_pid=None, claude_auth=
             "claude_pid": claude_pid}
 
 
+# ------------------------------------------------------------ Codex (D20)
+# Codex writes its rate limits into its own transcripts: each token_count event
+# carries `rate_limits` (limit_id; primary/secondary: used_percent,
+# window_minutes, resets_at) - exec threads too (measured 2026-10-01, Codex
+# 0.154). No app-server, no credential: the newest reading per limit wins.
+CODEX_TAIL = 64 * 1024            # a rollout's last token_count: within 8 KB of its end
+CODEX_WINDOWS = {300: "five_hour", 10080: "seven_day"}
+
+
+def _codex_readings(path, st, cache):
+    """{limit_id: (measured_at, windows)}: the last reading per limit in the
+    rollout's last CODEX_TAIL bytes, kept while the file is unchanged. Only a
+    line that holds "token_count" is parsed - what was said never is - and of
+    it only the windows' numbers are kept."""
+    key, ident = f"_codex_usage:{path}", (st.st_size, st.st_mtime, st.st_ino)
+    kept = cache.get(key) if cache is not None else None
+    if kept and kept[0] == ident:
+        return kept[1]
+    # a file that grew keeps what it said: a turn can write more than the tail
+    # after its last reading (review 2026-10-01); a new or shorter file is new
+    grown = kept and kept[0][2] == st.st_ino and st.st_size >= kept[0][0]
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, st.st_size - CODEX_TAIL))
+            block = fh.read(CODEX_TAIL)
+    except OSError:
+        return {}
+    out = dict(kept[1]) if grown else {}
+    for line in block.split(b"\n"):
+        if b'"token_count"' not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue                    # the cut first line, or one half written
+        # any shape at all is "no reading", never an error: an odd line must
+        # not cost the usage line its Claude entries
+        p = e.get("payload") if isinstance(e, dict) else None
+        if not isinstance(p, dict) or e.get("type") != "event_msg" \
+                or p.get("type") != "token_count":
+            continue
+        rl, when = p.get("rate_limits"), _epoch(e.get("timestamp"))
+        limit = rl.get("limit_id") if isinstance(rl, dict) else None
+        if not isinstance(limit, str) or not _SID.match(limit) or when is None:
+            continue
+        windows, odd = {}, False
+        for w in (rl.get("primary"), rl.get("secondary")):
+            if w is None:
+                continue                # premium: a limit with no window
+            minutes = w.get("window_minutes") if isinstance(w, dict) else None
+            if not (isinstance(minutes, int) and not isinstance(minutes, bool)
+                    and _number(w.get("used_percent"))):
+                odd = True              # no reading - never one that hides a good one
+                break
+            if minutes in CODEX_WINDOWS:
+                reset = w.get("resets_at")
+                windows[CODEX_WINDOWS[minutes]] = {"used_percentage": w["used_percent"],
+                                                   "resets_at": reset if _number(reset) else None}
+        if not odd:
+            out[limit] = (when, windows)    # a later line is a later reading
+    if cache is not None:
+        cache[key] = (ident, out)
+    return out
+
+
+_THREAD = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+
+
+def _codex_paths(home, now, threads, cache, every=False):
+    """The rollouts a scan reads: those in the date folders of the last 8 days -
+    by the calendar, so a clock change skips no date - and each open thread's,
+    wherever its folder is: a resumed thread writes on in the rollout of the
+    day it began. Never the whole history: it grows by thousands a year, and a
+    scan runs every 2 s while a thread is open (review 2026-10-01). `every`:
+    the whole history, by when each was written - a one-shot command's read."""
+    today, paths = datetime.date.fromtimestamp(now), set()
+    if every:
+        return set(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")))
+    for d in range(-1, 10):
+        day = today - datetime.timedelta(days=d)
+        paths.update(glob.glob(os.path.join(home, "sessions", f"{day:%Y/%m/%d}",
+                                            "rollout-*.jsonl")))
+    keep = set()
+    for thread in threads or ():
+        if not isinstance(thread, str) or not _THREAD.match(thread):
+            continue
+        key = f"_codex_path:{home}:{thread}"
+        keep.add(key)
+        path = cache.get(key) if cache is not None else None
+        if not path or not os.path.exists(path):
+            found = sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*",
+                                                  f"rollout-*-{thread}.jsonl")))
+            path = found[-1] if found else None
+            if cache is not None:
+                cache.pop(key, None)
+                if path:
+                    cache[key] = path
+        if path:
+            paths.add(path)
+    if cache is not None:               # a thread no longer open is no key kept
+        for key in [k for k in cache if k.startswith("_codex_path:") and k not in keep]:
+            del cache[key]
+    return paths
+
+
+def codex_rows(home, now, cache=None, threads=(), every=False):
+    """Codex usage (the owner's D20): one row per limit, from the newest reading
+    in the rollouts of the last 8 days - none for a limit whose newest reading
+    has no window ccwho can name. `sessions` is the rollouts that carried it.
+    `threads`: the open threads' ids, whose rollouts are read wherever they are."""
+    newest, carried, seen = {}, {}, set()
+    for path in sorted(_codex_paths(home, now, threads, cache, every)):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if now - st.st_mtime > KEEP_SECONDS:
+            continue
+        seen.add(f"_codex_usage:{path}")
+        for limit, (when, windows) in _codex_readings(path, st, cache).items():
+            carried[limit] = carried.get(limit, 0) + 1
+            if limit not in newest or when > newest[limit][0]:
+                newest[limit] = (when, windows)
+    if cache is not None:               # a rollout gone or too old is no key kept
+        for key in [k for k in cache if k.startswith("_codex_usage:") and k not in seen]:
+            del cache[key]
+    rows = []
+    for limit, (when, windows) in sorted(newest.items()):
+        if not windows:
+            continue
+        age = now - when
+        row = {"id": f"codex:{limit}", "kind": "codex", "brand": "oai", "email": "",
+               "label": limit, "sessions": carried[limit], "age": age,
+               "five_hour": None, "seven_day": None}
+        for name, w in windows.items():
+            reset = w["resets_at"]
+            row[name] = ({"state": "expired", "resets_at": reset, "age": age}
+                         if _number(reset) and reset <= now else
+                         {"state": "ok", "pct": w["used_percentage"], "resets_at": reset,
+                          "age": age})
+        rows.append(row)
+    return rows
+
+
 def load_readings(directory, now):
     """Every usable reading on disk. Corrupt, foreign and stale files are skipped."""
     try:
@@ -339,6 +484,9 @@ def resolve_id(query, ids):
     if colon and brand in BRANDS:
         if not rest:
             return None
+        if brand == "oai":              # a Codex limit by the line's own name, whole
+            return f"codex:{rest}" if f"codex:{rest}" in ids else None
+        ids = [i for i in ids if not i.startswith("codex:")]
         query = rest
     hits = [i for i in ids if i.startswith(query) or i.split(":", 1)[-1].startswith(query)]
     return hits[0] if len(hits) == 1 else None
@@ -419,6 +567,8 @@ def used_style(pct, base):
 
 
 def _base_name(row):
+    if row.get("kind") == "codex":
+        return row["id"].split(":", 1)[1]           # its limit: "codex" (D24)
     if row.get("kind") == "token":
         return row["id"].split(":", 1)[1][:4]
     email = row.get("email") or ""
@@ -494,14 +644,16 @@ def session_accounts(readings):
     return out
 
 
-def snapshot(readings, now, live_ids, facts, labels=None):
-    """What the list needs about usage, built once per collect."""
+def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
+    """What the list needs about usage, built once per collect. `codex`: the
+    Codex rows to show - the caller reads them only while a Codex thread is
+    open (the owner's D23), as a Claude account shows while a session spends it."""
     labels = labels or {}
     rows = accounts(readings, now, labels)
     spent = session_accounts(readings)
     live_ids = set(live_ids or ())
     sessions = {sid: aid for sid, aid in spent.items() if sid in live_ids}
-    live = [r for r in rows if r["id"] in set(sessions.values())]
+    live = [r for r in rows if r["id"] in set(sessions.values())] + list(codex or [])
     if live:
         state = "ok"
     else:
@@ -630,10 +782,14 @@ def row_tag(snap, session_id):
     if not isinstance(snap, dict) or snap.get("state") != "ok":
         return ""
     rows = snap.get("accounts", [])
-    if len(rows) < 2:
-        return ""
     aid = snap.get("sessions", {}).get(session_id)
     by_id = {r["id"]: r for r in rows}
+    # a tag names one of its brand's accounts (the owner's D25): one Claude
+    # account and Codex on the line tag no row - "(codex)" tells those apart.
+    # A session with no reading is a Claude session: only those are tagged
+    brand = by_id[aid].get("brand", "ant") if aid in by_id else "ant"
+    if sum(1 for r in rows if r.get("brand", "ant") == brand) < 2:
+        return ""
     if aid not in by_id:
         return "?"
     name = snap.get("names", {}).get(aid, aid)

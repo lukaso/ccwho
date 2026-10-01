@@ -3002,10 +3002,20 @@ def statusline(argv):
 _SHOWN_LAST = None       # what the shown-log last recorded, so it logs changes only
 
 
-def usage_snapshot(rows, now=None, record=True):
+_CODEX_USAGE = {}                 # what each Codex rollout's tail said, while unchanged
+
+
+def open_codex_threads(fleet):
+    """The ids of the Codex threads a fleet says are open."""
+    threads = (fleet if isinstance(fleet, dict) else {}).get("codex_threads") or []
+    return [t["thread"] for t in threads if isinstance(t, dict) and isinstance(t.get("thread"), str)]
+
+
+def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     """What the list and the table show about usage, for these live rows. Also
     logs what it shows (owner, 2026-09-25: the data that decides when an old
-    window loses its pace arrow)."""
+    window loses its pace arrow). Codex's usage is read only while a Codex
+    thread is open (the owner's D23)."""
     global _SHOWN_LAST
     now = time.time() if now is None else now
     # the module in sys.modules, not this file's handle: the live list imports
@@ -3013,8 +3023,16 @@ def usage_snapshot(rows, now=None, record=True):
     # what holds the module to use
     u = sys.modules.get("ccwho_usage", usage)
     readings = u.load_readings(usage_dir(), now)
+    codex = None
+    if codex_threads and hasattr(u, "codex_rows"):
+        try:
+            codex = u.codex_rows(engine.codex_home(), now, cache=_CODEX_USAGE,
+                                 threads=list(codex_threads))
+        except Exception:         # noqa: BLE001 - an odd rollout costs Codex's entry only
+            codex = None
     snap = u.snapshot(readings, now, engine.live_ids(rows),
-                      lambda: usage_facts(now, readings), read_labels())
+                      lambda: usage_facts(now, readings), read_labels(),
+                      **({"codex": codex} if codex else {}))
     # only a snapshot over the whole fleet is recorded: a filtered `ls` sees
     # fewer accounts, so fewer clashes - its names and lines are not the list's
     if record:
@@ -3058,7 +3076,8 @@ def with_usage(rows, fleet, record=True):
     "unknown" and never costs the table its rows (eng E-D7)."""
     fleet = dict(fleet) if isinstance(fleet, dict) else {}
     try:
-        fleet["usage"] = usage_snapshot(rows, record=record)
+        fleet["usage"] = usage_snapshot(rows, record=record,
+                                        codex_threads=open_codex_threads(fleet))
     except Exception:             # noqa: BLE001 - see the docstring
         fleet["usage"] = {"state": "unknown"}
     return fleet
@@ -3076,7 +3095,14 @@ def read_labels():
 def accounts(argv):
     """Usage per account, from what the sessions' statusLines recorded."""
     now = time.time()
-    rows = usage.accounts(usage.load_readings(usage_dir(), now), now, read_labels())
+    labels = read_labels()
+    rows = usage.accounts(usage.load_readings(usage_dir(), now), now, labels)
+    # Codex's limits too, a thread open or not: this is the whole listing (D20)
+    try:
+        rows += [dict(r, label=labels.get(r["id"]) or r["label"])
+                 for r in usage.codex_rows(engine.codex_home(), now, every=True)]
+    except Exception:             # noqa: BLE001 - an odd rollout costs Codex's line only
+        pass
     if argv and argv[0] == "name":
         if len(argv) != 3:
             print("usage: ccwho accounts name <id> <label>", file=sys.stderr)

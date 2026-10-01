@@ -7,6 +7,7 @@ never stores a credential. The fake token below must never come back out.
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -958,10 +959,17 @@ class TestRowTag(unittest.TestCase):
         self.assertEqual(usage.row_tag(s, "s2"), "ant:1a2b")
         self.assertEqual(usage.row_tag(s, "s3"), "?")
 
-    def test_the_tag_carries_its_brand_whatever_the_brands(self):
-        o = dict(acct_row("oai:x", kind="token", five=(1, None)), brand="oai")
+    def test_a_brand_with_one_account_tags_no_row(self):
+        # the owner's D25: one Claude account and Codex on the line - "(codex)"
+        # already tells the rows apart; a tag names one of a brand's accounts
+        o = dict(acct_row("codex:codex", kind="codex", week=(65, NOW + D7)), brand="oai",
+                 email="")
         s = snap([self.L, o], sessions={"s1": "login:a"})
-        self.assertEqual(usage.row_tag(s, "s1"), "ant:lukaso")
+        self.assertEqual(usage.row_tag(s, "s1"), "")
+        self.assertEqual(usage.row_tag(s, "s3"), "")                 # no reading: no tag
+        s = snap([self.L, self.T, o], sessions={"s1": "login:a", "s2": "token:1a2b3c4d"})
+        self.assertEqual(usage.row_tag(s, "s1"), "ant:lukaso")             # control
+        self.assertEqual(usage.row_tag(s, "s3"), "?")
 
     def test_no_snapshot_no_tag(self):
         self.assertEqual(usage.row_tag(None, "s1"), "")
@@ -1083,3 +1091,344 @@ class TestShownLogAcrossLongRunningProcesses(unittest.TestCase):
         a = usage.append_shown(path, usage.shown_records(s2), a, now=NOW)      # list: K2 again
         with open(path) as fh:
             self.assertEqual(len(fh.read().splitlines()), 2)
+
+
+# ------------------------------------------------- D20: Codex usage, passive
+import time as _time
+
+CODEX_RESET = NOW + 72 * 3600
+T1 = "019a8f2c-0000-7000-8000-00000000000a"
+T2 = "019a8f2c-0000-7000-8000-00000000000b"
+
+
+def token_count(epoch, used=65.0, minutes=10080, resets=CODEX_RESET, limit="codex",
+                secondary=None, rate_limits="default"):
+    """A token_count event as Codex 0.154 writes it (measured 2026-10-01)."""
+    rl = {"limit_id": limit, "limit_name": None, "plan_type": "prolite",
+          "primary": ({"used_percent": used, "window_minutes": minutes, "resets_at": resets}
+                      if used is not None else None),
+          "secondary": secondary,
+          "credits": {"balance": "7", "has_credits": True, "unlimited": False},
+          "individual_limit": None, "rate_limit_reached_type": None,
+          "spend_control_reached": None}
+    return {"timestamp": iso(epoch), "type": "event_msg",
+            "payload": {"type": "token_count", "info": None,
+                        "rate_limits": rl if rate_limits == "default" else rate_limits}}
+
+
+class CodexHome:
+    """A fake $CODEX_HOME: rollouts under sessions/YYYY/MM/DD, as Codex writes them."""
+
+    def __init__(self):
+        self.dir = tempfile.mkdtemp()
+
+    def rollout(self, events, when=NOW, thread=T1, pad=0, day=None):
+        t = _time.localtime(when)
+        d = os.path.join(self.dir, "sessions",
+                         _time.strftime("%Y/%m/%d", _time.localtime(day if day else when)))
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"rollout-{_time.strftime('%Y-%m-%dT%H-%M-%S', t)}-{thread}.jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"type": "session_meta",
+                                 "payload": {"id": thread, "source": "vscode"}}) + "\n")
+            for e in events:
+                fh.write(json.dumps(e) + "\n")
+            for _ in range(pad):          # what a turn writes after: no token_count
+                fh.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "message", "content": "x" * 1000}}) + "\n")
+        os.utime(path, (when, when))
+        return path
+
+
+class TestCodexUsage(unittest.TestCase):
+    """The owner's D20: Codex usage from the newest rate_limits its transcripts
+    hold - no app-server, no credential. One row per limit (limit_id)."""
+
+    def setUp(self):
+        self.home = CodexHome()
+        self.addCleanup(shutil.rmtree, self.home.dir, True)
+
+    def rows(self, cache=None, now=NOW, threads=()):
+        return usage.codex_rows(self.home.dir, now, cache=cache, threads=threads)
+
+    def test_the_newest_reading_is_the_row(self):
+        self.home.rollout([token_count(NOW - 3600, used=40.0)], when=NOW - 3600, thread=T1)
+        self.home.rollout([token_count(NOW - 60, used=65.0)], when=NOW - 60, thread=T2)
+        row, = self.rows()
+        self.assertEqual((row["id"], row["kind"], row["brand"]), ("codex:codex", "codex", "oai"))
+        self.assertEqual(row["seven_day"],
+                         {"state": "ok", "pct": 65.0, "resets_at": CODEX_RESET, "age": 60})
+        self.assertIsNone(row["five_hour"])
+        self.assertEqual(row["age"], 60)
+
+    def test_sessions_counts_the_rollouts_that_said_so(self):
+        self.home.rollout([token_count(NOW - 600)], when=NOW - 600, thread=T1)
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, thread=T2)
+        self.assertEqual(self.rows()[0]["sessions"], 2)
+
+    def test_the_last_reading_in_a_file_wins(self):
+        self.home.rollout([token_count(NOW - 120, used=40.0), token_count(NOW - 60, used=65.0)],
+                          when=NOW - 60)
+        self.assertEqual(self.rows()[0]["seven_day"]["pct"], 65.0)
+
+    def test_each_limit_is_its_own_row_and_one_without_a_window_is_none(self):
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, thread=T1)
+        self.home.rollout([token_count(NOW - 30, used=None, limit="premium")], when=NOW - 30,
+                          thread=T2)
+        self.assertEqual([r["id"] for r in self.rows()], ["codex:codex"])
+        self.home.rollout([token_count(NOW - 10, used=3.0, limit="premium")], when=NOW - 10,
+                          thread="019a8f2c-0000-7000-8000-00000000000c")
+        self.assertEqual(sorted(r["id"] for r in self.rows()), ["codex:codex", "codex:premium"])
+
+    def test_a_window_is_named_by_its_length(self):
+        self.home.rollout([token_count(NOW - 60, used=10.0, minutes=300, resets=NOW + 3600,
+                                       secondary={"used_percent": 30.0, "window_minutes": 10080,
+                                                  "resets_at": CODEX_RESET})], when=NOW - 60)
+        row, = self.rows()
+        self.assertEqual(row["five_hour"]["pct"], 10.0)
+        self.assertEqual(row["seven_day"]["pct"], 30.0)
+        # a window of a length ccwho has no name for is not shown as one it
+        # has: the newest reading holds none it can name - no row
+        self.home.rollout([token_count(NOW - 5, used=10.0, minutes=60)], when=NOW - 5, thread=T2)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_window_past_its_reset_is_expired_never_a_number(self):
+        self.home.rollout([token_count(NOW - 60, resets=NOW - 10)], when=NOW - 60)
+        self.assertEqual(self.rows()[0]["seven_day"],
+                         {"state": "expired", "resets_at": NOW - 10, "age": 60})
+
+    def test_a_reading_with_no_limits_is_no_reading(self):
+        self.home.rollout([token_count(NOW - 600, used=20.0)], when=NOW - 600, thread=T1)
+        self.home.rollout([token_count(NOW - 60, rate_limits=None)], when=NOW - 60, thread=T2)
+        self.assertEqual(self.rows()[0]["seven_day"]["pct"], 20.0)
+
+    def test_only_token_count_lines_are_parsed_and_only_numbers_kept(self):
+        # what was said is never parsed: a line is read only when it holds
+        # "token_count" - and of that, the windows' numbers are kept
+        self.home.rollout([{"type": "response_item", "payload": {"type": "message",
+                                                                 "content": "rate_limits 99%"}},
+                           token_count(NOW - 60)], when=NOW - 60)
+        parsed = []
+        real = usage.json.loads
+        usage.json.loads = lambda text, *a, **k: parsed.append(text) or real(text, *a, **k)
+        try:
+            row, = self.rows()
+        finally:
+            usage.json.loads = real
+        self.assertEqual(len(parsed), 1)
+        self.assertIn(b"token_count" if isinstance(parsed[0], bytes) else "token_count", parsed[0])
+        self.assertNotIn("credits", json.dumps(row))
+        self.assertNotIn("balance", json.dumps(row))
+
+    def test_a_message_that_says_token_count_is_no_reading(self):
+        self.home.rollout([{"type": "response_item", "payload": {
+            "type": "message", "content": '{"type": "token_count", "rate_limits": 1}'}}],
+            when=NOW - 60)
+        self.assertEqual(self.rows(), [])
+        # nor is any other event that carries a rate_limits of the right shape
+        real = token_count(NOW - 30)
+        other = {"timestamp": real["timestamp"], "type": "response_item",
+                 "payload": dict(real["payload"], type="message", content="token_count")}
+        self.home.rollout([other], when=NOW - 30, thread=T2)
+        self.assertEqual(self.rows(), [])
+
+    def test_an_odd_limit_or_no_time_is_no_reading(self):
+        odd = token_count(NOW - 60, limit="co dex\x1b[31m")
+        timeless = token_count(NOW - 50)
+        del timeless["timestamp"]
+        self.home.rollout([odd, timeless], when=NOW - 50)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_rollout_gone_leaves_the_cache(self):
+        keep = self.home.rollout([token_count(NOW - 60)], when=NOW - 60, thread=T1)
+        gone = self.home.rollout([token_count(NOW - 30)], when=NOW - 30, thread=T2)
+        cache = {}
+        self.rows(cache)
+        os.remove(gone)
+        self.rows(cache)
+        self.assertEqual(sorted(k for k in cache if k.startswith("_codex_usage:")),
+                         [f"_codex_usage:{keep}"])
+
+    def test_an_open_threads_rollout_in_an_old_folder_is_read(self):
+        # a resumed thread writes on in the rollout of the day it began: an open
+        # thread's rollout is found by its id, wherever its folder is
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 12 * 86400)
+        self.assertEqual([r["id"] for r in self.rows(threads=[T1])], ["codex:codex"])
+        self.assertEqual(self.rows(), [])            # control: old folders are not listed
+
+    def test_a_thread_id_that_is_no_id_finds_nothing(self):
+        # an id is a glob pattern's part: "*" would read the whole history
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 12 * 86400)
+        self.assertEqual(self.rows(threads=["*", "../x", 7, None]), [])
+
+    def test_an_open_threads_rollout_is_found_again_when_it_moves(self):
+        path = self.home.rollout([token_count(NOW - 600, used=40.0)], when=NOW - 600,
+                                 day=NOW - 12 * 86400)
+        cache = {}
+        self.assertEqual(self.rows(cache, threads=[T1])[0]["seven_day"]["pct"], 40.0)
+        os.remove(path)
+        self.home.rollout([token_count(NOW - 60, used=65.0)], when=NOW - 60,
+                          day=NOW - 11 * 86400)
+        self.assertEqual(self.rows(cache, threads=[T1])[0]["seven_day"]["pct"], 65.0)
+        self.rows(cache, threads=[])                  # closed: its path is no key kept
+        self.assertEqual([k for k in cache if k.startswith("_codex_path:")], [])
+
+    def test_an_old_folder_with_an_old_file_is_not_read(self):              # control
+        self.home.rollout([token_count(NOW - 9 * 86400)], when=NOW - 9 * 86400,
+                          day=NOW - 12 * 86400)
+        self.assertEqual(self.rows(threads=[T1]), [])
+
+    def test_a_clock_change_skips_no_folder(self):
+        # 2026-03-29 is 23 hours long in London: 24-hour steps back from 00:30
+        # on the 30th skip its folder (review 2026-10-01)
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "Europe/London"
+        _time.tzset()
+        try:
+            now = _time.mktime((2026, 3, 30, 0, 30, 0, 0, 0, -1))
+            self.home.rollout([token_count(now - 60)], when=now - 60,
+                              day=_time.mktime((2026, 3, 29, 12, 0, 0, 0, 0, -1)))
+            self.assertEqual(len(usage.codex_rows(self.home.dir, now)), 1)
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            _time.tzset()
+
+    def test_a_scan_reads_recent_folders_and_open_threads_only(self):
+        # the history grows by thousands a year: a scan every 2 s must not
+        # stat it all (review 2026-10-01: 86 ms at 15,000 rollouts)
+        for i in range(30):
+            self.home.rollout([token_count(NOW - (20 + i) * 86400)],
+                              when=NOW - (20 + i) * 86400,
+                              thread=f"019a8f2c-0000-7000-8000-0000000001{i:02d}")
+        self.home.rollout([token_count(NOW - 120)], when=NOW - 120, thread=T2)
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 15 * 86400)
+        stats = []
+        real = usage.os.stat
+        usage.os.stat = lambda p, *a, **k: (stats.append(p) if str(p).endswith(".jsonl")
+                                             else None) or real(p, *a, **k)
+        try:
+            row, = self.rows(threads=[T1])
+        finally:
+            usage.os.stat = real
+        self.assertEqual(row["sessions"], 2)
+        self.assertEqual(len(stats), 2, stats)
+
+    def test_a_turn_that_writes_past_64_kb_keeps_its_reading(self):
+        path = self.home.rollout([token_count(NOW - 600, used=65.0)], when=NOW - 600)
+        cache = {}
+        self.assertEqual(self.rows(cache)[0]["seven_day"]["pct"], 65.0)
+        with open(path, "a") as fh:                   # the same file, grown
+            for _ in range(80):
+                fh.write(json.dumps({"type": "response_item", "payload": {
+                    "type": "message", "content": "x" * 1000}}) + "\n")
+        os.utime(path, (NOW - 30, NOW - 30))
+        row, = self.rows(cache)
+        self.assertEqual((row["seven_day"]["pct"], row["age"]), (65.0, 600))
+
+    def test_a_replaced_or_shorter_file_is_read_as_new(self):
+        path = self.home.rollout([token_count(NOW - 600, used=65.0)], when=NOW - 600)
+        cache = {}
+        self.assertEqual(len(self.rows(cache)), 1)
+        new = path + ".new"                           # a new inode, no reading
+        with open(new, "w") as fh:
+            fh.write(json.dumps({"type": "session_meta", "payload": {}}) + "\n" + "x" * 900)
+        os.replace(new, path)
+        os.utime(path, (NOW - 30, NOW - 30))
+        self.assertEqual(self.rows(cache), [])
+        path = self.home.rollout([token_count(NOW - 600, used=65.0)], when=NOW - 600,
+                                 thread=T2)
+        self.assertEqual(len(self.rows(cache)), 1)
+        with open(path, "r+") as fh:                  # the same inode, shorter
+            fh.truncate(10)
+        os.utime(path, (NOW - 20, NOW - 20))
+        self.assertEqual(self.rows(cache), [])
+
+    def test_a_malformed_reading_is_no_reading_and_no_error(self):
+        good = token_count(NOW - 30)
+        bad = [["token_count"], {"type": "event_msg", "payload": "token_count"},
+               {"timestamp": good["timestamp"], "type": "event_msg", "payload": {
+                   "type": "token_count", "rate_limits": {"limit_id": "codex", "primary": {
+                       "used_percent": 5, "window_minutes": [10080], "resets_at": 1}}}},
+               {"timestamp": good["timestamp"], "type": "event_msg", "payload": {
+                   "type": "token_count", "rate_limits": ["token_count"]}},
+               {"timestamp": 12, "type": "event_msg", "payload": {
+                   "type": "token_count", "rate_limits": good["payload"]["rate_limits"]}}]
+        self.home.rollout(bad, when=NOW - 40, thread=T1)
+        self.assertEqual(self.rows(), [])
+        self.home.rollout(bad + [good], when=NOW - 30, thread=T2)
+        self.assertEqual(self.rows()[0]["seven_day"]["pct"], 65.0)
+
+    def test_older_than_eight_days_is_not_read(self):
+        self.home.rollout([token_count(NOW - 9 * 86400)], when=NOW - 9 * 86400)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_reading_far_from_the_end_is_not_looked_for(self):
+        # the last token_count is within 8 KB of a file's end (154 files,
+        # measured 2026-10-01): the read stops at 64 KB
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, pad=80)
+        self.assertEqual(self.rows(), [])
+        self.home.rollout([token_count(NOW - 30)], when=NOW - 30, thread=T2, pad=40)  # control
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_file_is_read_again_only_when_it_changed(self):
+        path = self.home.rollout([token_count(NOW - 60, used=65.0)], when=NOW - 60)
+        cache = {}
+        self.assertEqual(self.rows(cache)[0]["seven_day"]["pct"], 65.0)
+        with open(path, "r+") as fh:                  # the same size, the same inode
+            text = fh.read()
+            fh.seek(0)
+            fh.write(text.replace("65.0", "30.0"))
+        os.utime(path, (NOW - 60, NOW - 60))
+        self.assertEqual(self.rows(cache)[0]["seven_day"]["pct"], 65.0)
+        os.utime(path, (NOW - 59, NOW - 59))
+        self.assertEqual(self.rows(cache)[0]["seven_day"]["pct"], 30.0)
+
+    def test_no_codex_home_is_no_rows(self):
+        self.assertEqual(usage.codex_rows(os.path.join(self.home.dir, "nope"), NOW), [])
+
+    def test_a_broken_line_is_skipped(self):
+        path = self.home.rollout([token_count(NOW - 60)], when=NOW - 60)
+        with open(path, "a") as fh:
+            fh.write('{"type": "event_msg", "payload": {"type": "token_count", "rate_l\n')
+        os.utime(path, (NOW - 60, NOW - 60))
+        self.assertEqual(self.rows()[0]["seven_day"]["pct"], 65.0)
+
+
+class TestCodexOnTheUsageLine(unittest.TestCase):
+    """D23: on the line while a Codex thread is open; D24: named by its limit."""
+    CODEX = {"id": "codex:codex", "kind": "codex", "brand": "oai", "email": "", "label": "",
+             "sessions": 0, "age": 60, "five_hour": None,
+             "seven_day": {"state": "ok", "pct": 65.0, "resets_at": CODEX_RESET, "age": 60}}
+    FACTS = {"usage_roots": [{"root": "/h/.claude", "state": "ours", "opted_out": False}]}
+
+    def test_it_follows_the_claude_accounts_as_oai_codex(self):
+        r = reading("login:a", five=(5, FIVE_RESET), sid="s1", email="lukaso@gmail.com")
+        s = usage.snapshot([r], NOW, {"s1"}, self.FACTS, codex=[self.CODEX])
+        self.assertEqual([a["id"] for a in s["accounts"]], ["login:a", "codex:codex"])
+        line = text(usage.usage_lines(s, 200))[0]
+        self.assertIn("  │  oai:codex 7d 65%↑/57% ↻", line)
+        self.assertTrue(line.startswith("usage  ant:lukaso 5h 5%"), line)
+
+    def test_codex_alone_is_a_line(self):
+        s = usage.snapshot([], NOW, set(), {"usage_roots": []}, codex=[self.CODEX])
+        self.assertEqual(s["state"], "ok")
+        self.assertTrue(text(usage.usage_lines(s, 200))[0].startswith("usage  oai:codex 7d 65%"))
+
+    def test_no_codex_no_entry(self):                                     # control
+        r = reading("login:a", five=(5, FIVE_RESET), sid="s1")
+        for codex in (None, []):
+            s = usage.snapshot([r], NOW, {"s1"}, self.FACTS, codex=codex)
+            self.assertNotIn("oai", text(usage.usage_lines(s, 200))[0])
+
+    def test_a_copied_name_names_it(self):
+        self.assertEqual(usage.resolve_id("oai:codex", ["login:a", "codex:codex"]),
+                         "codex:codex")
+        # the line's own name, whole: "codex" is a prefix of "codex:premium" too
+        ids = ["login:a", "codex:codex", "codex:premium"]
+        self.assertEqual(usage.resolve_id("oai:codex", ids), "codex:codex")
+        self.assertEqual(usage.resolve_id("oai:premium", ids), "codex:premium")
+        self.assertIsNone(usage.resolve_id("ant:codex", ids))      # not a Claude account
+        self.assertIsNone(usage.resolve_id("ant:codex", ["login:a", "codex:codex"]))

@@ -792,6 +792,8 @@ class CcwhoUi(App):
         self.jumps = 0          # which jump is the latest: only its answer ends it
         self.seen = {}          # session id -> the turn (ts) you looked at
         self.loading = False    # the saves are being read for the o menu
+        self.note = ""          # an `o` that missed iTerm2's panes: shown until a key
+        self.note_at = 0.0      # when it came: time.monotonic, the clock of a key's .time
 
     # ------------------------------------------------------------------ layout
 
@@ -1127,7 +1129,7 @@ class CcwhoUi(App):
             f"{sessions} sessions" + (f" + {codex} codex" if codex else "")
             + (f": {counts}" if counts else "")
             + when + searching + ("  " + self.status if self.status else ""))
-        trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure)
+        trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure, self.note)
                             if line)
         banner.update(trouble)
         banner.display = bool(trouble)
@@ -2011,8 +2013,33 @@ class CcwhoUi(App):
 
     @work(thread=True)
     def reopening(self, path):
-        said = self.collector.restore(path)
-        self.call_from_thread(self.said, said)
+        report = {}
+        said = self.collector.restore(path, report=report)
+        self.call_from_thread(self.reopened, said, report.get("iterm_windows", 0))
+
+    def reopened(self, text, iterm_windows=0):
+        """What `o` did. When an iTerm2 session went to a new window - it did not
+        go back into the pane iTerm2 restored - it stays on the warning line until
+        a key is pressed: the header's status is gone at the next refresh, seconds
+        after the reopened sessions start, and a narrow window cuts it
+        (2026-09-30). Terminal.app's sessions always get a new window: no miss."""
+        if not iterm_windows:
+            self.said(text)
+            return
+        self.note, self.note_at, self.status = text, time.monotonic(), ""
+        self.paint_header(self.fleet.groups(self.filter_text))
+
+    async def on_event(self, event):
+        # a key pressed on the list after the note came: the note has been seen.
+        # Not a key pressed before it came - nor that key's second pass, when
+        # Textual forwards it back up to the App: the note may land between the
+        # two (Textual stamps a key with time.monotonic on macOS). Not a key for
+        # a menu or a box over the list: the note is under it (reviews 1-3)
+        if (isinstance(event, events.Key) and self.note and event.time > self.note_at
+                and not isinstance(self.screen, ModalScreen)):
+            self.note = ""
+            self.paint_header(self.fleet.groups(self.filter_text))
+        await super().on_event(event)
 
     def action_restart(self):
         # result, not message: run() returns the result, and `message` is only
@@ -2155,11 +2182,12 @@ class Collector:
         import ccwho as runner
         return runner.save_points(live_ids)
 
-    def restore(self, path=None):
-        """Reopen a save, by running ccwho's own restore."""
+    def restore(self, path=None, report=None):
+        """Reopen a save, by running ccwho's own restore. `report` is filled
+        as reopen_saved fills it."""
         try:
             import ccwho as runner
-            return runner.reopen_saved(path)
+            return runner.reopen_saved(path, report=report)
         except Exception as ex:
             return f"could not reopen ({type(ex).__name__})"
 

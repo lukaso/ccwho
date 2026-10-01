@@ -52,7 +52,12 @@ MANIFEST_SESSION_KEYS = {
                           # lack it: a pane id means iTerm2, else the default app
 }
 
-MANIFEST_TOP_KEYS = {"version", "savedAt", "count", "skipped", "skippedWhy", "sessions"}
+MANIFEST_TOP_KEYS = {
+    "version", "savedAt", "count", "skipped", "skippedWhy", "sessions",
+    "boot",               # added 2026-10-01: the boot it was saved in; a save that
+                          # could not ask iTerm2 copies panes only from a save of
+                          # this boot; older manifests lack it and give none
+}
 
 SESSION = {"pid": 4242, "cwd": "/Users/x/projects/liveapp", "kind": "interactive",
            "startedAt": 1788200000000, "sessionId": "4f2b91ac-1111-4222-8333-abc",

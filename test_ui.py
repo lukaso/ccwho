@@ -90,7 +90,7 @@ class FakeCollector:
     def saved_count(self):
         return self.saved
 
-    def restore(self, path=None):
+    def restore(self, path=None, report=None):
         return "reopened 14 session(s)"
 
     def save_points(self, live_ids=()):
@@ -2414,8 +2414,8 @@ class TestOOffersTheSaves(UiTest):
         self.restored = []
         self.asked = []
         self.real = (FakeCollector.restore, FakeCollector.save_points)
-        FakeCollector.restore = lambda s, path=None: (self.restored.append(path)
-                                                      or "reopened 11 session(s)")
+        FakeCollector.restore = lambda s, path=None, report=None: (
+            self.restored.append(path) or "reopened 11 session(s)")
         FakeCollector.save_points = lambda s, live_ids=(): (
             self.asked.append(set(live_ids)) or [dict(p) for p in self.points])
         self.addCleanup(self.put_back)
@@ -2653,6 +2653,145 @@ class TestOOffersTheSaves(UiTest):
                 self.assertNotIn(" o ", self.screen_text(app))
         finally:
             FakeCollector.saved_count = real
+
+
+class TestAReopenThatMissedItsPanesStaysOnScreen(UiTest):
+    """`o` that sent an iTerm2 session to a new window - it did not go back
+    into the pane iTerm2 restored - says so on the warning line until a key is
+    pressed. The header's status is gone at the next refresh, seconds after the
+    reopened sessions start, and a narrow window cuts it (2026-09-30).
+    Terminal.app's sessions always get new windows: they are no miss."""
+
+    MISSED = "reopened 11: 10 in their panes, 1 new window"
+    LONG = "reopened 11: all in new windows, 3 left out - they could not resume"
+
+    def answer(self, text, iterm_windows):
+        def restore(s, path=None, report=None):
+            if report is not None:
+                report["iterm_windows"] = iterm_windows
+            return text
+        real = FakeCollector.restore
+        FakeCollector.restore = restore
+        self.addCleanup(setattr, FakeCollector, "restore", real)
+
+    async def reopen(self, pilot):
+        await pilot.pause()
+        await pilot.press("o")
+        for _ in range(4):
+            await pilot.pause()
+        await pilot.press("enter")
+        for _ in range(6):
+            await pilot.pause()
+
+    def banner(self, app):
+        banner = app.query_one("#banner")
+        return str(banner.render()) if banner.display else ""
+
+    async def test_an_iterm2_new_window_puts_it_on_the_warning_line(self):
+        self.answer(self.MISSED, 1)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.reopen(pilot)
+            self.assertIn(self.MISSED, self.banner(app))
+
+    async def test_it_stays_through_a_refresh(self):
+        self.answer(self.MISSED, 1)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.reopen(pilot)
+            app.show(ui.Fleet([LIVE, BUSY], True, "12:00:05"))
+            await pilot.pause()
+            self.assertIn(self.MISSED, self.banner(app))
+
+    async def test_a_key_press_clears_it(self):
+        self.answer(self.MISSED, 1)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.reopen(pilot)
+            self.assertIn(self.MISSED, self.banner(app))        # shown, then gone
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertNotIn(self.MISSED, self.banner(app))
+
+    async def test_the_key_that_clears_it_still_does_its_job(self):
+        self.answer(self.MISSED, 1)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.reopen(pilot)
+            before = app.selected
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertNotIn(self.MISSED, self.banner(app))
+            self.assertNotEqual(app.selected, before, "down must still move the list")
+
+    async def test_a_key_s_second_pass_does_not_clear_it(self):
+        # Textual gives the App a key twice: from the terminal, then forwarded
+        # back up from the widget. The result may land between the two
+        # (reviews 1 and 2 of carry-panes)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            key = ui.events.Key("down", None)
+            await app.on_event(key)                         # its first pass: no note yet
+            app.reopened(self.MISSED, 1)                    # the result lands between
+            await app.on_event(key)                         # its pass back up, forwarded
+            self.assertIn(self.MISSED, self.banner(app))
+
+    async def test_a_key_pressed_before_it_arrived_does_not_clear_it(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            key = ui.events.Key("down", None)               # pressed, not yet handled
+            app.reopened(self.MISSED, 1)
+            await app.on_event(key)
+            self.assertIn(self.MISSED, self.banner(app))
+
+    async def test_a_note_that_lands_under_a_menu_is_seen_after_it(self):
+        # the keys pressed in a menu are the menu's: the note is under it, not
+        # seen yet (review 3)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("o")
+            for _ in range(4):
+                await pilot.pause()
+            self.assertIsInstance(app.screen, ui.SavesMenu)
+            app.reopened(self.MISSED, 1)                    # an earlier reopen lands now
+            await pilot.press("down", "escape")
+            for _ in range(3):
+                await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.SavesMenu)
+            self.assertIn(self.MISSED, self.banner(app))
+            await pilot.press("down")                       # the first key on the list
+            await pilot.pause()
+            self.assertNotIn(self.MISSED, self.banner(app))
+
+    async def test_a_narrow_window_shows_all_of_it(self):
+        self.answer(self.LONG, 2)
+        app = self.app()
+        async with app.run_test(size=(60, 24)) as pilot:
+            await self.reopen(pilot)
+            self.assertIn(self.LONG, self.banner(app))
+            self.assertGreaterEqual(app.query_one("#banner").size.height, 2,
+                                    "the warning line wraps; it is not cut")
+
+    async def test_it_does_not_hide_a_fleet_error(self):
+        self.answer(self.MISSED, 1)
+        fleet = ui.Fleet([LIVE], False, "12:00:00", "could not read the fleet: boom")
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test() as pilot:
+            await self.reopen(pilot)
+            self.assertIn("boom", self.banner(app))
+            self.assertIn(self.MISSED, self.banner(app))
+
+    async def test_only_terminal_app_windows_use_the_header(self):          # control
+        self.answer("reopened 3: all in new windows", 0)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.reopen(pilot)
+            self.assertEqual(self.banner(app), "")
+            self.assertIn("reopened 3: all in new windows",
+                          str(app.query_one("#header").content))
 
 
 class TestAHiddenSearchBoxCannotEatYourKeys(UiTest):
@@ -4920,6 +5059,22 @@ class TestARefreshAfterAKillWaitsItsTurn(UiTest):
 
 
 SECRET = "/Users/x/secret-project/.env"
+
+
+class TestTheCollectorPassesTheReportOn(unittest.TestCase):
+    """The list learns from the report whether an iTerm2 session missed its
+    pane: the real Collector must hand it on to reopen_saved (2026-09-30)."""
+
+    def test_the_report_reaches_reopen_saved(self):
+        import ccwho as runner
+
+        def reopen(path=None, report=None):
+            report["iterm_windows"] = 2
+            return "reopened 2: all in new windows"
+        report = {}
+        with mock.patch.object(runner, "reopen_saved", side_effect=reopen):
+            said = ui.Collector().restore("/r/x.json", report=report)
+        self.assertEqual((said, report), ("reopened 2: all in new windows", {"iterm_windows": 2}))
 
 
 class TestAnErrorSaysItsTypeOnly(unittest.TestCase):

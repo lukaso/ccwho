@@ -2311,7 +2311,22 @@ def in_temp_dir(path, temp_roots):
     return False
 
 
-def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None):
+def same_process(row, was):
+    """Is this live row the process a saved entry was? The same tty and the same
+    pid: a process keeps both while it runs, and a pane keeps its tty while its
+    process runs. A session resumed elsewhere, or after a reboot, has another
+    pid. No pid or no tty (None, 0, "") is no answer, and never a match - and
+    str(None) is "None", so the values are checked before they are compared."""
+    tty, was_tty = row.get("tty"), was.get("tty")
+    pid, was_pid = row.get("pid"), was.get("pid")
+    if not (isinstance(tty, str) and isinstance(was_tty, str) and tty and was_tty
+            and pid and was_pid):
+        return False
+    return (terms.short_tty_full(tty) == terms.short_tty_full(was_tty)
+            and str(pid) == str(was_pid))
+
+
+def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None, boot=None):
     """Capture the live fleet. Pure: the caller supplies the rows and the clock.
 
     Order is the caller's (collect() sorts needs-you first), so the restore list
@@ -2326,8 +2341,13 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None):
     iTerm2 brings back instead of opening a window beside it.
 
     panes=None means iTerm2 was not asked: each entry then takes its pane and
-    title from `known` (sessionId -> that session's entry in the last save).
+    title from `known` (sessionId -> that session's entry in the last save) -
+    only for the same process (same_process): a session id does not name a
+    pane. The caller gives `known` only from a save of this boot.
     panes={} means iTerm2 answered with none: no pane is recorded.
+
+    boot: this boot's id, recorded so the next save can tell a save made before
+    a reboot, whose pids and ttys are given out again.
     """
     now = int(time.time() if now is None else now)
     kept, why_count = [], {}
@@ -2355,9 +2375,11 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None):
             # iTerm2's: never carried onto a row another app shows
             pane, title = was.get("pane"), was.get("tabTitle")
             ours = r.get("terminal", "") in ("", terms.ITERM2.key)
-            kept[-1]["pane"] = pane if isinstance(pane, str) and ours else ""
-            kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or (title if isinstance(title, str) else "")
-    return {"version": MANIFEST_VERSION, "savedAt": now, "count": len(kept),
+            same = same_process(r, was)
+            kept[-1]["pane"] = pane if isinstance(pane, str) and ours and same else ""
+            kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or (
+                title if isinstance(title, str) and same else "")
+    return {"version": MANIFEST_VERSION, "savedAt": now, "boot": boot, "count": len(kept),
             "skipped": sum(why_count.values()), "skippedWhy": why_count,
             "sessions": kept}
 

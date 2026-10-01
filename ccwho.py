@@ -3431,10 +3431,17 @@ def save(argv):
         print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
         return 1
     panes = engine.terms.ITERM2.panes()
-    # iTerm2 not asked (None): keep the panes the last save knew
-    known = ({e_.get("sessionId"): e_ for e_ in engine.manifest_entries(newest_manifest())
-              if isinstance(e_.get("sessionId"), str)} if panes is None else None)
-    man = engine.manifest_from_rows(rows, why_not=save_problem, panes=panes, known=known)
+    boot = _boot_id()
+    # iTerm2 not asked (None): keep the panes the last save knew - only a save of
+    # this boot (a reboot gives its pids and ttys out again; a save from before
+    # the boot was recorded may hold a pane copied by session id alone), and
+    # only for the same process (manifest_from_rows)
+    last = newest_manifest() if panes is None else {}
+    known = ({e_.get("sessionId"): e_ for e_ in engine.manifest_entries(last)
+              if isinstance(e_.get("sessionId"), str)}
+             if panes is None and boot and last.get("boot") == boot else None)
+    man = engine.manifest_from_rows(rows, why_not=save_problem, panes=panes, known=known,
+                                    boot=boot)
     if man["count"] == 0:
         # Writing this would only push a manifest that HAS something out of the
         # keep-20 window. Nothing to restore is not something to record.
@@ -3471,6 +3478,16 @@ def save(argv):
     why = man.get("skippedWhy") or {}
     note = (", %d not saved (%s)" % (man["skipped"], "; ".join(
         "%d %s" % (n, w) for w, n in sorted(why.items()))) if man["skipped"] else "")
+    # the autosave log says when saves could not ask: on 2026-09-30 a save with
+    # no panes was the last before a reboot, and nothing said so. Of iTerm2's
+    # sessions only: a Terminal.app row never has a pane, and while iTerm2 does
+    # not run, every save of a Terminal.app user is "not asked"
+    in_iterm = [e_ for e_ in man["sessions"]
+                if e_.get("terminal") == engine.terms.ITERM2.key or e_.get("pane")]
+    if panes is None and in_iterm:
+        kept = sum(1 for e_ in in_iterm if e_.get("pane"))
+        print(f"iTerm2 not asked - kept the pane of {kept} of {len(in_iterm)} session(s)"
+              " from the last save")
     print(f"saved {man['count']} session(s){note} -> {out}")
     print("after the reboot:  ccwho restore        (add --open to reopen them)")
     return 0
@@ -3561,7 +3578,7 @@ def save_points(live_ids=()):
 _REOPENING = threading.Lock()
 
 
-def reopen_saved(path=None):
+def reopen_saved(path=None, report=None):
     """What `o` in the list does: the same restore the command line runs, on
     the save chosen in its menu (the newest when none is named).
 
@@ -3572,11 +3589,16 @@ def reopen_saved(path=None):
     One at a time: its output is taken by swapping the process's stdout, and
     the list runs it in a thread - two at once mixed their lines and left
     stdout on a buffer.
+
+    report: a dict, given "iterm_windows" - the sessions the save restored says
+    were in iTerm2 that went to a new window, not a pane iTerm2 restored
+    (restore() counts them): the list keeps its line on screen until a key is
+    pressed.
     """
     if not _REOPENING.acquire(blocking=False):
         return "a reopen is already running - wait for it to finish"
     try:
-        return _reopen_saved(path)
+        return _reopen_saved(path, report)
     finally:
         _REOPENING.release()
 
@@ -3597,11 +3619,63 @@ def _restore_failed(failed, opened=0):
 RESTORE_PART = "reopened"     # the lead of a restore that reopened some: `o` says it as it is
 
 
-def _reopen_saved(path):
-    out = io.StringIO()
+def _where_they_went(text):
+    """`o`'s count, the panes first: "reopened 11: 10 in their panes, 1 new
+    window", "reopened 11: all in their panes", "reopened 11: all in new
+    windows" - or "" when the restore printed no count. A reopen that missed
+    the panes iTerm2 restored must not read like one that filled them, and the
+    list's header is one line: short, the panes first (2026-09-30)."""
+    filled = sum(int(n) for n in re.findall(
+        r"^filled (\d+) pane\(s\) iTerm2 restored\.$", text, re.M))
+    opened = sum(int(n) for n in re.findall(
+        r"^opened (\d+) window\(s\)\. each is at its project, resuming its own session\.$",
+        text, re.M))
+    if not filled and not opened:
+        return ""
+    if filled + opened == 1:
+        where = "in its pane" if filled else "in a new window"
+    elif not opened:
+        where = "all in their panes"
+    elif not filled:
+        where = "all in new windows"
+    else:
+        where = f"{filled} in their panes, {opened} new window{'' if opened == 1 else 's'}"
+    return f"reopened {filled + opened}: {where}"
+
+
+def _iterm_windows(text):
+    """The iTerm2 sessions a restore put in a new window, as restore() counts
+    them: of the sessions the save restored says were in iTerm2, by a launch
+    that ran.
+    Terminal.app's sessions always get a window, and one in no app ccwho knows
+    was never in an iTerm2 pane. Matched as the whole line: a project name in
+    another line may say anything (review 1 of carry-panes)."""
+    return sum(int(n) for n in re.findall(
+        r"^(\d+) iTerm2 session\(s\) had no restored pane to go back into"
+        r" - each is in a new window\.$", text, re.M))
+
+
+class _OneLinePerWrite(io.StringIO):
+    """restore()'s output as `o` reads it: one line per print or write. A line
+    break inside what one call writes - a folder name, ccwho's own dir in a
+    path, an error's text - becomes "?", so no text from a file or the
+    environment makes a line of its own that `o` would count; the newline that
+    ends the call stays (reviews 2-7 of carry-panes). print(a, b) writes a and
+    b on calls of their own, so a break at the end of a stays: restore prints
+    one text per print."""
+
+    def write(self, text):
+        body, end = (text[:-1], "\n") if text.endswith("\n") else (text, "")
+        return super().write(_one_line(body) + end)
+
+
+def _reopen_saved(path, report=None):
+    out = _OneLinePerWrite()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
         rc = restore(["--open"] + (["--from", path] if path else []))
     text = out.getvalue()
+    if report is not None:
+        report["iterm_windows"] = _iterm_windows(text)
     if rc:
         tail = [l for l in text.splitlines() if l.strip()]
         last = (tail[-1] if tail else "see `ccwho restore --open`").removeprefix("ccwho restore: ")
@@ -3609,18 +3683,16 @@ def _reopen_saved(path):
             # in part: what else there is to say, as a whole success says it
             # (review 3 of slices 2-3)
             head, _, why = last.partition(", but ")
-            return f"{head}{_restore_counts(text)}, but {why}"
+            return f"{_where_they_went(text) or head}{_restore_counts(text)}, but {why}"
         if MAY_STILL_RUN in last or CUT_OFF in last:
             return last                     # not failed: not answered
         return "could not reopen: " + last
-    m = re.search(r"^(all \d+ session\(s\)) in that manifest (are already running[^.\n]*)",
+    m = re.search(r"^(all \d+ session\(s\)) in that manifest (are already running or starting)\.$",
                   text, re.M)
     if m:
         return f"{m.group(1)} in that save {m.group(2)}"
-    counts = [int(m.group(1)) for m in
-              re.finditer(r"^(?:opened|filled) (\d+) (?:window|pane)", text, re.M)]
-    said = (f"reopened {sum(counts)} session(s)" if counts
-            else "reopened that save" if path else "reopened the last save")
+    said = (_where_they_went(text)
+            or ("reopened that save" if path else "reopened the last save"))
     return said + _restore_counts(text)
 
 
@@ -3632,11 +3704,17 @@ def _restore_counts(text):
     held = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: holding"))
     blocked = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: blocked"))
     changed = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: changed"))
-    wait = max((int(n) for n in re.findall(r"try again in (\d+) s", text)), default=0)
+    # the advice comes from restore's own words, which end its own lines: a
+    # session's name earlier in a line - a folder name - may say anything (review 4)
+    lines = text.splitlines()
+    cut = [re.search(re.escape(CUT_OFF) + r" (\S+) quit; try again in (\d+) s$", l)
+           for l in lines if l.startswith("ccwho restore: holding")]
+    wait = max((int(m.group(2)) for m in cut if m), default=0)
     # the app the lines name - each launch's own - or all of them in one word
-    named = set(re.findall(r"restart (\S+?)[;.,]?$", text, re.M))
+    named = {m.group(1) for m in (re.search(r"restart (\S+?)[;.,]?$", l) for l in lines
+                                  if l.startswith("ccwho restore: still waiting on")) if m}
     restart = next(iter(named)) if len(named) == 1 else "the terminal app"
-    quit_ = set(re.findall(re.escape(CUT_OFF) + r" (\S+) quit", text))
+    quit_ = {m.group(1) for m in cut if m}
     gone = next(iter(quit_)) if len(quit_) == 1 else "the terminal app"
     return ((f", {left} left out - they could not resume" if left else "")
             + (f", {waiting} still waiting on an earlier launch - restart {restart} if they"
@@ -3644,6 +3722,21 @@ def _restore_counts(text):
             + (f", {held} {CUT_OFF} {gone} quit - try again in {wait} s" if held else "")
             + (f", {blocked} blocked - a claim file that cannot be read" if blocked else "")
             + (f", {changed} changed since the list was read - run it again" if changed else ""))
+
+
+def _one_line(text):
+    """Text that restore prints into one of its lines - a reason that holds a
+    path, a project name - kept on that line: `o` reads restore's lines one by
+    one, and a line break in a folder name would make a line of its own. Every
+    break splitlines() knows: printable() takes \r, \v, \f, \x1c-\x1e and \x85,
+    this \n, U+2028 and U+2029 (reviews 2 and 3 of carry-panes). Nothing that
+    starts an escape sequence either."""
+    return re.sub(r"[\n\u2028\u2029]", "?", engine.procs.printable(str(text)))
+
+
+def _named(entry):
+    """A saved session as restore's lines name it: its project, else its id."""
+    return _one_line(entry.get("project") or entry.get("sessionId") or "?")
 
 
 def restore(argv):
@@ -3670,7 +3763,8 @@ def restore(argv):
     except (OSError, ValueError, RecursionError) as ex:
         # the type only: the list's `o` shows this line, and an error's text can
         # hold a path
-        print(f"ccwho restore: cannot read {path} ({type(ex).__name__})", file=sys.stderr)
+        print(f"ccwho restore: cannot read {_one_line(path)} ({type(ex).__name__})",
+              file=sys.stderr)
         return 1
 
     if "--check" in argv:
@@ -3754,25 +3848,25 @@ def restore(argv):
                     unusable.append(e_)   # no resume line builds from it - say so, don't drop it
             for e_, action in running:
                 if action == "program":         # running, but nothing of yours to open
-                    print(f"{e_.get('project') or e_.get('sessionId')}: a program runs it")
+                    print(f"a program runs it: {_named(e_)}")
                     continue
-                print(f"already open: {e_.get('project') or e_.get('sessionId')}"
+                print(f"already open: {_named(e_)}"
                       f" - focus it with `ccwho open {e_.get('sessionId', '')}`")
             for e_, _ in starting:
-                print(f"already starting: {e_.get('project') or e_.get('sessionId')}"
+                print(f"already starting: {_named(e_)}"
                       " - another ccwho is opening it")
             for e_, why in gone:
-                print(f"ccwho restore: not reopening {e_.get('project') or e_.get('sessionId')}"
-                      f" - {why}", file=sys.stderr)
+                print(f"ccwho restore: not reopening {_named(e_)}"
+                      f" - {_one_line(why)}", file=sys.stderr)
             for e_ in unusable:
-                print(f"ccwho restore: {e_.get('project') or e_.get('sessionId') or '?'}"
-                      " cannot be reopened from this manifest", file=sys.stderr)
+                print(f"ccwho restore: cannot be reopened from this manifest: {_named(e_)}",
+                      file=sys.stderr)
             # each line leads with a word the list's `o` counts it by
             for reason, lead in (("unresolved", "still waiting on"), ("sending", "still waiting on"),
                                  ("cut off", "holding"),
                                  ("unreadable", "blocked"), ("newer", "changed")):
                 for e_, left in held[reason]:
-                    print(f"ccwho restore: {lead} {e_.get('project') or e_.get('sessionId')}"
+                    print(f"ccwho restore: {lead} {_named(e_)}"
                           f" - {_why_text(reason, e_.get('sessionId', ''), left)}", file=sys.stderr)
             if held["old list"]:
                 print(f"ccwho restore: {OLD_LIST}.", file=sys.stderr)
@@ -3852,6 +3946,14 @@ def restore(argv):
         r = done.get(iterm.key)
         wrote = set((r.stdout or "").split()) if r is not None else set()
         filled = [e_ for e_ in in_iterm if fill.get(e_.get("sessionId", "")) in wrote]
+        # iTerm2's misses: sessions the record restored says were in iTerm2 that
+        # a launch which ran put in a new window, not in a pane iTerm2 restored.
+        # One in no app ccwho knows was never in an iTerm2 pane, whatever an older
+        # save says (that still picks its window: D6). `o` keeps this line on
+        # screen (2026-09-30: every session missed its pane, and nothing said so)
+        went = sum(1 for e_ in in_iterm if _record_key(e_) == iterm.key
+                   and engine.restore_command(e_)
+                   and not fill.get(e_.get("sessionId", ""))) if r is not None else 0
         # only a launch that ran says what it did not write: one that failed
         # may still write it (its claims hold), and a second window would fork
         missed = [e_ for e_ in in_iterm
@@ -3859,8 +3961,8 @@ def restore(argv):
         if missed:
             # the script says it never wrote these: their panes closed in between
             for e_ in missed:
-                print(f"{e_.get('project') or e_.get('sessionId')}: its pane closed before"
-                      " ccwho could write to it - opening a new window")
+                print("its pane closed before ccwho could write to it - opening a new"
+                      f" window: {_named(e_)}")
             again = engine.open_script(iterm, missed)
             try:
                 r2, why = launch(iterm, again, restore_deadline(len(missed)),
@@ -3872,8 +3974,12 @@ def restore(argv):
                 failed.append(why)
             else:
                 n += len(missed)
+                went += sum(1 for e_ in missed if _record_key(e_) == iterm.key)
         if filled:
             print(f"filled {len(filled)} pane(s) iTerm2 restored.")
+        if went:
+            print(f"{went} iTerm2 session(s) had no restored pane to go back into"
+                  " - each is in a new window.")
         if n:
             print(f"opened {n} window(s). each is at its project, resuming its own session.")
         _restore_failed(failed, opened=n + len(filled))

@@ -552,6 +552,135 @@ class TestSaveAndRestore(unittest.TestCase):
             runner.subprocess.run = real
 
 
+class TestASaveThatCannotAskKeepsOnlyTheSameProcess(unittest.TestCase):
+    """A save that could not ask iTerm2 keeps a pane id from the last save only
+    for the same process - the same session id, tty and pid - and only from a
+    save made in this boot: pid and tty numbers are given again after a reboot,
+    and a save written before the boot was recorded may hold a pane that was
+    copied by session id alone (2026-09-30)."""
+
+    S1, S2 = "4f2b91ac-1111-4222-8333-abcdefabcdef", "5c3d02bd-2222-4333-8444-bcdefabcdef0"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(setattr, runner, "save_problem", runner.save_problem)
+        runner.save_problem = lambda row: ""
+        self.rows = [self.row(self.S1, "ttys032", 101), self.row(self.S2, "ttys033", 102)]
+
+        def fake_collect(cache=None, status=None, **k):
+            if status is not None:
+                status["source_ok"] = True
+            return ([dict(r) for r in self.rows], 0)
+        self.addCleanup(setattr, runner.engine, "collect", runner.engine.collect)
+        runner.engine.collect = fake_collect
+        iterm = runner.engine.terms.ITERM2
+        self.addCleanup(setattr, iterm, "panes", iterm.panes)
+        iterm.panes = lambda **k: None                  # the gate did not ask iTerm2
+        self.addCleanup(setattr, runner, "_boot_id", runner._boot_id)
+        runner._boot_id = lambda: "THIS-BOOT"
+
+    @staticmethod
+    def row(sid, tty, pid):
+        return {"sessionId": sid, "cwd": "/Users/x/p/liveapp", "project": "liveapp",
+                "topic": "t", "ask": "", "attention": "stopped", "tty": tty, "since": "1h",
+                "status": "idle", "first": "", "pid": pid, "terminal": "iterm2"}
+
+    def last_save(self, boot="THIS-BOOT", name="2026-09-29T0900.json"):
+        """The save before this one, from a save that asked iTerm2."""
+        d = os.path.join(self.tmp, "restore")
+        os.makedirs(d, exist_ok=True)
+        man = {"version": runner.engine.MANIFEST_VERSION, "savedAt": 1, "count": 2,
+               "sessions": [dict(self.row(self.S1, "ttys032", 101), pane="G-1", tabTitle="one"),
+                            dict(self.row(self.S2, "ttys033", 102), pane="G-2", tabTitle="two")]}
+        if boot is not ...:
+            man["boot"] = boot
+        with open(os.path.join(d, name), "w") as fh:
+            json.dump(man, fh)
+
+    def save(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = runner.save([])
+        self.assertEqual(rc, 0, buf.getvalue())
+        newest = runner.newest_manifest()
+        return {e_["sessionId"]: e_.get("pane") for e_ in newest["sessions"]}, newest, buf.getvalue()
+
+    def test_only_the_same_process_keeps_its_pane(self):
+        self.last_save()
+        self.rows[1]["pid"] = 202                       # S2 was resumed: a new process
+        panes, _, _ = self.save()
+        self.assertEqual(panes, {self.S1: "G-1", self.S2: ""})
+
+    def test_two_saves_that_cannot_ask_still_keep_it(self):
+        self.last_save()
+        self.save()
+        panes, _, _ = self.save()                       # copies from the save just written
+        self.assertEqual(panes[self.S1], "G-1")
+
+    def test_the_save_says_how_many_panes_it_kept(self):
+        self.last_save()
+        self.rows[1]["pid"] = 202
+        _, _, out = self.save()
+        self.assertIn("iTerm2 not asked - kept the pane of 1 of 2 session(s) from the last save",
+                      out)
+
+    def test_terminal_app_rows_alone_say_nothing_of_iterm2(self):
+        # no pane is ever theirs; and ITERM2.panes() is None when iTerm2 does
+        # not run, so the line would be in every save of a Terminal.app user
+        self.last_save()
+        for r in self.rows:
+            r["terminal"] = "terminal"
+        _, _, out = self.save()
+        self.assertNotIn("iTerm2", out)
+
+    def test_the_count_is_of_the_iterm2_rows(self):
+        self.last_save()
+        self.rows[1]["terminal"] = "terminal"               # S2 is in Terminal.app now
+        _, _, out = self.save()
+        self.assertIn("iTerm2 not asked - kept the pane of 1 of 1 session(s) from the last save",
+                      out)
+
+    def test_a_save_that_asked_says_nothing_of_it(self):                  # control
+        self.last_save()
+        runner.engine.terms.ITERM2.panes = lambda **k: {}
+        panes, _, out = self.save()
+        self.assertNotIn("not asked", out)
+        self.assertEqual(panes, {self.S1: "", self.S2: ""})
+
+    def test_every_save_records_its_boot(self):
+        self.assertEqual(self.save()[1].get("boot"), "THIS-BOOT")
+
+    def test_a_save_that_asked_gives_the_next_one_its_panes(self):
+        # the order of every day: a save that asked iTerm2, then one that could
+        # not - the first must record the boot the second checks (review 2)
+        runner.engine.terms.ITERM2.panes = lambda **k: {
+            "ttys032": {"pane": "G-1", "name": "one"}, "ttys033": {"pane": "G-2", "name": "two"}}
+        _, asked, _ = self.save()
+        self.assertEqual(asked.get("boot"), "THIS-BOOT")
+        runner.engine.terms.ITERM2.panes = lambda **k: None
+        self.assertEqual(self.save()[0], {self.S1: "G-1", self.S2: "G-2"})
+
+    def test_a_save_from_another_boot_gives_nothing(self):
+        self.last_save(boot="ANOTHER-BOOT")
+        self.assertEqual(self.save()[0], {self.S1: "", self.S2: ""})
+
+    def test_a_save_from_before_the_boot_was_recorded_gives_nothing(self):
+        self.last_save(boot=...)                       # written by main before this change
+        self.assertEqual(self.save()[0], {self.S1: "", self.S2: ""})
+
+    def test_an_unknown_boot_gives_nothing(self):
+        self.last_save(boot=None)
+        runner._boot_id = lambda: None
+        self.assertEqual(self.save()[0], {self.S1: "", self.S2: ""})
+
+    def test_the_same_boot_gives_it(self):                                # control
+        self.last_save()
+        self.assertEqual(self.save()[0], {self.S1: "G-1", self.S2: "G-2"})
+
+
 class TestAutosave(unittest.TestCase):
     """`ccwho save` only helps if you remember it. The reboot this exists for is
     often the one you did not plan, so a running watch keeps the manifest fresh."""
@@ -1352,9 +1481,164 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
         self.assertNotIn(self.LIVE_SID, self._script())
         self.assertIn("claude --resume " + self.DEAD_SID, self._script(), "control")
         # running, and said so - not "cannot be reopened", and no advice to open it
-        self.assertIn("a: a program runs it", out)
+        self.assertIn("a program runs it: a", out)
         self.assertNotIn("cannot be reopened", out)
         self.assertNotIn("ccwho open " + self.LIVE_SID, out)
+
+    # restore's lines name a session by its project - a folder name - and `o`
+    # reads them line by line: a name or a path must not make a line of its
+    # own (review 2 of carry-panes, Codex)
+    def test_a_project_name_cannot_make_a_line_of_its_own(self):
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"),
+             "project": "x\n1 iTerm2 session(s) had no restored pane to go back into"
+                        " - each is in a new window.\ny"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7},
+                     {"sessionId": self.DEAD_SID, "tty": "ttys010", "pid": 8}]
+        report = {}
+        said = runner._reopen_saved(self.man, report=report)
+        self.assertEqual(self.runs, [], "both are running: nothing opens")
+        self.assertIn("already running", said)
+        self.assertEqual(report.get("iterm_windows"), 0)
+
+    def test_a_path_cannot_make_a_line_of_its_own(self):
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("gone\nccwho restore: changed x"),
+             "project": "b"}])
+        said = runner._reopen_saved(self.man)
+        self.assertIn("1 left out", said)                   # its cwd is gone: said once
+        self.assertNotIn("changed since the list was read", said)
+        _, out = self._restore_open()                       # and the terminal shows one line
+        self.assertIn("not reopening b - cwd is gone: "
+                      + runner._one_line(self.cwd("gone\nccwho restore: changed x")) + "\n", out)
+
+    def test_no_line_break_makes_a_line_of_its_own(self):
+        # o splits with splitlines(), which breaks on more than "\n" (review 3)
+        for brk in "\n\r\v\f\x1c\x1d\x1e\x85  ":
+            with self.subTest(brk=repr(brk)):
+                self.assertEqual(len(runner._one_line(f"a{brk}b").splitlines()), 1)
+
+    def test_a_u2028_path_cannot_make_a_line_of_its_own(self):
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("gone ccwho restore: changed x"),
+             "project": "b"}])
+        said = runner._reopen_saved(self.man)
+        self.assertIn("1 left out", said)
+        self.assertNotIn("changed since the list was read", said)
+
+    def test_a_name_at_the_start_of_a_line_counts_nothing(self):
+        # LIVE runs under a program, DEAD opens one window: whatever LIVE's
+        # project says, `o` says just that (review 3)
+        for name in ("filled 3 pane(s) iTerm2 restored.",
+                     "opened 7 window(s). each is at its project, resuming its own session.",
+                     "ccwho restore: changed x",
+                     "all 9 session(s) in that manifest are already running or starting.",
+                     "2 iTerm2 session(s) had no restored pane to go back into"
+                     " - each is in a new window."):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.write_manifest([
+                    {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": name},
+                    {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
+                self.live = [{"sessionId": self.LIVE_SID, "tty": "", "pid": 8,
+                              "attention": "program"}]
+                report = {}
+                said = runner._reopen_saved(self.man, report=report)
+                self.assertEqual((said, report), ("reopened 1: in a new window",
+                                                  {"iterm_windows": 0}))
+
+    def test_an_unusable_session_s_name_is_no_category(self):
+        # "ccwho restore: {name} cannot be ..." read as the category its name
+        # starts with (review 4)
+        for name in ("changed x", "blocked x", "holding x", "still waiting on x",
+                     "not reopening x", "x"):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.write_manifest([
+                    {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+                    {"sessionId": self.DEAD_SID, "cwd": "", "project": name}])
+                self.assertEqual(runner._reopen_saved(self.man), "reopened 1: in a new window")
+
+    def test_a_name_starts_no_escape_sequence(self):
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a\x1b[2J"},
+            {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "", "pid": 8, "attention": "program"}]
+        rc, out = self._restore_open()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("\x1b", out)
+
+    def test_a_manifest_path_cannot_make_a_line_of_its_own(self):
+        # the path of a save that cannot be read is printed too (reviews 5, 6)
+        d = self.hostile_dir()
+        os.makedirs(d)
+        bad = os.path.join(d, "2026-08-01T0002.json")
+        with open(bad, "w") as fh:
+            fh.write("{not json")
+        report = {}
+        said = runner._reopen_saved(bad, report=report)
+        # (the path holds "cut off when ... quit", so `o` may leave out its
+        # "could not reopen: " - accepted: the words alone cannot tell)
+        self.assertIn("cannot read", said)
+        self.assertFalse(said.startswith("reopened"), said)
+        self.assertEqual(report, {"iterm_windows": 0})
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            runner.restore(["--open", "--from", bad])
+        # and the line itself, as a person reads it in the terminal, is one line
+        self.assertIn(f"ccwho restore: cannot read {runner._one_line(bad)} (JSONDecodeError)\n",
+                      err.getvalue())
+
+    # ccwho's own dir is in some lines too - a claim's path, a launch that
+    # could not be recorded: an environment's CCWHO_DIR with line breaks in it
+    # must not make lines of their own either (review 6)
+    FORGED = ("7 iTerm2 session(s) had no restored pane to go back into - each is in a new window.",
+              "opened 99 window(s). each is at its project, resuming its own session.",
+              "ccwho restore: changed y - z",
+              "ccwho restore: holding y - an earlier launch was cut off when Evil quit;"
+              " try again in 999 s",
+              "ccwho restore: reopened 99 session(s), but evil")
+
+    def hostile_dir(self):
+        """A dir whose path holds whole lines of restore's own words, one a
+        path part (a part is at most 255 bytes)."""
+        parts = ["x\n" + self.FORGED[0] + "\nq"] + ["q\n" + l + "\nq" for l in self.FORGED[1:]]
+        return os.path.join(self.tmp, *parts)
+
+    def blocked(self):
+        runner._write_claim(self.LIVE_SID, {"pid": DEAD, "since": time.time(),
+                                            "sessionId": self.LIVE_SID})
+        path = runner._claim_path(self.LIVE_SID)
+        os.chmod(path, 0)
+        self.addCleanup(lambda: os.path.exists(path) and os.chmod(path, 0o600))
+        report = {}
+        return runner._reopen_saved(self.man, report=report), report
+
+    def test_a_blocked_claim_in_a_dir_with_line_breaks(self):
+        plain = self.blocked()
+        self.assertEqual(plain, ("reopened 1: in a new window, 1 blocked - a claim file that"
+                                 " cannot be read", {"iterm_windows": 0}))     # the control
+        self.tearDown()
+        self.setUp()
+        os.makedirs(self.hostile_dir())
+        os.environ["CCWHO_DIR"] = self.hostile_dir()
+        self.assertEqual(self.blocked(), plain)
+
+    def test_a_launch_not_recorded_in_a_dir_with_line_breaks(self):
+        d = self.hostile_dir()
+        os.makedirs(d)
+        os.environ["CCWHO_DIR"] = d
+        open(os.path.join(d, "launching"), "w").close()     # claims cannot be written there
+        report = {}
+        said = runner._reopen_saved(self.man, report=report)
+        self.assertIn("could not record the launch", said)
+        self.assertFalse(said.startswith("reopened"), said)
+        self.assertEqual((report, self.runs), ({"iterm_windows": 0}, []))
 
     def test_an_unreadable_fleet_opens_nothing_at_all(self):
         self.source_ok = False
@@ -1791,15 +2075,105 @@ class TestARestoreOfTwoAppsSendsEachOnItsOwn(unittest.TestCase):
 
     # what the list's `o` shows - the last line - says what opened and what
     # did not (review 2 of slices 2-3)
-    def reopen(self):
-        return runner._reopen_saved(self.man)
+    def reopen(self, report=None):
+        return runner._reopen_saved(self.man, **({} if report is None else {"report": report}))
 
     def test_o_after_one_app_opened_and_one_refused(self):
         self.refuses = "terminal"
         said = self.reopen()
-        self.assertIn("reopened 1 session", said)
+        self.assertIn("reopened 1: in its pane, but", said)
         self.assertIn("Terminal.app refused", said)
         self.assertNotIn("could not reopen", said)
+
+    def test_o_says_where_each_app_s_sessions_went(self):
+        # the Terminal.app window is a new window, but not an iTerm2 one: a
+        # Terminal.app session always gets a window (2026-09-29), and is no miss
+        report = {}
+        said = self.reopen(report)
+        self.assertIn("reopened 2: 1 in their panes, 1 new window", said)
+        self.assertEqual(report.get("iterm_windows"), 0)
+
+    def test_o_counts_a_pane_that_closed_as_an_iterm2_window(self):
+        self.wrote = ""                                     # the fill wrote nothing: G-B closed
+        report = {}
+        said = self.reopen(report)
+        self.assertIn("reopened 2: all in new windows", said)
+        self.assertEqual(report.get("iterm_windows"), 1)
+
+    # an iTerm2 miss is a session its save says was in iTerm2 that a launch
+    # which ran put in a new window (review 1 of carry-panes): the real
+    # restore() prints the count, and `o` reads that line
+    def second(self, **entry):
+        """The manifest: LIVE in iTerm2's pane G-B, and DEAD as given."""
+        self.write_manifest([
+            {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a",
+             "terminal": "iterm2", "pane": "G-B"},
+            dict({"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}, **entry)])
+
+    def test_an_iterm2_session_with_no_pane_is_a_miss(self):                         # control
+        self.second(terminal="iterm2")                      # its save lost the pane, as on 2026-09-30
+        report = {}
+        with mock.patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}):
+            said = self.reopen(report)
+        self.assertIn("reopened 2: 1 in their panes, 1 new window", said)
+        self.assertEqual(report.get("iterm_windows"), 1)
+
+    def test_a_session_in_no_app_is_no_iterm2_miss(self):
+        # VS Code's terminal, tmux: never in an iTerm2 pane - it opens where you are
+        self.second(terminal="")
+        report = {}
+        with mock.patch.dict(os.environ, {"TERM_PROGRAM": "iTerm.app"}):
+            said = self.reopen(report)
+        self.assertIn("reopened 2: 1 in their panes, 1 new window", said)
+        self.assertEqual(report.get("iterm_windows"), 0)
+
+    def test_an_older_save_s_app_is_no_iterm2_miss(self):
+        # the save being restored says DEAD was in no app; an older save says
+        # iTerm2. The older save still chooses where its window opens (D6), but
+        # the record restored was in no iTerm2 pane to miss (review 2)
+        with open(os.path.join(os.path.dirname(self.man), "2026-07-01T0000.json"), "w") as fh:
+            json.dump({"version": 1, "savedAt": 1, "count": 1, "skipped": 0, "sessions": [
+                {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b",
+                 "terminal": "iterm2", "pane": "G-OLD"}]}, fh)
+        self.second(terminal="")
+        report = {}
+        with mock.patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}):
+            said = self.reopen(report)
+        self.assertNotIn("terminal", self.sent, "the older save still sends it to iTerm2")
+        self.assertIn("1 new window", said)
+        self.assertEqual(report.get("iterm_windows"), 0)
+
+    def test_a_record_from_before_apps_that_missed_its_pane_is_a_miss(self):         # control
+        self.second(pane="G-X")                             # no "terminal": its pane says iTerm2
+        report = {}
+        self.reopen(report)
+        self.assertEqual(report.get("iterm_windows"), 1)
+
+    def test_a_closed_pane_s_name_counts_nothing(self):
+        # its line names the session: the name must not read as restore's count
+        for name in ("filled 99 pane(s) iTerm2 restored.", "ccwho restore: changed x"):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.write_manifest([
+                    {"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": name,
+                     "terminal": "iterm2", "pane": "G-B"},
+                    {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b",
+                     "terminal": "terminal"}])
+                self.wrote = ""                             # G-B closed before the write
+                report = {}
+                said = self.reopen(report)
+                self.assertEqual((said, report), ("reopened 2: all in new windows",
+                                                  {"iterm_windows": 1}))
+
+    def test_a_refused_iterm2_window_opened_nothing(self):
+        self.write_manifest([{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a",
+                              "terminal": "iterm2"}])
+        self.refuses = "iterm2"
+        report = {}
+        said = self.reopen(report)
+        self.assertTrue(said.startswith("could not reopen"), said)
+        self.assertEqual(report.get("iterm_windows"), 0)
 
     def test_o_after_both_did_not_answer_names_both(self):
         self.fails = ("iterm2", "terminal")
@@ -1817,7 +2191,7 @@ class TestARestoreOfTwoAppsSendsEachOnItsOwn(unittest.TestCase):
         self.write_manifest(man["sessions"])
         self.refuses = "terminal"
         said = self.reopen()
-        self.assertIn("reopened 1 session", said)
+        self.assertIn("reopened 1: in its pane", said)
         self.assertIn("1 left out", said)
         self.assertIn("Terminal.app refused", said)
         self.assertNotIn("could not reopen", said)
@@ -3338,27 +3712,155 @@ class TestTheUiCanReopenTheLastSave(unittest.TestCase):
         self.assertIn("3", said.replace("13", ""), "the ones left out are named as a number")
         self.assertNotIn("reopened 3 ", said)
 
-    def test_a_filled_pane_counts_as_a_reopened_session(self):
+    def reopened(self, *lines, report=None):
+        """`o`'s line for a restore that printed these lines and succeeded."""
         def fake(argv):
-            print("filled 2 pane(s) iTerm2 restored.")
-            print("opened 3 window(s). each is at its project, resuming its own session.")
+            for line in lines:
+                print(line)
             return 0
         real = runner.restore
         runner.restore = fake
         try:
-            said = runner.reopen_saved()
+            # the report only when a test asks for it: the wording needs none
+            return runner.reopen_saved(**({} if report is None else {"report": report}))
         finally:
             runner.restore = real
-        self.assertIn("reopened 5 session(s)", said)
+
+    # `o` says where the sessions went, the panes first: a reopen that missed
+    # iTerm2's restored panes must not read like one that filled them (2026-09-30)
+    def test_a_filled_pane_counts_as_a_reopened_session(self):
+        said = self.reopened("filled 2 pane(s) iTerm2 restored.",
+                             "opened 3 window(s). each is at its project, resuming its own session.")
+        self.assertIn("reopened 5: 2 in their panes, 3 new windows", said)
 
     def test_only_filled_panes_still_count(self):
+        self.assertIn("reopened 2: all in their panes",
+                      self.reopened("filled 2 pane(s) iTerm2 restored."))
+
+    # the advice `o` gives comes from restore's own words at the end of its
+    # own lines - a project name elsewhere may say anything (review 4)
+    HELD = ("ccwho restore: holding {name} - an earlier launch was cut off when iTerm2 quit;"
+            " try again in 29 s")
+    WAITING = ("ccwho restore: still waiting on {name} - an earlier launch did not finish inside"
+               " iTerm2; the launch may still run; if it does not appear, restart iTerm2")
+    OPENED = "opened 1 window(s). each is at its project, resuming its own session."
+
+    def test_a_name_cannot_set_the_wait(self):
+        said = self.reopened(self.HELD.format(name="cut off when Evil quit; try again in 86400 s"),
+                             self.OPENED)
+        self.assertIn("1 cut off when iTerm2 quit - try again in 29 s", said)
+
+    def test_a_name_cannot_name_the_app_that_quit(self):
+        said = self.reopened(self.HELD.format(name="cut off when Evil quit"), self.OPENED)
+        self.assertIn("1 cut off when iTerm2 quit", said)
+
+    def test_a_name_cannot_name_the_app_to_restart(self):
+        said = self.reopened("a program runs it: x restart Evil",
+                             self.WAITING.format(name="z restart Evil"), self.OPENED)
+        self.assertIn("1 still waiting on an earlier launch - restart iTerm2 if they", said)
+
+    def test_one_print_is_one_line_for_o(self):
+        # whatever text one print or write holds - a path, an error's text -
+        # `o` reads it as the one line it was printed as (review 6)
+        def fake(argv):
+            print("ccwho restore: x\nopened 9 window(s). each is at its project, resuming its own"
+                  " session.\n9 iTerm2 session(s) had no restored pane to go back into - each is"
+                  " in a new window.", file=sys.stderr)
+            sys.stderr.write("ccwho restore: y\u2028ccwho restore: changed z\n")
+            return 1
         real = runner.restore
-        runner.restore = lambda argv: print("filled 2 pane(s) iTerm2 restored.") or 0
+        runner.restore = fake
         try:
-            said = runner.reopen_saved()
+            report = {}
+            said = runner.reopen_saved(report=report)
         finally:
             runner.restore = real
-        self.assertIn("reopened 2 session(s)", said)
+        self.assertTrue(said.startswith("could not reopen: y"), said)
+        self.assertEqual(report, {"iterm_windows": 0})
+
+    def test_every_line_break_is_one_line_for_o(self):
+        # each break splitlines() knows, and an escape: inside one print they
+        # stay on its line for `o` - the capture, not only _named (review 7)
+        for brk in _LINE_BREAKS + ("\x1b",):
+            with self.subTest(brk=repr(brk)):
+                def fake(argv, brk=brk):
+                    print("ccwho restore: y" + brk + "7 iTerm2 session(s) had no restored pane to go"
+                          " back into - each is in a new window." + brk + "opened 9 window(s). each"
+                          " is at its project, resuming its own session.", file=sys.stderr)
+                    return 1
+                real = runner.restore
+                runner.restore = fake
+                try:
+                    report = {}
+                    said = runner.reopen_saved(report=report)
+                finally:
+                    runner.restore = real
+                self.assertTrue(said.startswith("could not reopen: y"), said)
+                self.assertNotIn("\x1b", said)
+                self.assertEqual(report, {"iterm_windows": 0})
+
+    def test_a_count_line_is_the_whole_line(self):
+        # restore's own lines start with its own words; a line that starts with
+        # a count's words and goes on is not that count (review 3)
+        said = self.reopened(
+            "filled 3 pane(s) iTerm2 restored.: x",
+            "opened 7 window(s). each is at its project, resuming its own session.: y",
+            "all 9 session(s) in that manifest are already running or starting.: z",
+            "opened 1 window(s). each is at its project, resuming its own session.")
+        self.assertEqual(said, "reopened 1: in a new window")
+
+    def test_one_session_is_one(self):
+        self.assertIn("reopened 1: in its pane", self.reopened("filled 1 pane(s) iTerm2 restored."))
+        self.assertIn("reopened 1: in a new window", self.reopened(
+            "opened 1 window(s). each is at its project, resuming its own session."))
+
+    def test_one_new_window_is_one(self):
+        said = self.reopened("filled 10 pane(s) iTerm2 restored.",
+                             "opened 1 window(s). each is at its project, resuming its own session.")
+        self.assertIn("reopened 11: 10 in their panes, 1 new window", said)
+        self.assertNotIn("1 new windows", said)
+
+    def test_no_pane_filled_says_so(self):
+        said = self.reopened("opening 11 iTerm2 window(s)...",
+                             "opened 11 window(s). each is at its project, resuming its own session.")
+        self.assertIn("reopened 11: all in new windows", said)
+
+    def test_it_counts_the_iterm2_windows_for_the_list(self):
+        report = {}
+        self.reopened("opening 2 iTerm2 window(s)...", "opening 3 Terminal.app window(s)...",
+                      "2 iTerm2 session(s) had no restored pane to go back into"
+                      " - each is in a new window.",
+                      "opened 5 window(s). each is at its project, resuming its own session.",
+                      report=report)
+        self.assertEqual(report.get("iterm_windows"), 2)
+
+    def test_the_line_must_end_where_the_count_line_ends(self):
+        # a line that holds the count's words and then more is not the count:
+        # only the end of the line tells it from restore's own (review 2)
+        report = {}
+        self.reopened("2 iTerm2 session(s) had no restored pane to go back into - each is in"
+                      " a new window.: a program runs it",
+                      "all 1 session(s) in that manifest are already running or starting.",
+                      report=report)
+        self.assertEqual(report.get("iterm_windows"), 0)
+
+    def test_terminal_app_windows_are_not_iterm2_windows(self):            # control
+        report = {}
+        self.reopened("opening 3 Terminal.app window(s)...",
+                      "opened 3 window(s). each is at its project, resuming its own session.",
+                      report=report)
+        self.assertEqual(report.get("iterm_windows"), 0)
+
+    def test_a_project_named_like_the_lines_is_no_window(self):
+        # a project is a folder name: it may say anything (review 1, Codex)
+        report = {}
+        self.reopened("already open: x: its pane closed before ccwho could write to it - opening"
+                      " a new window - focus it with `ccwho open s1`",
+                      "already open: 1 iTerm2 session(s) had no restored pane to go back into"
+                      " - each is in a new window. - focus it with `ccwho open s2`",
+                      "all 2 session(s) in that manifest are already running or starting.",
+                      report=report)
+        self.assertEqual(report.get("iterm_windows"), 0)
 
     def test_it_says_when_the_restore_refused(self):
         real = runner.restore
@@ -5815,7 +6317,8 @@ class TestARestoreRetryThatTimesOutKeepsItsClaims(unittest.TestCase):
 
 class TestASaveThatCouldNotAsk(unittest.TestCase):
     """At save level: iTerm2 not asked, the newest manifest's panes carry over -
-    and a damaged newest manifest does not stop the save."""
+    from a save of this boot, for the same process - and a damaged newest
+    manifest does not stop the save."""
 
     ROWS = TestSaveAndRestore.ROWS
     setUp, tearDown, _save = TestSaveAndRestore.setUp, TestSaveAndRestore.tearDown, TestSaveAndRestore._save
@@ -5824,13 +6327,16 @@ class TestASaveThatCouldNotAsk(unittest.TestCase):
         d = runner.restore_dir()
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "2026-01-01T0000.json"), "w") as fh:
-            json.dump({"version": 1, "savedAt": 1, "count": 1, "skipped": 0, "sessions": sessions}, fh)
+            json.dump({"version": 1, "savedAt": 1, "count": 1, "skipped": 0, "sessions": sessions,
+                       "boot": "THIS-BOOT"}, fh)
 
     def setUp(self):
         TestSaveAndRestore.setUp(self)
         real = runner.engine.terms.ITERM2.panes
         self.addCleanup(setattr, runner.engine.terms.ITERM2, "panes", real)
         runner.engine.terms.ITERM2.panes = lambda **k: None
+        self.addCleanup(setattr, runner, "_boot_id", runner._boot_id)
+        runner._boot_id = lambda: "THIS-BOOT"
 
     def saved(self):
         d = runner.restore_dir()
@@ -5840,7 +6346,8 @@ class TestASaveThatCouldNotAsk(unittest.TestCase):
 
     def test_the_last_known_pane_is_kept(self):
         sid = self.ROWS[0]["sessionId"]
-        self.newest([{"sessionId": sid, "pane": "G-1", "tabTitle": "t"}])
+        self.newest([{"sessionId": sid, "pane": "G-1", "tabTitle": "t",
+                      "tty": self.ROWS[0]["tty"], "pid": self.ROWS[0]["pid"]}])
         rc, _ = self._save()
         self.assertEqual(rc, 0)
         self.assertEqual([e["pane"] for e in self.saved()["sessions"] if e["sessionId"] == sid], ["G-1"])
@@ -8142,6 +8649,198 @@ class TestASessionLaunchedSinceTheListLeavesTheRestAlone(unittest.TestCase):
         self.assertNotIn("claude --resume " + self.DEAD_SID, self._script())
         self.assertIn("run it again", out)
         self.assertNotIn("already running or starting", out)
+
+
+# restore's own words, each line break splitlines() knows, and names made of them
+_RESTORE_WORDS = (
+    "ccwho restore: changed x",
+    "ccwho restore: holding x - an earlier launch was cut off when Evil quit; try again in 999 s",
+    "ccwho restore: still waiting on x - restart Evil",
+    "ccwho restore: reopened 9 session(s), but Evil",
+    "ccwho restore: not reopening x - y",
+    "ccwho restore: blocked x",
+    "filled 9 pane(s) iTerm2 restored.",
+    "opened 9 window(s). each is at its project, resuming its own session.",
+    "7 iTerm2 session(s) had no restored pane to go back into - each is in a new window.",
+    "all 9 session(s) in that manifest are already running or starting.")
+_LINE_BREAKS = ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+_HOSTILE_NAMES = (
+    list(_RESTORE_WORDS)
+    + ["x" + brk + _RESTORE_WORDS[i % len(_RESTORE_WORDS)]
+       for i, brk in enumerate(_LINE_BREAKS * 2)]
+    + ["cut off when Evil quit; try again in 999 s", "x restart Evil.", "x, but y",
+       "reopened 3 session(s), but z", "the launch may still run", "a\x1b[2J",
+       "x - an earlier launch did not finish inside Evil; the launch may still run;"
+       " if it does not appear, restart Evil"])
+
+
+class _NamesChangeNothing:
+    """A session's project - a folder name - is printed in restore's lines, and
+    `o` reads those lines. On every branch that prints a session's name, a name
+    built from restore's own words, with each line break splitlines() knows,
+    must leave `o`'s line and its report as the plain name "n" does - and the
+    line restore prints must show the name on that one line, as _one_line has
+    it (reviews 2-6 of carry-panes; after review 5's probe). A branch must say
+    which line names the session (LINES): one that names nobody tests nothing."""
+
+    NAMES = _HOSTILE_NAMES
+    RESTORE_OPEN = TestRestoreOpenSkipsWhatIsAlreadyRunning._restore_open
+
+    def run_branch(self, branch, name):
+        """(`o`'s line, its report, what restore printed) for this branch and name."""
+        self.tearDown()
+        self.setUp()
+        branch(name)
+        report = {}
+        said = runner._reopen_saved(self.man, report=report)
+        self.tearDown()
+        self.setUp()
+        branch(name)
+        _, out = self.RESTORE_OPEN()
+        return said, report, out
+
+    def check(self, *branches):
+        for branch in branches:
+            line = self.LINES[branch.__name__]          # a KeyError: the branch names nobody
+            said, report, out = self.run_branch(branch, "n")
+            self.assertIn(line.format("n"), out, f"{branch.__name__} names its session")
+            for name in self.NAMES:
+                with self.subTest(branch=branch.__name__, name=name):
+                    got = self.run_branch(branch, name)
+                    self.assertEqual(got[:2], (said, report))
+                    self.assertIn(line.format(runner._one_line(name)), got[2])
+
+
+class TestNoSavedNameChangesWhatOSays(_NamesChangeNothing, unittest.TestCase):
+    _F = TestRestoreOpenSkipsWhatIsAlreadyRunning
+    LIVE_SID, DEAD_SID = _F.LIVE_SID, _F.DEAD_SID
+    write_manifest = _F.write_manifest
+    LINES = {"program": "a program runs it: {}", "open_": "already open: {}",
+             "starting": "already starting: {}", "gone": "ccwho restore: not reopening {}",
+             "unusable": "cannot be reopened from this manifest: {}",
+             "cut": "ccwho restore: holding {}", "waiting": "ccwho restore: still waiting on {}",
+             "unreadable": "ccwho restore: blocked {}", "changed": "ccwho restore: changed {}"}
+
+    def setUp(self):
+        self._F.setUp(self)
+
+    def tearDown(self):
+        self._F.tearDown(self)
+
+    def two(self, live, dead="b"):
+        self.write_manifest([{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": live},
+                             {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": dead}])
+
+    def claim(self, **rec):
+        runner._write_claim(self.LIVE_SID, dict({"since": time.time(), "sessionId": self.LIVE_SID},
+                                                **rec))
+
+    def program(self, name):
+        self.two(name)
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "", "pid": 8, "attention": "program"}]
+
+    def open_(self, name):
+        self.two(name)
+        self.live = [{"sessionId": self.LIVE_SID, "tty": "ttys009", "pid": 7}]
+
+    def starting(self, name):
+        self.two(name)
+        self.claim(pid=os.getpid())
+
+    def gone(self, name):
+        # its cwd is gone: the reason names that path, which holds the name too
+        self.write_manifest([{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+                             {"sessionId": self.DEAD_SID, "cwd": self.cwd("zz-gone-" + name),
+                              "project": name}])
+
+    def unusable(self, name):
+        self.write_manifest([{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": "a"},
+                             {"sessionId": self.DEAD_SID, "cwd": "", "project": name}])
+
+    def cut(self, name):
+        self.two(name)
+        self.claim(pid=DEAD, owner="x", since=time.time() - 10, launched=True, cut_off=True)
+
+    def waiting(self, name):
+        self.two(name)
+        me = os.getpid()
+        self.addCleanup(setattr, runner, "_boot_id", runner._boot_id)
+        runner._boot_id = lambda: "THIS-BOOT"
+        self.addCleanup(setattr, runner.engine.terms, "app_snapshot", GUARDS["app_snapshot"])
+        runner.engine.terms.app_snapshot = lambda: f"  PID UID UCOMM\n{me} {os.getuid()} iTerm2\n"
+        self.claim(pid=DEAD, owner="x", since=time.time() - 5, unresolved=True, iterm_pid=me,
+                   app="iterm2", boot="THIS-BOOT")
+
+    def unreadable(self, name):
+        self.two(name)
+        self.claim(pid=DEAD)
+        path = runner._claim_path(self.LIVE_SID)
+        os.chmod(path, 0)
+        self.addCleanup(lambda: os.path.exists(path) and os.chmod(path, 0o600))
+
+    def changed(self, name):
+        self.two(name)
+
+        def scan(cache=None, status=None, **k):
+            status["source_ok"] = True
+            self.claim(pid=DEAD, owner="x", since=time.time() + 1, launched=True)
+            return [], 0
+        runner.engine.collect = scan
+
+    def test_a_running_session(self):
+        self.check(self.program, self.open_, self.starting)
+
+    def test_one_left_out(self):
+        self.check(self.gone, self.unusable)
+
+    def test_one_held(self):
+        self.check(self.cut, self.waiting, self.unreadable, self.changed)
+
+
+class TestNoSavedNameChangesWhatOSaysOfTwoApps(_NamesChangeNothing, unittest.TestCase):
+    """The same, where iTerm2 fills a pane and Terminal.app opens a window: a
+    pane that closed before its write, and a third session held while one app
+    failed (the in-part line)."""
+
+    _G = TestARestoreOfTwoAppsSendsEachOnItsOwn
+    LIVE_SID, DEAD_SID = _G.LIVE_SID, _G.DEAD_SID
+    write_manifest = _G.write_manifest
+    THIRD = "33333333-3333-4333-8333-333333333333"
+    LINES = {"missed": "opening a new window: {}", "held_third": "ccwho restore: holding {}"}
+
+    def setUp(self):
+        self._G.setUp(self)
+
+    def tearDown(self):
+        self._G.tearDown(self)
+
+    def apps(self, iterm, terminal, third=None):
+        sessions = [{"sessionId": self.LIVE_SID, "cwd": self.cwd("a"), "project": iterm,
+                     "terminal": "iterm2", "pane": "G-B"},
+                    {"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": terminal,
+                     "terminal": "terminal"}]
+        if third is not None:
+            sessions.append({"sessionId": self.THIRD, "cwd": self.cwd("c"), "project": third,
+                             "terminal": "iterm2"})
+            self.on_disk.add(self.THIRD)
+            runner._write_claim(self.THIRD, {"pid": DEAD, "owner": "x", "since": time.time() - 10,
+                                             "sessionId": self.THIRD, "launched": True,
+                                             "cut_off": True, "app": "terminal"})
+        self.write_manifest(sessions)
+
+    def missed(self, name):
+        self.apps(name, "b")
+        self.wrote = ""                                     # G-B closed before the write
+
+    def held_third(self, name):
+        self.apps("a", "b", name)
+        self.fails = "terminal"
+
+    def test_a_pane_that_closed(self):
+        self.check(self.missed)
+
+    def test_one_held_while_an_app_failed(self):
+        self.check(self.held_third)
 
 
 class TestTheListCountsASessionThatChanged(unittest.TestCase):

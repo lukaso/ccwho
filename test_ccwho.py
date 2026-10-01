@@ -7655,20 +7655,53 @@ class TestAReusedTerminalLosesItsOldName(unittest.TestCase):
 
 class TestASaveThatCannotAskKeepsThePanesItKnew(unittest.TestCase):
     """A save every 15 minutes, keeping 20: five hours of saves while iTerm2 is
-    quarantined would push every manifest that knew its panes out."""
+    quarantined would push every manifest that knew its panes out.
 
-    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": ""}
+    Only for the same process: the same session id, tty and pid as the last
+    save. A session id does not name a pane - a session resumed elsewhere, or
+    after a reboot, would be given the pane it left (2026-09-30)."""
 
-    def test_unknown_panes_carry_over_from_the_last_save(self):
-        man = ccwho.manifest_from_rows([self.ROW], panes=None,
-                                       known={"s1": {"pane": "G-1", "tabTitle": "old tab"}})
-        self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]),
-                         ("G-1", "old tab"))
+    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": "",
+           "pid": 4100}
+    WAS = {"pane": "G-1", "tabTitle": "old tab", "tty": "ttys022", "pid": 4100}
+
+    def carried(self, row=None, **was):
+        man = ccwho.manifest_from_rows([dict(self.ROW, **(row or {}))], panes=None,
+                                       known={"s1": dict(self.WAS, **was)})
+        return man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]
+
+    def test_unknown_panes_carry_over_from_the_last_save(self):            # control
+        self.assertEqual(self.carried(), ("G-1", "old tab"))
 
     def test_asked_and_no_pane_is_no_pane(self):                         # control
-        man = ccwho.manifest_from_rows([self.ROW], panes={},
-                                       known={"s1": {"pane": "G-1", "tabTitle": "old tab"}})
+        man = ccwho.manifest_from_rows([self.ROW], panes={}, known={"s1": self.WAS})
         self.assertEqual(man["sessions"][0]["pane"], "")
+
+    def test_a_new_pid_on_the_same_tty_does_not_carry(self):
+        # resumed in the same tab, or after a reboot that gave the tty again
+        self.assertEqual(self.carried(row={"pid": 5200}), ("", ""))
+
+    def test_a_new_tty_does_not_carry(self):
+        self.assertEqual(self.carried(row={"tty": "ttys031"}), ("", ""))
+
+    def test_a_saved_entry_with_no_pid_does_not_carry(self):
+        self.assertEqual(self.carried(pid=None), ("", ""))
+
+    def test_a_row_with_no_tty_does_not_carry(self):
+        self.assertEqual(self.carried(row={"tty": ""}, tty=""), ("", ""))
+
+    def test_no_pid_on_either_side_does_not_carry(self):
+        # str(None) is "None", which is not empty: the check is on the values
+        self.assertEqual(self.carried(row={"pid": None}, pid=None), ("", ""))
+
+    def test_pid_zero_on_both_sides_does_not_carry(self):
+        self.assertEqual(self.carried(row={"pid": 0}, pid=0), ("", ""))
+
+    def test_a_pid_read_back_as_text_still_matches(self):                  # control
+        self.assertEqual(self.carried(pid="4100"), ("G-1", "old tab"))
+
+    def test_a_long_tty_matches_its_short_form(self):                      # control
+        self.assertEqual(self.carried(row={"tty": "/dev/ttys022"}), ("G-1", "old tab"))
 
 
 class TestTheRealTablesNameTheProgramNotItsArgv0(unittest.TestCase):
@@ -8007,11 +8040,19 @@ class TestACarriedPaneIsText(unittest.TestCase):
     """What the last save said is read off disk: a pane or title that is not a
     string would be copied into every save and break the restore that reads it."""
 
-    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": ""}
+    ROW = {"sessionId": "s1", "cwd": "/x", "project": "x", "tty": "ttys022", "tab_title": "",
+           "pid": 4100}
+    SAME = {"tty": "ttys022", "pid": 4100}      # the same process: only the values are junk
 
     def test_a_pane_that_is_not_text_is_not_carried(self):
-        man = ccwho.manifest_from_rows([self.ROW], panes=None, known={"s1": {"pane": ["G"], "tabTitle": 5}})
+        man = ccwho.manifest_from_rows([self.ROW], panes=None,
+                                       known={"s1": dict(self.SAME, pane=["G"], tabTitle=5)})
         self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]), ("", ""))
+
+    def test_text_is_carried(self):                                         # control
+        man = ccwho.manifest_from_rows([self.ROW], panes=None,
+                                       known={"s1": dict(self.SAME, pane="G", tabTitle="t")})
+        self.assertEqual((man["sessions"][0]["pane"], man["sessions"][0]["tabTitle"]), ("G", "t"))
 
 
 class TestOnlyAnITerm2RowCarriesAPane(unittest.TestCase):
@@ -8019,7 +8060,8 @@ class TestOnlyAnITerm2RowCarriesAPane(unittest.TestCase):
     the last save knew - never onto a row another app shows (review of
     slices 2-3)."""
 
-    KNOWN = {"s1": {"pane": "G-OLD", "tabTitle": "t"}}
+    # the same process as TestACarriedPaneIsText.ROW: only the app differs
+    KNOWN = {"s1": {"pane": "G-OLD", "tabTitle": "t", "tty": "ttys022", "pid": 4100}}
 
     def pane(self, terminal):
         row = dict(TestACarriedPaneIsText.ROW, terminal=terminal)

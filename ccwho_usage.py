@@ -42,6 +42,7 @@ import ccwho_text
 VERSION = 1
 WINDOWS = ("five_hour", "seven_day")
 SHORT = {"five_hour": "5h", "seven_day": "7d"}
+BRANDS = ("ant", "oai")            # Anthropic, OpenAI: the word before ":" in a name
 KEEP_SECONDS = 8 * 86400          # the 7-day window, and a day of grace
 SAME_WINDOW = 60                  # resets this close are one window, reported twice
 TAIL_BYTES = 256 * 1024
@@ -333,6 +334,12 @@ def resolve_id(query, ids):
         return None
     if query in ids:
         return query
+    # a row's tag, copied ("ant:d0a0"): the brand is no part of an id
+    brand, colon, rest = query.partition(":")
+    if colon and brand in BRANDS:
+        if not rest:
+            return None
+        query = rest
     hits = [i for i in ids if i.startswith(query) or i.split(":", 1)[-1].startswith(query)]
     return hits[0] if len(hits) == 1 else None
 
@@ -539,7 +546,9 @@ def _window_spans(name, w, now, base, resets=True, age=True):
 
 def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=True):
     base = "plain" if selected else "dim"
-    out = [((f"{row.get('brand', 'ant')} " if brand else "") + name, base)]
+    # "ant:lukaso" - the same words a row's tag says, so the eye joins them
+    # (owner, 2026-10-01: a tag "lukaso" was not read as an account)
+    out = [((f"{row.get('brand', 'ant')}:" if brand else "") + name, base)]
     first = True
     for wname in WINDOWS:
         w = row.get(wname)
@@ -628,8 +637,8 @@ def row_tag(snap, session_id):
     if aid not in by_id:
         return "?"
     name = snap.get("names", {}).get(aid, aid)
-    brands = {r.get("brand") for r in rows}
-    return f"{by_id[aid].get('brand', 'ant')} {name}" if len(brands) > 1 else name
+    # the usage line's own words for the account, brand and all
+    return f"{by_id[aid].get('brand', 'ant')}:{name}"
 
 
 def status_text(rec, now, labels=None, names=None):

@@ -196,7 +196,7 @@ was started in wherever you attach from; `--resume` uses the directory you are i
 ## Subscription usage
 
 ```
-usage  ant work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu  │  ant 1a2b 5h 0% · 7d 67%↑/40% ↻Mon
+usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu  │  ant:1a2b 5h 0% · 7d 67%↑/40% ↻Mon
 ```
 
 One dim line under the header, one entry per account that a live session spends:
@@ -205,9 +205,10 @@ fingerprint. `5h 42%↓/60%` is 42% of the 5-hour budget used with 60% of the 5 
 gone: `↓` (green) is on pace, `↑` (red) is faster than time passes. The used number
 turns yellow at 80% and bold at 95%. A window past its reset says `expired`; a window
 whose newest reading is older than 15 minutes says how old. With two or more accounts,
-each row ends with the account it spends (`?`: no reading yet), and the entry of the
-selected row's account is bright. The same line and tags are in `ccwho`, `ccwho ls`
-and `--watch`, and each session's own status bar shows its entry.
+each row ends with the account it spends, in the line's own words (`· ant:work`; `?`:
+no reading yet), and the entry of the selected row's account is bright. The same line
+and tags are in `ccwho`, `ccwho ls` and `--watch`, and each session's own status bar
+shows its entry.
 
 Where it comes from: Claude Code hands a statusLine command the rate limits of the
 account the session spends. `ccwho setup` offers to add `ccwho statusline` in each

@@ -1096,7 +1096,7 @@ class TestTheDetailIsOneClickAway(unittest.TestCase):
 
     def test_the_zones_are_where_a_tagged_row_is_drawn(self):
         for row in self.rows():
-            for tag in ("", "1a2b", "lukaso@gmail"):
+            for tag in ("", "ant:1a2b", "ant:lukaso@gmail"):
                 for width in (30, 40, 60, 100):
                     for line in (0, 1):
                         with self.subTest(tag=tag, width=width, line=line):
@@ -3744,13 +3744,14 @@ class TestTheViewModelBehindTheUi(unittest.TestCase):
         for width in range(58, 81):
             with self.subTest(width=width):
                 self.assertIn("· 5h · s022", ccwho.ui_row_lines(row, width=width)[0])
-                first = ccwho.ui_row_cells(row, width=width, tag="1a2b")[0]
+                first = ccwho.ui_row_cells(row, width=width, tag="ant:1a2b")[0]
                 self.assertIn("· 5h · s022", "".join(t for t, _ in first))
-                # the account whole or not at all: "· 1…" is no account
+                # the account whole or not at all: "· 1…" is no account - and
+                # without its brand before not at all
                 shown = [t for t, role in first if role == "account"]
-                self.assertIn(shown, ([], [" · 1a2b"]))
-                if width >= 65:             # where it fits, it is there
-                    self.assertEqual(shown, [" · 1a2b"])
+                self.assertIn(shown, ([], [" · ant:1a2b"], [" · 1a2b"]))
+                if width >= 65:             # where "1a2b" fits, the account is there
+                    self.assertNotEqual(shown, [])
         for width in range(52, 58):
             with self.subTest(width=width):
                 self.assertIn("· 5h", ccwho.ui_row_lines(row, width=width)[0])
@@ -6430,20 +6431,67 @@ class TestRowsWithUsage(unittest.TestCase):
     def test_a_tag_is_the_last_cell_and_the_name_gives_way(self):
         row = self.rows[0]
         for w in (60, 100, 160):
-            first, _ = ccwho.ui_row_cells(row, width=w, tag="1a2b")
+            first, _ = ccwho.ui_row_cells(row, width=w, tag="ant:1a2b")
             # last of the words; only the › that opens the detail comes after it
-            self.assertEqual(first[-3], (" · 1a2b", "account"))
+            self.assertEqual(first[-3], (" · ant:1a2b", "account"))
             self.assertEqual([r for _, r in first[-2:]], ["pad", "detail"])
             self.assertEqual(first[0][1], "mark")
             self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), w)
             plain, _ = ccwho.ui_row_cells(row, width=w)
             self.assertEqual(first[:3], plain[:3])       # mark, id, project untouched
 
+    def test_a_row_too_narrow_for_the_brand_keeps_the_account(self):
+        # where " · lukaso" fits, the row says it - " · ant:lukaso" or " · lukaso"
+        has = (lambda w, tag: [t for t, role in ccwho.ui_row_cells(self.rows[0], width=w,
+                                                                   tag=tag)[0]
+                               if role == "account"])
+        seen_short = False
+        for w in range(30, 100):
+            with self.subTest(width=w):
+                short, full = has(w, "lukaso"), has(w, "ant:lukaso")
+                self.assertIn(full, ([], [" · ant:lukaso"], [" · lukaso"]))
+                if short:
+                    self.assertNotEqual(full, [])
+                seen_short |= full == [" · lukaso"]
+        self.assertTrue(seen_short)
+
+    def test_the_brand_gives_way_only_where_that_buys_something(self):
+        # the short form only for a title of 8+ cells, or for the account
+        # itself: never "· lukaso" where "· ant:lukaso" fits and no title shows
+        account = (lambda w, row, tag: [t for t, role in ccwho.ui_row_cells(row, width=w,
+                                                                            tag=tag)[0]
+                                        if role == "account"])
+        name = (lambda w, row, tag: "".join(t for t, role in ccwho.ui_row_cells(
+            row, width=w, tag=tag)[0] if role == "name"))
+        rows = list(self.rows) + [dict(r, kind="background", windowed=False)
+                                  for r in self.rows]
+        # no title (it only says the name again): a switch buys it nothing -
+        # with ports or without: the ports give way to the account, not its brand
+        rows += [dict(r, tab_title="", title="", ports=ports)
+                 for r in self.rows for ports in (None, [3000])]
+        rows += [dict(r, tab_title="", title="fix") for r in self.rows]    # control
+        switched_for_fix = False
+        for row in rows:
+            for w in range(30, 121):
+                if account(w, row, "ant:lukaso") != [" · lukaso"]:
+                    continue
+                with self.subTest(width=w, row=row.get("sessionId")):
+                    # a tag as long as the full one, with no short form
+                    full = "antXlukaso"
+                    if name(w, row, "ant:lukaso"):
+                        self.assertEqual(name(w, row, full), "")   # it bought the title
+                        switched_for_fix |= row.get("title") == "fix"
+                    else:
+                        self.assertEqual(account(w, row, full), [])  # it kept the account
+        self.assertTrue(switched_for_fix)
+
     def test_a_long_name_gives_way_and_the_tag_stays_whole(self):
         row = dict(self.rows[0], tab_title="a very long tab title " * 6)
         for w in (60, 100):
-            first, _ = ccwho.ui_row_cells(row, width=w, tag="lukaso@gmail")
-            self.assertEqual(first[-3], (" · lukaso@gmail", "account"))
+            first, _ = ccwho.ui_row_cells(row, width=w, tag="ant:lukaso@gmail")
+            # whole - its brand gives way before the title is cut to nothing
+            self.assertIn(first[-3], [(" · ant:lukaso@gmail", "account"),
+                                      (" · lukaso@gmail", "account")])
             name = [t for t, role in first if role == "name"][0]
             self.assertTrue(name.endswith("…"), name)
             self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), w)
@@ -6467,13 +6515,13 @@ class TestRowsWithUsage(unittest.TestCase):
     def test_the_table_shows_the_usage_line_under_the_header_and_tags(self):
         out = ccwho.render(self.rows, {"usage": self.usage_snap()}, color=False, width=150)
         lines = out.splitlines()
-        self.assertTrue(lines[1].startswith("usage  ant lukaso 5h 42%"), lines[1])
+        self.assertTrue(lines[1].startswith("usage  ant:lukaso 5h 42%"), lines[1])
         body = [l for l in lines if l.startswith(("liveapp", "ccwho", "marketing"))]
         before = [l for l in self.expected["render"]["150"].splitlines()
                   if l.startswith(("liveapp", "ccwho", "marketing"))]
         # the tag follows the age column; the doing column gives up its width,
         # so a row is exactly as wide as it was
-        for row, line, old, tag in zip(self.rows, body, before, ("lukaso", "?", "1a2b")):
+        for row, line, old, tag in zip(self.rows, body, before, ("ant:lukaso", "?", "ant:1a2b")):
             self.assertIn(f"{row['since']:>5}  {tag}", line)
             self.assertEqual(ccwho._cells(line), ccwho._cells(old), line)
 
@@ -6543,8 +6591,54 @@ class TestShortTagsKeepTheirColumn(unittest.TestCase):
         snap = {"state": "ok", "accounts": accts, "names": {"q": "q", "r": "r"},
                 "sessions": {rows[0]["sessionId"]: "q", rows[2]["sessionId"]: "r"}, "now": 0}
         out = ccwho.render(rows, {"usage": snap}, color=False, width=150)
-        self.assertIn(f"{rows[0]['since']:>5}  q", out)
-        self.assertIn(f"{rows[2]['since']:>5}  r", out)
+        self.assertIn(f"{rows[0]['since']:>5}  ant:q", out)
+        self.assertIn(f"{rows[2]['since']:>5}  ant:r", out)
+        self.assertIn(f"{rows[1]['since']:>5}  ?", out)           # no reading: one cell
+
+    def test_a_narrow_column_drops_the_brand_before_the_name(self):
+        # "ant:cli…" twice names no one: the brand goes first, as on the line
+        TestRowsWithUsage.setUpClass()
+        rows = TestRowsWithUsage.rows
+        accts = [{"id": a, "kind": "login", "email": "", "brand": "ant", "label": "",
+                  "sessions": 1, "age": 1,
+                  "five_hour": {"state": "ok", "pct": 1, "resets_at": None, "age": 1},
+                  "seven_day": None} for a in ("q", "r")]
+        snap = {"state": "ok", "accounts": accts, "names": {"q": "client-a", "r": "client-b"},
+                "sessions": {rows[0]["sessionId"]: "q", rows[2]["sessionId"]: "r"}, "now": 0}
+        for width in range(70, 151, 4):
+            out = ccwho.render(rows, {"usage": snap}, color=False, width=width)
+            body = out.split("\n\n", 1)[1]
+            with self.subTest(width=width):
+                self.assertNotIn("ant:cli", body.replace("ant:client-a", "").replace(
+                    "ant:client-b", ""))
+                if "client-a" in body or "client-b" in body:
+                    self.assertIn("client-a", body)
+                    self.assertIn("client-b", body)
+
+    def test_one_column_says_the_brand_on_every_tag_or_on_none(self):
+        # "lukaso" over "ant:d0a0" reads as two kinds of thing
+        TestRowsWithUsage.setUpClass()
+        rows = TestRowsWithUsage.rows
+        accts = [{"id": a, "kind": "login", "email": "", "brand": "ant", "label": "",
+                  "sessions": 1, "age": 1,
+                  "five_hour": {"state": "ok", "pct": 1, "resets_at": None, "age": 1},
+                  "seven_day": None} for a in ("q", "r")]
+        snap = {"state": "ok", "accounts": accts, "names": {"q": "lukaso", "r": "d0a0"},
+                "sessions": {rows[0]["sessionId"]: "q", rows[2]["sessionId"]: "r"}, "now": 0}
+        seen = set()
+        for width in range(60, 151, 2):
+            body = ccwho.render(rows, {"usage": snap}, color=False,
+                                width=width).split("\n\n", 1)[1]
+            with self.subTest(width=width):
+                self.assertIn(body.count("ant:"), (0, 2), body)
+                seen.add(body.count("ant:"))
+        self.assertEqual(seen, {0, 2})          # both happen, never one of each
+
+    def test_a_tag_fits_its_cells_brand_first(self):
+        self.assertEqual(ccwho._fit_tag("ant:client-a", 12), "ant:client-a")
+        self.assertEqual(ccwho._fit_tag("ant:client-a", 10), "client-a")
+        self.assertEqual(ccwho._fit_tag("ant:client-a", 6), "clien\u2026")
+        self.assertEqual(ccwho._fit_tag("?", 3), "?")
 
 
 class TestTheBriefInParts(unittest.TestCase):

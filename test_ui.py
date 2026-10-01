@@ -3769,7 +3769,7 @@ class TestUsageLine(UiTest):
             await pilot.pause()
             widget = app.query_one("#usage")
             self.assertTrue(widget.display)
-            self.assertIn("usage  ant lukaso 5h 42%", str(self.usage_text(app)))
+            self.assertIn("usage  ant:lukaso 5h 42%", str(self.usage_text(app)))
             ids = [w.id for w in app.screen.children]
             self.assertLess(ids.index("header"), ids.index("usage"))
             self.assertLess(ids.index("usage"), ids.index("ports"))
@@ -3815,8 +3815,8 @@ class TestUsageLine(UiTest):
         async with app.run_test() as pilot:
             await pilot.pause()
             words = {w.row["sessionId"]: w.words(w.width) for w in app.query(ui.Row)}
-            self.assertIn(" · lukaso", words[LIVE["sessionId"]].split("\n")[0])
-            self.assertIn(" · 1a2b", words[BUSY["sessionId"]].split("\n")[0])
+            self.assertIn(" · ant:lukaso", words[LIVE["sessionId"]].split("\n")[0])
+            self.assertIn(" · ant:1a2b", words[BUSY["sessionId"]].split("\n")[0])
 
     async def test_one_account_no_tag(self):
         plain = self.app_with(None)

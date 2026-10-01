@@ -620,6 +620,17 @@ class TestLabels(unittest.TestCase):
         self.assertIsNone(usage.resolve_id("", ids))
 
 
+class TestACopiedTagNamesTheAccount(unittest.TestCase):
+    def test_the_brand_of_a_tag_is_no_part_of_the_id(self):
+        # "ant:d0a0" is what a row says: `ccwho accounts name ant:d0a0 work`
+        ids = ["login:a", "token:d0a0beef"]
+        self.assertEqual(usage.resolve_id("ant:d0a0", ids), "token:d0a0beef")
+        self.assertEqual(usage.resolve_id("d0a0", ids), "token:d0a0beef")      # control
+        self.assertIsNone(usage.resolve_id("ant:", ids))
+        self.assertIsNone(usage.resolve_id("ant:", ["login:a"]))          # a brand is no id
+        self.assertEqual(usage.resolve_id("token:d0a0beef", ids), "token:d0a0beef")
+
+
 class TestFormat(unittest.TestCase):
     def test_a_row_reads_label_windows_and_age(self):
         row = {"id": "login:a", "label": "a@example.com", "sessions": 2, "age": 180,
@@ -833,18 +844,18 @@ class TestUsageLines(unittest.TestCase):
 
     def test_one_account_one_line(self):
         line, = text(usage.usage_lines(snap([self.L]), 160))
-        self.assertTrue(line.startswith("usage  ant lukaso 5h 42%↓/60% ↻"), line)
+        self.assertTrue(line.startswith("usage  ant:lukaso 5h 42%↓/60% ↻"), line)
         self.assertIn("· 7d 2%↓/30% ↻", line)
 
     def test_two_accounts_fit_on_one_line_separated(self):
         line, = text(usage.usage_lines(snap([self.L, self.T]), 200))
-        self.assertIn("  │  ant 1a2b 5h 0% · 7d 67%↑/40%", line)
+        self.assertIn("  │  ant:1a2b 5h 0% · 7d 67%↑/40%", line)
 
     def test_they_stack_when_they_do_not_fit_one_per_account(self):
         lines = text(usage.usage_lines(snap([self.L, self.T]), 90))
         self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].startswith("usage  ant lukaso "))
-        self.assertTrue(lines[1].startswith("       ant 1a2b "))
+        self.assertTrue(lines[0].startswith("usage  ant:lukaso "))
+        self.assertTrue(lines[1].startswith("       ant:1a2b "))
 
     def test_all_live_accounts_are_shown_no_cap(self):
         rows = [acct_row(f"token:{i:04x}0000", kind="token", five=(1, None)) for i in range(7)]
@@ -861,7 +872,7 @@ class TestUsageLines(unittest.TestCase):
         self.assertIn("(2h ago)", no_reset)
         no_age = text(usage.usage_lines(snap([old]), len(no_reset) - 1))[0]
         self.assertNotIn("ago", no_age)
-        self.assertIn("ant ", no_age)
+        self.assertIn("ant:", no_age)
         no_brand = text(usage.usage_lines(snap([old]), len(no_age) - 1))[0]
         self.assertTrue(no_brand.startswith("usage  lukaso 5h 42%↓/60%"), no_brand)
         cut = text(usage.usage_lines(snap([old]), 20))[0]
@@ -903,7 +914,7 @@ class TestUsageLines(unittest.TestCase):
     def test_the_selected_account_is_bright(self):
         spans = self.styles(usage.usage_lines(snap([self.L, self.T]), 200, selected="token:1a2b3c4d"))
         bright = "".join(t for t, s in spans if s == "plain")
-        self.assertIn("ant 1a2b", bright)
+        self.assertIn("ant:1a2b", bright)
         self.assertNotIn("lukaso", bright)
 
     def test_arrows_are_never_dim(self):
@@ -941,14 +952,16 @@ class TestRowTag(unittest.TestCase):
 
     def test_tags_with_two_accounts_and_question_mark_without_reading(self):
         s = snap([self.L, self.T], sessions={"s1": "login:a", "s2": "token:1a2b3c4d"})
-        self.assertEqual(usage.row_tag(s, "s1"), "lukaso")
-        self.assertEqual(usage.row_tag(s, "s2"), "1a2b")
+        # the name the usage line gives the account, brand and all (owner,
+        # 2026-10-01): "· ant:lukaso" on the row is the "ant:lukaso" at the top
+        self.assertEqual(usage.row_tag(s, "s1"), "ant:lukaso")
+        self.assertEqual(usage.row_tag(s, "s2"), "ant:1a2b")
         self.assertEqual(usage.row_tag(s, "s3"), "?")
 
-    def test_brand_on_the_tag_only_with_two_brands(self):
+    def test_the_tag_carries_its_brand_whatever_the_brands(self):
         o = dict(acct_row("oai:x", kind="token", five=(1, None)), brand="oai")
         s = snap([self.L, o], sessions={"s1": "login:a"})
-        self.assertEqual(usage.row_tag(s, "s1"), "ant lukaso")
+        self.assertEqual(usage.row_tag(s, "s1"), "ant:lukaso")
 
     def test_no_snapshot_no_tag(self):
         self.assertEqual(usage.row_tag(None, "s1"), "")

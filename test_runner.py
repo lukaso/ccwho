@@ -4085,6 +4085,15 @@ class TestStatusline(unittest.TestCase):
             runner.main(["accounts"])
         self.assertIn("work", out.getvalue())
 
+    def test_accounts_name_refuses_a_label_with_a_colon(self):
+        # "work:home" would read as the brand "work" where the brand is dropped
+        self.run_with(self.payload())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["accounts", "name", "login:uuid", "work:home"]), 2)
+        self.assertIn(":", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "ccwho", "accounts.json")))
+
     def test_accounts_name_with_an_unknown_id_fails(self):
         self.run_with(self.payload())
         err = io.StringIO()

@@ -3528,8 +3528,11 @@ def ui_row_cells(row, width=100, tag=""):
             if re.sub(r"^[\W_]+", "", t) not in ("", handle)]
     name = said[0] if said else ""
     # the account this row spends (usage, 2+ accounts only): last, and the name
-    # gives way for it - never the mark, the id or the project
-    account = [(f" · {tag}", "account")] if tag else []
+    # gives way for it - never the mark, the id or the project. Its brand gives
+    # way first: "· lukaso" before a title cut to nothing (the tag says the usage
+    # line's "ant:lukaso", owner 2026-10-01; the line drops its brand first too)
+    tags = [t for t in (tag, tag.split(":", 1)[1] if ":" in tag else "") if t]
+    account = [(f" · {tags[0]}", "account")] if tags else []
 
     def room_for_title(tail, gap=2):
         # after the name, two spaces before a title and one before the meta,
@@ -3538,6 +3541,14 @@ def ui_row_cells(row, width=100, tag=""):
                 - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL[0]) - 1)
     if project and room_for_title(f" · {project}" + tail) >= 20:
         tail = f" · {project}" + tail
+    if len(tags) > 1:
+        full = room_for_title(tail)
+        short = full + _cells(tags[0]) - _cells(tags[1])
+        # only where that buys something: a title of 8+ cells - for a row that
+        # has one - or the account itself (below -1, "whole or not at all"
+        # drops it); never room for the ports, which give way to the account
+        if full < 8 and ((name and short >= 8) or full < -1 <= short):
+            account = [(f" · {tags[1]}", "account")]
     # the title is what gives way, down to nothing: the name says which session
     # this is, and a title of two letters and a … says nothing
     room = room_for_title(tail)
@@ -3609,6 +3620,16 @@ def _to_the_edge(line, half, width):
     line = _fit(line, width - _cells(half) - 1)
     gap = width - sum(_cells(t) for t, _ in line) - _cells(half)
     return _fit(line + [(" " * gap, "pad"), (half, "detail")], width)
+
+
+def _fit_tag(tag, width, brand=True):
+    """A row's account tag in `width` cells: whole (with `brand`), else without
+    its brand, else its name cut - the brand goes first, as on the usage line:
+    two accounts cut to "ant:cli…" name no one."""
+    if brand and _cells(tag) <= width:
+        return tag
+    name = tag.split(":", 1)[1] if ":" in tag else tag
+    return name if _cells(name) <= width else _cut(name, width)
 
 
 def ui_action_at(row, width, line, col, tag=""):
@@ -3717,6 +3738,9 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
     tag_w = min(max((_cells(t) + 2 for t in tags.values() if t), default=0), w_doing - 8)
     tag_w = tag_w if tag_w >= 3 else 0          # "  q": the smallest tag there is
     w_doing -= tag_w
+    # one column, one form: every tag with its brand, or none ("lukaso" over
+    # "ant:d0a0" reads as two kinds of thing)
+    branded = all(_cells(t) <= tag_w - 2 for t in tags.values() if t)
     # one dim line, never an alarm: NEEDS YOU owns this screen
     if held := ports_line(fleet, width):
         out.append(_paint(held, "dim", color))
@@ -3751,7 +3775,7 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
                 f"{' ' * max(0, w_d - len(shown_doing))}  "
                 f"{r['since']:>5}")
         if tag_w:
-            tag = _cut(tags.get(r.get("sessionId", ""), ""), tag_w - 2)
+            tag = _fit_tag(tags.get(r.get("sessionId", ""), ""), tag_w - 2, branded)
             line += _paint("  " + tag + " " * (tag_w - 2 - _cells(tag)), "dim", color)
         if r.get("ports"):
             line += _paint("  " + " ".join(f":{p}" for p in r["ports"]), "dim", color)

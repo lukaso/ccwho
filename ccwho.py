@@ -3081,6 +3081,12 @@ def accounts(argv):
         if len(argv) != 3:
             print("usage: ccwho accounts name <id> <label>", file=sys.stderr)
             return 2
+        if ":" in argv[2]:
+            # "work:home" reads as the brand "work" where a narrow line drops
+            # the brand ("ant:work" -> "work")
+            print("ccwho accounts: a label cannot hold ':' - it reads as a brand",
+                  file=sys.stderr)
+            return 2
         aid = usage.resolve_id(argv[1], [r["id"] for r in rows])
         if not aid:
             print(f"ccwho accounts: no single account matches {argv[1]!r}"

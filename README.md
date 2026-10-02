@@ -112,6 +112,37 @@ it because it is a data problem, not a display problem.
 `ccwho` shows the **last thing you actually said** to each session, pulled from its
 transcript. That is the column no tool has.
 
+## ccwho and herdr
+
+[herdr](https://github.com/herdrdev/herdr) is for the same problem: many agent
+sessions, and which one needs you. It is a terminal multiplexer, like tmux: your
+agents run in herdr panes, and herdr owns their terminals. ccwho does not run your
+agents: they stay in your usual terminal windows. To know their state, ccwho only
+reads - what Claude Code writes, `claude agents --json`, `ps` and `lsof`.
+It acts only when you ask: it brings a window to the front, kills processes after it
+shows you the list, and reopens sessions after a reboot.
+
+Compared with herdr v0.9.3 and [its docs](https://herdr.dev/docs/), on 2026-10-02.
+
+| Area | herdr | ccwho |
+|---|---|---|
+| Sessions it sees | Only agents in its panes | Claude Code sessions in any terminal and from every config dir, [`claude --bg` sessions](#background-sessions) and [SDK sessions](#started-by-a-program). Open Codex threads, in the live list |
+| Agents | Claude Code, Codex, Cursor, OpenCode, Grok, Copilot CLI and more | Claude Code. Codex: its open threads, their processes and its usage |
+| How it gets state | It reads the bottom of the pane screen and the terminal title, and compares them with rules. It shows `blocked` only when a known approval, question or permission prompt is on screen. The Claude hook tells herdr which session runs in the pane, for resume; it does not report state | It starts from Claude Code's own status (`claude agents --json`) and corrects it from the transcript: a tool call with no answer, the last line of a finished turn, turn-end records. It also reads the process tree ([what actually needs you](#what-actually-needs-you), [busy, but the turn is over](#busy-but-the-turn-is-over)) |
+| States | blocked, working, done (not seen yet), idle, unknown | NEEDS YOU, ASKED YOU, FINISHED, STUCK, STOPPED, busy, running, program. FINISHED: a turn ended, nothing runs under it, and you have not gone to the session from the list since. The live list puts it in NEEDS YOU |
+| What a row tells you | The state, the agent, and the workspace and tab names. A config line adds the agent's terminal title. Scripts and plugins can add fields | Live list: state, name, title, age, ports, account (with two or more), and Claude's recap with its age (with no recap, the last tool call). → adds the last thing you said and what Claude said last. `ccwho ls` shows the last tool call, or the question it asks |
+| Go to a session | Click an agent in the sidebar, or use the Goto picker (`prefix+g`), which filters agents by state | ⌥/ opens the list from any app (an iTerm2 hotkey window). Enter brings the session's window to the front, or opens a window that attaches a background session. Not for Codex threads ([finding the window](#finding-the-window)) |
+| Client closes or SSH drops | Processes keep running in the herdr server | Closing ccwho does not touch the sessions. If the terminal app quits or SSH drops, the sessions in it end, as without ccwho. `claude --bg` sessions keep running |
+| Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window. `restore --check` says whether each saved session can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
+| Processes and ports | Not built in | `ps`, `ps --port`, `kill`, `clean`, `reap`. It shows which session started each process ([processes and ports](#processes-and-ports)) |
+| Stuck work | Not built in | Finds a wait loop on a task that has ended (`until grep …; do sleep …; done`) and stdin readers that can never end, and gives you a box to kill them ([busy, but the turn is over](#busy-but-the-turn-is-over)) |
+| Old sessions | Not built in (the `memex` plugin searches transcripts) | `ls` and `show` search an index of every transcript in `~/.claude`, in the `CLAUDE_CONFIG_DIR` ccwho runs with, and in the dirs you list in `~/.ccwho/roots` (Claude Code keeps 30 days by default) ([finding an old session](#finding-an-old-session)) |
+| Usage limits | Plugins (`herdr-agent-usage`) | 5h and 7d use for each account, with pace, after `ccwho setup` adds its statusLine. Also Codex's, while a thread is open ([subscription usage](#subscription-usage)) |
+| Agents control agents | Yes. With the socket API and CLI, an agent can open panes, send prompts, read output, wait until another agent is blocked, and show notifications | No. An agent cannot send a prompt to a session or read its screen. It can read the state of every Claude Code session with `ccwho --json`. When an agent runs `kill` or `clean`, they take only what its own session started |
+| Remote machines | Yes: several SSH hosts in one window. A phone works through any SSH client | No. Local Mac only |
+| Platforms | macOS, Linux, Windows; any terminal | macOS. It lists sessions in any terminal; only iTerm2 and Terminal.app windows can be brought to the front |
+| Extensions | Plugin marketplace, more than 1,400 plugins | None |
+
 ## The live list
 
 ```

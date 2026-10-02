@@ -176,7 +176,7 @@ class TestEveryTestFileRunsInTheScript(unittest.TestCase):
         import re
         script = script.replace("\\\n", " ")
         core = re.search(r'^CORE="([^"]*)"', script, re.M).group(1).split()
-        ui = re.search(r"python -m unittest ([A-Za-z_. ]+?)\s+\"\$@\"", script).group(1).split()
+        ui = re.search(r"python -m unittest ([\w. ]+?)\s+\"\$@\"", script).group(1).split()
         return set(core) | {t for t in ui if "." not in t}
 
     def script(self):
@@ -189,10 +189,29 @@ class TestEveryTestFileRunsInTheScript(unittest.TestCase):
         import re
         here = os.path.dirname(os.path.abspath(__file__))
         run = self.modules_run(self.script())
-        files = sorted(f[:-3] for f in os.listdir(here)
-                       if re.fullmatch(r"test_[a-z_]+\.py", f))
+        files = self.module_names(os.listdir(here))
         self.assertEqual(sorted(set(files) - run), [])
         self.assertIn("test_ui", run)                                    # control: it parsed
+
+    @staticmethod
+    def module_names(names):
+        """The test modules among file names: every test_*.py."""
+        import re
+        return sorted(n[:-3] for n in names if re.fullmatch(r"test_\w+\.py", n))
+
+    def test_a_name_with_digits_or_capitals_is_a_test_module(self):
+        # test_[a-z_]+ skipped them: test_v2.py would never have run (2026-10-01)
+        self.assertEqual(self.module_names(["test_a.py", "test_V2.py", "test_x_1.py",
+                                            "testkit.py", "test_a.pyc", "test_.py.bak"]),
+                         ["test_V2", "test_a", "test_x_1"])
+        script = ('CORE="test_a test_b2"\n'
+                  'exec uv run python -m unittest test_ui test_Ui3 test_x.Y \\\n  "$@"\n')
+        self.assertEqual(self.modules_run(script), {"test_a", "test_b2", "test_ui", "test_Ui3"})
+
+    def test_the_script_names_its_modules_once(self):
+        # a list in a comment goes stale (it named eight of fourteen): CORE says
+        comments = [l for l in self.script().splitlines() if l.startswith("#")]
+        self.assertEqual([l for l in comments if "test_" in l], [])
 
     def test_a_class_a_stage_names_does_not_run_its_module(self):
         script = self.script()

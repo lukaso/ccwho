@@ -779,6 +779,7 @@ class CcwhoUi(App):
         self.again = False
         self.painted_width = 0
         self.painted_shape = None
+        self.hint_widget = None         # the Codex-only list's hint (place_hint)
         self.selected = ""      # by session id: widgets come and go, this does not
         self.acting = ""        # the session a window is being opened for
         self.kill_busy = False  # a kill is being read, asked or carried out
@@ -1010,9 +1011,11 @@ class CcwhoUi(App):
             return
         width = self.list_width()
         groups = self.fleet.groups(self.filter_text)
+        hint = self.codex_only_hint(groups)
         shape = self.shape_of(groups, width)
         if shape == self.painted_shape and listing.children:
             self.repaint_rows(groups, width)
+            self.place_hint(listing, hint)
             self.paint_header(groups)
             self.repaint_detail()
             return
@@ -1031,8 +1034,14 @@ class CcwhoUi(App):
             for group in groups:
                 fresh.append(self.heading(group))
                 fresh.extend(Row(row, width) for row in group["rows"])
+            # the hint is the list's own widget: one being removed with the
+            # rest is not it (Textual keeps it among the children until it goes)
+            self.hint_widget = (Static(hint, markup=False, classes="claude-hint")
+                                if hint and fresh else None)
             if not fresh:
                 fresh.append(Static(self.empty_text(), markup=False))
+            elif self.hint_widget is not None:
+                fresh.append(self.hint_widget)
             listing.mount_all(fresh)
             self.paint_header(groups)
         # Mounting is asynchronous: focusing a widget in the same breath as
@@ -1055,8 +1064,11 @@ class CcwhoUi(App):
         want_ids = {r.get("sessionId") for g in groups for r in g["rows"]}
         if not on_screen or want_ids != set(on_screen):
             return False
-        spare = {str(getattr(w, "content", "")): w
-                 for w in listing.children if not isinstance(w, Row)}
+        # the Codex-only hint is no heading: it stays, last - the rows move
+        # before it, and a move never changes whether it is wanted (the rows'
+        # kinds and the search do: a build, or the same shape's place_hint)
+        spare = {str(getattr(w, "content", "")): w for w in listing.children
+                 if not isinstance(w, Row) and not w.has_class("claude-hint")}
         with self.batch_update():
             wanted = []
             for group in groups:
@@ -1093,6 +1105,33 @@ class CcwhoUi(App):
                 widget.refresh_text(width)
         self.mark_selected()
         self.mark_acting()
+
+    def codex_only_hint(self, groups):
+        """The empty list's words, under a list of Codex threads only: no Claude
+        session runs, and `o` reopens a save - after a reboot with only the
+        Codex app open, the one pointer you need (item 2, 2026-10-01)."""
+        rows = [r for g in groups for r in g["rows"]]
+        if self.filter_text or not rows or any(r.get("kind") != "codex" for r in rows):
+            return ""
+        return self.empty_text()
+
+    def place_hint(self, listing, hint):
+        """The Codex-only list's hint: one, last - or none. The list's own
+        widget (hint_widget), never one found among the children: a hint being
+        removed is still there until it goes, and was taken for this one."""
+        have = self.hint_widget
+        if not hint:
+            if have is not None:
+                have.remove()
+                self.hint_widget = None
+            return
+        if have is None:
+            self.hint_widget = Static(hint, markup=False, classes="claude-hint")
+            listing.mount(self.hint_widget)
+            return
+        have.update(hint)
+        if list(listing.children)[-1] is not have:
+            listing.move_child(have, after=list(listing.children)[-1])
 
     def empty_text(self):
         if self.filter_text:

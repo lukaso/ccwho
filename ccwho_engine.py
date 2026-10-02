@@ -1448,6 +1448,22 @@ def _lsof(args, env=None):
 CODEX_LOCK_TTL = 30.0  # seconds lsof's answer is kept while the lock files stay the same
 
 
+def _forget_closed_threads(cache, home, held):
+    """Drop what was kept per thread under `home` that no lock holds now: its
+    rollout path, its missed transcript, its state read - a list stays open for
+    days (item 4, 2026-10-01). A held lock with no transcript keeps its miss,
+    or it is looked for again every scan."""
+    paths = {cache.get(f"_codex_rollout:{home}:{t}") for t in held}
+    for key in list(cache):
+        if key.startswith((f"_codex_rollout:{home}:", f"_codex_miss:{home}:")):
+            if key.rsplit(":", 1)[1] not in held:
+                del cache[key]
+        elif key.startswith("_codex_turn:"):
+            path = key[len("_codex_turn:"):]
+            if path.startswith(os.path.join(home, "")) and path not in paths:
+                del cache[key]
+
+
 def codex_threads(home, lsof=None, cache=None, clock=None):
     """The Codex threads open now, under the CODEX_HOME `home`: [{"thread",
     "name", "cwd", "host_pid", "originator", "source"}] - or None when lsof
@@ -1476,6 +1492,8 @@ def codex_threads(home, lsof=None, cache=None, clock=None):
             return []
     locks = listed()
     if not locks:
+        _forget_closed_threads(cache, home, set())
+        cache[f"_codex_watch:{home}"] = []      # no row: no rollout to watch
         return []
     # lsof reads every process's files: 0.5 s here in any form (measured
     # 2026-09-29). Its answer is kept for a TTL while the lock files are the
@@ -1492,6 +1510,8 @@ def codex_threads(home, lsof=None, cache=None, clock=None):
             # list again and ask once more
             locks = listed()
             if not locks:
+                _forget_closed_threads(cache, home, set())
+                cache[f"_codex_watch:{home}"] = []
                 return []
             text = lsof(["-nP", "-Fpn", "--"] + [os.path.join(lock_dir, f) for f in locks])
         asked = {os.path.join(lock_dir, f) for f in locks}
@@ -1535,6 +1555,10 @@ def codex_threads(home, lsof=None, cache=None, clock=None):
                     "source": text(meta.get("source")),
                     "turn": turn["turn"], "ask": text(turn["ask"]), "ts": turn["ts"],
                     "pending_tool": turn["pending_tool"], "mtime": turn["mtime"]})
+    _forget_closed_threads(cache, home, set(held))
+    # the rows' rollouts, for the list's quick check (watch_digest)
+    cache[f"_codex_watch:{home}"] = [cache[f"_codex_rollout:{home}:{t['thread']}"] for t in out
+                                     if cache.get(f"_codex_rollout:{home}:{t['thread']}")]
     return out
 
 
@@ -2966,7 +2990,7 @@ def _mtime(path):
         return 0
 
 
-def watch_digest(session_ids, cache=None, roots=None):
+def watch_digest(session_ids, cache=None, roots=None, env=None):
     """What the files say, in one comparable value. Starts no program at all.
 
     This is what lets the list notice a session needing you within a second.
@@ -2979,6 +3003,13 @@ def watch_digest(session_ids, cache=None, roots=None):
 
     A session ENDING is not visible here, and does not need to be: nothing that
     has stopped is waiting for you. The scheduled scan picks that up.
+
+    Codex too: an open thread's ask is a write to its rollout, and a new thread
+    is a new lock file - its ask showed up to 20 s late, at the next full scan
+    (2026-10-01). The rollouts are those of the last scan's Codex rows
+    (codex_threads keeps the list): a subagent's thread is held and never a
+    row, and its writes would start scans that change nothing. A stat each:
+    no glob, nothing read.
     """
     parts = []
     for sid in session_ids:
@@ -2986,6 +3017,13 @@ def watch_digest(session_ids, cache=None, roots=None):
         parts.append((sid, _mtime(path) if path else 0))
     for directory in project_dirs(roots or all_roots(cache)):
         parts.append((directory, _mtime(directory)))
+    home = codex_home(env)
+    locks = os.path.realpath(os.path.join(home, "thread-writer-locks"))
+    parts.append((locks, _mtime(locks)))
+    watched = (cache or {}).get(f"_codex_watch:{home}")
+    for path in watched if isinstance(watched, list) else ():
+        if isinstance(path, str):
+            parts.append((path, _mtime(path)))
     return tuple(sorted(parts))
 
 
@@ -3158,7 +3196,10 @@ def collect(cache=None, status=None, session_apps=True):
     rows.sort(key=sort_key)
     if status is not None:
         # The same value the cheap check computes, so finishing a scan never
-        # leaves the check thinking the world moved.
+        # leaves the check thinking the world moved. Taken BEFORE the Codex
+        # read: a write after this is the next check's change, never hidden in
+        # this digest (a digest after the read hid one for up to 20 s; review
+        # 2026-10-02) - at worst one more scan, once, when a thread opens
         status["watch"] = watch_digest(ids, cache=cache)
         status["reviewed"] = reviewed
     if cache is not None:                       # drop windows for sessions that ended

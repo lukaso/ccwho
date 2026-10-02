@@ -23,6 +23,8 @@ def setUpModule():
     import ccwho
     import testkit
     _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
+    # the quick check stats the Codex lock folder: never the user's own
+    _UNPIN.append(testkit.pin_codex_home())
 
 
 def tearDownModule():

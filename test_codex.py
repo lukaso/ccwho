@@ -1484,3 +1484,151 @@ class TestAnIndexWithABrokenByte(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheWatchSeesCodex(unittest.TestCase):
+    """The list's quick check moves when an open Codex thread writes - its ask
+    showed up to 20 s late, at the next full scan (item 1, 2026-10-01)."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.locks = os.path.join(self.home, "thread-writer-locks")
+        os.makedirs(self.locks)
+        self.open_one = self.rollout(A)
+        self.closed = self.rollout(B)
+        self.cache = {f"_codex_watch:{self.home}": [self.open_one],
+                      f"_codex_rollout:{self.home}:{B}": self.closed}   # held, no row
+
+    def rollout(self, thread):
+        d = os.path.join(self.home, "sessions", "2026", "10", "01")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"rollout-x-{thread}.jsonl")
+        open(path, "w").close()
+        os.utime(path, (1000, 1000))
+        return path
+
+    def digest(self):
+        # no session, no project folder: only what Codex adds
+        return engine.watch_digest([], cache=self.cache, roots=[self.home],
+                                   env={"CODEX_HOME": self.home})
+
+    def test_an_open_threads_write_moves_it(self):
+        before = self.digest()
+        os.utime(self.open_one, (1005, 1005))
+        self.assertNotEqual(self.digest(), before)
+
+    def test_a_thread_that_is_no_row_does_not(self):
+        # a subagent's thread is held and has a rollout, and is never a row:
+        # its writes would start scans that change nothing (review 2026-10-02)
+        before = self.digest()
+        os.utime(self.closed, (1005, 1005))
+        self.assertEqual(self.digest(), before)
+
+    def test_a_closed_threads_write_does_not(self):                      # control
+        before = self.digest()
+        os.utime(self.closed, (1005, 1005))
+        self.assertEqual(self.digest(), before)
+
+    def test_a_new_thread_moves_it(self):
+        before = self.digest()
+        open(os.path.join(self.locks, f"{C}.lock"), "w").close()
+        os.utime(self.locks, (2000, 2000))
+        self.assertNotEqual(self.digest(), before)
+
+    def test_it_reads_no_transcript(self):
+        # a stat each, as a session's transcript: never what was said
+        opened = []
+        real = open
+        import builtins
+        builtins.open = lambda *a, **k: opened.append(a[0]) or real(*a, **k)
+        try:
+            self.digest()
+        finally:
+            builtins.open = real
+        self.assertEqual(opened, [])
+
+
+class TestTheCodexCacheForgetsClosedThreads(unittest.TestCase):
+    """A list stays open for days: what it keeps per Codex thread - the rollout
+    path, a lock with no transcript, the state read - goes when the thread
+    closes (item 4, 2026-10-01). "Not known" forgets nothing."""
+
+    def setUp(self):
+        self.home = Home()
+        self.addCleanup(self.home.done)
+        self.home.lock(A, B, C)              # C: a lock with no transcript
+        self.home.rollout(A)
+        self.home.rollout(B)
+        self.cache, self.clock = {}, 0.0
+
+    def read(self, held, ok=True):
+        self.clock += engine.CODEX_LOCK_TTL + 1          # lsof is asked each time
+        text = lsof_text(held, self.home.path) if ok else None
+        return engine.codex_threads(self.home.path, lsof=lambda args: text,
+                                    cache=self.cache, clock=lambda: self.clock)
+
+    def kept(self):
+        return sorted(k.split(":", 1)[0] + ":" + k.rsplit(":", 1)[-1][-4:]
+                      if not k.startswith("_codex_turn:") else
+                      "_codex_turn:" + os.path.basename(k)[-10:-6]
+                      for k in self.cache if not k.startswith(("_codex_locks:", "_codex_watch:")))
+
+    def test_a_closed_threads_keys_go(self):
+        self.read({4215: [A, B, C]})
+        self.assertEqual(self.kept(), sorted([f"_codex_rollout:{A[-4:]}", f"_codex_rollout:{B[-4:]}",
+                                              f"_codex_miss:{C[-4:]}", f"_codex_turn:{A[-4:]}",
+                                              f"_codex_turn:{B[-4:]}"]))
+        self.read({4215: [A]})
+        self.assertEqual(self.kept(), sorted([f"_codex_rollout:{A[-4:]}", f"_codex_turn:{A[-4:]}"]))
+
+    def test_none_open_keeps_nothing(self):
+        self.read({4215: [A, B, C]})
+        self.read({})
+        self.assertEqual(self.kept(), [])
+
+    def test_no_lock_left_keeps_nothing(self):
+        self.read({4215: [A, B, C]})
+        for t in (A, B, C):
+            os.remove(os.path.join(self.home.path, "thread-writer-locks", f"{t}.lock"))
+        self.assertEqual(self.read({}), [])
+        self.assertEqual(self.kept(), [])
+        self.assertEqual(self.cache[f"_codex_watch:{self.home.path}"], [])  # nothing watched
+
+    def test_closed_while_asked_keeps_nothing(self):
+        # lsof fails as the last thread closes: listed again, none left
+        self.read({4215: [A, B, C]})
+        def closing(args):
+            for t in (A, B, C):
+                os.remove(os.path.join(self.home.path, "thread-writer-locks", f"{t}.lock"))
+            return None
+        self.clock += engine.CODEX_LOCK_TTL + 1
+        self.assertEqual(engine.codex_threads(self.home.path, lsof=closing, cache=self.cache,
+                                              clock=lambda: self.clock), [])
+        self.assertEqual(self.kept(), [])
+        self.assertEqual(self.cache[f"_codex_watch:{self.home.path}"], [])  # nothing watched
+
+    def test_another_homes_state_is_kept(self):
+        other = "_codex_turn:/elsewhere/sessions/rollout-x-y.jsonl"
+        self.cache[other] = ((1, 1.0, 1), {}, 0)
+        self.read({4215: [A]})
+        self.assertIn(other, self.cache)
+
+    def test_the_watch_lists_the_rows_rollouts_only(self):
+        # B is a subagent's thread: held, with a rollout, never a row
+        sub = os.path.join(self.home.path, "sessions", "2026", "09", "29",
+                           f"rollout-2026-09-29T11-13-00-{B}.jsonl")
+        with open(sub, "w") as fh:
+            fh.write(json.dumps({"type": "session_meta", "payload": {
+                "id": B, "cwd": "/x", "source": {"subagent": "review"}}}) + "\n")
+        self.read({4215: [A, B, C]})
+        watched = self.cache[f"_codex_watch:{self.home.path}"]
+        self.assertEqual([os.path.basename(p)[-10:-6] for p in watched], [A[-4:]])
+        self.read({})
+        self.assertEqual(self.cache[f"_codex_watch:{self.home.path}"], [])
+
+    def test_not_known_forgets_nothing(self):                            # control
+        self.read({4215: [A, B, C]})
+        before = self.kept()
+        self.assertIsNone(self.read({}, ok=False))
+        self.assertEqual(self.kept(), before)

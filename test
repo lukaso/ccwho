@@ -2,8 +2,7 @@
 # Every test, in one command.
 #
 # The engine, the brief, the index and the runner are stdlib and run anywhere:
-#   python3 -m unittest test_ccwho test_procs test_runner test_brief test_index test_setup \
-#                       test_contract test_panel
+# CORE below names them, once - a list in a comment went stale.
 #
 # The UI tests need Textual. uv fetches and caches it from the header in
 # ccwho_ui.py, so there is nothing to install - but if it cannot, the UI tests

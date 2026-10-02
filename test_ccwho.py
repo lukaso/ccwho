@@ -71,8 +71,13 @@ def install_guards():
     live.ask = TERMS_GATE_GUARD
 
 
+_UNPIN = []
+
+
 def setUpModule():
     install_guards()
+    # a scan's digest stats the Codex lock folder: never the user's own
+    _UNPIN.append(testkit.pin_codex_home())
 
 
 def tearDownModule():
@@ -80,6 +85,8 @@ def tearDownModule():
         if name not in TERMS_NAMES and not name.startswith("terms."):
             setattr(ccwho, name, real)
     testkit.fresh_terms(ccwho)                  # no guard or fake of ours stays on it
+    while _UNPIN:
+        _UNPIN.pop()()
 
 
 class MachinelessCollect(unittest.TestCase):
@@ -3480,6 +3487,38 @@ class TestCollectCarriesTheCodexThreads(MachinelessCollect):
     def test_not_known_is_none(self):
         rows, fleet = self.collect(None)
         self.assertIsNone(fleet["codex_threads"])
+
+    def test_a_write_during_the_scan_is_the_next_checks_change(self):
+        # the scan's digest is taken before its Codex read (review 2026-10-02):
+        # a write the read could have missed must show in the next check - a
+        # digest taken after the read hid it for up to 20 s
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "rollout.jsonl")
+        open(path, "w").close()
+        os.utime(path, (1000, 1000))
+        home = ccwho.codex_home()
+        when = {"t": None}
+        def read(env=None, cache=None):
+            cache[f"_codex_watch:{home}"] = [path]
+            if when["t"]:
+                os.utime(path, (when["t"], when["t"]))     # written as it is read
+            return [dict(self.T)]
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: "[]"
+        ccwho.read_codex_threads = read
+        cache = {}
+        try:
+            ccwho.collect(cache=cache, status={})          # the thread is seen
+            quiet = {}
+            ccwho.collect(cache=cache, status=quiet)       # nothing written
+            self.assertEqual(quiet["watch"], ccwho.watch_digest([], cache=cache))  # control
+            when["t"] = 2000
+            busy = {}
+            ccwho.collect(cache=cache, status=busy)
+        finally:
+            ccwho.agents_json = real
+        self.assertNotEqual(busy["watch"], ccwho.watch_digest([], cache=cache))
 
     def test_the_read_gets_the_scans_own_cache(self):
         # its lsof answer is kept in that cache: without it every tick pays 0.5 s

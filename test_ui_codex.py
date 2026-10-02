@@ -151,6 +151,113 @@ class TestTheCodexRows(UiTest):
                 self.assertIn(words, text)
 
 
+class TestACodexOnlyListKeepsItsHint(UiTest):
+    """No Claude session, Codex threads open: the list is not empty, and it
+    still says no session runs and how to reopen a save (item 2, 2026-10-01)."""
+
+    async def test_the_hint_stays_under_the_codex_rows(self):
+        app = self.app(collector=CodexCollector(rows=()))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            text = self.screen_text(app)
+            self.assertIn("fix the navbar (codex)", text)
+            self.assertIn("No Claude Code sessions running", text)
+
+    async def test_no_hint_beside_a_claude_session(self):                # control
+        app = self.app(collector=CodexCollector())
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertNotIn("No Claude Code sessions running", self.screen_text(app))
+
+    async def test_the_hint_survives_a_reorder_and_goes_with_a_session(self):
+        two = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0], mtime=1.0),
+                                         dict(PROCS["codex_threads"][0], thread=T[:-4] + "0000",
+                                              name="second", mtime=2.0)])
+        c = CodexCollector(procs=two, rows=())
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertIn("No Claude Code sessions running", self.screen_text(app))
+            # the same rows, swapped by age: the list moves them, the hint stays
+            swapped = dict(two, codex_threads=[dict(two["codex_threads"][0], mtime=3.0),
+                                               two["codex_threads"][1]])
+            c.fleet_value = fleet((), swapped)
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("No Claude Code sessions running", self.screen_text(app))
+            self.assertEqual(len(app.query(".claude-hint")), 1)
+            # a Claude session arrives: the hint goes
+            c.fleet_value = fleet((LIVE,), swapped)
+            app.collect()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertNotIn("No Claude Code sessions running", self.screen_text(app))
+
+    async def test_a_build_and_a_repaint_in_one_tick_leave_one_hint(self):
+        # Textual keeps a widget being removed among the children until it
+        # goes: a repaint in the same tick took the new hint for an extra
+        c = CodexCollector(rows=())
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            two = dict(PROCS, codex_threads=PROCS["codex_threads"] + [
+                dict(PROCS["codex_threads"][0], thread=T[:-4] + "0000", name="second")])
+            app.fleet = fleet((), two)
+            app.rebuild()                                  # a new row: a build
+            app.rebuild()                                  # the same shape: a repaint
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(len(app.query(".claude-hint")), 1)
+
+    async def test_a_search_typed_and_cleared_in_one_tick_leaves_one_hint(self):
+        app = self.app(collector=CodexCollector(rows=()))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            app.filter_text = "navbar"
+            app.rebuild()
+            app.filter_text = ""
+            app.rebuild()
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(len(app.query(".claude-hint")), 1)
+
+    async def test_a_search_has_no_hint(self):                           # control
+        app = self.app(collector=CodexCollector(rows=()))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(len(app.query(".claude-hint")), 1)
+            app.filter_text = "navbar"
+            app.rebuild()
+            await pilot.pause()
+            self.assertEqual(len(app.query(".claude-hint")), 0)
+            self.assertNotIn("no session matches", self.screen_text(app))
+            self.assertIn("fix the navbar (codex)", self.screen_text(app))
+
+    async def test_the_last_claude_session_leaving_brings_the_hint_at_once(self):
+        c = CodexCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            # the first width paint (check_width, every 0.2 s) is done: a
+            # loaded machine ran it inside the window counted below
+            for _ in range(50):
+                if app.painted_width == app.size.width:
+                    break
+                await pilot.pause(0.05)
+            self.assertEqual(app.painted_width, app.size.width)
+            self.assertEqual(len(app.query(".claude-hint")), 0)
+            builds = []
+            real = app.rebuild
+            app.rebuild = lambda: builds.append(1) or real()
+            c.fleet_value = fleet((), PROCS)
+            app.collect()
+            await pilot.pause()
+            # the paint the session left in, not a later one
+            self.assertEqual(len(builds), 1, builds)
+            self.assertEqual(len(app.query(".claude-hint")), 1)
+
+
 class TestXOnACodexRow(RowBoxTest):
     async def test_x_offers_its_processes_and_no_stop(self):
         app = self.app(collector=CodexCollector())

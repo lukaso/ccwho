@@ -384,15 +384,17 @@ class TestSaveAndRestore(unittest.TestCase):
         with open(path) as fh:
             self.assertEqual(json.load(fh)["sessions"][0]["pane"], "G-1")
 
-    def test_save_prunes_usage_readings_older_than_eight_days(self):
+    def test_save_prunes_usage_readings_older_than_two_weeks(self):
         d = os.path.join(self.tmp, "usage")
         os.makedirs(d)
         old, new = os.path.join(d, "old.json"), os.path.join(d, "new.json")
         for p in (old, new):
             with open(p, "w") as fh:
                 fh.write("{}")
-        stamp = time.time() - 9 * 86400
+        stamp = time.time() - 15 * 86400
         os.utime(old, (stamp, stamp))
+        stamp = time.time() - 13 * 86400       # last week's account stays (owner, 2026-10-03)
+        os.utime(new, (stamp, stamp))
         self._save()
         self.assertFalse(os.path.exists(old))
         self.assertTrue(os.path.exists(new))                                # control
@@ -4607,7 +4609,11 @@ class TestStatusline(unittest.TestCase):
     def test_housekeeping_prunes_old_readings(self):
         self.run_with(self.payload())
         old = self.usage_file()
-        stamp = time.time() - 9 * 86400
+        stamp = time.time() - 13 * 86400
+        os.utime(old, (stamp, stamp))
+        runner.prune_usage()
+        self.assertTrue(os.path.exists(old))                                # control
+        stamp = time.time() - 15 * 86400
         os.utime(old, (stamp, stamp))
         runner.prune_usage()
         self.assertFalse(os.path.exists(old))
@@ -5178,8 +5184,9 @@ class TestReloadRebindsUsage(unittest.TestCase):
 
 class TestCodexUsageInTheSnapshot(unittest.TestCase):
     THREAD = "019a8f2c-0000-7000-8000-00000000000a"
-    """D20/D23: the Codex entry is read and shown only while a Codex thread is
-    open - the list's own fleet says so, and so does `ccwho ls`'s."""
+    """D20: the Codex entry is read and shown for two weeks after its last
+    reading, a thread open or not (owner, 2026-10-03 - it was only while a
+    thread was open, D23). An open thread's rollout is still found by its id."""
 
     def setUp(self):
         import ccwho_usage
@@ -5208,15 +5215,33 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
                                  "payload": {"type": "token_count", "rate_limits": rl}}) + "\n")
         os.utime(path, (self.now - 60, self.now - 60))
         self.usage = ccwho_usage
+        # a snapshot with no live account reads the setup facts: never the
+        # real ~/.claude and ~/.ccwho (review 2026-10-03)
+        real = runner.usage_facts
+        runner.usage_facts = lambda *a, **k: {"usage_roots": []}
+        self.addCleanup(setattr, runner, "usage_facts", real)
 
     def ids(self, snap):
         return [a["id"] for a in (snap or {}).get("accounts") or []]
 
-    def test_only_while_a_thread_is_open(self):
+    def rollout(self):
+        return next(os.path.join(d, f) for d, _, fs in os.walk(os.path.join(self.tmp, "codex"))
+                    for f in fs if f.endswith(".jsonl"))
+
+    def test_a_thread_open_or_not(self):
         off = runner.usage_snapshot([], self.now, record=False)
         on = runner.usage_snapshot([], self.now, record=False, codex_threads=[self.THREAD])
-        self.assertNotIn("codex:codex", self.ids(off))
+        self.assertEqual(self.ids(off), ["codex:codex"])
         self.assertEqual(self.ids(on), ["codex:codex"])
+
+    def test_for_two_weeks(self):
+        stamp = self.now - 13 * 86400
+        os.utime(self.rollout(), (stamp, stamp))
+        self.assertEqual(self.ids(runner.usage_snapshot([], self.now, record=False)),
+                         ["codex:codex"])
+        stamp = self.now - 15 * 86400
+        os.utime(self.rollout(), (stamp, stamp))
+        self.assertEqual(self.ids(runner.usage_snapshot([], self.now, record=False)), [])
 
     def test_accounts_lists_it_open_or_not(self):
         # the whole listing: every account with a reading, Codex's limit too
@@ -5257,17 +5282,16 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
     def test_accounts_finds_a_resumed_thread_in_an_old_folder(self):
         # the list finds an open thread's rollout by its id; `ccwho accounts`,
         # one-shot, reads every rollout by when it was written
-        src = next(os.path.join(d, f) for d, _, fs in os.walk(os.path.join(self.tmp, "codex"))
-                   for f in fs if f.endswith(".jsonl"))
+        src = self.rollout()
         old = os.path.join(self.tmp, "codex", "sessions",
-                           time.strftime("%Y/%m/%d", time.localtime(self.now - 15 * 86400)))
+                           time.strftime("%Y/%m/%d", time.localtime(self.now - 20 * 86400)))
         os.makedirs(old, exist_ok=True)
         moved = os.path.join(old, os.path.basename(src))
         os.replace(src, moved)
         listed = lambda: [r["id"] for r in json.loads(self.accounts_json())]
         os.utime(moved, (self.now - 60, self.now - 60))
         self.assertIn("codex:codex", listed())
-        os.utime(moved, (self.now - 9 * 86400, self.now - 9 * 86400))     # control
+        os.utime(moved, (self.now - 15 * 86400, self.now - 15 * 86400))   # control
         self.assertNotIn("codex:codex", listed())
 
     def accounts_json(self):
@@ -5276,12 +5300,31 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
             runner.main(["accounts", "--json"])
         return out.getvalue()
 
-    def test_ls_asks_for_it_from_its_own_fleet(self):
+    def test_ls_shows_it_a_thread_open_or_not(self):
         open_ = runner.with_usage([], {"codex_threads": [{"thread": self.THREAD}]},
                                   record=False)
         closed = runner.with_usage([], {"codex_threads": []}, record=False)
         self.assertEqual(self.ids(open_["usage"]), ["codex:codex"])
-        self.assertNotIn("codex:codex", self.ids(closed["usage"]))
+        self.assertEqual(self.ids(closed["usage"]), ["codex:codex"])
+
+    def test_an_open_threads_rollout_in_an_old_folder_is_still_found(self):
+        # a resumed thread writes on in its first day's folder, past the folders
+        # a scan lists: its id finds it, and once it closes the list keeps it
+        # while a reading is kept (review 2026-10-03)
+        src = self.rollout()
+        old = os.path.join(self.tmp, "codex", "sessions",
+                           time.strftime("%Y/%m/%d", time.localtime(self.now - 20 * 86400)))
+        os.makedirs(old, exist_ok=True)
+        os.replace(src, os.path.join(old, os.path.basename(src)))
+        self.addCleanup(runner._CODEX_USAGE.clear)
+        on = runner.usage_snapshot([], self.now, record=False, codex_threads=[self.THREAD])
+        closed = runner.usage_snapshot([], self.now, record=False)
+        self.assertEqual(self.ids(on), ["codex:codex"])
+        self.assertEqual(self.ids(closed), ["codex:codex"])
+        # known, kept: a process that never saw the thread open does not look
+        # for it - the whole history is too much to list on every collect
+        runner._CODEX_USAGE.clear()
+        self.assertEqual(self.ids(runner.usage_snapshot([], self.now, record=False)), [])
 
 
 class TestUsageWords(unittest.TestCase):
@@ -5402,7 +5445,40 @@ class TestReviewRoundOneRunner(unittest.TestCase):
         self.assertEqual(snap["state"], "ok")
         self.assertEqual(calls, {"load": 1, "facts": 0})
 
-    def test_filtered_ls_shows_only_the_accounts_of_the_rows_shown(self):
+    def test_an_account_no_live_session_spends_stays_on_the_line(self):
+        # owner, 2026-10-03: every account read in the last two weeks
+        self.put("s1", "login:a", "ann@x.com")
+        self.put("s2", "login:b", "bob@x.com")
+        real = runner.usage_facts
+        runner.usage_facts = lambda *a, **k: {"usage_roots": []}
+        try:
+            snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now, record=False)
+            none = runner.usage_snapshot([], self.now, record=False)
+        finally:
+            runner.usage_facts = real
+        self.assertEqual([a["id"] for a in snap["accounts"]], ["login:a", "login:b"])
+        self.assertEqual(snap["sessions"], {"s1": "login:a"})
+        self.assertEqual((none["state"], len(none["accounts"])), ("ok", 2))
+
+    def test_off_writes_no_names_and_no_shown_log(self):
+        # opted out everywhere: kept readings make no line, and ccwho writes
+        # nothing about them (review 2026-10-03)
+        self.put("s1", "login:a", "ann@x.com")
+        self.put("s2", "login:b", "bob@x.com")
+        real = runner.usage_facts
+        runner.usage_facts = lambda *a, **k: {"usage_roots": [
+            {"root": "/h/.claude", "state": "missing", "opted_out": True}]}
+        try:
+            snap = runner.usage_snapshot([], self.now)
+        finally:
+            runner.usage_facts = real
+        self.assertEqual(snap["state"], "off")
+        self.assertFalse(os.path.exists(runner.names_path()))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "usage-shown.jsonl")))
+
+    def test_filtered_ls_shows_every_account(self):
+        # the line is about accounts, not the rows a filter keeps: the same
+        # accounts as the whole list (it was the filtered rows' only)
         self.put("s1", "login:a", "ann@x.com")
         self.put("s2", "login:b", "bob@x.com")
         rows = [dict(TestUsageInTheTable.ROWS[0], sessionId="s1", project="alpha"),
@@ -5418,7 +5494,7 @@ class TestReviewRoundOneRunner(unittest.TestCase):
         finally:
             runner.engine.collect, runner.fresh_index, runner.usage_facts = real
         self.assertIn("ann", out.getvalue())
-        self.assertNotIn("bob", out.getvalue())
+        self.assertIn("bob", out.getvalue())
 
     def test_the_status_bar_name_is_the_one_the_list_used(self):
         self.put("s1", "login:a", "lukaso@gmail.com")

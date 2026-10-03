@@ -3899,10 +3899,10 @@ def usage_snap(two=True):
 
 
 class TestTheCollectorAsksForCodexUsage(unittest.TestCase):
-    """D23: the list asks for the Codex entry only while its fleet holds an open
-    Codex thread."""
+    """The list hands the usage read its fleet's open Codex threads: a resumed
+    thread's rollout, in an old folder, is found by its id."""
 
-    def test_codex_usage_follows_an_open_thread(self):
+    def test_the_open_threads_go_to_the_usage_read(self):
         import ccwho as runner
         seen = []
         real = runner.usage_snapshot
@@ -4019,7 +4019,7 @@ class TestTheCollectorReadsUsage(unittest.TestCase):
         self.assertEqual(fleet.usage, {"state": "waiting", "rows": 1})
 
     def test_an_open_thread_reaches_the_usage_read(self):
-        # the list's own scan says which threads are open (D23)
+        # the list's own scan says which threads are open
         seen = []
         snap = lambda rows, codex_threads=(): seen.append(codex_threads) or {"state": "ok"}
         self.collect(snap, {"collected": True, "codex_threads": [{"thread": "t1"}]})

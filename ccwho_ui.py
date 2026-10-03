@@ -800,8 +800,8 @@ class CcwhoUi(App):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header", markup=False)
-        # subscription usage, one line per account a live session spends: dim,
-        # the selected row's account bright
+        # subscription usage, one line per account read in the last two weeks:
+        # dim, the selected row's account bright
         yield Static("", id="usage", markup=False)
         # what agents hold: one dim line, never louder than what needs you
         yield Static("", id="ports", markup=False)
@@ -2190,8 +2190,8 @@ class Collector:
 
     def usage(self, rows, procs=None):
         """The usage snapshot, on this collecting thread; "unknown" when it
-        cannot be read. Never the reason the list goes down. Codex's usage only
-        while a Codex thread is open (the owner's D23)."""
+        cannot be read. Never the reason the list goes down. The open Codex
+        threads go along: a resumed one's rollout is found by its id."""
         try:
             import ccwho as runner
             return runner.usage_snapshot(rows, codex_threads=runner.open_codex_threads(procs))

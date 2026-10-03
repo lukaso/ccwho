@@ -44,7 +44,9 @@ VERSION = 1
 WINDOWS = ("five_hour", "seven_day")
 SHORT = {"five_hour": "5h", "seven_day": "7d"}
 BRANDS = ("ant", "oai")            # Anthropic, OpenAI: the word before ":" in a name
-KEEP_SECONDS = 8 * 86400          # the 7-day window, and a day of grace
+# an account stays on the line this long after its last reading: past a weekly
+# reset, not forever (owner, 2026-10-03 - it was 8 days, and only while live)
+KEEP_SECONDS = 14 * 86400
 SAME_WINDOW = 60                  # resets this close are one window, reported twice
 TAIL_BYTES = 256 * 1024
 # Session ids are UUIDs. \Z, not $: $ lets a trailing newline through.
@@ -295,16 +297,17 @@ _THREAD = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
 
 
 def _codex_paths(home, now, threads, cache, every=False):
-    """The rollouts a scan reads: those in the date folders of the last 8 days -
-    by the calendar, so a clock change skips no date - and each open thread's,
-    wherever its folder is: a resumed thread writes on in the rollout of the
-    day it began. Never the whole history: it grows by thousands a year, and a
-    scan runs every 2 s while a thread is open (review 2026-10-01). `every`:
-    the whole history, by when each was written - a one-shot command's read."""
+    """The rollouts a scan reads: those in the date folders a reading is kept
+    for (KEEP_SECONDS, and a day) - by the calendar, so a clock change skips no
+    date - and each open thread's, wherever its folder is: a resumed thread
+    writes on in the rollout of the day it began. Never the whole history: it
+    grows by thousands a year, and the list scans on every collect (review
+    2026-10-01). `every`: the whole history, by when each was written - a
+    one-shot command's read."""
     today, paths = datetime.date.fromtimestamp(now), set()
     if every:
         return set(glob.glob(os.path.join(home, "sessions", "*", "*", "*", "rollout-*.jsonl")))
-    for d in range(-1, 10):
+    for d in range(-1, KEEP_SECONDS // 86400 + 2):
         day = today - datetime.timedelta(days=d)
         paths.update(glob.glob(os.path.join(home, "sessions", f"{day:%Y/%m/%d}",
                                             "rollout-*.jsonl")))
@@ -325,15 +328,27 @@ def _codex_paths(home, now, threads, cache, every=False):
                     cache[key] = path
         if path:
             paths.add(path)
-    if cache is not None:               # a thread no longer open is no key kept
+    if cache is not None:
+        # a thread no longer open keeps its path while a reading is kept: a
+        # resumed one's newest reading sits in an old folder (review
+        # 2026-10-03). Gone, past the keep, or another home's: no key kept
         for key in [k for k in cache if k.startswith("_codex_path:") and k not in keep]:
-            del cache[key]
+            # "_codex_path:<home>:<thread>" - a thread id holds no ":"
+            mine = key[len("_codex_path:"):].rpartition(":")[0] == home
+            try:
+                kept = mine and now - os.stat(cache[key]).st_mtime <= KEEP_SECONDS
+            except (OSError, TypeError, ValueError):
+                kept = False
+            if kept:
+                paths.add(cache[key])
+            else:
+                del cache[key]
     return paths
 
 
 def codex_rows(home, now, cache=None, threads=(), every=False):
     """Codex usage (the owner's D20): one row per limit, from the newest reading
-    in the rollouts of the last 8 days - none for a limit whose newest reading
+    in the rollouts of the last two weeks - none for a limit whose newest reading
     has no window ccwho can name. `sessions` is the rollouts that carried it.
     `threads`: the open threads' ids, whose rollouts are read wherever they are."""
     newest, carried, seen = {}, {}, set()
@@ -502,7 +517,8 @@ def _age(secs):
 
 def _clock(epoch, now):
     t = time.localtime(epoch)
-    if epoch - now < 86400:
+    # a day either way: a reset three days gone is no "15:50" (kept two weeks)
+    if abs(epoch - now) < 86400:
         return time.strftime("%H:%M", t)
     return time.strftime("%a %H:%M", t)
 
@@ -529,10 +545,11 @@ def format_row(row, now):
 
 
 # ------------------------------------------------------------ what the list shows
-# One line per account a live session spends (owner, 2026-09-25: all of them, no
-# cap), in a fixed order, built as (text, style) spans. Cutting happens on the
-# text; colour is added last (to_ansi, or Textual in the list), so a cut can
-# never split an escape code and leak colour into the session rows below.
+# One line per account read in the last two weeks (owner, 2026-10-03; all of
+# them, no cap: 2026-09-25), in a fixed order, built as (text, style) spans.
+# Cutting happens on the text; colour is added last (to_ansi, or Textual in the
+# list), so a cut can never split an escape code and leak colour into the
+# session rows below.
 
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 STYLES = ("dim", "plain", "green", "red", "yellow", "byellow")
@@ -645,35 +662,43 @@ def session_accounts(readings):
 
 
 def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
-    """What the list needs about usage, built once per collect. `codex`: the
-    Codex rows to show - the caller reads them only while a Codex thread is
-    open (the owner's D23), as a Claude account shows while a session spends it."""
+    """What the list needs about usage, built once per collect: every account
+    with a reading kept (KEEP_SECONDS), a live session spending it or not
+    (owner, 2026-10-03: "I switch between them" - it was the live ones only,
+    E-D6). `codex`: the Codex rows, kept as long. `sessions`: the live ones."""
     labels = labels or {}
     rows = accounts(readings, now, labels)
     spent = session_accounts(readings)
     live_ids = set(live_ids or ())
     sessions = {sid: aid for sid, aid in spent.items() if sid in live_ids}
-    live = [r for r in rows if r["id"] in set(sessions.values())] + list(codex or [])
-    if live:
+    shown = rows + list(codex or [])
+    if set(sessions.values()) & {r["id"] for r in rows}:
         state = "ok"
     else:
-        # facts may be a callable: reading settings is only needed without data
+        # facts may be a callable: settings are read only when no live session
+        # spends an account shown. Opted out everywhere is no line, kept
+        # readings or not (D3; review 2026-10-03)
         facts = facts() if callable(facts) else facts
         roots = (facts or {}).get("usage_roots") or []
-        if any(r.get("state") == "ours" for r in roots):
-            state = "waiting"
-        elif roots and all(r.get("opted_out") for r in roots):
+        ours = any(r.get("state") == "ours" for r in roots)
+        if not ours and roots and all(r.get("opted_out") for r in roots):
             state = "off"
+        elif shown:
+            state = "ok"
+        elif ours:
+            state = "waiting"
         else:
             state = "not_set_up"
-    names = short_names(live, labels)
-    return {"state": state, "accounts": ordered(live, names), "names": names,
+    if state == "off":
+        shown = []          # nothing to tag, log or name while usage is off
+    names = short_names(shown, labels)
+    return {"state": state, "accounts": ordered(shown, names), "names": names,
             "sessions": sessions, "now": now}
 
 
 def _reset_label(epoch, now):
     t = time.localtime(epoch)
-    return time.strftime("%H:%M" if epoch - now < 86400 else "%a", t)
+    return time.strftime("%H:%M" if abs(epoch - now) < 86400 else "%a", t)
 
 
 def _window_spans(name, w, now, base, resets=True, age=True):
@@ -701,14 +726,16 @@ def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=Tru
     # "ant:lukaso" - the same words a row's tag says, so the eye joins them
     # (owner, 2026-10-01: a tag "lukaso" was not read as an account)
     out = [((f"{row.get('brand', 'ant')}:" if brand else "") + name, base)]
-    first = True
-    for wname in WINDOWS:
-        w = row.get(wname)
-        if not w:
-            continue
-        out.append((" " if first else " · ", base))
+    shown = [(wname, row[wname]) for wname in WINDOWS if row.get(wname)]
+    for i, (wname, w) in enumerate(shown):
+        out.append((" · " if i else " ", base))
         out += _window_spans(wname, w, now, base, resets=resets, age=age)
-        first = False
+    # an expired window says no age: when every one has, the entry says its
+    # newest reading's - what tells an account last used days ago from today's
+    ages = [w["age"] for _, w in shown if _number(w.get("age"))]
+    if age and ages and all(w["state"] == "expired" for _, w in shown) \
+            and min(ages) > STALE_AFTER:
+        out.append((f" ({_age(min(ages))} ago)", base))
     return out
 
 

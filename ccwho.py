@@ -2933,7 +2933,7 @@ def labels_path():
 
 
 def prune_usage():
-    """Readings older than the 7-day window. Housekeeping: it never fails."""
+    """Readings older than they are kept (two weeks). Housekeeping: it never fails."""
     d = usage_dir()
     for name in usage.prune(d, time.time()):
         try:
@@ -3012,10 +3012,12 @@ def open_codex_threads(fleet):
 
 
 def usage_snapshot(rows, now=None, record=True, codex_threads=()):
-    """What the list and the table show about usage, for these live rows. Also
-    logs what it shows (owner, 2026-09-25: the data that decides when an old
-    window loses its pace arrow). Codex's usage is read only while a Codex
-    thread is open (the owner's D23)."""
+    """What the list and the table show about usage: every account read in the
+    last two weeks; `rows` (the live ones) say which account each row spends.
+    Also logs what it shows (owner, 2026-09-25: the data that decides when an
+    old window loses its pace arrow). Codex's usage is read a thread open or
+    not (owner, 2026-10-03; it was only while one was open, D23): an open
+    thread's id finds its rollout wherever its folder is."""
     global _SHOWN_LAST
     now = time.time() if now is None else now
     # the module in sys.modules, not this file's handle: the live list imports
@@ -3024,7 +3026,7 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     u = sys.modules.get("ccwho_usage", usage)
     readings = u.load_readings(usage_dir(), now)
     codex = None
-    if codex_threads and hasattr(u, "codex_rows"):
+    if hasattr(u, "codex_rows"):
         try:
             codex = u.codex_rows(engine.codex_home(), now, cache=_CODEX_USAGE,
                                  threads=list(codex_threads))
@@ -3033,8 +3035,8 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     snap = u.snapshot(readings, now, engine.live_ids(rows),
                       lambda: usage_facts(now, readings), read_labels(),
                       **({"codex": codex} if codex else {}))
-    # only a snapshot over the whole fleet is recorded: a filtered `ls` sees
-    # fewer accounts, so fewer clashes - its names and lines are not the list's
+    # only a snapshot over the whole fleet is recorded: a filtered `ls` leaves
+    # the shared names and shown-log to the list
     if record:
         _SHOWN_LAST = u.append_shown(os.path.join(ccwho_dir(), "usage-shown.jsonl"),
                                      u.shown_records(snap), _SHOWN_LAST, now)

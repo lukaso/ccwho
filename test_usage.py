@@ -4,6 +4,7 @@ Claude Code hands a statusLine command `rate_limits` for the account the session
 spends. ccwho records what it is given and never logs in, never calls the API and
 never stores a credential. The fake token below must never come back out.
 """
+import glob
 import hashlib
 import json
 import os
@@ -587,10 +588,14 @@ class TestLoadReadings(unittest.TestCase):
         self.put("good.json", reading("login:a", five=(5, FIVE_RESET)))
         self.assertEqual(len(usage.load_readings(self.dir, NOW)), 1)
 
-    def test_older_than_eight_days_is_ignored(self):
+    def test_older_than_two_weeks_is_ignored(self):
+        # owner, 2026-10-03: an account is kept two weeks after its last
+        # reading - past a weekly reset, and not forever
         self.put("old.json", reading("login:a", five=(5, FIVE_RESET),
-                                     received=NOW - 9 * 86400))
-        self.assertEqual(usage.load_readings(self.dir, NOW), [])
+                                     received=NOW - 14 * 86400 - 60))
+        self.put("new.json", reading("login:b", five=(5, FIVE_RESET), sid="b",
+                                     received=NOW - 14 * 86400 + 60))       # control
+        self.assertEqual([r["session_id"] for r in usage.load_readings(self.dir, NOW)], ["b"])
 
     def test_temp_files_and_other_names_are_not_readings(self):
         self.put(SID + ".json.123.tmp", reading("login:a", five=(5, FIVE_RESET)))
@@ -600,10 +605,11 @@ class TestLoadReadings(unittest.TestCase):
     def test_missing_dir_is_no_readings(self):
         self.assertEqual(usage.load_readings(os.path.join(self.dir, "nope"), NOW), [])
 
-    def test_prune_names_files_older_than_eight_days_only(self):
-        self.put("old.json", "{}", age=9 * 86400)
+    def test_prune_names_files_older_than_two_weeks_only(self):
+        self.put("old.json", "{}", age=14 * 86400 + 60)
         self.put("new.json", "{}", age=60)
-        self.put("old.json.1.tmp", "{}", age=9 * 86400)
+        self.put("week.json", "{}", age=13 * 86400)                       # control
+        self.put("old.json.1.tmp", "{}", age=14 * 86400 + 60)
         self.assertEqual(sorted(usage.prune(self.dir, NOW)), ["old.json", "old.json.1.tmp"])
 
 
@@ -642,6 +648,16 @@ class TestFormat(unittest.TestCase):
         self.assertIn("5h 42%", line)
         self.assertIn("7d expired", line)
         self.assertIn("3m ago", line)
+
+    def test_a_reset_more_than_a_day_ago_says_its_day(self):
+        row = {"id": "x", "label": "x", "sessions": 1, "age": 4 * 86400,
+               "five_hour": {"state": "expired", "resets_at": NOW - 3 * 86400},
+               "seven_day": {"state": "expired", "resets_at": NOW - 60}}
+        line = usage.format_row(row, NOW)
+        day = _time.strftime("%a %H:%M", _time.localtime(NOW - 3 * 86400))
+        self.assertIn(f"5h expired (reset {day})", line)
+        self.assertIn("7d expired (reset " + _time.strftime("%H:%M", _time.localtime(NOW - 60))
+                      + ")", line)                                         # control
 
     def test_a_missing_window_is_a_dash(self):
         row = {"id": "x", "label": "x", "sessions": 1, "age": 5,
@@ -809,12 +825,56 @@ class TestLoadReadingsValidates(unittest.TestCase):
 class TestSnapshot(unittest.TestCase):
     FACTS_OURS = {"usage_roots": [{"root": "/h/.claude", "state": "ours", "opted_out": False}]}
 
-    def test_only_accounts_a_live_session_spends(self):
+    def test_every_account_with_a_reading_live_or_not(self):
+        # owner, 2026-10-03: "I want to know what's being used on all my
+        # accounts since I switch between them" - an account no live session
+        # spends stays, with its age (it was dropped: E-D6)
         a = reading("login:a", five=(5, FIVE_RESET), sid="s1")
-        b = reading("login:b", five=(5, FIVE_RESET), sid="s2", email="b@x.com")
+        b = reading("login:b", five=(5, FIVE_RESET), sid="s2", email="b@x.com",
+                    measured=NOW - 2 * 86400)
         s = usage.snapshot([a, b], NOW, live_ids={"s1"}, facts=self.FACTS_OURS)
-        self.assertEqual([r["id"] for r in s["accounts"]], ["login:a"])
-        self.assertEqual(s["sessions"], {"s1": "login:a"})
+        self.assertEqual([r["id"] for r in s["accounts"]], ["login:a", "login:b"])
+        self.assertEqual(s["sessions"], {"s1": "login:a"})   # a tag names a live row only
+        self.assertEqual(s["state"], "ok")
+        self.assertIn("(2d ago)", text(usage.usage_lines(s, 200))[0])
+
+    def test_no_live_session_at_all_still_shows_them(self):
+        a = reading("login:a", five=(5, FIVE_RESET), sid="s1")
+        for facts in (self.FACTS_OURS, {"usage_roots": []}):
+            s = usage.snapshot([a], NOW, live_ids=set(), facts=facts)
+            self.assertEqual((s["state"], [r["id"] for r in s["accounts"]]), ("ok", ["login:a"]))
+
+    def test_a_dir_that_kept_ccwhos_statusline_is_not_off(self):
+        # "Remove ccwho's statusLine?" answered no: setup and doctor say
+        # "still on", and so does the line
+        b = reading("login:b", five=(5, FIVE_RESET), sid="s2", measured=NOW - 3 * 86400)
+        kept = {"usage_roots": [{"root": "/h/.claude", "state": "ours", "opted_out": True}]}
+        s = usage.snapshot([b], NOW, live_ids=set(), facts=kept)
+        self.assertEqual(s["state"], "ok")
+        self.assertTrue(usage.usage_lines(s, 200))
+        gone = {"usage_roots": [{"root": "/h/.claude", "state": "missing", "opted_out": True}]}
+        self.assertEqual(usage.snapshot([b], NOW, set(), gone)["state"], "off")    # control
+
+    def test_opted_out_everywhere_is_no_line_kept_readings_or_not(self):
+        # the owner's D3: "Opted out everywhere: no line at all" - a reading
+        # kept two weeks must not outlive `ccwho setup --no-usage` (review
+        # 2026-10-03); Codex's entry goes with it: usage info is off
+        b = reading("login:b", five=(5, FIVE_RESET), sid="s2", measured=NOW - 3 * 86400)
+        off = {"usage_roots": [{"root": "/h/.claude", "state": "missing", "opted_out": True}]}
+        codex = [dict(acct_row("codex:codex", kind="codex", week=(65, NOW + D7)), brand="oai")]
+        a = reading("login:a", five=(5, FIVE_RESET), sid="s1", measured=NOW - 86400)
+        for kw in ({}, {"codex": codex}):
+            s = usage.snapshot([a, b], NOW, live_ids=set(), facts=off, **kw)
+            self.assertEqual(s["state"], "off", kw)
+            self.assertEqual(usage.usage_lines(s, 200), [])
+            # off carries no account: nothing to tag, log or name (review 2026-10-03)
+            self.assertEqual((s["accounts"], s["names"]), ([], {}))
+            self.assertEqual((usage.row_tag(s, "s2"), usage.row_tag(s, "s9")), ("", ""))
+            self.assertEqual(usage.shown_records(s), [])
+        s = usage.snapshot([b], NOW, live_ids=set(), facts=self.FACTS_OURS)     # control
+        self.assertEqual(s["state"], "ok")
+        # a live session's account is shown without a settings read (E-D8)
+        s = usage.snapshot([b], NOW, live_ids={"s2"}, facts=lambda: self.fail("no facts"))
         self.assertEqual(s["state"], "ok")
 
     def test_empty_state_precedence(self):
@@ -887,6 +947,56 @@ class TestUsageLines(unittest.TestCase):
         five, week = line.split(" · 7d ")
         self.assertNotIn("ago", five)
         self.assertIn("(16m ago)", week)
+
+    def test_an_entry_whose_windows_all_expired_still_says_its_age(self):
+        # what an old account most often reads like: both windows past their
+        # reset - the age is the one thing left that says when it was used
+        r = acct_row("token:1a2b3c4d", kind="token", five="expired", week="expired",
+                     age=3 * 86400)
+        line = text(usage.usage_lines(snap([r]), 200))[0]
+        self.assertTrue(line.endswith(" (3d ago)"), line)
+        self.assertEqual(line.count("ago"), 1)
+        # two windows alike are still two names
+        self.assertTrue(line.startswith("usage  ant:1a2b 5h expired ↻"), line)
+        self.assertIn(" · 7d expired ↻", line)
+
+    def test_the_newest_window_gives_an_all_expired_entry_its_age(self):
+        r = acct_row("token:1a2b3c4d", kind="token", five="expired", week="expired",
+                     five_age=2 * 3600, week_age=3 * 86400)
+        self.assertTrue(text(usage.usage_lines(snap([r]), 200))[0].endswith(" (2h ago)"))
+
+    def test_a_window_that_says_its_age_says_it_once(self):                 # control
+        r = acct_row("login:a", email="lukaso@gmail.com", five="expired",
+                     week=(2, NOW + 0.7 * D7), age=2 * 3600)
+        line = text(usage.usage_lines(snap([r]), 200))[0]
+        self.assertEqual(line.count("ago"), 1)
+        self.assertTrue(line.endswith("(2h ago)"), line)
+        fresh = acct_row("login:a", email="lukaso@gmail.com", five="expired",
+                         week="expired", age=60)
+        self.assertNotIn("ago", text(usage.usage_lines(snap([fresh]), 200))[0])
+
+    def test_an_all_expired_entry_drops_its_age_where_the_others_do(self):
+        r = acct_row("token:1a2b3c4d", kind="token", five="expired", week="expired",
+                     age=3 * 86400)
+        full = text(usage.usage_lines(snap([r]), 200))[0]
+        no_reset = text(usage.usage_lines(snap([r]), len(full) - 1))[0]
+        self.assertNotIn("↻", no_reset)
+        self.assertIn("(3d ago)", no_reset)
+        no_age = text(usage.usage_lines(snap([r]), len(no_reset) - 1))[0]
+        self.assertNotIn("ago", no_age)
+        self.assertIn("ant:", no_age)
+
+    def test_a_reset_more_than_a_day_ago_says_its_day(self):
+        # kept two weeks, a window can be days past its reset: "↻21:00" would
+        # read as today's
+        long_ago = NOW - 3 * 86400
+        r = acct_row("token:1a2b3c4d", kind="token", five="expired", week="expired",
+                     age=4 * 86400)
+        r["seven_day"]["resets_at"] = long_ago
+        line = text(usage.usage_lines(snap([r]), 200))[0]
+        self.assertIn("7d expired ↻" + _time.strftime("%a", _time.localtime(long_ago)), line)
+        self.assertIn("5h expired ↻" + _time.strftime("%H:%M", _time.localtime(NOW - 60)),
+                      line)                                                # control
 
     def test_expired_window_has_no_number(self):
         r = acct_row("login:a", email="lukaso@gmail.com", five="expired", week=(2, NOW + 0.7 * D7))
@@ -1252,30 +1362,65 @@ class TestCodexUsage(unittest.TestCase):
     def test_an_open_threads_rollout_in_an_old_folder_is_read(self):
         # a resumed thread writes on in the rollout of the day it began: an open
         # thread's rollout is found by its id, wherever its folder is
-        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 12 * 86400)
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 20 * 86400)
         self.assertEqual([r["id"] for r in self.rows(threads=[T1])], ["codex:codex"])
         self.assertEqual(self.rows(), [])            # control: old folders are not listed
 
     def test_a_thread_id_that_is_no_id_finds_nothing(self):
         # an id is a glob pattern's part: "*" would read the whole history
-        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 12 * 86400)
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 20 * 86400)
         self.assertEqual(self.rows(threads=["*", "../x", 7, None]), [])
 
     def test_an_open_threads_rollout_is_found_again_when_it_moves(self):
         path = self.home.rollout([token_count(NOW - 600, used=40.0)], when=NOW - 600,
-                                 day=NOW - 12 * 86400)
+                                 day=NOW - 20 * 86400)
         cache = {}
         self.assertEqual(self.rows(cache, threads=[T1])[0]["seven_day"]["pct"], 40.0)
         os.remove(path)
         self.home.rollout([token_count(NOW - 60, used=65.0)], when=NOW - 60,
-                          day=NOW - 11 * 86400)
+                          day=NOW - 19 * 86400)
         self.assertEqual(self.rows(cache, threads=[T1])[0]["seven_day"]["pct"], 65.0)
-        self.rows(cache, threads=[])                  # closed: its path is no key kept
+        os.remove(glob.glob(os.path.join(self.home.dir, "sessions", "*", "*", "*",
+                                         f"*{T1}.jsonl"))[0])
+        self.rows(cache, threads=[])                  # closed and gone: no key kept
         self.assertEqual([k for k in cache if k.startswith("_codex_path:")], [])
 
+    def test_a_closed_threads_rollout_in_an_old_folder_keeps_its_reading(self):
+        # a resumed thread writes on in its first day's folder, past the ones a
+        # scan lists: closed, its newest reading must not give way to an older
+        # one - while the list runs, its path is kept as long as a reading is
+        # (review 2026-10-03)
+        old = self.home.rollout([token_count(NOW - 60, used=65.0)], when=NOW - 60,
+                                day=NOW - 20 * 86400)
+        self.home.rollout([token_count(NOW - 3 * 86400, used=40.0)], when=NOW - 3 * 86400,
+                          thread=T2)
+        cache = {}
+        pct_age = lambda rows: (rows[0]["seven_day"]["pct"], rows[0]["age"])
+        self.assertEqual(pct_age(self.rows(cache, threads=[T1])), (65.0, 60))
+        self.assertEqual(pct_age(self.rows(cache, threads=[])), (65.0, 60))
+        stamp = NOW - 15 * 86400                      # past the keep: the key goes
+        os.utime(old, (stamp, stamp))
+        self.assertEqual(pct_age(self.rows(cache, threads=[])), (40.0, 3 * 86400))
+        self.assertEqual([k for k in cache if k.startswith("_codex_path:")], [])
+
+    def test_a_kept_path_of_another_codex_home_is_not_read(self):
+        path = self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 20 * 86400)
+        for other in ("/elsewhere/.codex", self.home.dir + ":x"):     # a home that only starts alike
+            cache = {f"_codex_path:{other}:{T1}": path}
+            self.assertEqual(self.rows(cache, threads=[]), [], other)
+            self.assertEqual([k for k in cache if k.startswith("_codex_path:")], [])
+        cache = {f"_codex_path:{self.home.dir}:{T1}": path}                    # control
+        self.assertEqual(len(self.rows(cache, threads=[])), 1)
+
+    def test_a_rollout_begun_15_days_ago_and_written_13_days_ago_is_read(self):
+        # its folder is its first day's: the scan lists folders a day past the keep
+        self.home.rollout([token_count(NOW - 13 * 86400)], when=NOW - 13 * 86400,
+                          day=NOW - 15 * 86400)
+        self.assertEqual(len(self.rows()), 1)
+
     def test_an_old_folder_with_an_old_file_is_not_read(self):              # control
-        self.home.rollout([token_count(NOW - 9 * 86400)], when=NOW - 9 * 86400,
-                          day=NOW - 12 * 86400)
+        self.home.rollout([token_count(NOW - 15 * 86400)], when=NOW - 15 * 86400,
+                          day=NOW - 20 * 86400)
         self.assertEqual(self.rows(threads=[T1]), [])
 
     def test_a_clock_change_skips_no_folder(self):
@@ -1304,7 +1449,7 @@ class TestCodexUsage(unittest.TestCase):
                               when=NOW - (20 + i) * 86400,
                               thread=f"019a8f2c-0000-7000-8000-0000000001{i:02d}")
         self.home.rollout([token_count(NOW - 120)], when=NOW - 120, thread=T2)
-        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 15 * 86400)
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 17 * 86400)
         stats = []
         real = usage.os.stat
         usage.os.stat = lambda p, *a, **k: (stats.append(p) if str(p).endswith(".jsonl")
@@ -1361,9 +1506,18 @@ class TestCodexUsage(unittest.TestCase):
         self.home.rollout(bad + [good], when=NOW - 30, thread=T2)
         self.assertEqual(self.rows()[0]["seven_day"]["pct"], 65.0)
 
-    def test_older_than_eight_days_is_not_read(self):
-        self.home.rollout([token_count(NOW - 9 * 86400)], when=NOW - 9 * 86400)
+    def test_older_than_two_weeks_is_not_read(self):
+        self.home.rollout([token_count(NOW - 15 * 86400)], when=NOW - 15 * 86400)
         self.assertEqual(self.rows(), [])
+
+    def test_a_rollout_from_last_week_is_read_with_no_thread_open(self):
+        # owner, 2026-10-03: Codex stays on the line two weeks too - its
+        # folders are read that far back, a thread open or not
+        self.home.rollout([token_count(NOW - 13 * 86400, resets=NOW - 6 * 86400)],
+                          when=NOW - 13 * 86400)
+        row, = self.rows()
+        self.assertEqual(row["seven_day"]["state"], "expired")
+        self.assertEqual(row["age"], 13 * 86400)
 
     def test_a_reading_far_from_the_end_is_not_looked_for(self):
         # the last token_count is within 8 KB of a file's end (154 files,
@@ -1398,7 +1552,8 @@ class TestCodexUsage(unittest.TestCase):
 
 
 class TestCodexOnTheUsageLine(unittest.TestCase):
-    """D23: on the line while a Codex thread is open; D24: named by its limit."""
+    """On the line two weeks after its last reading, as a Claude account (owner,
+    2026-10-03 - it was only while a thread was open, D23); D24: named by its limit."""
     CODEX = {"id": "codex:codex", "kind": "codex", "brand": "oai", "email": "", "label": "",
              "sessions": 0, "age": 60, "five_hour": None,
              "seven_day": {"state": "ok", "pct": 65.0, "resets_at": CODEX_RESET, "age": 60}}

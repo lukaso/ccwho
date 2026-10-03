@@ -137,7 +137,7 @@ Compared with herdr v0.9.3 and [its docs](https://herdr.dev/docs/), on 2026-10-0
 | Processes and ports | Not built in | `ps`, `ps --port`, `kill`, `clean`, `reap`. It shows which session started each process ([processes and ports](#processes-and-ports)) |
 | Stuck work | Not built in | Finds a wait loop on a task that has ended (`until grep …; do sleep …; done`) and stdin readers that can never end, and gives you a box to kill them ([busy, but the turn is over](#busy-but-the-turn-is-over)) |
 | Old sessions | Not built in (the `memex` plugin searches transcripts) | `ls` and `show` search an index of every transcript in `~/.claude`, in the `CLAUDE_CONFIG_DIR` ccwho runs with, and in the dirs you list in `~/.ccwho/roots` (Claude Code keeps 30 days by default) ([finding an old session](#finding-an-old-session)) |
-| Usage limits | Plugins (`herdr-agent-usage`) | 5h and 7d use for each account, with pace, after `ccwho setup` adds its statusLine. Also Codex's, while a thread is open ([subscription usage](#subscription-usage)) |
+| Usage limits | Plugins (`herdr-agent-usage`) | 5h and 7d use for each account used in the last two weeks, with pace and age, after `ccwho setup` adds its statusLine. Also Codex's ([subscription usage](#subscription-usage)) |
 | Agents control agents | Yes. With the socket API and CLI, an agent can open panes, send prompts, read output, wait until another agent is blocked, and show notifications | No. An agent cannot send a prompt to a session or read its screen. It can read the state of every Claude Code session with `ccwho --json`. When an agent runs `kill` or `clean`, they take only what its own session started |
 | Remote machines | Yes: several SSH hosts in one window. A phone works through any SSH client | No. Local Mac only |
 | Platforms | macOS, Linux, Windows; any terminal | macOS. It lists sessions in any terminal; only iTerm2 and Terminal.app windows can be brought to the front |
@@ -227,16 +227,19 @@ was started in wherever you attach from; `--resume` uses the directory you are i
 ## Subscription usage
 
 ```
-usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu  │  ant:1a2b 5h 0% · 7d 67%↑/40% ↻Mon
+usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu  │  ant:1a2b 5h expired ↻Wed · 7d 67%↑/40% ↻Mon (2d ago)
 ```
 
-One dim line under the header, one entry per account that a live session spends:
-the machine login by its email, a `CLAUDE_CODE_OAUTH_TOKEN` by the first hex of its
-fingerprint. `5h 42%↓/60%` is 42% of the 5-hour budget used with 60% of the 5 hours
+One dim line under the header, one entry per account read in the last two weeks: the
+machine login by its email, a `CLAUDE_CODE_OAUTH_TOKEN` by the first hex of its
+fingerprint. An account stays when no session spends it any more - switch accounts and
+the one you left is still there, with its age - and leaves two weeks after its last
+reading. `5h 42%↓/60%` is 42% of the 5-hour budget used with 60% of the 5 hours
 gone: `↓` (green) is on pace, `↑` (red) is faster than time passes. The used number
 turns yellow at 80% and bold at 95%. A window past its reset says `expired`; a window
-whose newest reading is older than 15 minutes says how old. With two or more accounts,
-each row ends with the account it spends, in the line's own words (`· ant:work`; `?`:
+whose newest reading is older than 15 minutes says how old, and an entry whose windows
+have all expired ends with the age of its newest reading. With two or more accounts on
+the line, each row ends with the account it spends, in the line's own words (`· ant:work`; `?`:
 no reading yet), and the entry of the selected row's account is bright. The same line
 and tags are in `ccwho`, `ccwho ls` and `--watch`, and each session's own status bar
 shows its entry.
@@ -248,9 +251,16 @@ config dir where you run claude yourself - it shows the change and asks - and
 never logs in and never reads a credential: a token account is a fingerprint of the
 token, computed inside the session and never stored. A session reports after its next
 reply - including sessions that were already running when setup added the line
-(measured: they reload the settings). `ccwho accounts` lists every account seen in the last 8 days;
-`ccwho accounts name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
-off again.
+(measured: they reload the settings). `ccwho accounts` lists every account seen in the last
+two weeks; `ccwho accounts name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
+off again: the line goes, Codex's entry with it, once no running session spends an account on it.
+
+Codex has an entry too, after the Claude accounts, named by its limit:
+`oai:codex 7d 69%↑/60% ↻Sun (42m ago)`. It is kept two weeks after its last reading, the same
+as an account, a Codex thread open or not. ccwho reads it from Codex's own transcripts - the
+`rate_limits` of their `token_count` events - with no app-server and no credential, and it
+never parses what was said. `ccwho accounts` lists it, and `ccwho accounts name oai:codex
+<label>` names it.
 
 ## Finding an old session
 

@@ -2999,7 +2999,9 @@ def statusline(argv):
     return 0
 
 
-_SHOWN_LAST = None       # what the shown-log last recorded, so it logs changes only
+# what each shown-log last recorded, so it logs changes only - per log: one key
+# for the process skipped a second dir's log that had the same records
+_SHOWN_LAST = {}
 
 
 _CODEX_USAGE = {}                 # what each Codex rollout's tail said, while unchanged
@@ -3018,7 +3020,6 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     old window loses its pace arrow). Codex's usage is read a thread open or
     not (owner, 2026-10-03; it was only while one was open, D23): an open
     thread's id finds its rollout wherever its folder is."""
-    global _SHOWN_LAST
     now = time.time() if now is None else now
     # the module in sys.modules, not this file's handle: the live list imports
     # the runner once, and after its reload (or a failed one) sys.modules is
@@ -3038,8 +3039,9 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     # only a snapshot over the whole fleet is recorded: a filtered `ls` leaves
     # the shared names and shown-log to the list
     if record:
-        _SHOWN_LAST = u.append_shown(os.path.join(ccwho_dir(), "usage-shown.jsonl"),
-                                     u.shown_records(snap), _SHOWN_LAST, now)
+        path = os.path.join(ccwho_dir(), "usage-shown.jsonl")
+        _SHOWN_LAST[path] = u.append_shown(path, u.shown_records(snap),
+                                           _SHOWN_LAST.get(path), now)
         save_names(snap.get("names") or {})
     return snap
 

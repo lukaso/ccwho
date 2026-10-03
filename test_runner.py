@@ -84,7 +84,7 @@ REAL_RUN, REAL_TIME, REAL_KILL = subprocess.run, time.time, os.kill
 # ccwho's names as imported: a test that replaced one - a function, a clock,
 # a constant - and did not put it back is named at the end (tearDownModule)
 AT_IMPORT = dict(vars(runner))
-MOVES_ITSELF = {"_SHOWN_LAST", "index", "usage"}     # ccwho rebinds these (global, reload_engine)
+MOVES_ITSELF = {"index", "usage"}                    # ccwho rebinds these (reload_engine)
 
 
 _TERM_PROGRAM = []
@@ -5166,6 +5166,59 @@ class TestUsageSnapshotLogsWhatItShows(unittest.TestCase):
             lines = [json.loads(l) for l in fh]
         self.assertEqual([(l["account"], l["window"], l["used"]) for l in lines],
                          [("a", "5h", 5)])
+
+
+class TestEachShownLogKeepsItsOwnLast(unittest.TestCase):
+    """What the shown-log last wrote is the log's own, not the process's: one
+    remembered key for every dir made a second dir with the same records get
+    no log - the order-dependent test_names_and_shown_log_are_untouched
+    (2026-10-03)."""
+
+    def setUp(self):
+        self.now = time.time()
+        old = os.environ.get("CCWHO_DIR")
+        self.addCleanup(lambda: os.environ.pop("CCWHO_DIR", None) if old is None
+                        else os.environ.__setitem__("CCWHO_DIR", old))
+        real = runner.usage_facts
+        runner.usage_facts = lambda *a, **k: {"usage_roots": []}
+        self.addCleanup(setattr, runner, "usage_facts", real)
+
+    def dir_with_a_reading(self, used=5):
+        """A fresh CCWHO_DIR, in use, holding one reading; its shown-log's path."""
+        now = self.now
+        rec = {"v": 1, "session_id": "s1", "received_at": now, "measured_at": now,
+               "rate_limits": {"five_hour": {"used_percentage": used, "resets_at": now + 100}},
+               "account": {"kind": "login", "id": "login:a", "email": "a@x.com"},
+               "first_account": {"kind": "login", "id": "login:a", "email": "a@x.com"},
+               "first_seen": now, "login_at": None, "unsure": False}
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.environ["CCWHO_DIR"] = tmp
+        os.makedirs(os.path.join(tmp, "usage"))
+        with open(os.path.join(tmp, "usage", "s1.json"), "w") as fh:
+            json.dump(rec, fh)
+        return os.path.join(tmp, "usage-shown.jsonl")
+
+    def test_a_second_dir_with_the_same_records_gets_its_own_log(self):
+        logs = []
+        for used in (5, 5, 6):
+            logs.append(self.dir_with_a_reading(used))
+            runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        # the third, other records, is the control: logged either way - one
+        # assertion, so a red run shows it too
+        self.assertEqual([os.path.exists(p) for p in logs], [True, True, True])
+
+    def test_a_key_that_cannot_be_read_or_written_still_logs_a_change_once(self):
+        # the key beside the log is what the other processes read; when it can
+        # be neither read nor written, this process's own memory keeps the log
+        # from writing the same lines on every collect. (Known, kept: an old
+        # key that can be read but not replaced repeats them - review 2026-10-03)
+        log = self.dir_with_a_reading()
+        os.makedirs(log + ".key")                     # a folder: no key to read or write
+        for _ in range(3):
+            runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        with open(log) as fh:
+            self.assertEqual(len(fh.read().splitlines()), 1)
 
 
 class TestReloadRebindsUsage(unittest.TestCase):

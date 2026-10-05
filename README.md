@@ -157,7 +157,7 @@ ccwho                         # on a terminal
 | → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
-| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port |
+| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show last, under ENDED, found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder |
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `x` | on a process (after `p`): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
@@ -277,6 +277,9 @@ transcripts, 1 GB, measured 2026-09-19). `ls` and `show` search a small index in
 grow at the end, so (inode, size, offset) is enough to resume. The first build
 stored pasted logs whole and came to 177 MB; entries are now capped, since you
 recognise a line by its front.
+
+In the live list, `/` searches the same index: the ended sessions it finds show
+under the running ones, under ENDED (ten at most, the heading says how many).
 
 ## ccwho doctor
 

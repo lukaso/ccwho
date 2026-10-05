@@ -8225,3 +8225,124 @@ class TestTheGateWritesOneIterm2AsOnePid(unittest.TestCase):
 
     def test_two(self):                                                          # control
         self.assertEqual(self.asked(apps((100, ME, IT), (200, ME, IT))), [100, 200])
+
+
+class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
+    """A session you stopped is not in the live list, so no part of the id its
+    resume line printed found anything there (the owner, 2026-10-04: a resume id
+    copied wrong, and its prefix could not be searched). While you search, the
+    ended sessions the index knows show under the running ones, matched as
+    `ccwho ls` matches them: every word, in its names and what it was about."""
+
+    NOW = "2026-10-04T12:00:00.000Z"
+    SID = "10fe9603-70dd-459c-96dc-05a176242f56"
+    OTHER = "aaaa1111-0000-4000-8000-000000000001"
+
+    def entry(self, sid=SID, **kw):
+        e = {"sessionId": sid, "project": "liveapp", "cwd": "/Users/x/liveapp",
+             "title": "liveapp pull request 526 CI tests", "recap": "the CI flake, fixed",
+             "recap_ts": "2026-09-27T16:00:00.000Z", "turns_since_recap": 2,
+             "you_said": "fix the CI", "opened": "fix the CI", "last_any": "",
+             "last_ts": "2026-09-27T16:29:54.470Z", "entrypoint": "cli",
+             "path": f"/Users/x/.claude/projects/-Users-x-liveapp/{sid}.jsonl"}
+        e.update(kw)
+        return e
+
+    def index(self, *entries):
+        return {e["sessionId"]: e for e in entries}
+
+    def ended(self, idx, query, live=()):
+        return ccwho.ui_ended_groups(idx, query, list(live), self.NOW)
+
+    def ids(self, groups):
+        return [r["sessionId"] for g in groups for r in g["rows"]]
+
+    def test_any_part_of_the_id_finds_it(self):
+        idx = self.index(self.entry(), self.entry(self.OTHER, title="other", recap="",
+                                                  you_said="", opened="", project="marketing"))
+        for q in ("10fe", "fe9603", "70dd-459c", self.SID, "10FE96"):
+            with self.subTest(q=q):
+                groups = self.ended(idx, q)
+                self.assertEqual([g["heading"] for g in groups], ["ENDED"])
+                self.assertEqual(self.ids(groups), [self.SID])
+        self.assertEqual(self.ids(self.ended(idx, "aaaa11")), [self.OTHER])    # control
+
+    def test_every_word_matches_as_ls_matches(self):
+        idx = self.index(self.entry())
+        for q in ("CI flake", "pull 526", "liveapp"):
+            with self.subTest(q=q):
+                self.assertEqual(self.ids(self.ended(idx, q)), [self.SID])
+        self.assertEqual(self.ended(idx, "pull docker"), [], "every word has to match")
+
+    def test_a_running_session_is_not_also_ended(self):
+        idx = self.index(self.entry())
+        self.assertEqual(self.ended(idx, "10fe", live=[{"sessionId": self.SID}]), [])
+        # a terminal that parked it (ctrl+b) shows it: it runs
+        parked = {"sessionId": self.OTHER, "parked": [self.SID]}
+        self.assertEqual(self.ended(idx, "10fe", live=[parked]), [])
+        self.assertEqual(self.ids(self.ended(idx, "10fe", live=[{"sessionId": self.OTHER}])),
+                         [self.SID])                                          # control
+
+    def test_no_search_shows_no_ended_session(self):
+        idx = self.index(self.entry())
+        for q in ("", "   ", None):
+            with self.subTest(q=q):
+                self.assertEqual(self.ended(idx, q), [])
+        for empty in ({}, None):
+            with self.subTest(index=empty):
+                self.assertEqual(self.ended(empty, "10fe"), [])
+
+    def test_a_programs_session_is_left_out_as_ls_leaves_it_out(self):
+        self.assertEqual(self.ended(self.index(self.entry(entrypoint="sdk-cli")), "10fe"), [])
+        self.assertEqual(self.ids(self.ended(self.index(self.entry(entrypoint="cli")), "10fe")),
+                         [self.SID])                                          # control
+
+    def sessions(self, n):
+        return self.index(*[self.entry(f"{i:08x}-0000-4000-8000-000000000000",
+                                       last_ts=f"2026-09-{10 + i:02d}T00:00:00.000Z")
+                            for i in range(n)])
+
+    def test_a_long_list_shows_the_newest_ten_and_says_how_many(self):
+        groups = self.ended(self.sessions(12), "liveapp")
+        self.assertEqual(len(groups), 1)
+        rows = groups[0]["rows"]
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(rows[0]["sessionId"], f"{11:08x}-0000-4000-8000-000000000000")
+        self.assertIn("10 of 12", groups[0]["heading"])
+        self.assertTrue(groups[0]["heading"].startswith("ENDED"))
+        # the list's header counts them all, not the ten shown
+        self.assertEqual(groups[0]["total"], 12)
+        self.assertTrue(groups[0]["ended"])
+        self.assertEqual(self.ended(self.sessions(10), "liveapp")[0]["heading"], "ENDED")  # control
+
+    def test_the_ended_group_does_not_need_you(self):
+        self.assertFalse(self.ended(self.index(self.entry()), "10fe")[0]["needs_you"])
+
+    def test_its_row_says_it_ended_and_what_it_was_about(self):
+        row = self.ended(self.index(self.entry()), "10fe")[0]["rows"][0]
+        self.assertEqual(row["attention"], "ended")
+        self.assertEqual(row["cwd"], "/Users/x/liveapp")
+        first, second = ccwho.ui_row_lines(row, width=120)
+        self.assertIn("10fe", first)
+        self.assertIn("ended 6d ago", first)
+        self.assertNotIn("no window", first)
+        self.assertIn("the CI flake, fixed", second)
+        self.assertIn("6d", second, "the recap's age")
+
+    def test_no_recap_shows_what_you_said(self):
+        row = self.ended(self.index(self.entry(recap="", recap_ts="")), "10fe")[0]["rows"][0]
+        self.assertIn("fix the CI", ccwho.ui_row_lines(row, width=120)[1])
+
+    def test_a_running_session_the_index_finds_is_found_running(self):
+        # review 2: a word only the index has (what you said in it) - `ccwho ls`
+        # shows such a session as running, and so does the list
+        idx = self.index(self.entry(you_said="flamingo deploy"),
+                         self.entry(self.OTHER, title="other", recap="", you_said="", opened=""))
+        live, other = {"sessionId": self.SID}, {"sessionId": self.OTHER}
+        self.assertEqual(ccwho.ui_found_running(idx, "flamingo", [other, live]), [live])
+        parked = {"sessionId": "cccc3333-0000-4000-8000-000000000003", "parked": [self.SID]}
+        self.assertEqual(ccwho.ui_found_running(idx, "flamingo", [parked]), [parked])
+        self.assertEqual(ccwho.ui_found_running(idx, "pelican", [other, live]), [])   # control
+        for q in ("", None):
+            self.assertEqual(ccwho.ui_found_running(idx, q, [live]), [])
+        self.assertEqual(ccwho.ui_found_running(None, "flamingo", [live]), [])

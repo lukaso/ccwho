@@ -3551,7 +3551,10 @@ def ui_row_cells(row, width=100, tag=""):
     """
     sid = row.get("short") or brief.short_id(row.get("sessionId", ""))
     tail = f" · {row.get('since', '')}"
-    if row.get("kind") == "codex":
+    if row.get("attention") == "ended":
+        # no process and no window: when it ended is what there is to say
+        tail = f" · ended {row.get('since') or '?'} ago"
+    elif row.get("kind") == "codex":
         # a Claude row's shape (the owner's D21): its age, then where it runs -
         # its app in place of a tty, never "no window"
         tail = f" · {row.get('since') or '?'} · {_printable(row.get('where') or 'Codex')}"
@@ -3754,6 +3757,55 @@ def ui_filter(rows, query):
         if all(w in hay or w.lstrip(":") in held for w in words):
             out.append(r)
     return out
+
+
+# The most ended sessions the list's search shows, as `ccwho ls` shows ten: each
+# is a widget, and the list is built again on every key you type.
+UI_ENDED_SHOWN = 10
+
+
+def ended_row(entry, now_iso):
+    """An index entry in the shape a row is drawn from: a session that has
+    ended, what it was about (its recap, else what you said) and when."""
+    said, last = entry.get("you_said", ""), entry.get("last_ts", "")
+    return {"sessionId": entry.get("sessionId", ""), "project": entry.get("project", "?"),
+            "title": entry.get("title", ""), "tab_title": "", "name": "",
+            "attention": "ended", "status": "ended", "tty": "", "pid": None,
+            "cwd": entry.get("cwd", ""), "topic": said, "first": entry.get("opened", ""),
+            "ask": "", "doing": said, "recap": entry.get("recap", ""),
+            "recap_age": brief.age_between(entry.get("recap_ts", ""), now_iso),
+            "turns_since_recap": entry.get("turns_since_recap") or 0,
+            "orphans": 0, "work": 0, "ts": last, "since": brief.age_between(last, now_iso),
+            "age": "", "waitingFor": ""}
+
+
+def ui_found_running(idx, query, live_rows):
+    """The running rows the session index finds by what they were about - words
+    a row does not carry, as what you said in it - as `ccwho ls` shows them: a
+    session the search found under ENDED and you reopened stays in the list."""
+    if not (query or "").strip() or not idx:
+        return []
+    found = {e.get("sessionId") for e in ccwho_index.search(idx, query)}
+    return [r for r in live_rows or [] if any(sid in found for sid in answers_for(r) if sid)]
+
+
+def ui_ended_groups(idx, query, live_rows, now_iso, limit=UI_ENDED_SHOWN):
+    """The ENDED group the list's search shows under the running sessions: the
+    ended ones the session index finds as `ccwho ls` finds them - every word, in
+    a session's names (any part of its id too) and what it was about - and, as
+    there, not the ones a program started. The best matches first, then the
+    newest; `limit` of them, the heading saying how many there are. None while
+    you do not search."""
+    if not (query or "").strip() or not idx:
+        return []
+    live = live_ids(live_rows)
+    hits = [e for e in ccwho_index.search(idx, query) if e.get("sessionId") not in live]
+    if not hits:
+        return []
+    heading = ("ENDED" if len(hits) <= limit
+               else f"ENDED  {limit} of {len(hits)} - type more to narrow")
+    return [{"heading": heading, "rows": [ended_row(e, now_iso) for e in hits[:limit]],
+             "needs_you": False, "ended": True, "total": len(hits)}]
 
 
 def _plural(n, word):

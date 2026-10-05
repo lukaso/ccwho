@@ -1102,6 +1102,180 @@ class TestOpenSession(unittest.TestCase):
         self.assertIn("transcript is gone", out)
 
 
+class TestTheListReopensAnEndedSession(unittest.TestCase):
+    """Enter on an ended session the list's search found (the owner, 2026-10-04):
+    `ccwho open` on it, the session index standing in for a save - every guard
+    `open` has. `ccwho open` itself, and the ccwho:// link, still reopen only
+    what a save holds."""
+
+    _F = TestOpenSession
+    SID, ENTRY = _F.SID, _F.ENTRY
+    _open, write_entry = _F._open, _F.write_entry
+
+    def setUp(self):
+        self._F.setUp(self)
+        self.addCleanup(self._F.tearDown, self)
+        # no save holds it: only the index knows it
+        os.remove(os.path.join(self.tmp, "restore", "2026-08-01T0001.json"))
+        self.indexed = {self.SID: self.entry()}
+        # the index as the list's search last saved it; a walk of every
+        # transcript (fresh_index) is never this path's (review 5)
+        real = runner.saved_index if hasattr(runner, "saved_index") else None
+        runner.saved_index = lambda: self.indexed
+        self.addCleanup(lambda: setattr(runner, "saved_index", real) if real
+                        else delattr(runner, "saved_index"))
+        walk = runner.fresh_index
+        runner.fresh_index = lambda quiet=False: self.indexed
+        self.addCleanup(setattr, runner, "fresh_index", walk)
+
+    def entry(self, root="~/.claude", **kw):
+        e = {"sessionId": self.SID, "cwd": self.cwd, "project": "liveapp", "entrypoint": "cli",
+             "path": os.path.join(os.path.expanduser(root), "projects", "-p-liveapp",
+                                  self.SID + ".jsonl")}
+        e.update(kw)
+        return e
+
+    def script(self):
+        return " ".join(" ".join(c) for c in self.runs)
+
+    def test_a_session_only_the_index_knows_is_reopened_in_a_new_window(self):
+        said = runner.reopen_ended(self.SID)
+        self.assertIn("claude --resume " + self.SID, self.script())
+        self.assertIn("create window", self.script())
+        self.assertIn("cd " + self.cwd, self.script(), "in its own folder")
+        self.assertTrue(said.startswith("reopened"), said)
+
+    def test_ccwho_open_still_reopens_only_a_saved_one(self):                 # control
+        rc, out = self._open(self.SID)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.runs, [])
+        self.assertIn("saved", out)
+
+    def test_running_again_it_is_gone_to_not_reopened(self):
+        self.live = [{"sessionId": self.SID, "tty": "ttys032", "pid": 7}]
+        runner.reopen_ended(self.SID)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("claude --resume", self.script(),
+                         "reopening a live session would fork the conversation")
+
+    def test_its_folder_gone_nothing_opens_and_it_says_why(self):
+        self.indexed = {self.SID: self.entry(cwd="/definitely/not/here")}
+        said = runner.reopen_ended(self.SID)
+        self.assertEqual(self.runs, [])
+        self.assertIn("cwd is gone", said)
+        self.assertFalse(said.startswith("ccwho"), "in the list's words: " + said)
+
+    def test_a_list_it_cannot_read_says_so_not_the_advice_after_it(self):
+        def unreadable(cache=None, status=None, **k):
+            if status is not None:
+                status["source_ok"] = False
+            return ([], 0)
+        runner.engine.collect = unreadable          # the fixture's tearDown puts it back
+        said = runner.reopen_ended(self.SID)
+        self.assertEqual(self.runs, [])
+        self.assertIn("cannot read the live session list", said)
+
+    def test_a_session_from_another_config_dir_is_reopened_there(self):
+        other = os.path.join(self.tmp, "other-claude")
+        self.indexed = {self.SID: self.entry(root=other)}
+        runner.reopen_ended(self.SID)
+        self.assertIn("CLAUDE_CONFIG_DIR=" + other, self.script())
+
+    def test_one_from_the_default_dir_sets_no_config_dir(self):              # control
+        runner.reopen_ended(self.SID)
+        self.assertIn("claude --resume", self.script())
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.script())
+
+    def test_a_session_the_index_does_not_know_opens_nothing(self):
+        self.indexed = {}
+        said = runner.reopen_ended(self.SID)
+        self.assertEqual(self.runs, [])
+        self.assertIn("neither running", said)
+        self.assertIn("transcript is gone", said)
+
+    def test_an_index_entry_with_no_folder_says_that_and_opens_nothing(self):
+        # review 2: the transcript is there - "transcript is gone" was the wrong reason
+        self.indexed = {self.SID: self.entry(cwd="")}
+        said = runner.reopen_ended(self.SID)
+        self.assertEqual(self.runs, [])
+        self.assertNotIn("transcript is gone", said)
+        self.assertIn("no cwd", said)
+
+    def test_a_save_that_holds_it_wins_over_the_index(self):
+        # the save names its folder and config dir as they were when it was open
+        other = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(other)
+        self.write_entry(dict(self.ENTRY, cwd=self.cwd))
+        self.indexed = {self.SID: self.entry(root=os.path.join(self.tmp, "other-claude"),
+                                             cwd=other)}
+        runner.reopen_ended(self.SID)
+        self.assertIn("cd " + self.cwd + " ", self.script())
+        self.assertNotIn(other, self.script())
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.script())
+
+    def test_the_reopen_does_not_wait_on_the_walk_of_every_transcript(self):
+        # a root on a volume that is gone: the walk never ends - and the reopen
+        # held the lock `o` needs while it waited
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def hung(quiet=False):
+            gate.wait(4)
+            return self.indexed
+        runner.fresh_index = hung           # setUp's cleanup puts the real one back
+        said = {}
+        t = threading.Thread(target=lambda: said.setdefault("it", runner.reopen_ended(self.SID)))
+        t.start()
+        t.join(1.5)
+        stuck = t.is_alive()
+        gate.set()
+        t.join(5)
+        self.assertFalse(stuck, "it waited on the whole walk, holding the lock")
+        self.assertFalse(runner._REOPENING.locked())
+        self.assertTrue(said["it"].startswith("reopened"), said["it"])
+
+    def test_one_reopen_at_a_time(self):
+        runner._REOPENING.acquire()
+        try:
+            said = runner.reopen_ended(self.SID)
+        finally:
+            runner._REOPENING.release()
+        self.assertEqual(self.runs, [])
+        self.assertIn("already running", said)
+
+
+class TestTheReopenReadsTheSavedIndex(unittest.TestCase):
+    """Review 6: every reopen test replaced saved_index - its own body ran in
+    none. Here it reads the index file the list's search saved, and the walk of
+    every transcript raises: the reopen never walks."""
+
+    _R = TestTheListReopensAnEndedSession
+    _F = _R._F                  # what _R's setUp builds on, by this name
+    SID, ENTRY = _R.SID, _R.ENTRY
+    _open, write_entry, entry, script = _R._open, _R.write_entry, _R.entry, _R.script
+
+    def setUp(self):
+        self._R.setUp(self)
+        real = runner.saved_index
+        self.addCleanup(setattr, runner, "saved_index", real)
+        runner.saved_index = AT_IMPORT["saved_index"]      # the real one: reads the file
+
+        def no_walk(quiet=False):
+            raise AssertionError("the reopen walked every transcript")
+        runner.fresh_index = no_walk            # setUp's cleanup puts the real one back
+
+    def test_the_reopen_finds_what_the_search_saved(self):
+        runner.index.save(self.indexed, runner.index_path())
+        said = runner.reopen_ended(self.SID)
+        self.assertTrue(said.startswith("reopened"), said)
+        self.assertIn("claude --resume " + self.SID, self.script())
+
+    def test_no_saved_index_reopens_nothing(self):                            # control
+        said = runner.reopen_ended(self.SID)
+        self.assertEqual(self.runs, [])
+        self.assertIn("neither running", said)
+
+
 class TestManifestList(unittest.TestCase):
     """With 20 kept, you need to see them before you can choose one."""
 

@@ -116,6 +116,22 @@ class FakeCollector:
         self.killed = (self.killed or []) + [row.get("sessionId")]
         return ["killed loop 86246"]
 
+    # the session index the search reads for ended sessions: none, unless a
+    # test gives it some
+    index_value = None
+    index_calls = 0
+
+    def index(self):
+        self.index_calls += 1
+        return dict(self.index_value or {})
+
+    reopened = None
+    reopen_answer = "reopened 10fe9603-70dd-459c-96dc-05a176242f56"
+
+    def reopen_ended(self, row):
+        self.reopened = (self.reopened or []) + [row.get("sessionId")]
+        return self.reopen_answer
+
 
 class FakeAdapter:
     def __init__(self, answer="focused s022", hang=False, copy_error=""):
@@ -5282,3 +5298,1160 @@ class TestAFocusAfterTheListIsGone(UiTest):
             row = list(app.query(ui.Row))[-1]
             app.followed_focus(types.SimpleNamespace(widget=row))
             self.assertEqual(app.selected, row.row.get("sessionId", ""))
+
+
+ENDED_SID = "10fe9603-70dd-459c-96dc-05a176242f56"
+ENDED_ENTRY = {"sessionId": ENDED_SID, "project": "liveapp", "cwd": "/Users/x/liveapp",
+               "title": "liveapp pull request 526 CI tests", "recap": "the CI flake, fixed",
+               "recap_ts": "2026-09-27T16:00:00.000Z", "turns_since_recap": 2,
+               "you_said": "fix the CI", "opened": "fix the CI", "last_any": "",
+               "last_ts": "2026-09-27T16:29:54.470Z", "entrypoint": "cli",
+               "path": f"/Users/x/.claude/projects/-Users-x-liveapp/{ENDED_SID}.jsonl"}
+
+
+class TestTheSearchFindsASessionThatEnded(UiTest):
+    """The owner stopped a session, copied its resume id wrong, and no part of
+    that id found anything here (2026-10-04): the list had only the running
+    sessions. While you search, the ended ones the session index knows show
+    under them, under ENDED - found by any word `ccwho ls` finds them by, a
+    part of the id too. Enter on one reopens it in a new window."""
+
+    def collector(self, fleet=None):
+        c = FakeCollector(fleet=fleet)
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY)}
+        return c
+
+    async def until(self, pilot, done, wait=2.0):
+        """The index is read off the UI thread: wait for what it brings."""
+        for _ in range(int(wait / 0.05)):
+            if done():
+                return True
+            await pilot.pause(0.05)
+        return done()
+
+    async def search(self, pilot, text):
+        await pilot.press("slash")
+        await pilot.pause()
+        for ch in text:
+            await pilot.press(ch)
+        await pilot.pause()
+
+    async def test_part_of_its_id_finds_it(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            self.assertNotIn("ENDED", self.screen_text(app), "not while you do not search")
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)),
+                            self.screen_text(app))
+            text = self.screen_text(app)
+            self.assertIn("liveapp pull request 526", text)
+            self.assertIn("ended ", text)
+            self.assertNotIn("no session matches", text)
+            self.assertNotIn("Issue 362", text, "the running ones still narrow")
+
+    async def test_escape_takes_it_away(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("escape")
+            await pilot.pause()
+            text = self.screen_text(app)
+            self.assertNotIn("ENDED", text)
+            self.assertIn("Issue 362", text)
+
+    async def test_the_header_counts_the_running_ones_as_before(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            header = str(app.query_one("#header").content)
+            self.assertIn("0 of 2 + 1 ended", header)
+            # the counts before the time are of the sessions that run
+            self.assertNotIn("ended", header.split("12:00:00")[0])
+
+    async def test_a_scan_that_finds_it_running_again_takes_it_out_of_ended(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            # resumed somewhere: the next scan has it running
+            live = row(ENDED_SID, "stopped", title="liveapp pull request 526 CI tests",
+                       tab_title="")
+            app.show(ui.Fleet([live, BUSY], True, "12:00:05"))
+            await pilot.pause()
+            self.assertNotIn("ENDED", self.screen_text(app))
+            self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()], [ENDED_SID])
+
+    async def test_the_index_is_read_only_when_you_search(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause(0.2)
+            self.assertEqual(c.index_calls, 0)
+            await self.search(pilot, "fe96")
+            self.assertTrue(await self.until(pilot, lambda: c.index_calls >= 1))
+
+    async def read(self, pilot, app, c):
+        """Until the index the search asked for is back: an absence checked
+        before it is back checks nothing."""
+        self.assertTrue(await self.until(
+            pilot, lambda: c.index_calls >= 1 and not app.index_reading))
+        await pilot.pause()
+
+    async def test_a_search_it_does_not_match_shows_no_ended_group(self):     # control
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "release")
+            await self.read(pilot, app, c)
+            text = self.screen_text(app)
+            self.assertIn("Release queue", text)
+            self.assertNotIn("ENDED", text)
+
+    async def test_a_running_session_is_shown_once(self):
+        live = row(ENDED_SID, "stopped", title="liveapp pull request 526 CI tests",
+                   tab_title="")
+        c = self.collector(fleet=ui.Fleet([live, BUSY], True, "12:00:00"))
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            await self.read(pilot, app, c)
+            self.assertNotIn("ENDED", self.screen_text(app))
+            self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()], [ENDED_SID])
+
+    async def test_enter_reopens_it(self):
+        adapter, c = FakeAdapter(), self.collector()
+        app = self.app(collector=c, adapter=adapter)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("enter")          # out of the box, onto its row
+            await pilot.pause()
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: c.reopened))
+            self.assertEqual(c.reopened, [ENDED_SID])
+            self.assertEqual(adapter.asked, [], "no window to go to: none is asked for")
+            self.assertEqual(adapter.attached, [])
+            self.assertTrue(await self.until(
+                pilot, lambda: "reopened" in str(app.query_one("#header").content)))
+
+    async def test_enter_on_a_running_one_still_goes_to_it(self):             # control
+        adapter, c = FakeAdapter(), self.collector()
+        app = self.app(collector=c, adapter=adapter)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "release")
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            self.assertEqual(adapter.asked, [BUSY["sessionId"]])
+            self.assertIsNone(c.reopened)
+
+    async def test_x_on_it_says_it_has_ended(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.ChoiceBox)
+            header = str(app.query_one("#header").content)
+            self.assertIn("it has ended", header)
+            self.assertNotIn("end it in its window", header)
+
+    async def test_an_index_that_cannot_be_read_leaves_the_search_working(self):
+        c = self.collector()
+
+        def broken():
+            c.index_calls += 1
+            raise OSError("index unreadable")
+        c.index = broken
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "release")
+            self.assertTrue(await self.until(pilot, lambda: c.index_calls >= 1))
+            await pilot.pause()
+            self.assertTrue(app.is_running)
+            self.assertIn("Release queue", self.screen_text(app))
+
+
+class TestTheEndedSessionsArriveAfterYouType(UiTest):
+    """The first index build reads every transcript (~11 s): the words are
+    typed long before it lands. When it lands, the ENDED group shows - no
+    further key needed."""
+
+    async def test_the_index_landing_late_still_shows_them(self):
+        gate = threading.Event()
+        c = FakeCollector()
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY)}
+        real = c.index
+
+        def slow():
+            gate.wait(5)
+            return real()
+        c.index = slow
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            for ch in "fe9603":
+                await pilot.press(ch)
+            await pilot.pause(0.2)
+            self.assertNotIn("ENDED", self.screen_text(app), "not read yet")
+            gate.set()
+            for _ in range(40):
+                if "ENDED" in self.screen_text(app):
+                    break
+                await pilot.pause(0.05)
+            self.assertIn("ENDED", self.screen_text(app))
+
+    async def test_while_it_is_read_nothing_matching_is_not_said_yet(self):
+        # eleven seconds of "no session matches" is wrong about the one
+        # session you are looking for
+        gate = threading.Event()
+        c = FakeCollector()
+        real = c.index
+
+        def slow():
+            gate.wait(5)
+            return real()
+        c.index = slow
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            for ch in "zzzz":
+                await pilot.press(ch)
+            await pilot.pause(0.2)
+            text = self.screen_text(app)
+            gate.set()
+            self.assertIn("reading the ended sessions", text)
+            self.assertNotIn("no session matches", text)
+            for _ in range(40):
+                if "no session matches" in self.screen_text(app):
+                    break
+                await pilot.pause(0.05)
+            self.assertIn("no session matches 'zzzz'", self.screen_text(app),
+                          "once it is read - and all of what you typed")
+            self.assertNotIn("reading the ended sessions", self.screen_text(app))
+
+    async def test_an_index_that_cannot_be_read_says_nothing_matches(self):
+        c = FakeCollector()
+
+        def broken():
+            c.index_calls += 1
+            raise OSError("index unreadable")
+        c.index = broken
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            for ch in "zzzz":
+                await pilot.press(ch)
+            for _ in range(40):
+                if "no session matches" in self.screen_text(app):
+                    break
+                await pilot.pause(0.05)
+            self.assertIn("no session matches", self.screen_text(app))
+            self.assertNotIn("reading the ended sessions", self.screen_text(app))
+
+
+class TestTheCollectorReadsTheIndexAndReopens(unittest.TestCase):
+    """The list's real doors to ccwho's own index and `open`."""
+
+    def test_it_reads_the_index_quietly(self):
+        import ccwho as runner
+        asked = []
+        with mock.patch.object(runner, "fresh_index",
+                               lambda quiet=False: asked.append(quiet) or {"x": {}}):
+            self.assertEqual(ui.Collector().index(), {"x": {}})
+        self.assertEqual(asked, [True], "a first build prints to a terminal the list owns")
+
+    def test_it_reopens_by_the_session_id(self):
+        import ccwho as runner
+        asked = []
+        with mock.patch.object(runner, "reopen_ended",
+                               lambda sid: asked.append(sid) or "reopened it"):
+            said = ui.Collector().reopen_ended({"sessionId": ENDED_SID})
+        self.assertEqual((asked, said), ([ENDED_SID], "reopened it"))
+
+    def test_a_reopen_that_raises_is_said_by_its_type(self):
+        import ccwho as runner
+
+        def boom(sid):
+            raise RuntimeError("/Users/x/secret")
+        with mock.patch.object(runner, "reopen_ended", boom):
+            said = ui.Collector().reopen_ended({"sessionId": ENDED_SID})
+        self.assertEqual(said, "could not reopen (RuntimeError)")
+
+
+def ended_entry(sid, **kw):
+    return dict(ENDED_ENTRY, sessionId=sid,
+                path=f"/Users/x/.claude/projects/-Users-x-liveapp/{sid}.jsonl", **kw)
+
+
+class GatedFleetCollector(FakeCollector):
+    """The first scan waits for the test: the list as it is before it lands."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.gate = threading.Event()
+
+    def fleet(self):
+        self.gate.wait(5)
+        return super().fleet()
+
+
+class TestEndedRowsAfterTheFirstReview(UiTest):
+    """Review 1 of the search-ended slice: an ENDED row only from a list that
+    knows what runs; Enter on one blinks and holds the list, as a jump does;
+    the footer names the reopen; one index read at a time; a failed read keeps
+    the last good one; the header counts every ended match."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, search, read = _T.until, _T.search, _T.read
+
+    def collector(self, fleet=None, cls=FakeCollector):
+        c = cls(fleet=fleet)
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY),
+                         BUSY["sessionId"]: ended_entry(BUSY["sessionId"], title="Release queue")}
+        return c
+
+    async def test_a_list_that_could_not_be_read_shows_no_ended_row(self):
+        c = self.collector(fleet=ui.Fleet([], False, "", "could not read the fleet (OSError)"))
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "bbbb2222")
+            await self.read(pilot, app, c)
+            # BUSY may well run: nothing says it does not
+            self.assertNotIn("ENDED", self.screen_text(app))
+            self.assertNotIn("ended", str(app.query_one("#header").content))
+
+    async def test_before_the_first_scan_no_ended_row_and_after_it_one(self):
+        c = self.collector(fleet=ui.Fleet([BUSY], True, "12:00:00"), cls=GatedFleetCollector)
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            try:
+                await pilot.pause()
+                await self.search(pilot, "bbbb2222")
+                await self.read(pilot, app, c)
+                self.assertNotIn("ENDED", self.screen_text(app), "it runs - not known yet")
+            finally:
+                c.gate.set()
+            await pilot.pause()
+            app.query_one("#search").value = "fe9603"
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)),
+                            "control: the scan is in, and fe96 does not run")
+
+    async def test_enter_blinks_the_row_and_holds_the_list_until_it_is_reopened(self):
+        gate, c = threading.Event(), self.collector()
+        real = c.reopen_ended
+
+        def slow(row):
+            gate.wait(5)
+            return real(row)
+        c.reopen_ended = slow
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            try:
+                await pilot.pause()
+                await self.search(pilot, "fe9603")
+                self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(app.acting, ENDED_SID)
+                widget = next(w for w in app.rows_on_screen()
+                              if w.row.get("sessionId") == ENDED_SID)
+                self.assertTrue(widget.has_class("acting"))
+                later = ui.Fleet([LIVE, BUSY], True, "12:00:09")
+                app.show(later)
+                self.assertIs(app.held, later, "nothing moves while it opens")
+            finally:
+                gate.set()
+            self.assertTrue(await self.until(pilot, lambda: not app.acting))
+            self.assertIsNone(app.held)
+
+    async def test_the_status_says_the_short_id_and_the_title(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            header = lambda: str(app.query_one("#header").content)
+            self.assertTrue(await self.until(pilot, lambda: "reopened" in header()))
+            self.assertIn("reopened 10fe", header())
+            self.assertIn("liveapp pull request 526", header())
+            self.assertNotIn(ENDED_SID, header())
+
+    def enter_says(self, app):
+        """What the footer on screen says Enter does: its drawn keys, not
+        active_bindings - that asks check_action afresh on every read."""
+        said = [k.description for k in app.query("FooterKey") if k.key == "enter"]
+        return said[0] if len(said) == 1 else said or None
+
+    async def test_the_footer_says_enter_reopens_an_ended_row(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.enter_says(app), "go to")                    # control
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("enter")              # out of the box, onto the row
+            await pilot.pause()
+            self.assertEqual(self.enter_says(app), "resume")
+
+    async def test_a_click_on_an_ended_row_reopens_it(self):
+        adapter, c = FakeAdapter(), self.collector()
+        app = self.app(collector=c, adapter=adapter)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            widget = next(w for w in app.rows_on_screen() if w.row.get("sessionId") == ENDED_SID)
+            await pilot.click(widget)
+            self.assertTrue(await self.until(pilot, lambda: c.reopened))
+            self.assertEqual(c.reopened, [ENDED_SID])
+            self.assertEqual((adapter.asked, adapter.attached), ([], []))
+
+    async def test_the_header_counts_every_ended_match_not_the_ten_shown(self):
+        c = FakeCollector()
+        c.index_value = {sid: ended_entry(sid, title="old work") for sid in
+                         (f"{i:08x}-0000-4000-8000-000000000000" for i in range(12))}
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "old work")
+            await self.read(pilot, app, c)
+            self.assertIn("+ 12 ended", str(app.query_one("#header").content))
+
+    async def test_a_read_that_fails_keeps_the_last_good_index(self):
+        c = self.collector()
+        good = c.index
+
+        def then_broken():
+            c.index = broken
+            return good()
+
+        def broken():
+            c.index_calls += 1
+            raise OSError("index unreadable")
+        c.index = then_broken
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("escape")
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: c.index_calls >= 2
+                                             and not app.index_reading))
+            await pilot.pause()
+            self.assertIn("ENDED", self.screen_text(app))
+
+    async def test_a_second_search_while_the_index_is_read_does_not_read_it_again(self):
+        gate, c = threading.Event(), FakeCollector()
+        real = c.index
+
+        def slow():
+            c.entered = getattr(c, "entered", 0) + 1
+            gate.wait(5)
+            return real()
+        c.index = slow
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            try:
+                await pilot.pause()
+                await self.search(pilot, "zz")
+                await pilot.press("escape")
+                await pilot.pause()
+                await self.search(pilot, "zz")
+                await pilot.pause(0.2)
+                self.assertEqual(getattr(c, "entered", 0), 1, "one build at a time")
+                self.assertIn("reading the ended sessions", self.screen_text(app))
+            finally:
+                gate.set()
+            self.assertTrue(await self.until(
+                pilot, lambda: "no session matches" in self.screen_text(app)))
+
+    async def test_a_list_read_without_its_source_shows_no_ended_row(self):
+        # read, at a time, but `claude agents` did not answer: what runs is not known
+        c = self.collector(fleet=ui.Fleet([], False, "12:00:00",
+                                          "cannot read the session list - run `ccwho doctor`"))
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "bbbb2222")
+            await self.read(pilot, app, c)
+            self.assertNotIn("ENDED", self.screen_text(app))
+
+    async def test_the_footer_follows_a_reopened_row_out_of_ended(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(self.enter_says(app), "resume")
+            # it runs again: the scan has it, the same widget moves out of ENDED
+            live = row(ENDED_SID, "stopped", title="liveapp pull request 526 CI tests",
+                       tab_title="")
+            app.show(ui.Fleet([live, BUSY], True, "12:00:09"))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertNotIn("ENDED", self.screen_text(app))
+            self.assertEqual(self.enter_says(app), "go to")
+
+
+class TestEndedRowsAfterTheSecondReview(UiTest):
+    """Review 2 of the search-ended slice: why a reopen did not happen can be
+    read in a narrow window; a second Enter does not end the first reopen's
+    blink; a session the index finds by what it was about stays when it runs;
+    an index read that never returns does not block the next; the guards and
+    the look a jump has, a reopen has too."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, search, read = _T.until, _T.search, _T.read
+    collector = _T.collector
+
+    async def ended_row_selected(self, pilot, app, q="fe9603"):
+        await pilot.pause()
+        await self.search(pilot, q)
+        self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+        await pilot.press("enter")              # out of the box, onto the row
+        await pilot.pause()
+
+    def drawn(self, widget):
+        return "\n".join(widget.render_line(y).text for y in range(widget.size.height))
+
+    async def test_a_failed_reopen_says_why_where_a_narrow_window_shows_it(self):
+        c = self.collector()
+        c.reopen_answer = (f"not reopening {ENDED_SID} - cwd is gone:"
+                           " /private/var/folders/ab/T/tmp1")
+        app = self.app(collector=c)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            banner = app.query_one("#banner")
+            self.assertTrue(await self.until(pilot, lambda: banner.display))
+            await pilot.pause()
+            shown = self.drawn(banner) + self.drawn(app.query_one("#header"))
+            self.assertIn("cwd is gone", self.drawn(banner))
+            self.assertIn("10fe", shown)
+            self.assertNotIn(ENDED_SID, shown, "the short id, as the row shows it")
+            self.assertFalse(app.acting, "it is over")
+
+    async def test_a_reopen_that_worked_leaves_the_warning_line_alone(self):      # control
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: "reopened" in app.status))
+            await pilot.pause()
+            self.assertFalse(app.query_one("#banner").display)
+
+    async def test_a_second_enter_while_it_reopens_does_not_end_the_blink(self):
+        gate, c = threading.Event(), self.collector()
+        real, calls = c.reopen_ended, []
+
+        def slow(row):
+            calls.append(row.get("sessionId"))
+            gate.wait(5)
+            return real(row)
+        c.reopen_ended = slow
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            try:
+                await self.ended_row_selected(pilot, app)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                self.assertEqual(calls, [ENDED_SID], "one reopen")
+                self.assertEqual(app.acting, ENDED_SID, "the first still runs")
+                later = ui.Fleet([LIVE, BUSY], True, "12:00:09")
+                app.show(later)
+                self.assertIs(app.held, later)
+            finally:
+                gate.set()
+            self.assertTrue(await self.until(pilot, lambda: not app.acting))
+
+    async def test_a_session_found_by_what_it_was_about_stays_when_it_runs(self):
+        c = FakeCollector()
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY, you_said="flamingo deploy")}
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "flamingo")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            # reopened: the scan has it running - no word of "flamingo" on its row
+            live = row(ENDED_SID, "stopped", title="liveapp pull request 526 CI tests",
+                       tab_title="")
+            app.show(ui.Fleet([live, BUSY], True, "12:00:05"))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()], [ENDED_SID])
+            self.assertNotIn("ENDED", self.screen_text(app))
+            self.assertIn("STOPPED", self.screen_text(app), "in its running group")
+
+    async def test_an_index_read_that_never_returns_is_asked_again_after_a_while(self):
+        gate, c, calls = threading.Event(), FakeCollector(), []
+
+        def hung():
+            calls.append(1)
+            gate.wait(5)
+            return {}
+        c.index = hung
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zz")
+                    await pilot.pause(0.3)
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    await self.search(pilot, "zz")
+                    await pilot.pause(0.2)
+                    self.assertEqual(len(calls), 2, "past its patience, the read is asked again")
+                finally:
+                    gate.set()
+
+    async def test_narrow_with_the_process_screen_enter_does_not_reopen(self):
+        # the process screen covers the list: Enter would act on a row you cannot see
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            self.assertTrue(app.on_ended())
+            await pilot.press("p")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(app.detail_mode, "procs")
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            self.assertIsNone(c.reopened)
+            self.assertIn("Esc for the list", app.status)
+
+    async def test_it_looks_again_soon_after_a_reopen(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "AFTER_A_JUMP", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await self.ended_row_selected(pilot, app)
+                await pilot.pause(0.3)
+                before = c.calls
+                await pilot.press("enter")
+                self.assertTrue(await self.until(pilot, lambda: c.reopened))
+                self.assertTrue(await self.until(pilot, lambda: c.calls > before, wait=1.0),
+                                "a scan soon after the reopen")
+
+    async def test_a_new_index_with_the_same_words_and_list_is_searched_anew(self):
+        # the second read comes back after the words are typed: the same search
+        # text and the same scan, searched in the last index until then
+        c, gate = self.collector(), threading.Event()
+        real = c.index
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            try:
+                await pilot.pause()
+                await self.search(pilot, "fe9603")
+                await self.read(pilot, app, c)
+                await pilot.press("escape")
+                await pilot.pause()
+                new = "cccc3333-0000-4000-8000-000000000003"
+                c.index_value = dict(c.index_value,
+                                     **{new: ended_entry(new, title="notes on fe9603")})
+
+                def later():
+                    gate.wait(5)
+                    return real()
+                c.index = later
+                await self.search(pilot, "fe9603")
+                await pilot.pause(0.2)
+                self.assertIn("ENDED", self.screen_text(app), "from the last index")
+                self.assertNotIn("notes on fe9603", self.screen_text(app), "not read yet")
+            finally:
+                gate.set()
+            self.assertTrue(await self.until(pilot, lambda: "notes on fe9603" in self.screen_text(app)))
+
+    async def test_after_a_reopen_lands_the_next_enter_reopens_again(self):
+        c = self.collector()
+        c.reopen_answer = f"not reopening {ENDED_SID} - cwd is gone: /x"
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: c.reopened and not app.acting))
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: len(c.reopened or []) == 2),
+                            "the first one is over: the next Enter is not held back")
+
+
+def attribute_clashes(source, namespace):
+    """Every `self.<name> = ...` in a class of `source` where <name> is a method
+    of that class - its own, or one it inherits (Textual's): `namespace` holds
+    the classes, built."""
+    import ast
+    clashes = []
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        own = {n.name for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        real = namespace.get(cls.name)
+        methods = own | {n for n in dir(real) if not n.startswith("__")
+                         and callable(getattr(real, n, None))}
+        for node in ast.walk(cls):
+            targets = (node.targets if isinstance(node, ast.Assign) else
+                       [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else [])
+            for t in targets:
+                for e in (t.elts if isinstance(t, ast.Tuple) else [t]):
+                    if (isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name)
+                            and e.value.id == "self" and e.attr in methods):
+                        clashes.append(f"{cls.name}.{e.attr} (line {node.lineno})")
+    return clashes
+
+
+class TestNoAttributeHidesAMethod(UiTest):
+    """Review 3: `self.reopening = ""` hid the worker `reopening(path)` that `o`
+    starts - every reopen of a save took the list down. No class here may set
+    an attribute named as one of its methods, its own or Textual's."""
+
+    def test_no_self_assignment_is_named_as_a_method(self):
+        with open(ui.__file__) as fh:
+            self.assertEqual(attribute_clashes(fh.read(), vars(ui)), [])
+
+    def test_the_check_sees_an_own_and_a_textual_clash(self):                 # control
+        src = ("from textual.app import App\n"
+               "class A:\n    def go(self):\n        self.go = 1\n"
+               "class B(App):\n    def x(self):\n        self.notify = 1\n")
+        built = {}
+        exec(src, built)
+        self.assertEqual(attribute_clashes(src, built), ["A.go (line 4)", "B.notify (line 7)"])
+
+    async def test_once_running_no_attribute_hides_a_method(self):
+        # what the source cannot show: a name set by setattr, or by Textual
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            kind = type(app)
+            self.assertEqual(sorted(n for n in vars(app) if not n.startswith("__")
+                                    and callable(getattr(kind, n, None))), [])
+
+
+class TestEndedRowsAfterTheThirdReview(UiTest):
+    """Review 3 of the search-ended slice: `o` reopens a save after an ended
+    reopen; a path in a reason keeps the whole id; a read that lands after a
+    newer one does not replace it."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, search, read = _T.until, _T.search, _T.read
+    collector = _T.collector
+    ended_row_selected = TestEndedRowsAfterTheSecondReview.ended_row_selected
+
+    async def test_o_reopens_a_save_after_an_ended_reopen(self):
+        c = self.collector()
+        restored = []
+        c.restore = lambda path=None, report=None: restored.append(path) or "reopened 1 session(s)"
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: c.reopened and not app.acting))
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("o")
+            for _ in range(4):
+                await pilot.pause()
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: restored))
+            self.assertEqual(restored, [POINTS[0]["path"]])
+            self.assertTrue(app.is_running)
+
+    async def test_a_path_in_the_reason_keeps_the_whole_id(self):
+        c = self.collector()
+        path = f"/Users/x/.ccwho/launching/{ENDED_SID}.json"
+        c.reopen_answer = (f"not launching {ENDED_SID} - its claim file cannot be read:"
+                           f" {path}. Remove it if no ccwho is launching it")
+        app = self.app(collector=c)
+        async with app.run_test(size=(200, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            self.assertTrue(await self.until(pilot, lambda: bool(app.note)))
+            self.assertIn("not launching 10fe -", app.note)
+            self.assertIn(path, app.note, "the file to remove, as it is on disk")
+
+    async def test_a_late_read_does_not_replace_the_newer_index(self):
+        c, first, calls = FakeCollector(), threading.Event(), []
+        old = {ENDED_SID: dict(ENDED_ENTRY)}
+        newer = "cccc3333-0000-4000-8000-000000000003"
+        new = dict(old, **{newer: ended_entry(newer, title="notes on fe9603 later")})
+
+        def index():
+            calls.append(1)
+            if len(calls) == 1:
+                first.wait(5)
+                return dict(old)
+            return dict(new)
+        c.index = index
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "fe9603")
+                    await pilot.pause(0.3)
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    await self.search(pilot, "fe9603")
+                    self.assertTrue(await self.until(
+                        pilot, lambda: "notes on fe9603 later" in self.screen_text(app)))
+                finally:
+                    first.set()
+                await pilot.pause(0.3)
+                await pilot.pause()
+                self.assertIn("notes on fe9603 later", self.screen_text(app),
+                              "the older read, landing last, must not take it away")
+
+    async def test_a_late_read_does_not_end_the_newer_ones_reading(self):
+        c, first, second, calls = FakeCollector(), threading.Event(), threading.Event(), []
+
+        def index():
+            calls.append(1)
+            (first if len(calls) == 1 else second).wait(5)
+            return {}
+        c.index = index
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.3):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zz")
+                    await pilot.pause(0.4)              # past its patience
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    await self.search(pilot, "zz")      # a second read, within its own
+                    self.assertEqual(len(calls), 2)
+                    first.set()                         # the first lands, late
+                    await pilot.pause(0.2)
+                    # the flag, not reading(): that also counts the patience, and
+                    # typing under load outlasts 0.3 s
+                    self.assertTrue(app.index_reading, "the second is still out")
+                finally:
+                    first.set()
+                    second.set()
+
+    async def test_a_running_row_found_both_ways_shows_once(self):
+        live = row(ENDED_SID, "stopped", title="liveapp flamingo", tab_title="")
+        c = FakeCollector(fleet=ui.Fleet([live, BUSY], True, "12:00:00"))
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY, you_said="flamingo deploy")}
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "flamingo")
+            await self.read(pilot, app, c)
+            self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()], [ENDED_SID])
+            self.assertIn("1 of 2", str(app.query_one("#header").content))
+
+
+class TestEndedRowsAfterTheFourthReview(UiTest):
+    """Review 4 of the search-ended slice: a list that cannot say what runs
+    does not say "no session matches"; reads that never return do not fill the
+    thread pool; Enter's word on an ended row is not `o`'s."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, search, read = _T.until, _T.search, _T.read
+    collector = _T.collector
+    enter_says = TestEndedRowsAfterTheFirstReview.enter_says
+
+    async def test_an_unread_list_does_not_say_nothing_matches(self):
+        c = self.collector(fleet=ui.Fleet([], False, "", "could not read the fleet (OSError)"))
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            await self.read(pilot, app, c)
+            text = self.screen_text(app)
+            self.assertNotIn("no session matches", text, "it may well be there")
+            self.assertIn("not read yet", text)
+
+    async def test_a_read_list_with_no_match_still_says_so(self):              # control
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "zzzz")
+            await self.read(pilot, app, c)
+            self.assertIn("no session matches 'zzzz'", self.screen_text(app))
+            self.assertNotIn("not read yet", self.screen_text(app))
+
+    async def test_reads_that_never_return_take_two_threads_at_most(self):
+        gate, c, calls = threading.Event(), FakeCollector(), []
+
+        def hung():
+            calls.append(1)
+            gate.wait(5)
+            return {}
+        c.index = hung
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    for _ in range(5):
+                        await pilot.press("slash")
+                        await pilot.pause(0.15)         # past its patience each time
+                        await pilot.press("escape")
+                        await pilot.pause()
+                    self.assertEqual(len(calls), 2, "one read, and one more if it hangs")
+                finally:
+                    gate.set()
+
+    async def test_enter_on_an_ended_row_is_not_named_as_o_is(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "fe9603")
+            self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
+            await pilot.press("enter")
+            await pilot.pause()
+            o_says = [k.description for k in app.query("FooterKey") if k.key == "o"]
+            self.assertEqual(self.enter_says(app), "resume")
+            self.assertNotIn(self.enter_says(app), o_says)
+
+    async def test_reads_that_come_back_free_their_thread(self):              # control
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            for n in (1, 2, 3):
+                await pilot.press("slash")
+                self.assertTrue(await self.until(
+                    pilot, lambda: c.index_calls == n and not app.index_reading))
+                await pilot.press("escape")
+                await pilot.pause()
+            self.assertEqual(c.index_calls, 3, "every search reads it again")
+
+
+class TestEndedRowsAfterTheFifthReview(UiTest):
+    """Review 5 of the search-ended slice: a list not read says so while the
+    index reads too; a read that comes back stale, or was dropped before it
+    ran, gives its slot back."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, search = _T.until, _T.search
+
+    async def empty_text_while_the_index_reads(self, fleet=None, gated=False):
+        gate = threading.Event()
+        c = (GatedFleetCollector if gated else FakeCollector)(fleet=fleet)
+
+        def index():
+            gate.wait(5)
+            return {}
+        c.index = index
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            try:
+                await pilot.pause()
+                await self.search(pilot, "fe9603")
+                await pilot.pause(0.2)
+                return self.screen_text(app)
+            finally:
+                gate.set()
+                if gated:
+                    c.gate.set()
+
+    async def test_an_unreadable_list_while_the_index_reads(self):
+        text = await self.empty_text_while_the_index_reads(
+            fleet=ui.Fleet([], False, "", "could not read the fleet (OSError)"))
+        self.assertNotIn("no running session matches", text)
+        self.assertNotIn("no session matches", text)
+        self.assertIn("not read yet", text)
+
+    async def test_the_first_scan_not_back_while_the_index_reads(self):
+        text = await self.empty_text_while_the_index_reads(gated=True)
+        self.assertNotIn("no running session matches", text)
+        self.assertIn("not read yet", text)
+
+    async def test_a_read_list_while_the_index_reads(self):                     # control
+        text = await self.empty_text_while_the_index_reads()
+        self.assertIn("no running session matches 'fe9603'", text)
+        self.assertIn("reading the ended sessions", text)
+
+    async def slash(self, pilot):
+        await pilot.press("slash")
+        await pilot.pause(0.15)
+        await pilot.press("escape")
+        await pilot.pause()
+
+    async def test_a_stale_read_that_comes_back_gives_its_slot_back(self):
+        first, second, rest, calls = (threading.Event(), threading.Event(),
+                                      threading.Event(), [])
+
+        def index():
+            calls.append(1)
+            (first if len(calls) == 1 else second if len(calls) == 2 else rest).wait(5)
+            return {}
+        c = FakeCollector()
+        c.index = index
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.slash(pilot)
+                    await self.slash(pilot)
+                    self.assertEqual(len(calls), 2)
+                    first.set()             # the stale one lands
+                    second.set()            # then the latest
+                    self.assertTrue(await self.until(pilot, lambda: not app.index_reading))
+                    await pilot.pause(0.1)
+                    await self.slash(pilot)
+                    await self.slash(pilot)
+                    self.assertEqual(len(calls), 4, "both came back: two more may go")
+                finally:
+                    first.set()
+                    second.set()
+                    rest.set()
+
+    async def test_a_read_dropped_before_it_ran_gives_its_slot_back(self):
+        import asyncio
+        import concurrent.futures
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        blocker = threading.Event()
+        c = FakeCollector()
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause(0.3)
+                    held = loop.run_in_executor(None, blocker.wait, 5)   # the pool is full
+                    await self.slash(pilot)         # read 1: waits for a thread
+                    await self.slash(pilot)         # read 2: waits too
+                    blocker.set()
+                    await held
+                    self.assertTrue(await self.until(pilot, lambda: not app.index_reading))
+                    await pilot.pause(0.2)
+                    self.assertEqual(app.index_out, 0, "nothing is out")
+                finally:
+                    blocker.set()
+
+
+QUIT_WHILE_THE_INDEX_READS = """
+import sys, threading
+sys.path.insert(0, sys.argv[1])
+import ccwho_ui as ui, test_ui
+c = test_ui.FakeCollector()
+c.index = lambda: threading.Event().wait(20) or {}      # a read that does not come back
+app = ui.CcwhoUi(adapter=test_ui.FakeAdapter(), collector=c)
+
+async def drive(pilot):
+    await pilot.pause()
+    await pilot.press("slash")
+    await pilot.pause(0.3)
+    await pilot.press("escape")
+    await pilot.pause()
+    await pilot.press("q")
+
+app.run(headless=True, auto_pilot=drive)
+print("quit", flush=True)
+"""
+
+
+class TestEndedRowsAfterTheSixthReview(UiTest):
+    """Review 6 of the search-ended slice: `q` does not wait for an index read
+    that has not come back; a read older than the latest, back while nothing
+    newer has landed, shows its rows."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, search = _T.until, _T.search
+
+    def test_q_does_not_wait_for_an_index_read(self):
+        import os
+        import sys
+        import time
+        here = os.path.dirname(os.path.abspath(ui.__file__))
+        began = time.monotonic()
+        done = subprocess.run([sys.executable, "-c", QUIT_WHILE_THE_INDEX_READS, here],
+                              capture_output=True, text=True, timeout=12, cwd=here,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        took = time.monotonic() - began
+        self.assertIn("quit", done.stdout, done.stderr[-500:])
+        self.assertLess(took, 6, "q waited for the read")
+
+    async def two_reads(self, which_first):
+        first, second, calls = threading.Event(), threading.Event(), []
+        old = {ENDED_SID: dict(ENDED_ENTRY)}
+        newer = "cccc3333-0000-4000-8000-000000000003"
+        new = dict(old, **{newer: ended_entry(newer, title="notes on fe9603 later")})
+
+        def index():
+            calls.append(1)
+            mine = len(calls)               # this read's own number, kept
+            (first if mine == 1 else second).wait(5)
+            return dict(old if mine == 1 else new)
+        c = FakeCollector()
+        c.index = index
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "INDEX_PATIENCE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await pilot.press("slash")
+                    await pilot.pause(0.15)
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    await self.search(pilot, "fe9603")      # read 2, read 1 still out
+                    self.assertEqual(len(calls), 2)
+                    (first if which_first == 1 else second).set()
+                    shown = await self.until(pilot, lambda: "ENDED" in self.screen_text(app))
+                    self.assertTrue(shown, "back first, and nothing newer has landed")
+                    self.assertEqual("notes on fe9603 later" in self.screen_text(app),
+                                     which_first == 2)
+                    (second if which_first == 1 else first).set()
+                    await pilot.pause(0.3)
+                    await pilot.pause()
+                    # whatever the order, the newer read's rows are what stays
+                    self.assertIn("notes on fe9603 later", self.screen_text(app))
+                    self.assertFalse(app.index_reading)
+                finally:
+                    first.set()
+                    second.set()
+
+    async def test_an_older_read_back_first_shows_its_rows_until_the_newer(self):
+        await self.two_reads(which_first=1)
+
+    async def test_the_newer_read_back_first_stays(self):                       # control
+        await self.two_reads(which_first=2)
+
+    def test_a_read_back_when_the_list_is_not_running_says_nothing(self):
+        # its thread outlives the list (q, restart): nobody to tell, and no
+        # traceback on the terminal the list gave back
+        app = ui.CcwhoUi(adapter=FakeAdapter(), collector=FakeCollector())
+        app.index_out = 1
+        app._read_index(1)          # no raise

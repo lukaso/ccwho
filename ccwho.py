@@ -981,18 +981,6 @@ def fresh_index(quiet=False):
     return fresh
 
 
-def _ended_row(entry, now_iso):
-    """An index entry in the shape the row renderers expect."""
-    return {"sessionId": entry.get("sessionId", ""), "project": entry.get("project", "?"),
-            "title": entry.get("title", ""), "tab_title": "", "name": "",
-            "attention": "ended", "status": "ended", "tty": "", "pid": None,
-            "cwd": entry.get("cwd", ""), "topic": entry.get("you_said", ""),
-            "first": entry.get("opened", ""), "ask": "", "doing": "",
-            "orphans": 0, "work": 0, "ts": entry.get("last_ts", ""),
-            "since": engine.brief.age_between(entry.get("last_ts", ""), now_iso),
-            "age": "", "waitingFor": ""}
-
-
 def matches(query, rows, everything=False):
     """Every session matching, live ones as live rows and the rest as ended ones.
 
@@ -1018,7 +1006,7 @@ def matches(query, rows, everything=False):
             if by_id[sid] not in hits:
                 hits.append(by_id[sid])      # running, found by what it is about
         else:
-            ended.append(_ended_row(entry, now))
+            ended.append(engine.ended_row(entry, now))
     hits.sort(key=engine.sort_key)
     return hits, ended
 
@@ -2273,18 +2261,48 @@ def window_app(session_id):
     return app or engine.terms.default_app(os.environ, installed=installed)
 
 
-def open_session(argv):
+def saved_index():
+    """The session index as last saved: what the list's search found a session
+    in. Not brought up to date: that walks every transcript - ~11 s cold, and
+    never done on a root whose volume hangs - and the reopen held `o`'s lock
+    while it walked. (The reopen's own scan still reads the transcripts of the
+    sessions that run; the walk was the long part, not the only read.)"""
+    return index.load(index_path())
+
+
+def indexed_entry(session_id):
+    """A session the session index knows, as a save records one: its folder, and
+    its config dir when that is not ~/.claude - `claude --resume` finds a session
+    only in the config dir it runs with. None when the index does not know it."""
+    e_ = saved_index().get(session_id) if session_id else None
+    if not isinstance(e_, dict):
+        return None
+    # the transcript is <config dir>/projects/<folder>/<id>.jsonl
+    root = os.path.dirname(os.path.dirname(os.path.dirname(str(e_.get("path") or ""))))
+    conf = "" if not root or root == os.path.expanduser("~/.claude") else root
+    return {"sessionId": session_id, "cwd": e_.get("cwd", ""),
+            "project": e_.get("project", ""), "configDir": conf}
+
+
+def open_session(argv, from_index=False):
     """Get me to this session: focus its window if it is up, reopen it if not.
 
     The verb is decided HERE, against the world at click time, not baked into the
     link when the list was printed. After a reboot every link in a restore list
     resolves to "reopen"; ten minutes later the same link focuses the window it
     just made.
+
+    It reopens what a save holds. `from_index` (the list's Enter on an ended
+    session, reopen_ended) also reopens what only the session index knows - not
+    the command line's `open`, nor a ccwho:// link from a page.
     """
     sid = (argv[0] if argv else "").strip()
     status = {}
     rows, _ = scan(cache={}, status=status)
-    action, value = engine.resolve_open(sid, rows, known_entries(),
+    entries = known_entries()
+    if from_index and not any(e_.get("sessionId") == sid for e_ in entries):
+        entries += [e_ for e_ in (indexed_entry(sid),) if e_]
+    action, value = engine.resolve_open(sid, rows, entries,
                                         source_ok=status.get("source_ok", False))
     if action == "jump":
         return jump([value])
@@ -2309,7 +2327,7 @@ def open_session(argv):
               file=sys.stderr)
         return 1
     if action == "resume":
-        entry = next((e_ for e_ in known_entries() if e_.get("sessionId") == sid), {})
+        entry = next((e_ for e_ in entries if e_.get("sessionId") == sid), {})
         why = resume_problem(entry)
         if why:
             print(f"ccwho open: not reopening {sid} - {why}", file=sys.stderr)
@@ -2325,8 +2343,14 @@ def open_session(argv):
             return 1
         print("reopened %s" % sid)
         return 0
-    print("ccwho open: %s is neither running nor in any saved manifest" % (sid or "?"),
-          file=sys.stderr)
+    found = next((e_ for e_ in entries if e_.get("sessionId") == sid), None) if from_index else None
+    if found:
+        # the index knows it, and no resume line builds from what it knows
+        why = resume_problem(found) or "no resume line can be built"
+        print(f"ccwho open: not reopening {sid} - {why}", file=sys.stderr)
+        return 1
+    print("ccwho open: %s is neither running nor in any saved manifest" % (sid or "?")
+          + (", and its transcript is gone" if from_index else ""), file=sys.stderr)
     return 1
 
 
@@ -3631,6 +3655,29 @@ def reopen_saved(path=None, report=None):
         return _reopen_saved(path, report)
     finally:
         _REOPENING.release()
+
+
+def reopen_ended(session_id):
+    """What Enter does on an ended session the list's search found: `ccwho open`
+    on it, the session index standing in for a save (open_session's from_index).
+    Not a second implementation: running again, it is gone to, not forked; a
+    launch already made is held. One line, in the list's words - what it did, or
+    why it did not. One at a time with `o`: both take the process's stdout."""
+    if not _REOPENING.acquire(blocking=False):
+        return "a reopen is already running - wait for it to finish"
+    try:
+        out = _OneLinePerWrite()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = open_session([session_id], from_index=True)
+    finally:
+        _REOPENING.release()
+    lines = [l for l in out.getvalue().splitlines() if l.strip()]
+    # what it did is its last line; why it did not, its first - the advice after
+    # it ("Check that `claude` is on PATH") is not the reason
+    said = (lines[-1] if not rc else lines[0]) if lines else ""
+    for lead in ("ccwho open: ", "ccwho: "):
+        said = said.removeprefix(lead)
+    return said or ("reopened it" if not rc else "could not reopen it")
 
 
 def _restore_failed(failed, opened=0):

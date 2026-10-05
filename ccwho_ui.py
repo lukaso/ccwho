@@ -15,7 +15,8 @@ What it does that the one-shot table cannot:
   - the second line of every row is the RECAP, with its age
   - -> opens the full brief; at narrow widths it takes the whole screen
   - Enter goes to the window, and nothing here waits for iTerm2 to answer
-  - / searches every name a session has, plus what it is about
+  - / searches every name a session has, plus what it is about - and the
+    ended sessions too, from the index `ccwho ls` searches; Enter reopens one
 
 Collection runs in a worker thread. `claude agents --json` can take 30 seconds
 when it is unhappy, and a list that freezes at the moment you reach for it is the
@@ -101,6 +102,10 @@ PULSE_EVERY = 0.45             # the blink on a row that is being opened
 # fifteen changed four times a minute, and acting on every change is ~4% of a
 # core.
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
+# The session index's first build reads every transcript: ~11 s. A read that has
+# not come back by this is asked again at the next `/` - a thread worker cannot
+# be stopped, and one that never returns must not stop every search after it.
+INDEX_PATIENCE = 60.0
 
 
 class Fleet:
@@ -140,8 +145,12 @@ class Fleet:
     def visible(self, query):
         return engine.ui_filter(self.rows, query)
 
-    def groups(self, query):
-        return engine.ui_groups(self.visible(query))
+    def groups(self, query, also=()):
+        """The rows the search finds, in their groups - and `also`, the running
+        rows the session index finds by what they were about."""
+        shown = self.visible(query)
+        seen = {id(r) for r in shown}
+        return engine.ui_groups(shown + [r for r in also if id(r) not in seen])
 
 
 def brief_parts(b, row):
@@ -749,6 +758,9 @@ class CcwhoUi(App):
 
     BINDINGS = [
         Binding("enter", "go", "go to"),
+        # an ended row (a search found it): Enter reopens it - check_action
+        # picks which of the two the footer shows
+        Binding("enter", "reopen_ended", "resume"),
         Binding("right", "detail", "detail"),
         Binding("left,escape", "back", "back"),
         Binding("slash", "search", "search"),
@@ -795,6 +807,18 @@ class CcwhoUi(App):
         self.loading = False    # the saves are being read for the o menu
         self.note = ""          # an `o` that missed iTerm2's panes: shown until a key
         self.note_at = 0.0      # when it came: time.monotonic, the clock of a key's .time
+        # the session index the search finds ended sessions in: read when a
+        # search opens, off the UI thread; None until then
+        self.ended_index = None
+        self.ended_cache = None  # (query, index, fleet) -> the ENDED group they make
+        self.index_reading = False  # a read asked for and not back yet
+        self.index_asked = 0.0      # when it was asked: time.monotonic
+        self.index_reads = 0        # which read is the latest: only it lands
+        self.index_out = 0          # reads started and not back: each holds a thread
+        self.index_landed = 0       # the newest read that has landed
+        # the ended session being reopened, or "" - not `reopening`: that is
+        # the worker `o` starts, and an attribute of its name hid it
+        self.reopening_sid = ""
 
     # ------------------------------------------------------------------ layout
 
@@ -1005,14 +1029,91 @@ class CcwhoUi(App):
         except Exception:
             return None
 
+    def groups(self):
+        """What the list shows: the running sessions the search finds - by
+        their rows, and by what the index says they were about, as `ccwho ls`
+        finds them - and, while you search, the ended ones, last, under ENDED."""
+        running, ended = self.index_found()
+        return self.fleet.groups(self.filter_text, also=running) + ended
+
+    def index_found(self):
+        """(the running rows the index finds, the ENDED group), from the index
+        as read when the search opened. Asked for on every paint and every
+        move: made once per search text, index and scan - a scan brings new
+        ages, and which sessions run."""
+        if not self.filter_text or not self.ended_index:
+            return [], []
+        if not (self.fleet.source_ok and self.fleet.at):
+            # not read yet, or not readable: a session that runs would show as
+            # ended - nothing says it does not run
+            return [], []
+        key = (self.filter_text, self.ended_index, self.fleet)
+        got = self.ended_cache
+        if got and got[0][0] == key[0] and got[0][1] is key[1] and got[0][2] is key[2]:
+            return got[1]
+        try:
+            found = (engine.ui_found_running(self.ended_index, self.filter_text,
+                                             self.fleet.rows),
+                     engine.ui_ended_groups(self.ended_index, self.filter_text,
+                                            self.fleet.rows, engine.now_iso()))
+        except Exception:               # an odd index never costs the running ones
+            found = ([], [])
+        self.ended_cache = (key, found)
+        return found
+
+    def read_index(self, n=0):
+        """The session index, brought up to date: 0.03 s warm - and the first
+        build ever reads every transcript, ~11 s. Never on the UI thread, and
+        never the reason the list goes down: unread, the search finds the
+        running sessions only.
+
+        On a daemon thread of its own, not a worker: workers run in the pool
+        `q` and restart wait for - a cold build held the exit 11 s, and a read
+        that never comes back held it for good (review 6). Nor was a worker
+        sure to run: one dropped before its thread started never came back."""
+        threading.Thread(target=self._read_index, args=(n,), daemon=True,
+                         name="ccwho-index").start()
+
+    def _read_index(self, n):
+        try:
+            idx = self.collector.index()
+        except Exception:
+            idx = None
+        try:
+            self.call_from_thread(self.index_read, idx, n)
+        except Exception:
+            pass                # the list has gone: there is no one to tell
+
+    def reading(self):
+        """Is a read of the index under way - one asked for within its patience?"""
+        return self.index_reading and time.monotonic() - self.index_asked <= INDEX_PATIENCE
+
+    def index_read(self, idx, n=0):
+        """The read is back: the ENDED group it finds, or - unread - the one
+        from the last read, if any. Never an older read than one that has
+        landed: it would put an older index back (review 3). An older one back
+        while nothing newer has landed is the best there is (review 6) - and
+        only the latest says the reading is over."""
+        self.index_out -= 1
+        if n == self.index_reads:
+            self.index_reading = False
+        if idx is not None and n > self.index_landed:
+            self.ended_index, self.index_landed = idx, n
+        if self.filter_text:
+            self.rebuild()
+
     def rebuild(self):
         listing = self.part("#list")
         if listing is None or self.part("#header") is None:
             return
         width = self.list_width()
-        groups = self.fleet.groups(self.filter_text)
+        groups = self.groups()
         hint = self.codex_only_hint(groups)
-        shape = self.shape_of(groups, width)
+        # an empty search is its words: what you typed, and whether the ended
+        # sessions are still being read - a new word is a new list. Not an
+        # empty fleet's: those read the newest save
+        shape = (self.shape_of(groups, width) if groups or not self.filter_text
+                 else (width, self.empty_text()))
         if shape == self.painted_shape and listing.children:
             self.repaint_rows(groups, width)
             self.place_hint(listing, hint)
@@ -1134,6 +1235,17 @@ class CcwhoUi(App):
             listing.move_child(have, after=list(listing.children)[-1])
 
     def empty_text(self):
+        if self.filter_text and not (self.fleet.source_ok and self.fleet.at):
+            # the ended sessions wait for it (index_found): "no session matches"
+            # would be wrong about the one you are looking for - and so would
+            # "no running session matches", while the index reads
+            return (f"  {self.filter_text!r}: the running sessions are not read yet"
+                    f" - until they are, no ended one shows")
+        if self.filter_text and self.reading():
+            # the first read of the index takes ~11 s: "no session matches" is
+            # not known yet about the ended ones
+            return (f"  no running session matches {self.filter_text!r}"
+                    f" - reading the ended sessions...")
         if self.filter_text:
             return f"  no session matches {self.filter_text!r} - esc to clear"
         if not self.fleet.source_ok:
@@ -1148,6 +1260,10 @@ class CcwhoUi(App):
         header, banner = self.part("#header"), self.part("#banner")
         if header is None or banner is None:
             return
+        # the ended sessions are not counted with the ones that run: "1 ended"
+        # among them reads as a running session that ended. The search says them
+        ended = sum(g.get("total", len(g["rows"])) for g in groups if g.get("ended"))
+        groups = [g for g in groups if not g.get("ended")]
         counts = " · ".join(f"{len(g['rows'])} {g['heading'].split()[0].lower()}"
                             for g in groups)
         # Always say when this was true. Without it, a list that has stopped
@@ -1158,8 +1274,8 @@ class CcwhoUi(App):
         # looking. The box at the bottom is easy to forget, and a filtered list
         # you have forgotten about looks like a broken one.
         shown = sum(len(g["rows"]) for g in groups)
-        searching = (f"   search {self.filter_text!r}: {shown} of "
-                     f"{len(self.fleet.rows)} · esc to clear"
+        searching = (f"   search {self.filter_text!r}: {shown} of {len(self.fleet.rows)}"
+                     + (f" + {ended} ended" if ended else "") + " · esc to clear"
                      if self.filter_text else "")
         # sessions are Claude's; the Codex threads are counted by their group
         sessions = sum(1 for r in self.fleet.rows if r.get("kind") != "codex")
@@ -1340,7 +1456,7 @@ class CcwhoUi(App):
 
     def visible_rows(self):
         """Every row on screen, in the order the screen puts them."""
-        return [row for group in self.fleet.groups(self.filter_text)
+        return [row for group in self.groups()
                 for row in group["rows"]]
 
     def selected_id(self):
@@ -1405,6 +1521,12 @@ class CcwhoUi(App):
             widget.set_class(widget.row.get("sessionId") == self.selected,
                              "selected")
         self.paint_usage()          # the selected row's account is the bright one
+        # what Enter does follows the row: the footer is rebuilt when that
+        # changes - a reopened session keeps its widget as it moves out of ENDED
+        ended = self.on_ended()
+        if ended != getattr(self, "_enter_for", False):
+            self._enter_for = ended
+            self.refresh_bindings()
 
     # ----------------------------------------------------------------- actions
 
@@ -1490,7 +1612,14 @@ class CcwhoUi(App):
             # process screen - it is not about the selected row
             return (not (self.detail_open and self.detail_mode == "procs")
                     and bool(self.row_choices(self.selected_row())[0]))
+        if action in ("go", "reopen_ended"):
+            return self.on_ended() == (action == "reopen_ended")
         return True
+
+    def on_ended(self):
+        """Is the selected row an ended session - one Enter reopens?"""
+        row = self.selected_row()
+        return bool(row) and row.get("attention") == "ended"
 
     def action_row_x(self):
         """`x` on a session: the box of what fits it. The process screen's `x`
@@ -1522,6 +1651,8 @@ class CcwhoUi(App):
         row = self.selected_row()
         if row and row.get("kind") == "codex":
             self.said(f"nothing to kill here: {engine.codex_there(row, 'end')}")
+        elif row and row.get("attention") == "ended":
+            self.said("nothing to kill or stop here - it has ended. Enter reopens it")
         elif row:
             self.said("nothing to kill or stop here - an interactive session: end it in its"
                       " window (/exit)")
@@ -1840,6 +1971,17 @@ class CcwhoUi(App):
             self.rebuild()
 
     def action_search(self):
+        # the ended sessions are searched too: their index, read again now -
+        # unless a read is under way (the first build takes ~11 s, and a
+        # thread worker cannot be stopped: a second would run beside it)
+        # never more than two out: one that hangs (a root on a volume that is
+        # gone) holds a thread of the pool every worker shares - one each `/`
+        # filled it, and the list stopped (review 4)
+        if not self.reading() and self.index_out < 2:
+            self.index_reading, self.index_asked = True, time.monotonic()
+            self.index_reads += 1
+            self.index_out += 1
+            self.read_index(self.index_reads)
         box = self.show_search()
         # after the refresh, for the same reason the selection is: a widget that
         # was hidden a moment ago cannot take focus yet, and the keys you type
@@ -1852,9 +1994,12 @@ class CcwhoUi(App):
             # narrow, the process screen hides the list: Enter would go to a
             # session you cannot see. Not said(): a jump under way stays marked
             self.status = "Esc for the list, then Enter on a session"
-            self.paint_header(self.fleet.groups(self.filter_text))
+            self.paint_header(self.groups())
             return
         self._go()
+
+    def action_reopen_ended(self):
+        self.action_go()        # the same Enter: _go knows an ended row
 
     def _go(self):
         row = self.selected_row()
@@ -1868,6 +2013,23 @@ class CcwhoUi(App):
                       f"  {engine.cut_codex_title(row.get('tab_title'), 40)}:"
                       f" {engine.codex_there(row, 'open')}")
             self.looked_at(row, row.get("ts"))
+            return
+        if row.get("attention") == "ended" and self.reopening_sid:
+            # one at a time, as `ccwho open` has it: a second Enter's "already
+            # running" would end the first one's blink while it still opens
+            self.said(f"reopening {engine.brief.short_id(self.reopening_sid)} - wait for it")
+            return
+        if row.get("attention") == "ended":
+            # nothing to go to: it is reopened, in a new window, by `ccwho
+            # open`'s own rules - blinking while that is under way, as a jump does
+            self.reopening_sid = row.get("sessionId", "")
+            self.status = (f"reopening {engine.brief.short_id(row.get('sessionId', ''))}"
+                           f" {engine.truncate(row.get('title') or '', 40)}...")
+            self.mark_acting(row.get("sessionId", ""))
+            self.paint_header(self.groups())
+            self.jumps += 1
+            self.reopening_ended(row, self.jumps)
+            self.set_timer(AFTER_A_JUMP, self.look_again)
             return
         # Name it the way you picked it. "going to daf9..." is not something
         # you can check against the window that comes forward; the title is.
@@ -1885,7 +2047,7 @@ class CcwhoUi(App):
             # line uses decides this, so neither can resume a live session.
             self.status = "opening a window for it..."
             self.mark_acting(row.get("sessionId", ""))
-            self.paint_header(self.fleet.groups(self.filter_text))
+            self.paint_header(self.groups())
             self.jumps += 1         # only where a jump starts: a number with no
             self.attaching(value, row, self.jumps)      # answer would never end
             return
@@ -1897,7 +2059,7 @@ class CcwhoUi(App):
             self.said(engine.no_window_note(row))
             return
         self.mark_acting(row.get("sessionId", ""))
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
         self.jumps += 1
         self.go_to(row, self.jumps)
         # The session you just opened is about to stop needing you. Look again
@@ -1944,6 +2106,21 @@ class CcwhoUi(App):
         self.call_from_thread(self.landed, said, row, jump)
 
     @work(thread=True)
+    def reopening_ended(self, row, jump):
+        said = self.collector.reopen_ended(row)
+        self.call_from_thread(self.reopen_landed, said, row, jump)
+
+    def reopen_landed(self, text, row, jump):
+        """A reopen's answer lands as a jump's does. One that reopened nothing
+        says why on the warning line too, until a key, as `o`'s miss does: the
+        header is one line, and a narrow window cut the reason off (review 2)."""
+        self.reopening_sid = ""
+        self.landed(text, row, jump)
+        if not text.startswith(("reopened", "focused", "attached")):
+            self.note, self.note_at, self.status = self.status, time.monotonic(), ""
+            self.paint_header(self.groups())
+
+    @work(thread=True)
     def go_to(self, row, jump):
         """Also off the UI thread: osascript is another program, and a hung
         iTerm2 must not take the list with it."""
@@ -1977,7 +2154,7 @@ class CcwhoUi(App):
             self.looked_at(next((r for r in self.fleet.rows
                                  if r.get("sessionId") == sid), looked),
                            looked.get("ts", ""))
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
 
     def action_copy_value(self, value):
         """A click on a value in the detail: onto the clipboard, and said."""
@@ -2002,8 +2179,16 @@ class CcwhoUi(App):
                     or row.get("name") or "")
             text = (f"went to {engine.brief.short_id(row.get('sessionId', ''))}"
                     f"  {engine.truncate(name, 40)}")
+        elif row is not None and text == f"reopened {row.get('sessionId', '')}":
+            # what `ccwho open` says, with the whole id: the row's short id and title
+            text = (f"reopened {engine.brief.short_id(row.get('sessionId', ''))}"
+                    f"  {engine.truncate(row.get('title') or '', 40)} in a new window")
+        elif row is not None and row.get("sessionId") and row["sessionId"] in text:
+            # why it did not: its short id, so the reason fits - the first one
+            # only, the subject: a path later on is a file to act on, whole
+            text = text.replace(row["sessionId"], engine.brief.short_id(row["sessionId"]), 1)
         self.status = text
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
 
     def action_reopen(self):
         """Offer every save, whatever is running.
@@ -2017,7 +2202,7 @@ class CcwhoUi(App):
             return          # one menu: a second o while the first is read is the same ask
         self.loading = True
         self.status = "reading the saves..."
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
         self.loading_saves(engine.live_ids(self.fleet.rows))
 
     @work(thread=True, exclusive=True, group="saves")
@@ -2040,14 +2225,14 @@ class CcwhoUi(App):
             self.said("nothing saved yet - `ccwho save` keeps the list for a restart")
             return
         self.status = ""
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
         self.push_screen(SavesMenu(points), callback=self.chose_save)
 
     def chose_save(self, path):
         if not path:
             return
         self.status = "reopening that save..."
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
         self.reopening(path)
 
     @work(thread=True)
@@ -2066,7 +2251,7 @@ class CcwhoUi(App):
             self.said(text)
             return
         self.note, self.note_at, self.status = text, time.monotonic(), ""
-        self.paint_header(self.fleet.groups(self.filter_text))
+        self.paint_header(self.groups())
 
     async def on_event(self, event):
         # a key pressed on the list after the note came: the note has been seen.
@@ -2077,7 +2262,7 @@ class CcwhoUi(App):
         if (isinstance(event, events.Key) and self.note and event.time > self.note_at
                 and not isinstance(self.screen, ModalScreen)):
             self.note = ""
-            self.paint_header(self.fleet.groups(self.filter_text))
+            self.paint_header(self.groups())
         await super().on_event(event)
 
     def action_restart(self):
@@ -2228,6 +2413,20 @@ class Collector:
         try:
             import ccwho as runner
             return runner.reopen_saved(path, report=report)
+        except Exception as ex:
+            return f"could not reopen ({type(ex).__name__})"
+
+    def index(self):
+        """The session index `ccwho ls` searches, brought up to date. It raises
+        when it cannot be read: the list then searches the running sessions."""
+        import ccwho as runner
+        return runner.fresh_index(quiet=True)
+
+    def reopen_ended(self, row):
+        """Reopen an ended session the search found, by ccwho's own `open`."""
+        try:
+            import ccwho as runner
+            return runner.reopen_ended(row.get("sessionId", ""))
         except Exception as ex:
             return f"could not reopen ({type(ex).__name__})"
 

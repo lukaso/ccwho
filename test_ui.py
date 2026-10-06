@@ -125,6 +125,14 @@ class FakeCollector:
         self.index_calls += 1
         return dict(self.index_value or {})
 
+    # the grep of what was said: {query: session ids}, and each call made
+    grep_value = None
+    grep_calls = None
+
+    def grep(self, entries, query, stop=None):
+        self.grep_calls = (self.grep_calls or []) + [(query, stop)]
+        return set((self.grep_value or {}).get(query, ()))
+
     reopened = None
     reopen_answer = "reopened 10fe9603-70dd-459c-96dc-05a176242f56"
 
@@ -445,7 +453,11 @@ class TestKeys(UiTest):
             await pilot.press("slash")
             for ch in "zzzz":
                 await pilot.press(ch)
-            await pilot.pause()
+            # once what was said is searched too: half a second after the last key
+            for _ in range(60):
+                if "no session matches" in self.screen_text(app):
+                    break
+                await pilot.pause(0.05)
             self.assertIn("no session matches", self.screen_text(app))
 
 
@@ -6205,7 +6217,9 @@ class TestEndedRowsAfterTheFourthReview(UiTest):
             await pilot.pause()
             await self.search(pilot, "zzzz")
             await self.read(pilot, app, c)
-            self.assertIn("no session matches 'zzzz'", self.screen_text(app))
+            # once what was said is searched too: half a second after the last key
+            self.assertTrue(await self.until(
+                pilot, lambda: "no session matches 'zzzz'" in self.screen_text(app)))
             self.assertNotIn("not read yet", self.screen_text(app))
 
     async def test_reads_that_never_return_take_two_threads_at_most(self):
@@ -6455,3 +6469,536 @@ class TestEndedRowsAfterTheSixthReview(UiTest):
         app = ui.CcwhoUi(adapter=FakeAdapter(), collector=FakeCollector())
         app.index_out = 1
         app._read_index(1)          # no raise
+
+
+class TestTheSearchFindsWhatWasSaid(UiTest):
+    """The owner, 2026-10-05: "a keyword search on the session contents (a
+    basic case independent grep)". Half a second after the last key, the list
+    greps what was said in every session - your prompts and Claude's replies -
+    in the background; the sessions only that finds show last, under SAID."""
+
+    _T = TestTheSearchFindsASessionThatEnded
+    until, read = _T.until, _T.read
+
+    def collector(self, fleet=None, found=None):
+        c = FakeCollector(fleet=fleet)
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY)}       # no "flamingo" in its names
+        c.grep_value = {"flamingo": {ENDED_SID}} if found is None else found
+        return c
+
+    async def search(self, pilot, text, app=None):
+        """`/`, then the words in one step: pilot keys come slower than the
+        test's short pause, and each gap would start a grep of its own."""
+        await pilot.press("slash")
+        await pilot.pause()
+        (app or self.app_now).query_one("#search").value = text
+        await pilot.pause()
+
+    def app(self, collector=None, adapter=None):
+        self.app_now = super().app(collector=collector, adapter=adapter)
+        return self.app_now
+
+    def calls(self, c):
+        return [q for q, _ in c.grep_calls or []]
+
+    def header(self, app):
+        return str(app.query_one("#header").content)
+
+    async def test_a_pause_after_typing_finds_a_session_by_what_was_said(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "flamingo")
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertIn("liveapp pull request 526", self.screen_text(app))
+                self.assertEqual(self.calls(c), ["flamingo"])
+
+    async def test_typing_fast_greps_once_after_the_last_key(self):
+        c = self.collector()
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.4):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await pilot.press("slash")
+                await pilot.pause()
+                for ch in "flamingo":
+                    await pilot.press(ch)           # keys well inside the pause
+                self.assertEqual(self.calls(c), [], "not while you type")
+                self.assertTrue(await self.until(pilot, lambda: self.calls(c)))
+                await pilot.pause(0.5)
+                self.assertEqual(self.calls(c), ["flamingo"])
+
+    async def test_a_running_session_found_by_what_was_said_shows_under_said(self):
+        c = self.collector(found={"flamingo": {BUSY["sessionId"]}})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "flamingo")
+                self.assertTrue(await self.until(pilot, lambda: "Release queue" in self.screen_text(app)))
+                self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()],
+                                 [BUSY["sessionId"]])
+                text = self.screen_text(app)
+                self.assertIn("SAID", text)
+                self.assertNotIn("BUSY", text, "not in its group: no name of it matched")
+                self.assertIn("0 of 2 + 1 said", self.header(app))
+
+    async def test_enter_after_the_grep_goes_to_the_name_match(self):
+        # review 1: "release" was said in LIVE too; Enter went to LIVE
+        c = self.collector(found={"release": {LIVE["sessionId"], BUSY["sessionId"]}})
+        adapter = FakeAdapter()
+        app = self.app(collector=c, adapter=adapter)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "release")
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()],
+                                 [BUSY["sessionId"], LIVE["sessionId"]],
+                                 "the name match first, what was said last")
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                self.assertEqual(adapter.asked, [BUSY["sessionId"]])
+
+    async def test_a_new_text_does_not_show_the_last_texts_finds(self):
+        c = self.collector()                        # "flamingo" -> ENDED_SID
+        gate = threading.Event()
+        real = c.grep
+
+        def later(entries, query, stop=None):
+            if query != "flamingo":
+                gate.wait(5)                        # the new text's grep is still out
+            return real(entries, query, stop)
+        c.grep = later
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "flamingo")
+                    self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                    app.query_one("#search").value = "flamingo zebra"
+                    await pilot.pause(0.3)
+                    self.assertNotIn("SAID", self.screen_text(app),
+                                     "the finds for 'flamingo' are not those for 'flamingo zebra'")
+                finally:
+                    gate.set()
+
+    async def test_a_grep_dropped_while_two_were_out_runs_once_they_are_back(self):
+        c, gate = self.collector(found={"abc": {ENDED_SID}}), threading.Event()
+
+        def hung(entries, query, stop=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            if query != "abc":
+                gate.wait(5)                        # and never looks at stop
+            return set(c.grep_value.get(query, ()))
+        c.grep = hung
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "a")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    app.query_one("#search").value = "ab"
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 2))
+                    app.query_one("#search").value = "abc"
+                    await pilot.pause(0.3)
+                    self.assertEqual(self.calls(c), ["a", "ab"], "two out: abc waits")
+                    self.assertNotIn("no session matches", self.screen_text(app),
+                                     "nothing has searched the conversations for abc yet")
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertEqual(self.calls(c)[-1], "abc")
+
+    async def test_with_no_answer_yet_the_list_does_not_search_again_on_every_paint(self):
+        c = self.collector(found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 30):      # no answer lands
+          async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await self.search(pilot, "zzzz")
+            await self.read(pilot, app, c)
+            self.assertIsNone(app.content_found)
+            with mock.patch.object(ui.engine, "ui_ended_groups",
+                                   wraps=ui.engine.ui_ended_groups) as made:
+                app.index_found()
+                app.index_found()
+                app.index_found()
+            self.assertLessEqual(made.call_count, 1)
+            app.filter_text = ""                    # the 30 s timer: nothing to grep
+
+    async def test_the_pause_before_the_grep_does_not_say_nothing_matches(self):
+        # review 2: for the half second after every key the list said "no
+        # session matches" about words no grep had looked for yet
+        c = self.collector(found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 30):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                await self.read(pilot, app, c)
+                self.assertNotIn("no session matches", self.screen_text(app))
+                self.assertIn("searching the conversations", self.screen_text(app))
+                app.query_one("#search").value = ""          # the 30 s timer goes
+
+    async def test_a_grep_that_hangs_stops_saying_it_searches_after_a_while(self):
+        c, gate = self.collector(found={}), threading.Event()
+
+        def hung(entries, query, stop=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            gate.wait(5)                    # a root on a volume that is gone
+            return set()
+        c.grep = hung
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05), \
+                mock.patch.object(ui, "CONTENT_PATIENCE", 0.3):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    await pilot.pause()
+                    self.assertIn("searching the conversations", self.header(app))
+                    await pilot.pause(0.6)              # past its patience: no key, no scan
+                    self.assertNotIn("searching the conversations", self.header(app))
+                    self.assertIn("no session matches", self.screen_text(app))
+                finally:
+                    gate.set()
+
+    async def test_an_index_that_hangs_says_nothing_matches_after_its_patience(self):
+        # review 3: no grep can run without the index; "searching" stayed for good
+        c, gate = self.collector(found={}), threading.Event()
+
+        def hung():
+            c.index_calls += 1
+            gate.wait(5)
+            return {}
+        c.index = hung
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05), \
+                mock.patch.object(ui, "INDEX_PATIENCE", 1.0):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertIn("reading the ended sessions", self.screen_text(app))
+                    await pilot.pause(1.4)              # past its patience: no key, no scan
+                    text = self.screen_text(app)
+                    self.assertIn("no session matches 'zzzz'", text)
+                    self.assertNotIn("searching the conversations", text)
+                    self.assertNotIn("reading the ended sessions", text)
+                finally:
+                    gate.set()
+
+    async def test_a_read_that_fails_while_the_grep_waits_says_nothing_matches(self):
+        c, gate = self.collector(found={}), threading.Event()
+
+        def late_and_broken():
+            c.index_calls += 1
+            gate.wait(5)
+            raise OSError("index unreadable")
+        c.index = late_and_broken
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_waiting))
+                finally:
+                    gate.set()                  # the read comes back: no index
+                self.assertTrue(await self.until(
+                    pilot, lambda: "no session matches 'zzzz'" in self.screen_text(app)))
+
+    async def failed_then_good(self, slow_failure):
+        """Review 4: the first read of the index fails - after the pause ended,
+        or before - and `/` again (from a row, the words kept) reads it. The
+        grep for the words has never run: it runs now."""
+        c, gate = self.collector(found={"release": {ENDED_SID}}), threading.Event()
+        calls = []
+
+        def index():
+            calls.append(1)
+            if len(calls) == 1:
+                if slow_failure:
+                    gate.wait(5)                    # back after the pause ended
+                raise OSError("index unreadable")
+            return {ENDED_SID: dict(ENDED_ENTRY)}
+        c.index = index
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "release")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_waiting))
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(pilot, lambda: app.index_out == 0))
+                await pilot.pause(0.2)
+                await pilot.press("enter")          # to the row: the box keeps the words
+                await pilot.pause()
+                await pilot.press("slash")          # read again: this one works
+                await pilot.pause()
+                self.assertTrue(await self.until(pilot, lambda: len(calls) == 2
+                                                 and app.index_out == 0))
+                await self.until(pilot, lambda: "SAID" in self.screen_text(app), wait=1.5)
+                self.assertEqual(self.calls(c), ["release"], "the grep for the words ran")
+                self.assertIn("SAID", self.screen_text(app))
+
+    async def test_a_new_text_while_the_index_is_read_greps_it_once(self):
+        # review 5: the index lands inside the pause after a new text - the
+        # pause's timer greps it, not index_read as well (a new text ends the
+        # old wait); two greps for one text filled both threads
+        c, gate = self.collector(found={"flamingo": {ENDED_SID}}), threading.Event()
+        real = c.index
+
+        def slow():
+            gate.wait(5)
+            return real()
+        c.index = slow
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.6):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "release")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_waiting))
+                    app.query_one("#search").value = "flamingo"
+                    await pilot.pause()
+                finally:
+                    gate.set()                      # lands inside the 0.6 s pause
+                self.assertTrue(await self.until(pilot, lambda: app.index_out == 0))
+                await pilot.pause(1.2)
+                self.assertEqual(self.calls(c), ["flamingo"])
+
+    async def test_a_slow_failed_read_then_a_good_one_greps(self):
+        await self.failed_then_good(slow_failure=True)
+
+    async def test_a_fast_failed_read_then_a_good_one_greps(self):              # control
+        await self.failed_then_good(slow_failure=False)
+
+    async def test_nothing_says_it_greps_before_a_grep_was_asked(self):
+        app = self.app(collector=self.collector())
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.filter_text = "zzzz"                # no key: no grep asked
+            self.assertFalse(app.grepping())
+
+    def gated(self, c):
+        """Each grep waits for the gate - recorded as it starts, not as it ends."""
+        gate = threading.Event()
+
+        def slow(entries, query, stop=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            gate.wait(5)
+            return set((c.grep_value or {}).get(query, ()))
+        c.grep = slow
+        return gate
+
+    async def test_while_it_greps_it_says_so_and_not_that_nothing_matches(self):
+        c = self.collector(found={})
+        gate = self.gated(c)
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: c.grep_calls is not None
+                                                     or app.content_out))
+                    await pilot.pause(0.2)
+                    text = self.screen_text(app)
+                    self.assertIn("searching the conversations", self.header(app))
+                    self.assertNotIn("no session matches", text)
+                    self.assertIn("searching the conversations", text)
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(
+                    pilot, lambda: "no session matches 'zzzz'" in self.screen_text(app)))
+                self.assertNotIn("searching the conversations", self.header(app))
+
+    async def test_a_newer_search_stops_the_older_grep(self):
+        c = self.collector(found={"flam": {BUSY["sessionId"]}, "flamingo": {ENDED_SID}})
+        gates = {"flam": threading.Event(), "flamingo": threading.Event()}
+
+        def slow(entries, query, stop=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            gates[query].wait(5)            # and never looks at stop: it lands late
+            return set(c.grep_value[query])
+        c.grep = slow
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "flam")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    app.query_one("#search").value = "flamingo"
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 2))
+                    gates["flamingo"].set()                 # the newer one first
+                    self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                    gates["flam"].set()                     # then the older one, late
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 0))
+                    await pilot.pause()
+                finally:
+                    for g in gates.values():
+                        g.set()
+                (first, stop1), (second, stop2) = c.grep_calls
+                self.assertEqual((first, second), ("flam", "flamingo"))
+                self.assertTrue(stop1(), "the older one is told to stop")
+                self.assertFalse(stop2())
+                self.assertIn("SAID", self.screen_text(app))
+                self.assertNotIn("Release queue", self.screen_text(app),
+                                 "the older answer, back last, is not shown")
+
+    async def test_esc_stops_the_grep_and_its_answer_shows_nowhere(self):
+        c = self.collector()
+        gate = self.gated(c)
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "flamingo")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    await pilot.press("escape")
+                    await pilot.pause()
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(pilot, lambda: app.content_out == 0))
+                await pilot.pause()
+                self.assertTrue(c.grep_calls[0][1](), "told to stop")
+                self.assertNotIn("SAID", self.screen_text(app))
+                self.assertEqual(app.filter_text, "")
+
+    async def test_no_grep_until_the_index_is_read(self):
+        c = self.collector()
+        gate, real = threading.Event(), c.index
+
+        def slow():
+            gate.wait(5)
+            return real()
+        c.index = slow
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "flamingo")
+                    await pilot.pause(0.4)
+                    self.assertEqual(self.calls(c), [], "it greps the index's transcripts")
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertEqual(self.calls(c), ["flamingo"])
+
+    async def test_a_grep_that_fails_leaves_the_search_working(self):
+        c = self.collector()
+
+        def broken(entries, query, stop=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            raise OSError("unreadable")
+        c.grep = broken
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "release")
+                self.assertTrue(await self.until(pilot, lambda: c.grep_calls and not app.content_out))
+                await pilot.pause()
+                self.assertTrue(app.is_running)
+                self.assertIn("Release queue", self.screen_text(app))
+                self.assertNotIn("searching the conversations", self.header(app))
+
+    async def test_greps_that_never_come_back_take_two_threads_at_most(self):
+        c, gate = self.collector(found={}), threading.Event()
+
+        def hung(entries, query, stop=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            gate.wait(5)                    # and never looks at stop
+            return set()
+        c.grep = hung
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "a")
+                    for text in ("ab", "abc", "abcd"):
+                        await pilot.pause(0.3)
+                        app.query_one("#search").value = text
+                    await pilot.pause(0.3)
+                    self.assertEqual(len(c.grep_calls), 2)
+                finally:
+                    gate.set()
+
+
+QUIT_WHILE_IT_GREPS = """
+import sys, threading
+sys.path.insert(0, sys.argv[1])
+import ccwho_ui as ui, test_ui
+ui.CONTENT_PAUSE = 0.05
+c = test_ui.FakeCollector()
+c.index_value = {"x": {"sessionId": "x"}}
+c.grep = lambda entries, query, stop=None: threading.Event().wait(20) or set()
+
+app = ui.CcwhoUi(adapter=test_ui.FakeAdapter(), collector=c)
+
+async def drive(pilot):
+    await pilot.pause()
+    await pilot.press("slash")
+    await pilot.pause()
+    app.query_one("#search").value = "flamingo"
+    for _ in range(40):
+        await pilot.pause(0.05)
+        if app.content_out:
+            break
+    print("out", app.content_out, flush=True)
+    await pilot.press("escape")
+    await pilot.pause()
+    await pilot.press("escape")
+    await pilot.pause()
+    await pilot.press("q")
+
+app.run(headless=True, auto_pilot=drive)
+print("quit", flush=True)
+"""
+
+
+class TestTheGrepNeverHoldsTheList(unittest.TestCase):
+    def test_q_does_not_wait_for_a_grep(self):
+        import os
+        import sys
+        import time
+        here = os.path.dirname(os.path.abspath(ui.__file__))
+        began = time.monotonic()
+        done = subprocess.run([sys.executable, "-c", QUIT_WHILE_IT_GREPS, here],
+                              capture_output=True, text=True, timeout=12, cwd=here,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        self.assertIn("out 1", done.stdout, "a grep was out when q came: " + done.stderr[-400:])
+        self.assertIn("quit", done.stdout)
+        self.assertLess(time.monotonic() - began, 6, "q waited for the grep")
+
+    def test_a_grep_back_when_the_list_is_not_running_says_nothing(self):
+        app = ui.CcwhoUi(adapter=FakeAdapter(), collector=FakeCollector())
+        app.content_out = 1
+        app._grep(1, "flamingo", {})            # no raise
+
+
+class TestTheCollectorGreps(unittest.TestCase):
+    def test_it_greps_the_index_entries_it_is_given(self):
+        import ccwho_index
+        asked = []
+        stop = lambda: False                        # noqa: E731
+        with mock.patch.object(ccwho_index, "grep",
+                               lambda entries, query, stop=None: asked.append(
+                                   (entries, query, stop)) or {"x"}):
+            self.assertEqual(ui.Collector().grep({"e": {}}, "flamingo", stop), {"x"})
+        self.assertEqual(asked, [({"e": {}}, "flamingo", stop)])

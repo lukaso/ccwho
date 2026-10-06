@@ -3808,6 +3808,34 @@ def ui_ended_groups(idx, query, live_rows, now_iso, limit=UI_ENDED_SHOWN):
              "needs_you": False, "ended": True, "total": len(hits)}]
 
 
+def ui_said_group(idx, query, live_rows, found, now_iso, limit=UI_ENDED_SHOWN):
+    """The SAID group, last: the sessions the grep of what was said found
+    (`found`, ccwho_index.grep) and nothing else did - running ones first, as
+    their own rows, then ended ones, newest first. A session that matches by a
+    name, or by what the index says it was about, shows where that puts it and
+    never here as well: a common word was said in most sessions, and mixed in
+    they pushed the name matches down (review 1). `limit` of them, the heading
+    saying how many there are. None while you do not search."""
+    found = set(found or ())
+    if not (query or "").strip() or not found:
+        return []
+    live_rows = list(live_rows or [])
+    # by a name on the row, or by what the index says it was about - a running
+    # one the index finds is in that search, its parked terminals with it
+    shown = {sid for r in ui_filter(live_rows, query) for sid in answers_for(r) if sid}
+    shown |= {e.get("sessionId") for e in ccwho_index.search(idx or {}, query)}
+    running = [r for r in live_rows
+               if found & set(answers_for(r)) and not shown & set(answers_for(r))]
+    ended = sorted((idx[sid] for sid in found - shown - live_ids(live_rows) if sid in (idx or {})),
+                   key=lambda e: str(e.get("last_ts", "")), reverse=True)
+    total = len(running) + len(ended)
+    if not total:
+        return []
+    rows = (running + [ended_row(e, now_iso) for e in ended[:max(0, limit - len(running))]])[:limit]
+    heading = "SAID" if total <= limit else f"SAID  {limit} of {total} - type more to narrow"
+    return [{"heading": heading, "rows": rows, "needs_you": False, "said": True, "total": total}]
+
+
 def _plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else ("es" if word.endswith("s") else "s"))
 

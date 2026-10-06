@@ -16,7 +16,10 @@ What it does that the one-shot table cannot:
   - -> opens the full brief; at narrow widths it takes the whole screen
   - Enter goes to the window, and nothing here waits for iTerm2 to answer
   - / searches every name a session has, plus what it is about - and the
-    ended sessions too, from the index `ccwho ls` searches; Enter reopens one
+    ended sessions too, from the index `ccwho ls` searches; Enter reopens one.
+    Half a second after the last key it also greps what was said in each -
+    your prompts and Claude's replies, any case - and lists what only that
+    finds under SAID, last
 
 Collection runs in a worker thread. `claude agents --json` can take 30 seconds
 when it is unhappy, and a list that freezes at the moment you reach for it is the
@@ -106,6 +109,14 @@ FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
 # not come back by this is asked again at the next `/` - a thread worker cannot
 # be stopped, and one that never returns must not stop every search after it.
 INDEX_PATIENCE = 60.0
+# The search also greps what was said in every session (ccwho_index.grep:
+# 0.2-2.4 s, a word beyond a-z up to ~5 s): once, this long after the last key
+# - not on every key.
+CONTENT_PAUSE = 0.5
+# A grep not back by this is not said to be searching any more: one that hangs
+# (a root on a volume that is gone) said so for good (review 2).
+CONTENT_PATIENCE = 60.0
+NOTHING_SAID = frozenset()      # one object: the cache compares by identity
 
 
 class Fleet:
@@ -816,6 +827,16 @@ class CcwhoUi(App):
         self.index_reads = 0        # which read is the latest: only it lands
         self.index_out = 0          # reads started and not back: each holds a thread
         self.index_landed = 0       # the newest read that has landed
+        # the grep of what was said, on a thread of its own after a pause:
+        # (search text, the ids it found) for the latest that came back
+        self.content_found = None
+        self.content_n = 0          # which grep is the latest: an older one stops
+        self.content_out = 0        # greps started and not back: each holds a thread
+        self.content_running = None     # the latest grep's number, while it runs
+        self.content_dropped = False    # two were out: the latest waits for one back
+        self.content_since = 0.0        # when the latest grep started: time.monotonic
+        self.content_timer = None   # the pause after the last key
+        self.content_waiting = False    # the pause is over, the index not read yet
         # the ended session being reopened, or "" - not `reopening`: that is
         # the worker `o` starts, and an attribute of its name hid it
         self.reopening_sid = ""
@@ -1032,32 +1053,40 @@ class CcwhoUi(App):
     def groups(self):
         """What the list shows: the running sessions the search finds - by
         their rows, and by what the index says they were about, as `ccwho ls`
-        finds them - and, while you search, the ended ones, last, under ENDED."""
-        running, ended = self.index_found()
-        return self.fleet.groups(self.filter_text, also=running) + ended
+        finds them - and, while you search, the ended ones under ENDED, then
+        under SAID those only the grep of what was said found."""
+        running, ended, said = self.index_found()
+        return self.fleet.groups(self.filter_text, also=running) + ended + said
 
     def index_found(self):
-        """(the running rows the index finds, the ENDED group), from the index
-        as read when the search opened. Asked for on every paint and every
-        move: made once per search text, index and scan - a scan brings new
-        ages, and which sessions run."""
+        """(the running rows the index finds, the ENDED group, the SAID group),
+        from the index as read when the search opened and the grep's answer for
+        this text. Asked for on every paint and every move: made once per search
+        text, index, scan and answer - a scan brings new ages, and which
+        sessions run."""
         if not self.filter_text or not self.ended_index:
-            return [], []
+            return [], [], []
         if not (self.fleet.source_ok and self.fleet.at):
             # not read yet, or not readable: a session that runs would show as
             # ended - nothing says it does not run
-            return [], []
-        key = (self.filter_text, self.ended_index, self.fleet)
+            return [], [], []
+        said = (self.content_found[1] if self.content_found
+                and self.content_found[0] == self.filter_text else NOTHING_SAID)
+        key = (self.filter_text, self.ended_index, self.fleet, said)
         got = self.ended_cache
-        if got and got[0][0] == key[0] and got[0][1] is key[1] and got[0][2] is key[2]:
+        if (got and got[0][0] == key[0] and got[0][1] is key[1] and got[0][2] is key[2]
+                and got[0][3] is key[3]):
             return got[1]
         try:
+            now = engine.now_iso()
             found = (engine.ui_found_running(self.ended_index, self.filter_text,
                                              self.fleet.rows),
                      engine.ui_ended_groups(self.ended_index, self.filter_text,
-                                            self.fleet.rows, engine.now_iso()))
+                                            self.fleet.rows, now),
+                     engine.ui_said_group(self.ended_index, self.filter_text,
+                                          self.fleet.rows, said, now))
         except Exception:               # an odd index never costs the running ones
-            found = ([], [])
+            found = ([], [], [])
         self.ended_cache = (key, found)
         return found
 
@@ -1101,6 +1130,81 @@ class CcwhoUi(App):
             self.ended_index, self.index_landed = idx, n
         if self.filter_text:
             self.rebuild()
+        if self.content_waiting and self.ended_index is not None:
+            self.grep_now()         # the pause ended while the index was read
+
+    # ------------------------------------------------------------- the grep
+
+    def grep_soon(self):
+        """The search text changed: an older grep stops, and a new one starts
+        once you have not typed for CONTENT_PAUSE - not on every key."""
+        self.content_n += 1
+        self.content_waiting = self.content_dropped = False
+        if self.content_timer is not None:
+            self.content_timer.stop()
+            self.content_timer = None
+        if self.filter_text:
+            self.content_timer = self.set_timer(CONTENT_PAUSE, self.grep_now)
+
+    def grep_now(self):
+        """Grep what every session the index knows said, for the search text -
+        on a daemon thread of its own (q and restart do not wait for it), two
+        out at most (one that hangs holds its thread)."""
+        self.content_timer = None
+        self.content_waiting = False
+        if not self.filter_text:
+            return
+        if self.ended_index is None:
+            # it starts when an index lands (index_read) - from this read or a
+            # later one; the list says what it knows meanwhile
+            self.content_waiting = True
+            self.rebuild()
+            return
+        if self.content_out >= 2:
+            # one that hangs holds its thread: this one starts when one is back
+            self.content_dropped = True
+            self.rebuild()              # an empty search says it searches
+            return
+        self.content_dropped = False
+        n, query, entries = self.content_n, self.filter_text, self.ended_index
+        self.content_out += 1
+        self.content_running, self.content_since = n, time.monotonic()
+        self.set_timer(CONTENT_PATIENCE + 0.05, self.rebuild)   # it may hang: say so then
+        self.rebuild()                  # the header, and an empty search, say it searches
+        threading.Thread(target=self._grep, args=(n, query, entries), daemon=True,
+                         name="ccwho-grep").start()
+
+    def _grep(self, n, query, entries):
+        try:
+            ids = self.collector.grep(entries, query, lambda: n != self.content_n)
+        except Exception:
+            ids = None              # the search still finds by names
+        try:
+            self.call_from_thread(self.grep_back, n, query, ids)
+        except Exception:
+            pass                    # the list has gone: there is no one to tell
+
+    def grepping(self):
+        """Is the grep for the search text under way - or waiting for one of
+        two that are out to come back?"""
+        return (bool(self.filter_text)
+                and (self.content_running == self.content_n or self.content_dropped)
+                and time.monotonic() - self.content_since <= CONTENT_PATIENCE)
+
+    def grep_back(self, n, query, ids):
+        """A grep is back: the sessions it found join the search - the latest
+        one's, for the text it was asked; an older one's are dropped."""
+        self.content_out -= 1
+        if self.content_running == n:
+            self.content_running = None
+        if n == self.content_n and ids is not None and query == self.filter_text:
+            self.content_found = (query, frozenset(ids))
+        if self.filter_text:
+            self.rebuild()
+        else:
+            self.paint_header(self.groups())
+        if self.content_dropped and self.filter_text:
+            self.grep_now()             # the one that waited for a thread
 
     def rebuild(self):
         listing = self.part("#list")
@@ -1243,9 +1347,15 @@ class CcwhoUi(App):
                     f" - until they are, no ended one shows")
         if self.filter_text and self.reading():
             # the first read of the index takes ~11 s: "no session matches" is
-            # not known yet about the ended ones
+            # not known yet about the ended ones - nor about what was said: the
+            # grep reads the transcripts the index names
             return (f"  no running session matches {self.filter_text!r}"
                     f" - reading the ended sessions...")
+        if self.filter_text and (self.grepping() or self.content_timer is not None):
+            # nor while the grep waits for you to stop typing: "no session
+            # matches" is not known yet about what was said
+            return (f"  nothing matches {self.filter_text!r} by name yet"
+                    f" - searching the conversations...")
         if self.filter_text:
             return f"  no session matches {self.filter_text!r} - esc to clear"
         if not self.fleet.source_ok:
@@ -1263,7 +1373,8 @@ class CcwhoUi(App):
         # the ended sessions are not counted with the ones that run: "1 ended"
         # among them reads as a running session that ended. The search says them
         ended = sum(g.get("total", len(g["rows"])) for g in groups if g.get("ended"))
-        groups = [g for g in groups if not g.get("ended")]
+        said = sum(g.get("total", len(g["rows"])) for g in groups if g.get("said"))
+        groups = [g for g in groups if not (g.get("ended") or g.get("said"))]
         counts = " · ".join(f"{len(g['rows'])} {g['heading'].split()[0].lower()}"
                             for g in groups)
         # Always say when this was true. Without it, a list that has stopped
@@ -1275,7 +1386,10 @@ class CcwhoUi(App):
         # you have forgotten about looks like a broken one.
         shown = sum(len(g["rows"]) for g in groups)
         searching = (f"   search {self.filter_text!r}: {shown} of {len(self.fleet.rows)}"
-                     + (f" + {ended} ended" if ended else "") + " · esc to clear"
+                     + (f" + {ended} ended" if ended else "")
+                     + (f" + {said} said" if said else "")
+                     + (" · searching the conversations..." if self.grepping() else "")
+                     + " · esc to clear"
                      if self.filter_text else "")
         # sessions are Claude's; the Codex threads are counted by their group
         sessions = sum(1 for r in self.fleet.rows if r.get("kind") != "codex")
@@ -1982,6 +2096,8 @@ class CcwhoUi(App):
             self.index_reads += 1
             self.index_out += 1
             self.read_index(self.index_reads)
+            # its patience out: the list says so then, not at the next scan
+            self.set_timer(INDEX_PATIENCE + 0.05, self.rebuild)
         box = self.show_search()
         # after the refresh, for the same reason the selection is: a widget that
         # was hidden a moment ago cannot take focus yet, and the keys you type
@@ -2273,6 +2389,7 @@ class CcwhoUi(App):
     @on(Input.Changed, "#search")
     def searched(self, event):
         self.filter_text = event.value
+        self.grep_soon()        # first: the list it builds says a grep is to come
         self.rebuild()
 
     @on(Input.Submitted, "#search")
@@ -2415,6 +2532,11 @@ class Collector:
             return runner.reopen_saved(path, report=report)
         except Exception as ex:
             return f"could not reopen ({type(ex).__name__})"
+
+    def grep(self, entries, query, stop=None):
+        """Grep what the sessions the index knows said (ccwho_index.grep), as
+        the engine's index module has it now - it is reloaded beside the engine."""
+        return engine.ccwho_index.grep(entries, query, stop=stop)
 
     def index(self):
         """The session index `ccwho ls` searches, brought up to date. It raises

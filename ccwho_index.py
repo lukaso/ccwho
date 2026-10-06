@@ -337,3 +337,93 @@ def search(idx, query, live_ids=None, everything=False):
 def _neg(ts):
     """Sort newest first on a string timestamp without reversing the whole key."""
     return tuple(-ord(c) for c in ts)
+
+
+def grep(idx, query, stop=None, everything=False):
+    """The ids of the sessions in which every word of `query` was said - in your
+    prompts or Claude's replies - in any case. Not what Claude Code stores in a
+    transcript (skills, CLAUDE.md, reminders), nor what a tool printed, nor the
+    JSON around it: those are in every session, and a plain grep of the file
+    found a common word in all of them (review 1). Only your sessions, as
+    search() has it, unless `everything`.
+
+    Measured 2026-10-05 over the owner's 123 sessions: 0.2-2.4 s a word, and
+    up to ~5 s for a word beyond a-z (its every line is parsed).
+    `stop()`, asked before every line, ends it early with None: a newer search
+    has started."""
+    words = [w for w in (query or "").lower().split() if w]
+    if not words:
+        return set()
+    found = set()
+    for entry in list((idx or {}).values()):
+        if not everything and not is_yours(entry):
+            continue
+        said = _said_in(entry["path"], words, stop) if entry.get("path") else False
+        if said is None:
+            return None
+        if said:
+            found.add(entry.get("sessionId"))
+    return found
+
+
+def _said_in(path, words, stop):
+    """Was every word said in this transcript? A line is parsed only when the
+    bytes of a word not found yet are in it - as the file has them (a quote is
+    \\", a letter beyond a-z as typed), any case for a-z - and a word beyond a-z
+    is looked for in every line. None: a stop was asked for."""
+    left = set(words)
+    marks = {w: json.dumps(w, ensure_ascii=False)[1:-1].encode("utf-8") for w in words}
+    try:
+        with open(path, "rb") as fh:
+            for line in fh:
+                if stop and stop():
+                    return None
+                low = line.lower()
+                if not any(not marks[w].isascii() or marks[w] in low for w in left):
+                    continue
+                try:
+                    text = _said(json.loads(line)).lower()
+                except Exception:
+                    continue            # a line cut off, not JSON, or a record of no known shape
+                left = {w for w in left if w not in text}
+                if not left:
+                    return True
+    except OSError:
+        return False                    # gone, or not readable: not found
+    return False
+
+
+def _said(rec):
+    """What a person typed or Claude wrote in this record: a prompt - typed at
+    the prompt, or while Claude worked (queued) - or the text of a reply. Not
+    what the harness put there: a tool's result, a reminder, an interrupt, a
+    record it marks meta, the tags around a slash command (review 2). "" for
+    anything else."""
+    if not isinstance(rec, dict) or rec.get("isMeta"):
+        return ""
+    if rec.get("type") == "attachment":
+        queued = rec.get("attachment")
+        if (isinstance(queued, dict) and queued.get("type") == "queued_command"
+                and (queued.get("origin") or {}).get("kind") == "human"):
+            return _typed(queued.get("prompt"))
+        return ""
+    if rec.get("type") not in ("user", "assistant"):
+        return ""
+    message = rec.get("message")
+    if not isinstance(message, dict) or message.get("model") == "<synthetic>":
+        return ""                   # a reply the harness wrote: "No response requested."
+    text = brief._text_of(message.get("content"))
+    return _typed(text) if rec["type"] == "user" else text
+
+
+INTERRUPTED = "[Request interrupted by user"
+
+
+def _typed(text):
+    """A prompt as the person typed it - a slash command as `/review the gate`,
+    not its tags - or "" when the harness wrote it."""
+    if not isinstance(text, str) or not brief.is_human_prompt(text):
+        return ""
+    if text.strip().startswith(INTERRUPTED):
+        return ""
+    return brief.command_of(text) or text

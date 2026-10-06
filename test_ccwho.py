@@ -8346,3 +8346,61 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
         for q in ("", None):
             self.assertEqual(ccwho.ui_found_running(idx, q, [live]), [])
         self.assertEqual(ccwho.ui_found_running(None, "flamingo", [live]), [])
+
+    # the grep of what was said (ccwho_index.grep): the ids it found go to a
+    # SAID group of their own, last - never among the name matches (review 1)
+    def said(self, idx, query, live=(), found=(), limit=10):
+        return ccwho.ui_said_group(idx, query, list(live), set(found), self.NOW, limit=limit)
+
+    def test_an_ended_session_found_only_by_what_was_said(self):
+        idx = self.index(self.entry())                 # no "flamingo" in its names
+        groups = self.said(idx, "flamingo", found={self.SID})
+        self.assertEqual([g["heading"] for g in groups], ["SAID"])
+        self.assertEqual(self.ids(groups), [self.SID])
+        self.assertEqual(groups[0]["rows"][0]["attention"], "ended")
+        self.assertFalse(groups[0]["needs_you"])
+        self.assertTrue(groups[0]["said"])
+        self.assertEqual(self.said(idx, "flamingo"), [])                      # control
+        self.assertEqual(ccwho.ui_ended_groups(idx, "flamingo", [], self.NOW), [],
+                         "not under ENDED")
+
+    def test_a_running_session_found_only_by_what_was_said_is_its_own_row(self):
+        idx = self.index(self.entry())
+        live = {"sessionId": self.SID, "title": "x", "attention": "busy"}
+        groups = self.said(idx, "flamingo", live=[live], found={self.SID})
+        self.assertIs(groups[0]["rows"][0], live, "the running row, with its state")
+        parked = {"sessionId": self.OTHER, "parked": [self.SID], "attention": "busy"}
+        self.assertIs(self.said(idx, "flamingo", live=[parked], found={self.SID})[0]["rows"][0],
+                      parked)
+
+    def test_a_session_that_matches_by_name_is_not_also_said(self):
+        named = self.entry(self.OTHER, title="flamingo notes")
+        idx = self.index(self.entry(), named)
+        self.assertEqual(self.ids(self.said(idx, "flamingo", found={self.SID, self.OTHER})),
+                         [self.SID], "OTHER shows under ENDED by its title")
+        live = {"sessionId": "cccc3333-0000-4000-8000-000000000003", "title": "flamingo run"}
+        self.assertEqual(self.said(idx, "flamingo", live=[live], found={live["sessionId"]}), [],
+                         "it shows in its group by its title")
+        yours = self.index(self.entry(you_said="flamingo deploy"))
+        live = {"sessionId": self.SID}
+        self.assertEqual(self.said(yours, "flamingo", live=[live], found={self.SID}), [],
+                         "the index finds it by what you said: in its group")
+
+    def test_running_first_then_the_newest_ten_and_how_many(self):
+        idx = self.sessions(12)
+        live = {"sessionId": f"{3:08x}-0000-4000-8000-000000000000", "attention": "busy"}
+        groups = self.said(idx, "flamingo", live=[live], found=set(idx))
+        rows = groups[0]["rows"]
+        self.assertIs(rows[0], live)
+        self.assertEqual(rows[1]["sessionId"], f"{11:08x}-0000-4000-8000-000000000000")
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(groups[0]["total"], 12)
+        self.assertIn("10 of 12", groups[0]["heading"])
+        self.assertEqual(self.said(self.sessions(10), "flamingo",
+                                   found=set(self.sessions(10)))[0]["heading"], "SAID")  # control
+
+    def test_nothing_said_without_a_search(self):
+        idx = self.index(self.entry())
+        for q in ("", "  ", None):
+            self.assertEqual(self.said(idx, q, found={self.SID}), [])
+        self.assertEqual(self.said(idx, "flamingo", found={"not-in-the-index"}), [])

@@ -492,5 +492,182 @@ class TestSearch(Base):
         self.assertEqual(index.search(self.entries(), ""), [])
 
 
+
+class TestGrep(Base):
+    """A keyword search of what was said in a session - your prompts and
+    Claude's replies (the owner, 2026-10-05: "a basic case independent grep";
+    then, after review 1: what was said, not the whole file). Every word, in
+    the same session, any case."""
+
+    A = "aaaa1111-0000-4000-8000-000000000001"
+    B = "bbbb2222-0000-4000-8000-000000000002"
+
+    def entries(self):
+        return self.update()
+
+    def test_a_word_in_a_prompt_or_a_reply_any_case(self):
+        self.write(self.A, [user("deploy the Flamingo build"), assistant("done")])
+        self.write(self.B, [user("hello"), assistant("The FLAMINGO build is green")])
+        for q in ("flamingo", "Flamingo", "FLAMINGO", "flam"):
+            with self.subTest(q=q):
+                self.assertEqual(index.grep(self.entries(), q), {self.A, self.B})
+        self.assertEqual(index.grep(self.entries(), "pelican"), set())          # control
+
+    def test_every_word_in_the_same_session(self):
+        self.write(self.A, [user("flamingo"), assistant("ok")])
+        self.write(self.B, [assistant("pelican")])
+        self.assertEqual(index.grep(self.entries(), "flamingo pelican"), set())
+        self.write(self.A, [user("flamingo"), assistant("and a pelican")])     # two records
+        self.assertEqual(index.grep(self.entries(), "pelican flamingo"), {self.A})
+
+    def test_not_what_claude_code_stored_or_a_tool_printed(self):
+        # the skills, CLAUDE.md, a reminder, a tool's output, a key, the branch:
+        # in every session, so a common word found them all (review 1)
+        self.write(self.A, [
+            rec(type="attachment", timestamp="2026-09-18T10:00:00.000Z",
+                attachment={"type": "skill_listing", "content": "flamingo skill"}),
+            rec(type="system", subtype="informational", content="flamingo",
+                timestamp="2026-09-18T10:00:00.000Z"),
+            rec(type="attachment", timestamp="2026-09-18T10:00:00.000Z",
+                message={"role": "user", "content": "flamingo as a message"}),
+            rec(type="system", timestamp="2026-09-18T10:00:00.000Z",
+                message={"role": "user", "content": "flamingo as a system message"}),
+            rec(type="user", timestamp="2026-09-18T10:00:00.000Z", gitBranch="flamingo",
+                message={"role": "user",
+                         "content": "<system-reminder>flamingo in CLAUDE.md</system-reminder>"}),
+            rec(type="user", timestamp="2026-09-18T10:00:00.000Z",
+                message={"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "flamingo log"}]}),
+            rec(type="assistant", timestamp="2026-09-18T10:00:00.000Z", message={
+                "role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "grep flamingo"}}]}),
+            user("something else"),
+        ])
+        self.assertEqual(index.grep(self.entries(), "flamingo"), set())
+        self.assertEqual(index.grep(self.entries(), "role"), set(), "a key is not said")
+        self.write(self.B, [user("hello"), assistant("the flamingo log is clean")])  # control
+        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.B})
+
+    TS = "2026-09-18T10:00:00.000Z"
+
+    def test_a_slash_command_is_said_as_typed_not_as_its_tags(self):
+        # how Claude Code records `/compact` you typed: "args" found 43 real
+        # sessions through these tags alone (review 2)
+        self.write(self.A, [user("<command-name>/compact</command-name>\n"
+                                 "<command-message>compact</command-message>\n"
+                                 "<command-args></command-args>"), assistant("ok")])
+        self.write(self.B, [user("<command-name>/review</command-name>\n"
+                                 "<command-args>the gate flake</command-args>")])
+        self.assertEqual(index.grep(self.entries(), "args"), set(), "a tag is not said")
+        self.assertEqual(index.grep(self.entries(), "message"), set(), "a tag is not said")
+        self.assertEqual(index.grep(self.entries(), "/compact"), {self.A})        # control
+        self.assertEqual(index.grep(self.entries(), "gate flake"), {self.B})
+
+    def test_a_prompt_typed_while_claude_works_is_said(self):
+        # queued: only an attachment, never a user record (review 2: 159 of them
+        # in the 150 newest transcripts)
+        def queued(prompt, **kw):
+            return rec(type="attachment", timestamp=self.TS, attachment=dict(
+                {"type": "queued_command", "prompt": prompt, "commandMode": "prompt",
+                 "origin": {"kind": "human"}}, **kw))
+        self.write(self.A, [user("first"), queued("and the flamingo too")])
+        self.write(self.B, [user("first"), queued("<task-notification>flamingo</task-notification>",
+                                                  commandMode="task-notification")])
+        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A})
+        self.write(self.B, [user("first"), queued("flamingo from a peer", origin={"kind": "peer"})])
+        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A}, "not a person's")
+
+    def test_an_interrupt_is_not_said(self):
+        self.write(self.A, [user("deploy it"), user("[Request interrupted by user for tool use]")])
+        self.assertEqual(index.grep(self.entries(), "interrupted"), set())
+        self.assertEqual(index.grep(self.entries(), "deploy"), {self.A})          # control
+
+    def test_what_the_harness_writes_as_meta_is_not_said(self):
+        self.write(self.A, [user("deploy it"),
+                            rec(type="user", isMeta=True, timestamp=self.TS, message={
+                                "role": "user", "content": [{"type": "text", "text":
+                                    "[Image: original 1932x2188, displayed at 1766x2000.]"}]}),
+                            rec(type="user", isMeta=True, timestamp=self.TS, message={
+                                "role": "user", "content": "(Re-invocation of /land - the skill"
+                                " instructions were previously loaded)"})])
+        self.assertEqual(index.grep(self.entries(), "displayed"), set())
+        self.assertEqual(index.grep(self.entries(), "instructions"), set())
+        self.assertEqual(index.grep(self.entries(), "deploy"), {self.A})          # control
+
+    def test_what_the_harness_writes_as_a_reply_is_not_said(self):
+        # "No response requested.", an API error, a spend limit: a reply of
+        # model "<synthetic>" (review 3: 29 of the 300 newest transcripts)
+        self.write(self.A, [user("hello"), rec(type="assistant", timestamp=self.TS, message={
+            "role": "assistant", "model": "<synthetic>",
+            "content": [{"type": "text", "text": "No response requested."}]})])
+        self.write(self.B, [user("hello"), assistant("none was requested")])
+        self.assertEqual(index.grep(self.entries(), "requested"), {self.B})
+
+    def test_one_odd_record_does_not_cost_the_rest(self):
+        self.write(self.A, [user("flamingo")])
+        idx = self.entries()
+        # B's entry by hand: the index build (update) is not what is tested here
+        # the word is in the odd records too, outside what was said: they are parsed
+        odd = self.write(self.B, [rec(type="user", timestamp=self.TS, message={
+                                      "role": "user", "content": [{"type": "text", "text": None},
+                                                                  {"type": "image", "alt": "flamingo"}]}),
+                                  rec(type="assistant", timestamp=self.TS, message="flamingo"),
+                                  user("flamingo")])
+        idx[self.B] = {"sessionId": self.B, "path": odd, "entrypoint": "cli"}
+        self.assertEqual(index.grep(idx, "flamingo"), {self.A, self.B})
+
+    def test_letters_beyond_a_z_in_any_case(self):
+        self.write(self.A, [user("Ärger im Büro"), assistant("ÉCOLE fermée")])
+        for q in ("Ärger", "ärger", "ÄRGER", "école", "ÉCOLE", "büro"):
+            with self.subTest(q=q):
+                self.assertEqual(index.grep(self.entries(), q), {self.A})
+
+    def test_a_quote_or_a_backslash_as_it_was_said(self):
+        # the file has them escaped (\" and \\): what was said has them as typed
+        self.write(self.A, [user('run "deploy" now'), assistant("saved to C:\\temp\\new")])
+        for q in ('"deploy"', 'deploy"', "c:\\temp", "temp\\new"):
+            with self.subTest(q=q):
+                self.assertEqual(index.grep(self.entries(), q), {self.A})
+
+    def test_a_programs_session_only_with_everything(self):
+        self.write(self.A, [rec(type="user", entrypoint="sdk-cli", timestamp="2026-09-18T10:00:00.000Z",
+                                message={"role": "user", "content": "flamingo"})])
+        self.assertEqual(index.grep(self.entries(), "flamingo"), set())
+        self.assertEqual(index.grep(self.entries(), "flamingo", everything=True), {self.A})
+
+    def test_a_stop_asked_for_ends_it_with_no_answer(self):
+        self.write(self.A, [user("flamingo")])
+        self.write(self.B, [user("flamingo")])
+        self.assertIsNone(index.grep(self.entries(), "flamingo", stop=lambda: True))
+        self.assertEqual(index.grep(self.entries(), "flamingo", stop=lambda: False),
+                         {self.A, self.B})                                     # control
+
+    def test_a_stop_during_the_last_file_has_no_answer(self):
+        self.write(self.A, [user("one"), user("two"), user("three"), user("flamingo")])
+        asked = []
+        during = lambda: asked.append(1) or len(asked) > 2      # noqa: E731 - inside its lines
+        self.assertIsNone(index.grep(self.entries(), "flamingo", stop=during))
+        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A})    # control
+
+    def test_a_transcript_gone_unreadable_or_cut_is_passed_over(self):
+        self.write(self.A, [user("flamingo")])
+        p = self.write(self.B, [user("flamingo")])
+        idx = self.entries()
+        os.remove(p)
+        self.assertEqual(index.grep(idx, "flamingo"), {self.A})
+        idx[self.A] = dict(idx[self.A], path=None)
+        self.assertEqual(index.grep(idx, "flamingo"), set())
+        cut = self.write(self.B, [user("hello")])
+        with open(cut, "a") as fh:
+            fh.write('{"type": "user", "message": {"content": "flamingo')     # a line cut off
+        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A}, "not B")
+
+    def test_no_words_finds_nothing(self):
+        self.write(self.A, [user("flamingo")])
+        for q in ("", "   ", None):
+            with self.subTest(q=q):
+                self.assertEqual(index.grep(self.entries(), q), set())
+
 if __name__ == "__main__":
     unittest.main()

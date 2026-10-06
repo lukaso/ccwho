@@ -825,6 +825,18 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
                      if c["name"] == "iterm2")
         self.assertIn("restart iTerm2", " ".join(map(str, check.values())))
 
+    def test_a_stuck_one_says_when_ccwho_asks_it_again(self):
+        # 2026-10-03: one unanswered ask; the gate now tries again after a wait
+        # (terms.STUCK_RETRY), and doctor says when - not "has stopped asking"
+        def refused(timeout=5.0, why=None):
+            why.update(refused="stuck", retry_at=1420.0)
+        setup.iterm_scriptable = refused
+        facts = setup.gather(ccwho_dir=self.tmp, now=1000.0)
+        self.assertEqual(facts.get("iterm_retry_in"), 420.0)
+        check = next(c for c in setup.doctor_checks(facts) if c["name"] == "iterm2")
+        self.assertIn("ccwho asks it again in 7m", check["detail"])
+        self.assertNotIn("stopped asking", check["detail"])
+
     def test_claude_is_found_where_it_installs_itself(self):
         real = setup.engine.find_tool
         self.addCleanup(setattr, setup.engine, "find_tool", real)
@@ -1475,6 +1487,33 @@ class TheIterm2CheckTellsBusyFromBroken(unittest.TestCase):
         self.assertNotIn("not answering", text)
         self.assertNotIn("restart iTerm2", text)
 
+    def test_doctor_says_when_a_stuck_iterm2_is_asked_again(self):
+        check = next(c for c in setup.doctor_checks(
+            {"iterm_ok": None, "iterm_why": "stuck", "iterm_retry_in": 420.0}) if c["name"] == "iterm2")
+        self.assertFalse(check["ok"])
+        self.assertIn("did not answer for 2 minutes - ccwho asks it again in 7m;"
+                      " no tab names until then", check["detail"])
+        self.assertIn("restart iTerm2 to ask it at once", check["fix"])
+
+    def test_a_retry_under_a_second_away_is_in_a_moment(self):
+        check = next(c for c in setup.doctor_checks(
+            {"iterm_ok": None, "iterm_why": "stuck", "iterm_retry_in": 0.4}) if c["name"] == "iterm2")
+        self.assertIn("ccwho asks it again in a moment", check["detail"])
+        self.assertNotIn("0s", check["detail"])
+
+    def test_without_a_time_it_says_what_it_said(self):                 # control
+        for facts in ({"iterm_ok": None}, {"iterm_ok": None, "iterm_why": "stuck"},
+                      {"iterm_ok": None, "iterm_why": "busy", "iterm_retry_in": 420.0}):
+            check = next(c for c in setup.doctor_checks(facts) if c["name"] == "iterm2")
+            self.assertIn("not answering Apple Events", check["detail"], facts)
+
+    def test_no_line_says_ccwho_stopped_asking(self):
+        # it asks again: after 30 s, or after a stuck one's wait - doctor's own
+        # ask can be the one that tries again, and time out
+        for facts in ({"iterm_ok": None}, {"iterm_ok": None, "iterm_why": "busy"}):
+            check = next(c for c in setup.doctor_checks(facts) if c["name"] == "iterm2")
+            self.assertNotIn("stopped asking", check["detail"], facts)
+
     def test_doctor_still_names_automation_when_iterm2_refused(self):   # control
         check = next(c for c in setup.doctor_checks({"iterm_ok": False}) if c["name"] == "iterm2")
         self.assertIn("Automation", " ".join(str(v) for v in check.values()))
@@ -1677,8 +1716,34 @@ class TestDoctorSaysWhatTerminalAppLastAnswered(unittest.TestCase):
     nothing: the first Apple Event to an app shows macOS's prompt (review of
     slices 4-5: doctor, and setup with it, used to ask Terminal.app)."""
 
-    def row(self, says, age=600.0):
-        return by_name(setup.doctor_checks(facts(terminal_says=says, terminal_age=age))).get("Terminal.app")
+    def row(self, says, age=600.0, retry_in=None):
+        return by_name(setup.doctor_checks(facts(terminal_says=says, terminal_age=age,
+                                                 terminal_retry_in=retry_in))).get("Terminal.app")
+
+    def test_stuck_says_when_it_asks_again(self):
+        # the gate asks a stuck app again after a wait (terms.STUCK_RETRY)
+        detail = self.row("stuck", retry_in=420.0)["detail"]
+        self.assertIn("timed out - ccwho asks it again in 7m, while a session runs in one of"
+                      " its tabs", detail)
+        self.assertNotIn("stopped asking", detail)
+
+    def test_stuck_with_its_wait_over_says_what_asks_again(self):
+        # the list asks it only while a session runs in one of its tabs (D7) -
+        # never "in 0s" (review 1)
+        for retry_in in (0.0, 0.4):
+            detail = self.row("stuck", retry_in=retry_in)["detail"]
+            self.assertIn("timed out - the list asks again while a session runs in one of its"
+                          " tabs", detail, retry_in)
+            self.assertNotIn("0s", detail)
+            self.assertNotIn("stopped asking", detail)
+
+    def test_stuck_with_no_time_yet_names_a_wait(self):
+        # not settled yet, or a gate file from before retries: the next ask
+        # starts a wait, it does not go out (review 3)
+        detail = self.row("stuck")["detail"]
+        self.assertIn("timed out - ccwho asks it again after a wait, while a session runs in"
+                      " one of its tabs", detail)
+        self.assertNotIn("the list asks again", detail)
 
     # each row says it is the list's last ask, how long ago, and what asks
     # again (review 2 of slices 4-5: a refusal outlived the fix, unexplained)
@@ -1738,10 +1803,19 @@ class TestGatherReadsTerminalAppsGate(unittest.TestCase):
         terms = setup.engine.terms
         testkit.patch(self, terms, "gate_says", lambda app, procs=None: seen.append(app) or "refused")
         testkit.patch(self, terms, "gate_when", lambda app: seen.append(app) or time.time() - 120)
+        testkit.patch(self, terms, "gate_retry_at", lambda app: seen.append(app) or time.time() + 420)
         got = setup.terminal_facts()
         self.assertEqual(got["terminal_says"], "refused")
         self.assertTrue(115 < got["terminal_age"] < 200, got)
-        self.assertEqual(seen, [terms.TERMINAL, terms.TERMINAL])
+        self.assertTrue(400 < got["terminal_retry_in"] <= 420, got)
+        self.assertEqual(seen, [terms.TERMINAL] * 3)
+
+    def test_no_retry_time_is_none(self):                                 # control
+        terms = setup.engine.terms
+        testkit.patch(self, terms, "gate_says", lambda app, procs=None: "stuck")
+        testkit.patch(self, terms, "gate_when", lambda app: None)
+        testkit.patch(self, terms, "gate_retry_at", lambda app: None)
+        self.assertIsNone(setup.terminal_facts()["terminal_retry_in"])
 
 
 class TestTheHotkeysReachIsCheckedInITerm2(unittest.TestCase):

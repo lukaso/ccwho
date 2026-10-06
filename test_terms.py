@@ -7,6 +7,7 @@ at the osascript the gate would start.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import subprocess
@@ -499,6 +500,93 @@ class TestWhatTheLastAskCameTo(unittest.TestCase):
         self.ask('echo "execution error: Not authorized. (-1743)" >&2; exit 1')
         REAL_ASK(["-e", "x"], app=terms.TERMINAL)     # settles the first, then waits: not sent
         self.assertEqual(self.says(), "refused")
+
+    def test_a_timeout_records_when_it_asks_again(self):
+        # doctor says when (terms.STUCK_RETRY), not "has stopped asking"
+        self.ask('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
+        got = terms.gate_retry_at(terms.TERMINAL)
+        self.assertTrue(time.time() + terms.STUCK_RETRY - 30 < got <= time.time() + terms.STUCK_RETRY, got)
+
+    def test_an_unsettled_timeout_has_no_retry_time_yet(self):
+        # its -1712 came back and no ask has settled it: the next ask starts
+        # a wait, so there is no time to tell yet (review 3 of env-panes)
+        self.stub("echo 1")
+        os.makedirs(terms.STATE_DIR, exist_ok=True)
+        first = {"pending": True, "asked_pid": 400, "boot": terms.boot_id()}
+        # the try after a wait that is over, timed out again
+        again = dict(first, quarantine=400, last_error="-1712", strikes=1,
+                     retry_at=time.time() - 5, slow=True)
+        for state in (first, again):
+            for name, text in (("json", json.dumps(state)), ("status", "1\n"),
+                               ("err", "AppleEvent timed out. (-1712)"), ("out", "")):
+                with open(terms._gate_path(terms.TERMINAL, name), "w") as fh:
+                    fh.write(text)
+            self.assertEqual(self.says(), "stuck", state)
+            self.assertIsNone(terms.gate_retry_at(terms.TERMINAL), state)
+
+    def gate_files(self, state, **files):
+        """The Terminal.app gate as an ask left it: its state and its files."""
+        self.stub("echo 1")
+        os.makedirs(terms.STATE_DIR, exist_ok=True)
+        with open(terms._gate_path(terms.TERMINAL, "json"), "w") as fh:
+            json.dump(dict(state, boot=terms.boot_id()), fh)
+        for name, text in files.items():
+            with open(terms._gate_path(terms.TERMINAL, name), "w") as fh:
+                fh.write(text)
+
+    SHUT = {"quarantine": 400, "asked_pid": 400, "last_error": "-1712", "strikes": 1,
+            "pending": True}
+
+    def test_a_try_that_ended_with_no_code_reads_as_stuck_before_and_after(self):
+        # _settle keeps such a gate shut, as stuck: gate_says must say so
+        # before the next ask settles it too (review 4 of env-panes)
+        for files in ({"status": "1\n", "err": ""}, {"err": ""}):          # killed; wrapper died
+            self.gate_files(dict(self.SHUT, retry_at=time.time() - 5), **files)
+            self.assertEqual(self.says(), "stuck", files)
+            REAL_ASK(["-e", "x"], app=terms.TERMINAL)
+            self.assertEqual(self.says(), "stuck", files)
+
+    def test_a_try_with_no_code_names_the_quarantined_copies(self):
+        # the try may reach two copies; the quarantine names the one that shut
+        # it - with that one gone, ask asks at once, so it is not stuck (review 5)
+        self.gate_files(dict(self.SHUT, asked_pid=[400, 500], retry_at=time.time() - 5),
+                        status="1\n", err="")
+        only_500 = "  PID   UID UCOMM\n  500 %d Terminal\n" % self.ME
+        self.assertIsNone(self.says(procs=only_500))
+        self.assertEqual(self.says(procs=only_500 + "  400 %d Terminal\n" % self.ME), "stuck")
+
+    def test_a_status_left_after_its_settle_has_no_retry_time(self):
+        # settled, but its status file not removed: the next ask settles it
+        # again and the wait doubles - the time on record is not the one
+        self.gate_files({"quarantine": 400, "asked_pid": 400, "last_error": "-1712", "strikes": 1,
+                         "retry_at": time.time() + 600},
+                        status="1\n", err="AppleEvent timed out. (-1712)")
+        self.assertIsNone(terms.gate_retry_at(terms.TERMINAL))
+
+    def test_with_no_quarantine_it_reads_as_failed(self):                     # control
+        self.gate_files({"asked_pid": 400, "pending": True}, status="1\n", err="")
+        self.assertEqual(self.says(), "failed")
+        REAL_ASK(["-e", "x"], app=terms.TERMINAL)
+        self.assertEqual(self.says(), "failed")
+
+    def test_a_try_in_flight_or_whose_wrapper_died_has_no_retry_time(self):
+        # pending, no status file: the next ask decides (review 4)
+        self.gate_files(dict(self.SHUT, retry_at=time.time() - 5), err="AppleEvent timed out. (-1712)")
+        self.assertIsNone(terms.gate_retry_at(terms.TERMINAL))
+
+    def test_a_settled_wait_that_is_over_keeps_its_time(self):              # control
+        self.ask('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
+        state = json.loads(open(terms._gate_path(terms.TERMINAL, "json")).read())
+        state["retry_at"] = time.time() - 5
+        with open(terms._gate_path(terms.TERMINAL, "json"), "w") as fh:
+            json.dump(state, fh)
+        self.assertLess(terms.gate_retry_at(terms.TERMINAL), time.time())
+
+    def test_no_retry_time_without_a_quarantine(self):                     # control
+        self.ask("echo 1")
+        self.assertIsNone(terms.gate_retry_at(terms.TERMINAL))
+        self.ask('echo "execution error: Not authorized. (-1743)" >&2; exit 1')
+        self.assertIsNone(terms.gate_retry_at(terms.TERMINAL))
 
     def test_stuck_while_that_copy_runs(self):
         self.ask('echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')

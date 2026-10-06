@@ -133,7 +133,7 @@ Compared with herdr v0.9.3 and [its docs](https://herdr.dev/docs/), on 2026-10-0
 | What a row tells you | The state, the agent, and the workspace and tab names. A config line adds the agent's terminal title. Scripts and plugins can add fields | Live list: state, name, title, age, ports, account (with two or more), and Claude's recap with its age (with no recap, the last tool call). → adds the last thing you said and what Claude said last. `ccwho ls` shows the last tool call, or the question it asks |
 | Go to a session | Click an agent in the sidebar, or use the Goto picker (`prefix+g`), which filters agents by state | ⌥/ opens the list from any app (an iTerm2 hotkey window). Enter brings the session's window to the front, or opens a window that attaches a background session. Not for Codex threads ([finding the window](#finding-the-window)) |
 | Client closes or SSH drops | Processes keep running in the herdr server | Closing ccwho does not touch the sessions. If the terminal app quits or SSH drops, the sessions in it end, as without ccwho. `claude --bg` sessions keep running |
-| Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window. `restore --check` says whether each saved session can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
+| Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window. `restore --check` says whether each saved session that `--open` would reopen can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
 | Processes and ports | Not built in | `ps`, `ps --port`, `kill`, `clean`, `reap`. It shows which session started each process ([processes and ports](#processes-and-ports)) |
 | Stuck work | Not built in | Finds a wait loop on a task that has ended (`until grep …; do sleep …; done`) and stdin readers that can never end, and gives you a box to kill them ([busy, but the turn is over](#busy-but-the-turn-is-over)) |
 | Old sessions | Not built in (the `memex` plugin searches transcripts) | `ls` and `show` search an index of every transcript in `~/.claude`, in the `CLAUDE_CONFIG_DIR` ccwho runs with, and in the dirs you list in `~/.ccwho/roots` (Claude Code keeps 30 days by default) ([finding an old session](#finding-an-old-session)) |
@@ -161,7 +161,7 @@ ccwho                         # on a terminal
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `x` | on a process (after `p`): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
-| `o` | a menu of every save, newest first, with how many of its sessions run now; the last save before the restart is marked. Running sessions are left alone |
+| `o` | a menu of every save, newest first, with how many of its sessions run now; the last save before the restart is marked. Running sessions, and those Claude Desktop or a program ran, are left alone |
 | `r` | restart the list |
 | `q` | quit |
 
@@ -524,10 +524,29 @@ line into its own pane, in the same window, tab and split. A pane that came back
 with a new id is found by its title instead, but only when exactly one saved session
 and exactly one pane have it; the status mark Claude Code puts in front (`✳`, `◐`)
 does not count. It writes only into a pane where nothing runs but a shell at its
-prompt, and clears a half-typed line there first. Every other session - and one
-whose pane closed before the write - opens in a new window, as before. `restore --check`
+prompt, and clears a half-typed line there first. Every other terminal session - and
+one whose pane closed before the write - opens in a new window, as before. `restore --check`
 says how many of the saved panes are open now. A session saved from a Terminal.app
 tab reopens in a new Terminal.app window ([#30](https://github.com/lukaso/ccwho/issues/30)).
+
+The pane comes from iTerm2 when it answers, and from the session's own process when
+it does not: iTerm2 puts `ITERM_SESSION_ID=w0t1p2:<pane id>` in every pane it starts,
+so the save reads it there - no Apple Event. On 2026-10-03 iTerm2 left one ask
+unanswered for 2 minutes and ccwho asked it nothing more for two days; the save
+before the next reboot knew the pane of 3 of 12 sessions, and 9 opened in new windows.
+Now a save finds the pane of each session whose own process runs in an iTerm2 pane.
+One the Claude Code daemon runs (`claude --bg`, shown by `claude attach`) keeps the
+pane the last save knew, and one in tmux has none. A stuck iTerm2 is asked again
+after 10 minutes (doubling to 2 hours while it stays stuck; `ccwho doctor` says when).
+
+**Not what Claude Desktop or a program ran.** Such a session is not reopened in a
+terminal window. `restore --open` names it, with the `ccwho open <id>` that opens it
+if you want it; `o` leaves it out of the sessions it would reopen and counts it in
+what it says after; `ccwho restore` marks it "--open leaves it"; `restore --check`
+names it as `--open` does and does not count it as restorable. On 2026-10-05 a
+restore put two Claude Desktop sessions, idle for days, in new iTerm2 windows. A save
+made before this version does not record what started a session, and reopens them
+all, as before.
 
 **It saves itself.** Two ways, because the reboot this exists for is usually the one
 you did not plan. `ccwho --watch` writes a manifest every 5 minutes

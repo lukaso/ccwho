@@ -690,7 +690,8 @@ class SavesMenu(ModalScreen):
         with Vertical(id="savesbox"):
             with Horizontal(id="savestop"):
                 yield Static("reopen a save - enter or click a line, esc to close."
-                             " Sessions still running are left alone.",
+                             " Sessions still running, and those Claude Desktop or a"
+                             " program ran, are left alone.",
                              id="saveshead", markup=False)
                 # the owner's iTerm2 passes only a plain left click: Esc is
                 # not the only way out

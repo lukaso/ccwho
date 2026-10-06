@@ -675,8 +675,12 @@ def applescript_str(text):
 # pool and froze it, main thread and all. So, for each app:
 #   - one event in flight, across every ccwho process: a lock file, held by the
 #     osascript child itself until it exits. It is never killed.
-#   - an event that timed out INSIDE the app (-1712) means that app is stuck:
-#     no background ask reaches it again until it is a different process.
+#   - an event that timed out INSIDE the app (-1712) means that app may be
+#     stuck: no background ask reaches it for STUCK_RETRY, then one does, alone
+#     in flight like every ask. Each one that times out again doubles the wait,
+#     up to STUCK_RETRY_LONGEST; an answer, a restart or a reboot ends it.
+#     2026-10-03: one unanswered ask, and the old rule - not until it is a
+#     different process - asked an iTerm2 that worked fine nothing for 2 days.
 #   - a caller that gave up waiting, or any other failure, waits
 #     ASK_WAIT_AFTER_ERROR: a slow app must not always have an event in flight.
 # Things you do (jump, open, restore) are not background asks and do not come
@@ -684,6 +688,22 @@ def applescript_str(text):
 
 STATE_DIR = os.path.expanduser("~/.cache/ccwho")
 ASK_WAIT_AFTER_ERROR = 30.0
+# a stuck app gets one more event after each wait: at the longest, 12 a day -
+# against the 509 that froze iTerm2
+STUCK_RETRY = 600.0
+STUCK_RETRY_LONGEST = 7200.0
+STRIKES_KEPT = 64
+
+
+def _stuck_wait(strikes):
+    """How long a quarantine holds after its `strikes`-th unanswered ask."""
+    return min(STUCK_RETRY * 2 ** (max(strikes, 1) - 1), STUCK_RETRY_LONGEST)
+
+
+def _unquarantine(state):
+    """Drop a quarantine and everything that times it."""
+    for key in ("quarantine", "last_error", "retry_at", "strikes"):
+        state.pop(key, None)
 
 
 def _ask_sh(app):
@@ -737,6 +757,13 @@ def _read_gate(app, now):
     wait = state.get("wait_until")
     if type(wait) in (int, float) and wait <= now + ASK_WAIT_AFTER_ERROR:
         clean["wait_until"] = wait
+    # a retry further off than the longest wait is from a clock set back: the
+    # wait starts again (ask), it does not hold the gate shut that much longer
+    retry = state.get("retry_at")
+    if type(retry) in (int, float) and retry <= now + STUCK_RETRY_LONGEST:
+        clean["retry_at"] = retry
+    if type(state.get("strikes")) is int and 0 < state["strikes"] <= STRIKES_KEPT:
+        clean["strikes"] = state["strikes"]
     if isinstance(state.get("last_error"), str) and re.fullmatch(r"-?\w{1,12}", state["last_error"]):
         clean["last_error"] = state["last_error"]
     if isinstance(state.get("boot"), str) and len(state["boot"]) <= 64:
@@ -772,20 +799,33 @@ def _settle(app, state, now):
     answered = status is not None and status.strip() == "0"
     slow = state.pop("slow", False)
     if answered:
-        state.pop("quarantine", None)
-        state.pop("last_error", None)
+        _unquarantine(state)
         state.pop("unasked", None)          # set again if this answer is the sentinel (ask)
         if slow:        # a late answer: the pause runs from when it was seen
             state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
     else:
-        state["last_error"] = ae_error_code(err) or "failed"
-        if state["last_error"] == AE_TIMED_OUT:
+        code = ae_error_code(err) or "failed"
+        if code == AE_TIMED_OUT:
             # of the boot the ask was sent in: settled after a reboot, the
-            # quarantine is dropped by ask - its pid is nobody's now
-            state["quarantine"] = state.get("asked_pid")
-            state["boot"] = state.get("boot") or boot_id()
-        else:
+            # quarantine is dropped by ask - its pid is nobody's now. One that
+            # was already quarantined was its retry: the wait doubles
+            # (counted only as far as the gate file keeps: _read_gate)
+            strikes = (min(state.get("strikes", 1) + 1, STRIKES_KEPT)
+                       if state.get("quarantine") is not None else 1)
+            state.update(quarantine=state.get("asked_pid"), boot=state.get("boot") or boot_id(),
+                         strikes=strikes, retry_at=now + _stuck_wait(strikes))
+        elif code == "failed" and state.get("quarantine") is not None:
+            # killed, or no error code: no proof it answers - its wait starts
+            # again, and what shut it stays on record (gate_says: stuck)
+            state["retry_at"] = now + _stuck_wait(state.get("strikes", 1))
             state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
+            code = state.get("last_error") or AE_TIMED_OUT
+        else:
+            # an error came back - the app, or macOS for it, answered - or,
+            # with no quarantine to keep, it failed: pause as after any error
+            _unquarantine(state)
+            state["wait_until"] = now + ASK_WAIT_AFTER_ERROR
+        state["last_error"] = code
     if not _write_gate(app, state):
         return state, None, False
     for name in ("status", "out", "err"):
@@ -826,7 +866,10 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
     check inside the script (guarded) -, no-table - the process list could not
     be read -, io - its state, lock or spawn failed -, busy, stuck, waiting)
     and "error" (the Apple Event error code that ended osascript's message,
-    "timeout", or "failed" when it ended with none).
+    "timeout", or "failed" when it ended with none - while quarantined, an end
+    with none keeps the code that shut it once settled (_settle); "failed" while
+    its wrapper has died and no ask has settled it yet); refused as stuck, also
+    "retry_at" - when the next ask goes out to see whether it answers again.
 
     `args` is ["-e", script]: the script is sent guarded. Anything else is a
     ValueError, raised before the gate is touched.
@@ -887,19 +930,24 @@ def ask(args, *, app, timeout=5.0, procs=None, now=None, wait=0.0, why=None):
             return None
         if (state.get("quarantine") is not None and state.get("boot") is not None
                 and boot_id() is not None and state["boot"] != boot_id()):
-            state.pop("quarantine")         # of a copy before a reboot: its pid is nobody's now
+            _unquarantine(state)            # of a copy before a reboot: its pid is nobody's now
                                             # (a boot not recorded, or not readable: it holds)
-            state.pop("last_error", None)
         stuck = state.get("quarantine")
         stuck = [] if stuck is None else ([stuck] if type(stuck) is int else stuck)
         if stuck and not set(stuck) & set(pids):
-            state.pop("quarantine")         # restarted: none that may be stuck runs
-            state.pop("last_error", None)
+            _unquarantine(state)            # restarted: none that may be stuck runs
         elif stuck:
             # one of them still runs - beside another too: `tell application`
-            # may reach it yet
-            why.update(refused="stuck", error=state.get("last_error"))
-            return None
+            # may reach it yet. Until its wait is over: then this ask goes out,
+            # alone in flight, to see whether it answers again
+            if "retry_at" not in state:
+                # from before retries, or a clock set back: the wait starts now
+                state["retry_at"] = now + _stuck_wait(state.get("strikes", 1))
+                _write_gate(app, state)
+            if now < state["retry_at"]:
+                why.update(refused="stuck", error=state.get("last_error"),
+                           retry_at=state["retry_at"])
+                return None
         elif now < state.get("wait_until", 0):
             why.update(refused="waiting", error=state.get("last_error"))
             return None
@@ -964,7 +1012,8 @@ def gate_says(app, procs=None):
     another boot). Else "answered", "refused" (-1743: Automation), "stuck"
     (-1712, on a copy that still runs - `procs`, default app_snapshot()),
     "slow" (an ask whose osascript still runs: a prompt may be waiting), or
-    "failed" - as the next ask will record it."""
+    "failed" - as the next ask will record it: one with no error code while
+    quarantined keeps what shut it (_settle), and reads "stuck"."""
     state = _read_gate(app, time.time())
     asked = state.get("asked_pid")
     now_boot = boot_id()
@@ -973,7 +1022,7 @@ def gate_says(app, procs=None):
     if status is not None:                  # it ended; the next ask settles it
         if status.strip() == "0":
             return None if (_gate_text(app, "out") or "").strip() == NOT_RUNNING else "answered"
-        code, stuck = ae_error_code(_gate_text(app, "err") or ""), asked
+        code, stuck = _as_settled(state, ae_error_code(_gate_text(app, "err") or ""), asked)
     elif state.get("pending") or state.get("slow"):
         if _lock_held(app):
             # its osascript still runs. Every ask does, for a moment: only
@@ -992,7 +1041,7 @@ def gate_says(app, procs=None):
         else:
             # its wrapper died with no word: what its osascript wrote, as
             # the next ask settles it
-            code, stuck = ae_error_code(_gate_text(app, "err") or "") or "failed", asked
+            code, stuck = _as_settled(state, ae_error_code(_gate_text(app, "err") or ""), asked)
     else:
         code, stuck = state.get("last_error"), state.get("quarantine")
         if code is None:
@@ -1008,9 +1057,30 @@ def gate_says(app, procs=None):
     return "refused" if code == AE_NOT_PERMITTED else "failed"
 
 
+def _as_settled(state, code, asked):
+    """(code, the pids it names) for an ask's end not yet settled, as _settle
+    will record it: no error code while quarantined keeps what shut it."""
+    if code is None and state.get("quarantine") is not None:
+        return state.get("last_error") or AE_TIMED_OUT, state.get("quarantine")
+    return code or "failed", asked
+
+
 # longer than any background ask may take to answer (they wait at most 5 s):
 # one still in flight after this is waiting on something - a prompt, a hang
 ASK_LONGEST = 30.0
+
+
+def gate_retry_at(app):
+    """When `app`'s gate asks it again after an ask that timed out inside it
+    (STUCK_RETRY), on the wall clock. None when no quarantine is recorded (a
+    retry time goes with one: _unquarantine); when none has its time yet - an
+    ask's end not settled, or one in flight: its settle decides it; and when
+    the time recorded is past the longest wait (a clock set back: _read_gate).
+    Read from its files, never asked."""
+    state = _read_gate(app, time.time())
+    if state.get("pending") or _gate_text(app, "status") is not None:
+        return None
+    return state.get("retry_at")
 
 
 def gate_when(app):

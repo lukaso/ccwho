@@ -50,6 +50,10 @@ MANIFEST_SESSION_KEYS = {
                           # older manifests lack them and open new windows
     "terminal",           # added 2026-09-30: the app it was in; older manifests
                           # lack it: a pane id means iTerm2, else the default app
+    "entrypoint",         # added 2026-10-05: what started it (cli, claude-desktop,
+                          # sdk-*); `restore --open` leaves what Claude Desktop
+                          # or a program ran; older manifests lack it and every
+                          # entry reopens as before
 }
 
 MANIFEST_TOP_KEYS = {

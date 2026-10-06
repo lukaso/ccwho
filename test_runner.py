@@ -65,6 +65,9 @@ GUARDS["panes_snapshot"] = lambda *a, **k: {}
 GUARDS["idle_snapshot"] = lambda *a, **k: set()
 GUARDS["iterm_ask"] = lambda *a, **k: None       # the same answer, one level down
 GUARDS["app_snapshot"] = lambda: "  PID UID UCOMM\n"   # no iTerm2 of ours, unless a test says so
+# a save that cannot ask iTerm2 reads each session's pane from its process: a
+# row's pid in a test may be any process of this machine's
+GUARDS["read_iterm_pane"] = _guard("read_iterm_pane")
 _unpinned_live_file_sessions = GUARDS["live_file_sessions"]
 TERMS_GATE_GUARD = lambda *a, **k: None       # noqa: E731 - the gate every app's asks go through
 
@@ -584,6 +587,16 @@ class TestASaveThatCannotAskKeepsOnlyTheSameProcess(unittest.TestCase):
         iterm.panes = lambda **k: None                  # the gate did not ask iTerm2
         self.addCleanup(setattr, runner, "_boot_id", runner._boot_id)
         runner._boot_id = lambda: "THIS-BOOT"
+        # what each process's environment names: none, unless a test says so
+        self.env, self.read = {}, []
+        self.addCleanup(setattr, runner.engine, "read_iterm_pane", GUARDS["read_iterm_pane"])
+        runner.engine.read_iterm_pane = lambda pid: self.read.append(pid) or self.env.get(pid, "")
+        # each process's own tty, as ps says it: the one each row shows, unless
+        # a test says otherwise
+        self.own = {101: "ttys032", 102: "ttys033", 202: "ttys033"}
+        self.addCleanup(setattr, runner.engine, "tty_snapshot", runner.engine.tty_snapshot)
+        runner.engine.tty_snapshot = lambda: "  PID TTY UID UCOMM\n" + "".join(
+            f"{pid} {tty} 501 claude\n" for pid, tty in self.own.items())
 
     @staticmethod
     def row(sid, tty, pid):
@@ -627,8 +640,75 @@ class TestASaveThatCannotAskKeepsOnlyTheSameProcess(unittest.TestCase):
         self.last_save()
         self.rows[1]["pid"] = 202
         _, _, out = self.save()
-        self.assertIn("iTerm2 not asked - kept the pane of 1 of 2 session(s) from the last save",
-                      out)
+        self.assertIn("iTerm2 not asked - found the pane of 1 of 2 session(s):"
+                      " 0 from their process, 1 from the last save", out)
+
+    def test_a_session_no_save_knew_gets_the_pane_its_process_names(self):
+        # 2026-10-05: 9 of 12 iTerm2 sessions had started since the gate shut
+        self.env = {101: "E-1"}
+        panes, _, _ = self.save()
+        self.assertEqual(panes, {self.S1: "E-1", self.S2: ""})
+
+    def test_its_process_beats_the_last_save(self):
+        # what the process names beats what the last save carried for it - a
+        # /clear gives a new id the carry, by session id, would not find at all
+        self.last_save()
+        self.env = {102: "E-2"}
+        panes, _, _ = self.save()
+        self.assertEqual(panes, {self.S1: "G-1", self.S2: "E-2"})
+
+    def test_the_save_says_where_each_pane_came_from(self):
+        self.last_save()
+        self.rows[1]["pid"] = 202
+        self.env = {202: "E-2"}
+        _, _, out = self.save()
+        self.assertIn("iTerm2 not asked - found the pane of 2 of 2 session(s):"
+                      " 1 from their process, 1 from the last save", out)
+
+    def test_a_session_shown_on_another_tty_takes_no_pane_from_its_process(self):
+        # a daemon session: its process (claude bg-spare) has the daemon
+        # starter's environment, and the row shows the tty of a `claude attach`
+        # elsewhere - review 1 of env-panes. The carry, by that row, stands
+        self.last_save()
+        self.own[102] = "ttys040"
+        self.env = {101: "E-1", 102: "E-WRONG"}
+        panes, _, _ = self.save()
+        self.assertEqual(panes, {self.S1: "E-1", self.S2: "G-2"})
+
+    def test_a_process_with_no_tty_takes_no_pane_from_it(self):
+        del self.own[101]                                   # ps: ??
+        self.env = {101: "E-1"}
+        self.assertEqual(self.save()[0], {self.S1: "", self.S2: ""})
+
+    def test_an_unreadable_process_list_takes_none(self):
+        runner.engine.tty_snapshot = lambda: ""
+        self.env = {101: "E-1", 102: "E-2"}
+        self.assertEqual(self.save()[0], {self.S1: "", self.S2: ""})
+
+    def test_a_long_tty_name_is_the_same_tty(self):                     # control
+        self.rows[0]["tty"] = "/dev/ttys032"
+        self.env = {101: "E-1"}
+        self.assertEqual(self.save()[0][self.S1], "E-1")
+
+    def test_a_save_with_no_iterm2_row_runs_no_second_ps(self):
+        # a Terminal.app user's every save is "not asked" (review 2)
+        for r in self.rows:
+            r["terminal"] = "terminal"
+        ran = []
+        runner.engine.tty_snapshot = lambda: ran.append(1) or ""
+        self.save()
+        self.assertEqual(ran, [])
+
+    def test_only_an_iterm2_row_s_process_is_read(self):
+        self.rows[1]["terminal"] = "terminal"
+        self.save()
+        self.assertEqual(self.read, [101])
+
+    def test_a_save_that_asked_reads_no_process(self):
+        runner.engine.terms.ITERM2.panes = lambda **k: {}
+        self.env = {101: "E-1"}
+        panes, _, _ = self.save()
+        self.assertEqual((self.read, panes), ([], {self.S1: "", self.S2: ""}))
 
     def test_terminal_app_rows_alone_say_nothing_of_iterm2(self):
         # no pane is ever theirs; and ITERM2.panes() is None when iTerm2 does
@@ -643,8 +723,8 @@ class TestASaveThatCannotAskKeepsOnlyTheSameProcess(unittest.TestCase):
         self.last_save()
         self.rows[1]["terminal"] = "terminal"               # S2 is in Terminal.app now
         _, _, out = self.save()
-        self.assertIn("iTerm2 not asked - kept the pane of 1 of 1 session(s) from the last save",
-                      out)
+        self.assertIn("iTerm2 not asked - found the pane of 1 of 1 session(s):"
+                      " 0 from their process, 1 from the last save", out)
 
     def test_a_save_that_asked_says_nothing_of_it(self):                  # control
         self.last_save()
@@ -876,6 +956,136 @@ class TestRestoreCheck(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("reaped", out)
         self.assertIn("/definitely/not/here", out)
+
+    # --check says what --open will do (the owner, 2026-10-06): a session
+    # Claude Desktop or a program ran is not reopened, so it is not counted
+    # as restorable, nor as a problem - it is named as --open names it
+    GOOD, DESK = "4f2b91ac-1111-4222-8333-abcdefabcdef", "44444444-4444-4444-8444-444444444444"
+
+    def checked(self, sessions):
+        self.write(sessions)
+        real = runner.engine.transcript_path
+        runner.engine.transcript_path = lambda sid, roots=None: "/tx"
+        try:
+            return self.run_check(["--check"])
+        finally:
+            runner.engine.transcript_path = real
+
+    def entry(self, sid, project, **kw):
+        return dict({"sessionId": sid, "cwd": self.tmp, "project": project, "first": "f",
+                     "topic": "t", "ask": ""}, **kw)
+
+    def test_one_open_leaves_is_named_not_counted(self):
+        rc, out = self.checked([self.entry(self.GOOD, "good"),
+                                self.entry(self.DESK, "cofs", entrypoint="claude-desktop", tty="")])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("restorable: 1 session(s)", out)
+        self.assertIn(f"not reopened: cofs - it ran in Claude Desktop. To open it in a window:"
+                      f" ccwho open {self.DESK}", out)
+
+    def test_a_program_s_session_is_named_as_open_names_it(self):
+        rc, out = self.checked([self.entry(self.GOOD, "good"),
+                                self.entry(self.DESK, "job", entrypoint="sdk-cli", tty="ttys009")])
+        self.assertIn("restorable: 1 session(s)", out)
+        self.assertIn("not reopened: job - a program ran it.", out)
+
+    def test_one_open_leaves_is_no_problem_even_if_it_could_not_resume(self):
+        # --open names where it ran first, and opens nothing for it
+        rc, out = self.checked([self.entry(self.GOOD, "good"),
+                                self.entry(self.DESK, "cofs", entrypoint="claude-desktop",
+                                           cwd="/definitely/not/here")])
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("NOT fully restorable", out)
+        self.assertIn("not reopened: cofs - it ran in Claude Desktop.", out)
+
+    def test_only_such_sessions_says_nothing_to_reopen(self):
+        rc, out = self.checked([self.entry(self.DESK, "cofs", entrypoint="claude-desktop")])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("nothing to reopen in a window: 1 ran in Claude Desktop or a program.", out)
+        self.assertNotIn("restorable:", out)
+
+    def test_a_session_saved_twice_is_checked_as_open_takes_it(self):
+        # --open opens the first entry of an id, once
+        rc, out = self.checked([self.entry(self.GOOD, "good"),
+                                self.entry(self.GOOD, "good", cwd="/definitely/not/here")])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("restorable: 1 session(s)", out)
+
+    def test_a_damaged_id_is_still_a_problem_not_a_crash(self):
+        rc, out = self.checked([self.entry(self.GOOD, "good"), self.entry([1], "bad")])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT fully restorable: 1 of 2 session(s)", out)
+
+    def test_a_save_that_is_not_an_object_fails_without_a_traceback(self):
+        d = runner.restore_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "2026-01-01T0000.json"), "w") as fh:
+            json.dump([{"sessionId": self.GOOD}], fh)
+        rc, out = self.run_check(["--check"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no sessions in it", out)
+
+    def test_one_with_no_resume_line_is_a_problem_wherever_it_ran(self):
+        # --open cannot build its line, so names it as one it cannot reopen
+        # - before it ever asks where it ran (review 7)
+        rc, out = self.checked([self.entry(self.GOOD, "good"),
+                                self.entry(self.DESK, "cofs", entrypoint="claude-desktop", cwd="")])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("cofs: no resume line can be built", out)
+        self.assertNotIn("not reopened", out)
+
+    def test_two_entries_with_no_id_are_one_problem(self):
+        # --open takes the first entry of an id - no id too (review 7)
+        rc, out = self.checked([self.entry(self.GOOD, "good"), {"cwd": self.tmp, "project": "a"},
+                                {"cwd": self.tmp, "project": "b"}])
+        self.assertIn("NOT fully restorable: 1 of 2 session(s)", out)
+
+    def test_damaged_entries_are_problems_not_a_crash(self):
+        rc, out = self.checked([self.entry(self.GOOD, "good"), {"sessionId": 5, "cwd": self.tmp},
+                                self.entry(self.DESK, "pathless", cwd=[1])])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT fully restorable: 2 of 3 session(s)", out)
+        self.assertIn("pathless: its saved cwd is not a path", out)
+
+    def test_the_pane_count_is_of_the_panes_open_would_fill(self):
+        # a program's session is not reopened: its pane is nobody's to fill
+        rc, out = self.checked([self.entry(self.GOOD, "good", pane="G-1", terminal="iterm2"),
+                                self.entry(self.DESK, "job", pane="G-2", terminal="iterm2",
+                                           entrypoint="sdk-cli", tty="ttys009")])
+        self.assertIn("iTerm2 has 0 of 1 saved panes open now.", out)
+
+    def test_a_transcript_only_in_its_own_folder_is_found(self):
+        # where --open and `ccwho open` look: its own config dir (review 9)
+        alt = os.path.join(self.tmp, "alt")
+        self.addCleanup(setattr, runner.engine, "transcript_path", runner.engine.transcript_path)
+        runner.engine.transcript_path = lambda sid, roots=None: "/tx" if alt in (roots or []) else None
+        self.write([self.entry(self.GOOD, "good", configDir=alt)])
+        rc, out = self.run_check(["--check"])
+        self.assertIn("restorable: 1 session(s)", out)
+        self.write([self.entry(self.GOOD, "good")])                         # control
+        rc, out = self.run_check(["--check"])
+        self.assertIn("good: transcript is gone", out)
+
+    def test_a_problem_stays_on_its_line(self):
+        # a name or a cwd off disk may hold a line break: --open keeps both on
+        # one line too (review 10: the name was not checked)
+        rc, out = self.checked([self.entry(self.GOOD, "x\nccwho restore: y",
+                                           cwd="/not/here\nccwho restore: z")])
+        lines = [l for l in out.splitlines() if "cwd is gone" in l]
+        self.assertEqual(len(lines), 1, out)
+        self.assertIn("  x?ccwho restore: y: cwd is gone: /not/here?ccwho restore: z", lines[0])
+        self.assertFalse([l for l in out.splitlines() if l.startswith("ccwho restore: ")], out)
+
+    def test_one_with_no_project_is_named_by_its_whole_id(self):
+        # as --open names it (engine.saved_name)
+        rc, out = self.checked([self.entry(self.GOOD, "good"),
+                                {"sessionId": self.DESK, "cwd": "/definitely/not/here"}])
+        self.assertIn(f"  {self.DESK}: cwd is gone", out)
+
+    def test_an_empty_save_still_fails(self):                                 # control
+        rc, out = self.checked([])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no sessions in it", out)
 
     def test_check_opens_nothing(self):
         self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef",
@@ -1893,6 +2103,245 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
         self.assertIn("already open", out)
 
 
+class TestRestoreOpenLeavesWhatHadNoTerminalWindow(unittest.TestCase):
+    """2026-10-05: `o` after a reboot opened two Claude Desktop sessions, idle
+    for days, in new iTerm2 windows. A restore puts back what was in a
+    terminal; the rest it names, with the command that opens one (choice A)."""
+
+    TERM = "33333333-3333-4333-8333-333333333333"
+    DESK = "44444444-4444-4444-8444-444444444444"
+    ALT = "55555555-5555-4555-8555-555555555555"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+        d = os.path.join(self.tmp, "restore")
+        os.makedirs(d)
+        self.man = os.path.join(d, "2026-10-05T2150.json")
+        for proj in ("a", "c"):
+            os.makedirs(os.path.join(self.tmp, "p", proj))
+        self.cwd = lambda proj: os.path.join(self.tmp, "p", proj)
+        self.addCleanup(setattr, runner.engine, "transcript_path", runner.engine.transcript_path)
+        # sid -> the config dir its transcript is in, when not a default one:
+        # found only when that dir is among the roots looked in (review 8)
+        self.only_in = {}
+        runner.engine.transcript_path = lambda sid, roots=None: (
+            "/tx/%s.jsonl" % sid if sid in (self.TERM, self.DESK, self.ALT)
+            and (sid not in self.only_in or self.only_in[sid] in (roots or [])) else None)
+        self.live = []
+
+        def fake_collect(cache=None, status=None, **k):
+            if status is not None:
+                status["source_ok"] = True
+            return (list(self.live), 0)
+        self.addCleanup(setattr, runner.engine, "collect", runner.engine.collect)
+        runner.engine.collect = fake_collect
+        self.runs = []
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+        self.addCleanup(setattr, runner.subprocess, "run", runner.subprocess.run)
+        runner.subprocess.run = lambda *a, **k: self.runs.append(a) or Done()
+        self.write(desk={})
+
+    def write(self, desk, term=True, drop=()):
+        """The 2026-10-05 manifest's two kinds: a terminal session, and one
+        Claude Desktop ran - no tty, no app. `drop`: keys neither entry has."""
+        sessions = [{"sessionId": self.TERM, "cwd": self.cwd("a"), "project": "a",
+                     "tty": "ttys005", "entrypoint": "cli"}] if term else []
+        if desk is not None:
+            sessions.append(dict({"sessionId": self.DESK, "cwd": self.cwd("c"),
+                                  "project": "chiefofstaff", "tty": "", "terminal": "",
+                                  "entrypoint": "claude-desktop"}, **desk))
+        sessions = [{k: v for k, v in e_.items() if k not in drop} for e_ in sessions]
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1791233414, "count": len(sessions),
+                       "skipped": 0, "sessions": sessions}, fh)
+
+    def restore_open(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = runner.restore(["--open"])
+        return rc, out.getvalue(), " ".join(str(a) for run in self.runs for a in run[0])
+
+    def test_a_claude_desktop_session_is_named_not_opened(self):
+        rc, out, script = self.restore_open()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(self.DESK, script)
+        self.assertIn("claude --resume " + self.TERM, script)                # control
+        self.assertIn(f"not reopened: chiefofstaff - it ran in Claude Desktop. To open it in"
+                      f" a window: ccwho open {self.DESK}", out)
+
+    def test_one_saved_with_no_tty_opens_as_before(self):
+        # an empty tty is no proof of no window: a save whose ps could not be
+        # read records every session so (review 1). The manifest of 2026-10-05
+        # had no entrypoint yet; its two Claude Desktop sessions reopen
+        self.write(desk={"tty": ""}, drop=("entrypoint",))
+        rc, out, script = self.restore_open()
+        self.assertIn("claude --resume " + self.DESK, script)
+        self.assertNotIn("not reopened", out)
+
+    def test_a_program_s_session_is_not_opened(self):
+        self.write(desk={"tty": "ttys009", "entrypoint": "sdk-cli"})
+        rc, out, script = self.restore_open()
+        self.assertNotIn(self.DESK, script)
+        self.assertIn("not reopened: chiefofstaff - a program ran it.", out)
+
+    def test_an_entry_that_says_nothing_of_a_tty_opens_as_before(self):       # control
+        self.write(desk={}, drop=("tty", "entrypoint"))
+        rc, out, script = self.restore_open()
+        self.assertIn("claude --resume " + self.TERM, script)
+        self.assertIn("claude --resume " + self.DESK, script)
+        self.assertNotIn("not reopened", out)
+
+    def test_only_such_sessions_opens_nothing_and_says_so(self):
+        self.write(desk={}, term=False)
+        rc, out, script = self.restore_open()
+        self.assertEqual((rc, self.runs), (0, []), out)
+        self.assertIn("nothing to reopen in a window: 1 ran in Claude Desktop or a program.", out)
+
+    def test_the_rest_running_says_both(self):
+        self.live = [{"sessionId": self.TERM, "tty": "ttys009", "pid": 7}]
+        rc, out, script = self.restore_open()
+        self.assertEqual((rc, self.runs), (0, []), out)
+        self.assertIn("nothing to reopen in a window: 1 ran in Claude Desktop or a program,"
+                      " 1 already running or starting.", out)
+
+    def rewrite(self, **by_sid):
+        """Change the saved entries: session id -> the keys to set."""
+        with open(self.man) as fh:
+            man = json.load(fh)
+        for e_ in man["sessions"]:
+            e_.update(by_sid.get(e_["sessionId"], {}))
+        with open(self.man, "w") as fh:
+            json.dump(man, fh)
+
+    def test_with_one_that_cannot_resume_it_is_no_success(self):
+        # review 1: "nothing to reopen" must not hide a session that is lost
+        self.rewrite(**{self.TERM: {"cwd": self.cwd("gone")}})
+        rc, out, script = self.restore_open()
+        self.assertEqual((rc, self.runs), (1, []), out)
+        self.assertIn("ccwho restore: not reopening a - cwd is gone", out)
+        self.assertNotIn("nothing to reopen in a window", out)
+        self.assertNotIn("nothing to reopen", runner.reopen_saved())
+
+    def test_one_it_leaves_is_named_so_even_if_it_could_not_resume(self):
+        # where it ran, first: a window would not have been opened anyway
+        self.rewrite(**{self.DESK: {"cwd": self.cwd("gone")}})
+        rc, out, script = self.restore_open()
+        self.assertIn("not reopened: chiefofstaff - it ran in Claude Desktop.", out)
+        self.assertNotIn("not reopening chiefofstaff", out)
+
+    def verdicts(self, sessions):
+        """What --check and --open each say of every saved session, by name:
+        left where it ran, a problem, or reopened / restorable."""
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1, "count": len(sessions), "skipped": 0,
+                       "sessions": sessions}, fh)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            runner.restore(["--check"])
+        check = out.getvalue()
+        _rc, opened, script = self.restore_open()
+        names = {str(e_.get("project") or e_.get("sessionId") or "?") for e_ in sessions}
+        left = lambda text: {n for n in names if f"not reopened: {n} - " in text}
+        bad_check = {n for n in names if f"  {n}: " in check}
+        bad_open = {n for n in names if f"not reopening {n} - " in opened
+                    or f"cannot be reopened from this manifest: {n}" in opened}
+        ok_open = {e_["sessionId"] for e_ in sessions if isinstance(e_.get("sessionId"), str)
+                   and "claude --resume " + e_["sessionId"] in script}
+        # --check names no restorable session, it counts them
+        m = re.search(r"^restorable: (\d+)|^NOT fully restorable: (\d+) of (\d+)", check, re.M)
+        ok_check = (0 if m is None else int(m.group(1)) if m.group(1)
+                    else int(m.group(3)) - int(m.group(2)))
+        return ((left(check), bad_check, ok_check), (left(opened), bad_open, len(ok_open)))
+
+    def test_open_looks_for_a_transcript_where_its_own_session_ran(self):
+        # not in the folder another saved session names (review 8)
+        alt = {"sessionId": self.ALT, "cwd": self.cwd("a"), "project": "alt", "tty": "ttys006"}
+        self.only_in = {self.ALT: self.tmp}
+        self.write(desk=None, term=False)
+        with open(self.man, "w") as fh:
+            json.dump({"version": 1, "savedAt": 1, "sessions": [
+                {"sessionId": self.TERM, "cwd": self.cwd("a"), "project": "a", "configDir": self.tmp},
+                alt]}, fh)
+        rc, out, script = self.restore_open()
+        self.assertIn("not reopening alt - transcript is gone", out)
+        self.assertNotIn(self.ALT, script)
+        self.assertIn("claude --resume " + self.TERM, script)                # control
+
+    def test_check_says_what_open_does(self):
+        # the owner, 2026-10-06: "restore --check should match what restore
+        # actually does". Each save: --check's sorting of its sessions is --open's
+        good = {"sessionId": self.TERM, "cwd": self.cwd("a"), "project": "good", "tty": "ttys005"}
+        desk = {"sessionId": self.DESK, "cwd": self.cwd("c"), "project": "desk", "tty": "",
+                "entrypoint": "claude-desktop"}
+        saves = {"a Desktop one": [good, desk],
+                 "a Desktop one whose cwd is gone": [good, dict(desk, cwd=self.cwd("gone"))],
+                 "a Desktop one with no resume line": [good, dict(desk, cwd="")],
+                 "a program's in a terminal": [good, dict(desk, entrypoint="sdk-cli", tty="ttys009")],
+                 "a cwd that is gone": [good, dict(desk, entrypoint="cli", cwd=self.cwd("gone"))],
+                 "a damaged id": [good, dict(desk, sessionId=[1], entrypoint="cli")],
+                 "no id twice": [good, {"cwd": self.cwd("a"), "project": "x"},
+                                 {"cwd": self.cwd("a"), "project": "y"}],
+                 "a cwd that is not a path": [good, dict(desk, entrypoint="cli", cwd=[1])],
+                 "an id saved twice": [good, dict(good, cwd=self.cwd("gone"))]}
+        # review 8: transcripts in a session's own folder, names with no project,
+        # and damaged values that crashed one command and not the other
+        alt = {"sessionId": self.ALT, "cwd": self.cwd("a"), "project": "alt", "tty": "ttys006"}
+        saves.update({
+            "its transcript only in the folder of its second entry":
+                [good, alt, dict(alt, configDir=self.tmp)],
+            "its transcript only in another session's folder":
+                [dict(good, configDir=self.tmp), alt],
+            "one with no project": [good, {"sessionId": self.DESK, "cwd": self.cwd("gone")}],
+            "a title that is not text": [dict(good, tabTitle="t"), dict(desk, tabTitle=5)],
+            "a pane that is not text": [good, dict(desk, entrypoint="cli", cwd=self.cwd("gone"),
+                                                   pane=[1], terminal="iterm2")],
+            "one left and one that would not resume, none to open":
+                [desk, dict(alt, cwd=self.cwd("gone"))],
+            "an id of 8 digits": [good, {"sessionId": 12345678, "cwd": self.cwd("a"),
+                                         "project": "num"}],
+            "a pane that is not text on one it reopens":
+                [dict(good, pane=[1], terminal="iterm2"), dict(alt, pane={"a": 1}, terminal="iterm2",
+                                                               configDir=self.tmp)]})
+        self.only_in = {self.ALT: self.tmp}
+        for name, sessions in saves.items():
+            with self.subTest(save=name):
+                self.runs.clear()
+                # each save on its own: a launch claims its sessions
+                shutil.rmtree(os.path.join(self.tmp, "launching"), ignore_errors=True)
+                check, opened = self.verdicts(sessions)
+                self.assertEqual(check, opened)
+
+    def test_a_running_one_is_already_open_as_before(self):                   # control
+        self.live = [{"sessionId": self.DESK, "tty": "", "pid": 8}]
+        rc, out, script = self.restore_open()
+        self.assertNotIn(self.DESK, script)
+        self.assertIn("already open: chiefofstaff", out)
+        self.assertNotIn("not reopened", out)
+
+    def test_o_counts_it(self):
+        said = runner.reopen_saved()
+        self.assertEqual(said, "reopened 1: in a new window, 1 not reopened - Claude Desktop"
+                               " or a program ran it")
+
+    def test_o_with_nothing_to_open_says_so(self):
+        self.write(desk={}, term=False)
+        self.assertEqual(runner.reopen_saved(), "nothing to reopen in a window: 1 ran in"
+                                                " Claude Desktop or a program")
+
+    def test_o_says_them_of_two(self):
+        said = TestTheUiCanReopenTheLastSave.reopened(
+            self, "not reopened: a - it ran in Claude Desktop. To open it in a window: ccwho open x",
+            "not reopened: b - a program ran it. To open it in a window: ccwho open y",
+            "opened 1 window(s). each is at its project, resuming its own session.")
+        self.assertEqual(said, "reopened 1: in a new window, 2 not reopened - Claude Desktop"
+                               " or a program ran them")
+
+
 class TestRestoreOpenFillsRestoredPanes(unittest.TestCase):
     """The person's workaround was to let iTerm2 bring its windows back, then
     move every reopened session into its old pane by hand. A pane iTerm2
@@ -2444,11 +2893,41 @@ class TestTheSaveAsksNoSessionApp(unittest.TestCase):
             runner.save([])
         self.assertEqual(seen, [False])
 
-class TestRestoreCheckCountsPanes(unittest.TestCase):
+class TestADamagedIdLeavesOpenToTheRest(unittest.TestCase):
+    """`ccwho open <id>` - the command restore prints - reads every save: one
+    damaged id in one of them must not stop it for every session (review 9)."""
+
     setUp = TestRestoreCheck.setUp
     tearDown = TestRestoreCheck.tearDown
     write = TestRestoreCheck.write
+
+    def test_every_good_session_is_still_known(self):
+        good = {"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": "/p", "project": "a"}
+        self.write([{"sessionId": [1]}, {"sessionId": {"a": 1}}, good, {"sessionId": 5}])
+        self.assertEqual(runner.known_entries(), [good])
+
+
+class TestRestoreCheckCountsPanes(unittest.TestCase):
+    tearDown = TestRestoreCheck.tearDown
+    write = TestRestoreCheck.write
     run_check = TestRestoreCheck.run_check
+
+    def setUp(self):
+        TestRestoreCheck.setUp(self)
+        # the panes --open could fill: of sessions that would resume - these do
+        self.addCleanup(setattr, runner, "resume_problem", runner.resume_problem)
+        runner.resume_problem = lambda entry: ""
+
+    def test_the_pane_of_one_that_would_not_resume_is_not_counted(self):
+        # --open opens no window for it, so fills no pane (review 9)
+        runner.resume_problem = lambda entry: "cwd is gone" if entry.get("project") == "b" else ""
+        self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": self.tmp,
+                     "project": "a", "pane": "G-A"},
+                    {"sessionId": "a1b2c3d4-1111-4222-8333-abcdefabcdef", "cwd": self.tmp,
+                     "project": "b", "pane": "G-B"}])
+        testkit.patch(self, runner.engine.terms.ITERM2, "panes", lambda **k: {})
+        _rc, out = self.run_check(["--check"])
+        self.assertIn("0 of 1 saved panes", out)
 
     def test_check_says_how_many_saved_panes_are_open(self):
         self.write([{"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "cwd": self.tmp,

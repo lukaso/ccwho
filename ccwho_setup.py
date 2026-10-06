@@ -88,11 +88,20 @@ def doctor_checks(facts):
             "iterm2", False,
             "could not read the process list (ps) - cannot tell whether iTerm2 runs",
             "run `ccwho doctor` again; if it persists, check that /bin/ps runs"))
+    elif (facts.get("iterm_ok", False) is None and facts.get("iterm_why") == "stuck"
+          and isinstance(facts.get("iterm_retry_in"), (int, float))):
+        # an ask timed out inside iTerm2: the gate asks it again after a wait
+        out.append(_check(
+            "iterm2", False,
+            "did not answer for 2 minutes - ccwho asks it again in"
+            f" {age_words(facts['iterm_retry_in']) if facts['iterm_retry_in'] >= 1 else 'a moment'};"
+            " no tab names until then",
+            "wait for that ask, or restart iTerm2 to ask it at once"))
     elif facts.get("iterm_ok", False) is None:
         # the gate would not ask: iTerm2 is not answering Apple Events
         out.append(_check(
             "iterm2", False,
-            "not answering Apple Events - ccwho has stopped asking it for tab names",
+            "not answering Apple Events - no tab names from it for now",
             "restart iTerm2; if that does not help, check ~/.cache/ccwho is yours and writable"))
     else:
         out.append(_check(
@@ -101,7 +110,8 @@ def doctor_checks(facts):
             "not running or not scriptable - no tab names, and `go` cannot focus a window",
             "start iTerm2, and allow it under System Settings > Privacy > Automation"))
 
-    terminal = _terminal_check(facts.get("terminal_says"), facts.get("terminal_age"))
+    terminal = _terminal_check(facts.get("terminal_says"), facts.get("terminal_age"),
+                               facts.get("terminal_retry_in"))
     if terminal:
         out.append(terminal)
 
@@ -291,7 +301,7 @@ _TERMINAL_RESTART = ("`ccwho save`, then quit and reopen Terminal.app - that end
 _ASKED_AGAIN = "the list asks again while a session runs in one of its tabs"
 
 
-def _terminal_check(says, age=None):
+def _terminal_check(says, age=None, retry_in=None):
     """Terminal.app's row: what the list's last ask came to, and when - a
     record, not a look now, so each row says so, and what asks again (review
     2 of slices 4-5: a refusal outlived its fix, unexplained)."""
@@ -309,9 +319,16 @@ def _terminal_check(says, age=None):
                       " whether an app may control Terminal",
                       "answer the prompt; with none open, " + _TERMINAL_RESTART)
     if says == "stuck":
+        # the gate asks it again after a wait (terms.STUCK_RETRY) - the list,
+        # while a session runs in one of its tabs (D7). A wait that is over says
+        # that, never "in 0s"; one not timed yet starts with the next ask
+        when = (_ASKED_AGAIN if retry_in is not None and retry_in < 1 else
+                "ccwho asks it again " + (f"in {age_words(retry_in)}" if retry_in is not None
+                                          else "after a wait")
+                + ", while a session runs in one of its tabs")
         return _check("Terminal.app", False,
-                      f"{last} timed out - ccwho has stopped asking it for tab names",
-                      _TERMINAL_RESTART)
+                      f"{last} timed out - {when}; no tab names until then",
+                      "wait for that ask, or " + _TERMINAL_RESTART)
     return _check("Terminal.app", True,
                   f"{last} was answered" if says == "answered" else
                   f"{last} failed - {_ASKED_AGAIN}", "")
@@ -364,6 +381,9 @@ def gather(ccwho_dir=None, settings_path=None, now=None, home=None):
         "iterm_use": use,
         "iterm_ok": iterm_scriptable(why=why) if iterm else None,
         "iterm_why": why.get("refused"),
+        # a stuck iTerm2: when the gate asks it again (terms.STUCK_RETRY)
+        "iterm_retry_in": (max(0.0, why["retry_at"] - (time.time() if now is None else now))
+                           if isinstance(why.get("retry_at"), (int, float)) else None),
         "handler_registered": handler_registered(),
         "launchd_loaded": launchd_loaded(),
         "last_run_age": last_run_age(ccwho_dir, now=now),
@@ -406,8 +426,10 @@ def terminal_facts():
     only while a session runs in one of its tabs (D7). None: never asked."""
     terms = engine.terms
     when = terms.gate_when(terms.TERMINAL)
+    retry = terms.gate_retry_at(terms.TERMINAL)
     return {"terminal_says": terms.gate_says(terms.TERMINAL),
-            "terminal_age": None if when is None else max(0.0, time.time() - when)}
+            "terminal_age": None if when is None else max(0.0, time.time() - when),
+            "terminal_retry_in": None if retry is None else max(0.0, retry - time.time())}
 
 
 def _session_files_bad():

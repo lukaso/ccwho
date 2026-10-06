@@ -208,6 +208,62 @@ class TestParseAuth(unittest.TestCase):
             self.assertIsNone(procs.parse_auth(junk), repr(junk))
 
 
+class TestParseItermPane(unittest.TestCase):
+    """The iTerm2 pane a process runs in, from its own environment: iTerm2 puts
+    ITERM_SESSION_ID=w<window>t<tab>p<pane>:<unique id> in every session it
+    starts, and the unique id is AppleScript's. Measured 2026-10-05 on 7 claude
+    processes: the id matched iTerm2's own answer for each, also after a pane
+    moved to another window. So a save learns a pane with no Apple Event - on
+    2026-10-03 a stuck gate left 9 of 12 sessions with none, for two days."""
+
+    PANE = "510D3545-DC2F-46FF-8669-B8CC8B209E6A"
+
+    def pane(self, env, argv=("claude",)):
+        return procs.parse_iterm_pane(procargs(list(argv), env))
+
+    def test_the_unique_id_comes_back(self):
+        self.assertEqual(self.pane([f"ITERM_SESSION_ID=w6t0p4:{self.PANE}", "HOME=/x"]), self.PANE)
+
+    def test_nothing_else_comes_back(self):
+        got = self.pane([f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}", f"ITERM_SESSION_ID=w0t0p0:{self.PANE}",
+                         f"TERM_SESSION_ID=w0t0p0:{self.PANE}"])
+        self.assertEqual(got, self.PANE)
+        self.assertNotIn(TOKEN, repr(got))
+
+    def test_no_pane_in_the_environment_is_empty_not_none(self):          # control
+        self.assertEqual(self.pane(["HOME=/x", "PATH=/bin"]), "")
+
+    def test_terminal_app_s_session_id_is_no_iterm2_pane(self):
+        # Terminal.app sets TERM_SESSION_ID to its own id; only iTerm2 sets this
+        self.assertEqual(self.pane([f"TERM_SESSION_ID={self.PANE}", "HOME=/x"]), "")
+
+    def test_only_iterm2_s_own_shape_counts(self):
+        for value in (self.PANE, f"w0t0p0:{self.PANE.lower()}", f"w0t0p0:{self.PANE}x",
+                      f"w0t0p0:{self.PANE}\n", f"x0t0p0:{self.PANE}", f"w0t0p:{self.PANE}",
+                      f"w0t0p0:{self.PANE[:-1]}", "w0t0p0:", "", f"w0t0p0:\x1b]0;{self.PANE}"):
+            with self.subTest(value=value):
+                self.assertEqual(self.pane([f"ITERM_SESSION_ID={value}", "HOME=/x"]), "")
+
+    def test_the_first_of_two_entries_is_the_one_getenv_sees(self):
+        other = "11111111-2222-3333-4444-555555555555"
+        self.assertEqual(self.pane([f"ITERM_SESSION_ID=w1t0p0:{other}",
+                                    f"ITERM_SESSION_ID=w0t0p0:{self.PANE}"]), other)
+
+    def test_an_argument_is_no_pane_when_the_environment_was_found(self):
+        self.assertEqual(self.pane(["HOME=/x"], argv=("claude", f"ITERM_SESSION_ID=w0t0p0:{self.PANE}")), "")
+
+    def test_an_argument_counts_where_a_rewritten_title_ate_the_environment(self):
+        # the kernel keeps the old argc: as parse_auth reads it
+        buf = struct.pack("i", 9) + b"/usr/local/bin/node\0\0\0claude\0" + \
+            f"ITERM_SESSION_ID=w0t0p0:{self.PANE}\0".encode() + b"\0"
+        self.assertEqual(procs.parse_iterm_pane(buf), self.PANE)
+
+    def test_an_unreadable_or_hidden_environment_is_none(self):
+        self.assertIsNone(procs.parse_iterm_pane(TestParseProcargs.HIDDEN_SLEEP))
+        for junk in (None, b"", b"ab", "text", b"\xff\xff\xff\xff" + b"x\0"):
+            self.assertIsNone(procs.parse_iterm_pane(junk), repr(junk))
+
+
 class TestConfigDirs(unittest.TestCase):
     def test_running_sessions_add_their_own_config_dirs(self):
         got = procs.config_dirs(["/Users/x/.claude-work", "/Users/x/.claude"],

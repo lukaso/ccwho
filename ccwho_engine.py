@@ -1278,9 +1278,17 @@ def read_auth(pid):
     return procs.parse_auth(procargs_buffer(pid))
 
 
+def read_iterm_pane(pid):
+    """The iTerm2 pane a process runs in (procs.parse_iterm_pane): "" when its
+    environment names none, None if unreadable. The same buffer, handed
+    straight to the parse, which keeps the pane's id and nothing else."""
+    return procs.parse_iterm_pane(procargs_buffer(pid))
+
+
 def procargs_buffer(pid):
     """The raw KERN_PROCARGS2 answer for a pid, or None. It holds every secret in
-    that environment: only procs.parse_procargs and procs.parse_auth read it."""
+    that environment: only procs.parse_procargs, procs.parse_auth and
+    procs.parse_iterm_pane read it."""
     import ctypes
     import ctypes.util
     try:
@@ -2319,7 +2327,8 @@ _SESSION_ID = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,63}\Z")
 _MANIFEST_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}\.json\Z")
 
 _MANIFEST_KEYS = ("sessionId", "cwd", "project", "topic", "first", "ask",
-                  "attention", "status", "tty", "pid", "since", "configDir", "terminal")
+                  "attention", "status", "tty", "pid", "since", "configDir", "terminal",
+                  "entrypoint")
 
 
 def in_temp_dir(path, temp_roots):
@@ -2350,7 +2359,8 @@ def same_process(row, was):
             and str(pid) == str(was_pid))
 
 
-def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None, boot=None):
+def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None, boot=None,
+                       env_panes=None):
     """Capture the live fleet. Pure: the caller supplies the rows and the clock.
 
     Order is the caller's (collect() sorts needs-you first), so the restore list
@@ -2364,10 +2374,12 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None, boo
     pane it was shown in and that tab's title, so a restore can fill the pane
     iTerm2 brings back instead of opening a window beside it.
 
-    panes=None means iTerm2 was not asked: each entry then takes its pane and
-    title from `known` (sessionId -> that session's entry in the last save) -
-    only for the same process (same_process): a session id does not name a
-    pane. The caller gives `known` only from a save of this boot.
+    panes=None means iTerm2 was not asked: each entry then takes the pane its
+    process names (`env_panes`: str(pid) -> procs.parse_iterm_pane), else the
+    pane from `known` (sessionId -> that session's entry in the last save), and
+    its title from `known` either way - only for the same process
+    (same_process): a session id does not name a pane. The caller gives
+    `known` only from a save of this boot.
     panes={} means iTerm2 answered with none: no pane is recorded.
 
     boot: this boot's id, recorded so the next save can tell a save made before
@@ -2403,6 +2415,13 @@ def manifest_from_rows(rows, now=None, why_not=None, panes=None, known=None, boo
             kept[-1]["pane"] = pane if isinstance(pane, str) and ours and same else ""
             kept[-1]["tabTitle"] = kept[-1]["tabTitle"] or (
                 title if isinstance(title, str) and same else "")
+        own = (env_panes or {}).get(str(r.get("pid", ""))) if panes is None else None
+        if isinstance(own, str) and own and r.get("terminal", "") == terms.ITERM2.key:
+            # the pane the process itself names: it holds for a session no save
+            # has seen, and one /clear gave a new id (2026-10-05: 9 of 12 had
+            # none). Only on a row ps places in iTerm2: a terminal started from
+            # an iTerm2 shell inherits the variable
+            kept[-1]["pane"] = own
     return {"version": MANIFEST_VERSION, "savedAt": now, "boot": boot, "count": len(kept),
             "skipped": sum(why_count.values()), "skippedWhy": why_count,
             "sessions": kept}
@@ -2417,7 +2436,10 @@ def restore_command(entry):
     the CLAUDE.md it loads. Getting that wrong is silent, not an error.
     """
     entry = entry if isinstance(entry, dict) else {}
-    sid = str(entry.get("sessionId", "") or "")
+    # an id is text: a number off disk passes the pattern as str(), and every
+    # lookup by it raises (review 8 of env-panes)
+    sid = entry.get("sessionId", "")
+    sid = sid if isinstance(sid, str) else ""
     cwd = str(entry.get("cwd", "") or "")
     if not cwd or not _SESSION_ID.match(sid):
         return None
@@ -2482,10 +2504,15 @@ def save_points(saves, live_ids=(), booted=None):
                  if isinstance(e.get("sessionId"), str) and e.get("sessionId")}
                 if isinstance(man, dict) else None)
         running = len(sids & live) if sids is not None else 0
+        # what a restore leaves where it ran (no_window): not "to reopen" - by
+        # the first entry of an id, as restore opens it
+        first = {e["sessionId"]: e for e in first_entries(manifest_entries(man))
+                 if isinstance(e.get("sessionId"), str) and e.get("sessionId")}
+        away = {sid for sid, e in first.items() if left_by_restore(e)} - live
         points.append({"name": name, "at": at,
                        "count": len(sids) if sids is not None else None,
-                       "running": running,
-                       "to_open": len(sids) - running if sids is not None else 0,
+                       "running": running, "left": len(away),
+                       "to_open": len(sids) - running - len(away) if sids is not None else 0,
                        "before_reboot": False})
     points.sort(key=lambda p: p["name"], reverse=True)
     if booted:
@@ -2516,10 +2543,16 @@ def save_point_line(point, now=None, booted=None):
         return f"{when}   unreadable"
     what = f"{n} session{'' if n == 1 else 's'}"
     running, to_open = point.get("running", 0), point.get("to_open", n)
-    if n and not to_open:
+    # what a restore leaves (Claude Desktop's, a program's) is not "to reopen",
+    # and gets no words of its own: the menu shows 94 cells, and the mark of
+    # the save before the restart must stay in them (review 3 of env-panes)
+    left = point.get("left", 0)
+    if n and not to_open and not left:
         what += " · all running"
     elif running:
         what += f" · {running} running, {to_open} to reopen"
+    elif left:
+        what += f" · {to_open} to reopen"
     mark = ""
     if point.get("before_reboot"):
         mark = "   ← last save before the restart" + (
@@ -2536,24 +2569,98 @@ def manifest_transcript_finder(manifest):
     return lambda sid: transcript_path(sid, roots=roots)
 
 
-def check_manifest(manifest, cwd_exists, transcript_for):
-    """Would this manifest actually restore? Returns (ok, [(project, reason), ...]).
+def check_manifest(manifest, problem_of):
+    """Would this manifest actually restore? Returns (ok, problems, left, ready):
+    problems [(name, why)], left [(entry, why)] - what `restore --open` leaves
+    where it ran - and ready, the entries it would reopen.
 
-    Pure: the caller injects the two disk predicates. Answers the only question
-    that matters before a reboot, and answers it while you can still fix it.
+    Pure: the caller injects `problem_of(entry)` - why that one saved session
+    would not resume, or "" (the caller's resume_problem: the one `--open` and
+    `ccwho open` ask). Each entry is sorted by sort_saved, the first of each id
+    (first_entries): `--check` says what `--open` does (the owner, 2026-10-06).
+    Answers the only question that matters before a reboot, and answers it
+    while you can still fix it.
 
     An EMPTY manifest fails. "Nothing to restore" is the exact shape of the bug
     this tool exists to prevent, so it must never read as a clean bill of health.
     """
-    entries = manifest_entries(manifest)
+    entries = first_entries(manifest_entries(manifest))
     if not entries:
-        return False, [("(manifest)", "no sessions in it - run `ccwho save` while they are open")]
-    problems = []
+        return (False, [("(manifest)", "no sessions in it - run `ccwho save` while they are open")],
+                [], [])
+    problems, left, ready = [], [], []
     for e_ in entries:
-        why = entry_problem(e_, cwd_exists, transcript_for)
-        if why:
-            problems.append((e_.get("project") or e_.get("sessionId", "?")[:8] or "?", why))
-    return (not problems), problems
+        kind, why = sort_saved(e_, problem_of)
+        if kind == "left":
+            left.append((e_, why))
+        elif kind == "open":
+            ready.append(e_)
+        else:
+            problems.append((saved_name(e_), why))
+    return (not problems), problems, left, ready
+
+
+def saved_name(entry):
+    """A saved session as restore names it: its project, else its id."""
+    return str(entry.get("project") or entry.get("sessionId") or "?")
+
+
+def sort_saved(entry, problem_of):
+    """What `restore --open` does with one saved session that is not running -
+    and so what `--check` says it will: ("unusable", why) - no resume line
+    builds; ("left", why) - Claude Desktop or a program ran it (no_window);
+    ("gone", why) - `problem_of(entry)` says it would not resume; else
+    ("open", "")."""
+    if not restore_command(entry):
+        return "unusable", "no resume line can be built (bad session id, or no cwd)"
+    away = no_window(entry)
+    if away:
+        return "left", away
+    why = problem_of(entry)
+    return ("gone", why) if why else ("open", "")
+
+
+def first_entries(entries):
+    """The first saved entry of each session id, as `restore --open` takes them:
+    one process per transcript, however the manifest got two. An id that
+    cannot be a key - a damaged entry - is its own."""
+    seen, out = set(), []
+    for e_ in entries:
+        sid = e_.get("sessionId", "")
+        try:
+            if sid in seen:
+                continue
+            seen.add(sid)
+        except TypeError:
+            pass
+        out.append(e_)
+    return out
+
+
+def left_by_restore(entry):
+    """Why `restore --open` leaves this saved session where it ran (no_window),
+    or "". Only one it could reopen: one with no resume line is a problem,
+    wherever it ran - so --check, the `o` menu and --open say the same."""
+    return no_window(entry) if restore_command(entry) else ""
+
+
+def no_window(entry):
+    """Why a saved session had no terminal window to put back, or "".
+
+    2026-10-05: `o` after a reboot opened two Claude Desktop sessions, idle for
+    days, in new iTerm2 windows. A restore puts back what was in a terminal;
+    the rest stays where it was, and `ccwho open <id>` opens one (choice A).
+    Only what started it says so. An empty saved tty proves nothing: a save
+    whose ps could not be read records every session with none, and they
+    reopen as before (review 1 of env-panes)."""
+    if not isinstance(entry, dict):
+        return ""
+    ep = entry.get("entrypoint")
+    if ep == "claude-desktop":
+        return "it ran in Claude Desktop"
+    if ep in ccwho_index.AGENT_ENTRYPOINTS:
+        return "a program ran it"
+    return ""
 
 
 def entry_problem(entry, cwd_exists, transcript_for):
@@ -2564,6 +2671,8 @@ def entry_problem(entry, cwd_exists, transcript_for):
     """
     if not restore_command(entry):
         return "no resume line can be built (bad session id, or no cwd)"
+    if not isinstance(entry.get("cwd", ""), str):
+        return "its saved cwd is not a path"
     if not cwd_exists(entry.get("cwd", "")):
         return "cwd is gone: %s" % entry.get("cwd", "")
     if not transcript_for(entry.get("sessionId", "")):
@@ -2588,22 +2697,24 @@ def render_restore(manifest, color=True, width=None, links=False):
         c["bold"], len(entries), "" if len(entries) == 1 else "s", stamp, c["reset"]))
     for i, s_ in enumerate(entries, 1):
         cmd = restore_command(s_)
-        name = s_.get("project") or "?"
+        name = _text(s_.get("project")) or "?"
         head = "%s%2d. %s%s" % (c["bold"], i, osc8(name, open_url(s_), links), c["reset"])
-        was = s_.get("tty") or ""
-        out.append("%s  %s%s%s\n" % (head, c["dim"], ("was " + was) if was else "", c["reset"]))
+        was = _text(s_.get("tty"))
+        away = left_by_restore(s_)
+        out.append("%s  %s%s%s\n" % (head, c["dim"], f"{away} - --open leaves it" if away
+                                      else ("was " + was) if was else "", c["reset"]))
         # BOTH halves, because neither alone identifies a session. Measured on a real
         # 17-session fleet: `topic` (the latest turn) read "/compact", "go ahead" and
         # "let's fix 1-3" for 3 of them, while `first` read "restart from disk" for 1.
-        opened = (s_.get("first") or "").strip()
-        latest = (s_.get("topic") or "").strip()
+        opened = _text(s_.get("first")).strip()
+        latest = _text(s_.get("topic")).strip()
         w = (width or 100) - 14
         if opened and latest and opened != latest:
             out.append("      %sopened:%s %s\n" % (c["dim"], c["reset"], truncate(opened, w)))
             out.append("      %slatest:%s %s\n" % (c["dim"], c["reset"], truncate(latest, w)))
         elif opened or latest:
             out.append("      %s\n" % truncate(latest or opened, (width or 100) - 6))
-        ask = s_.get("ask") or ""
+        ask = _text(s_.get("ask"))
         if ask:
             out.append("      %sASKED YOU: %s%s\n" % (
                 c["asks"], truncate(ask, (width or 100) - 17), c["reset"]))
@@ -2614,7 +2725,7 @@ def render_restore(manifest, color=True, width=None, links=False):
             # is exactly the one you would otherwise spend an hour hunting for.
             out.append("      %sno resume line (bad id or no cwd) - find it with: claude --resume%s\n"
                        % (c["dim"], c["reset"]))
-    skipped = m.get("skipped") or 0
+    skipped = m.get("skipped") if type(m.get("skipped")) is int else 0
     why = m.get("skippedWhy")
     if skipped and isinstance(why, dict) and why:
         # a manifest from before skippedWhy only ever skipped for the one reason
@@ -2627,14 +2738,21 @@ def render_restore(manifest, color=True, width=None, links=False):
     return "".join(out)
 
 
+def _text(value):
+    """A saved value as text: a manifest is read off disk, and a value of
+    another type is shown as nothing, never raised on (review 9 of env-panes)."""
+    return value if isinstance(value, str) else ""
+
+
 _TITLE_MARK = re.compile(r"^[^\w\s]+(\s+|\Z)")
 
 
 def title_key(title):
     """A tab title without the status mark Claude Code puts in front of it.
     Measured: "✳ topic" at rest, "◐ topic" and "◑ topic" while it works - the
-    mark when a save ran need not be the mark iTerm2 restored."""
-    return _TITLE_MARK.sub("", (title or "").strip()).strip()
+    mark when a save ran need not be the mark iTerm2 restored. A title off
+    disk that is not text has none."""
+    return _TITLE_MARK.sub("", (title if isinstance(title, str) else "").strip()).strip()
 
 
 def match_panes(entries, panes, idle, saved=None):
@@ -2664,7 +2782,8 @@ def match_panes(entries, panes, idle, saved=None):
                                                           else entries) or []]
     got, used = {}, set()
     for e_ in entries or []:
-        uid = e_.get("pane") or ""
+        uid = e_.get("pane")
+        uid = uid if isinstance(uid, str) else ""       # off disk: text, or no pane
         if uid in live and uid not in used:
             got[e_.get("sessionId", "")] = uid
             used.add(uid)

@@ -1176,7 +1176,8 @@ def known_entries():
             continue
         for e_ in engine.manifest_entries(man):
             sid = e_.get("sessionId")
-            if sid and sid not in seen:
+            # text only: a damaged id would stop `open` for every session
+            if isinstance(sid, str) and sid and sid not in seen:
                 seen[sid] = e_
     return list(seen.values())
 
@@ -2161,10 +2162,13 @@ def resume_problem(entry):
     before it does. A saved cwd in a temp dir is gone after the next cleanup, and
     a headless worker leaves no transcript: both opened a window onto an error.
     """
-    if not isinstance(entry.get("cwd", ""), str):
-        return "its saved cwd is not a path"
-    finder = engine.manifest_transcript_finder({"sessions": [entry]})
-    return engine.entry_problem(entry, os.path.isdir, finder)
+    return engine.entry_problem(entry, os.path.isdir, _saved_finder(entry))
+
+
+def _saved_finder(entry):
+    """Where a saved session's transcript is looked for: its own config dir
+    and the known roots - for `open`, `restore --open` and `--check` alike."""
+    return engine.manifest_transcript_finder({"sessions": [entry]})
 
 
 OLD_LIST = "the session list it read is too old to act on (the Mac slept?) - run it again"
@@ -3494,8 +3498,20 @@ def save(argv):
     known = ({e_.get("sessionId"): e_ for e_ in engine.manifest_entries(last)
               if isinstance(e_.get("sessionId"), str)}
              if panes is None and boot and last.get("boot") == boot else None)
+    # ...and before that, the pane each iTerm2 session's own process names: no
+    # Apple Event, so it holds while the gate is shut - on 2026-10-03 it was
+    # shut for two days, and 9 of 12 sessions were saved with no pane. Only a
+    # process on the tty its row shows: a daemon's session runs in a process
+    # with the daemon starter's environment, shown by an attach elsewhere
+    iterm_rows = [r for r in rows if r.get("pid") and r.get("terminal") == engine.terms.ITERM2.key]
+    own_tty = ({str(pid): engine.terms.short_tty_full(tty)
+                for pid, tty in engine.parse_tty_map(engine.tty_snapshot()).items()}
+               if panes is None and iterm_rows else {})
+    env_panes = ({str(r["pid"]): engine.read_iterm_pane(r["pid"]) for r in iterm_rows
+                  if own_tty.get(str(r["pid"])) == engine.terms.short_tty_full(r.get("tty") or "")}
+                 if panes is None else None)
     man = engine.manifest_from_rows(rows, why_not=save_problem, panes=panes, known=known,
-                                    boot=boot)
+                                    boot=boot, env_panes=env_panes)
     if man["count"] == 0:
         # Writing this would only push a manifest that HAS something out of the
         # keep-20 window. Nothing to restore is not something to record.
@@ -3539,9 +3555,11 @@ def save(argv):
     in_iterm = [e_ for e_ in man["sessions"]
                 if e_.get("terminal") == engine.terms.ITERM2.key or e_.get("pane")]
     if panes is None and in_iterm:
-        kept = sum(1 for e_ in in_iterm if e_.get("pane"))
-        print(f"iTerm2 not asked - kept the pane of {kept} of {len(in_iterm)} session(s)"
-              " from the last save")
+        found = sum(1 for e_ in in_iterm if e_.get("pane"))
+        own = sum(1 for e_ in in_iterm
+                  if e_.get("pane") and e_["pane"] == (env_panes or {}).get(str(e_.get("pid", ""))))
+        print(f"iTerm2 not asked - found the pane of {found} of {len(in_iterm)} session(s):"
+              f" {own} from their process, {found - own} from the last save")
     print(f"saved {man['count']} session(s){note} -> {out}")
     print("after the reboot:  ccwho restore        (add --open to reopen them)")
     return 0
@@ -3768,6 +3786,10 @@ def _reopen_saved(path, report=None):
                   text, re.M)
     if m:
         return f"{m.group(1)} in that save {m.group(2)}"
+    m = re.search(r"^(nothing to reopen in a window: \d+ ran in Claude Desktop or a program"
+                  r"(?:, \d+ already running or starting)?)\.$", text, re.M)
+    if m:
+        return m.group(1)
     said = (_where_they_went(text)
             or ("reopened that save" if path else "reopened the last save"))
     return said + _restore_counts(text)
@@ -3777,6 +3799,7 @@ def _restore_counts(text):
     """What a restore's output says of the sessions it did not open - left
     out, still waiting, held, blocked, changed - in the words `o` shows."""
     left = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: not reopening"))
+    away = sum(1 for l in text.splitlines() if l.startswith("not reopened: "))
     waiting = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: still waiting on"))
     held = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: holding"))
     blocked = sum(1 for l in text.splitlines() if l.startswith("ccwho restore: blocked"))
@@ -3793,7 +3816,9 @@ def _restore_counts(text):
     restart = next(iter(named)) if len(named) == 1 else "the terminal app"
     quit_ = {m.group(1) for m in cut if m}
     gone = next(iter(quit_)) if len(quit_) == 1 else "the terminal app"
-    return ((f", {left} left out - they could not resume" if left else "")
+    return ((f", {away} not reopened - Claude Desktop or a program ran"
+             f" {'it' if away == 1 else 'them'}" if away else "")
+            + (f", {left} left out - they could not resume" if left else "")
             + (f", {waiting} still waiting on an earlier launch - restart {restart} if they"
                " do not appear" if waiting else "")
             + (f", {held} {CUT_OFF} {gone} quit - try again in {wait} s" if held else "")
@@ -3812,8 +3837,9 @@ def _one_line(text):
 
 
 def _named(entry):
-    """A saved session as restore's lines name it: its project, else its id."""
-    return _one_line(entry.get("project") or entry.get("sessionId") or "?")
+    """A saved session as restore's lines name it: its project, else its id -
+    as --check names it (engine.saved_name)."""
+    return _one_line(engine.saved_name(entry))
 
 
 def restore(argv):
@@ -3848,14 +3874,24 @@ def restore(argv):
         # Deliberately BEFORE --open: a check must never launch anything, even if
         # both flags are given. Answering "would this work?" cannot be the thing
         # that opens seventeen windows.
-        ok, problems = engine.check_manifest(
-            man, cwd_exists=os.path.isdir,
-            transcript_for=engine.manifest_transcript_finder(man))
-        n = len(engine.manifest_entries(man))
+        # what --open does with each saved session (engine.sort_saved, by
+        # engine.check_manifest): one it leaves where it ran is named as --open
+        # names it, and not checked (the owner, 2026-10-06)
+        ok, problems, away, ready = engine.check_manifest(man, resume_problem)
+        for e_, why in away:
+            print(f"not reopened: {_named(e_)} - {why}. To open it in a window:"
+                  f" ccwho open {_one_line(e_.get('sessionId', ''))}")
+        if away and ok and not ready:
+            print(f"nothing to reopen in a window: {len(away)} ran in Claude Desktop"
+                  " or a program.")
+            return 0
+        n = len(engine.first_entries(engine.manifest_entries(man))) - len(away)
         # a pane id is iTerm2's: one on another app's record is nothing to
-        # count - told by the record alone, with no look for the app
-        saved = {e_.get("pane") for e_ in engine.manifest_entries(man)
-                 if e_.get("pane") and _record_key(e_) == engine.terms.ITERM2.key}
+        # count - told by the record alone, with no look for the app. Only the
+        # panes --open could fill: of the sessions it would reopen
+        saved = {e_.get("pane") for e_ in ready
+                 if isinstance(e_.get("pane"), str) and e_.get("pane")
+                 and _record_key(e_) == engine.terms.ITERM2.key}
         if saved:
             # asked only of a manifest that names panes: nothing else to count
             live = {p["pane"] for p in engine.terms.ITERM2.panes(direct=True).values()}
@@ -3867,7 +3903,7 @@ def restore(argv):
         print(f"NOT fully restorable: {len(problems)} of {n} session(s) in {path}",
               file=sys.stderr)
         for who, why in problems:
-            print(f"  {who}: {why}", file=sys.stderr)
+            print(f"  {_one_line(who)}: {_one_line(why)}", file=sys.stderr)
         return 1
 
     if "--open" in argv:
@@ -3885,8 +3921,8 @@ def restore(argv):
             print("  Reopening a session that is still running forks its conversation,"
                   " and here it would be every one of them.", file=sys.stderr)
             return 1
-        openable, running, unusable, starting, seen = [], [], [], [], set()
-        gone = []
+        openable, running, unusable, starting = [], [], [], []
+        gone, windowless = [], []
         # why_held's reasons -> the entries held for each (the rest: starting)
         held = {"old list": [], "newer": [], "unreadable": [], "unresolved": [], "sending": [],
                 "cut off": []}
@@ -3898,17 +3934,19 @@ def restore(argv):
             # one process table for the claims, when one needs it - taken again
             # for a claim newer than it (_tables)
             tables = _tables()
-            for e_ in entries:
+            # one process per transcript, however the manifest got two - and
+            # --check takes them the same way
+            for e_ in engine.first_entries(entries):
                 sid = e_.get("sessionId", "")
-                if sid in seen:
-                    continue          # one process per transcript, however the manifest got two
-                seen.add(sid)
                 action, _v = engine.resolve_open(sid, live, [e_], source_ok=True)
                 if action in ("jump", "attach", "program"):
                     running.append((e_, action))
                 elif action == "resume":
-                    why = resume_problem(e_)
-                    if why:
+                    # as --check sorts it (engine.sort_saved)
+                    kind, why = engine.sort_saved(e_, resume_problem)
+                    if kind == "left":
+                        windowless.append((e_, why))      # no window to put back (choice A)
+                    elif kind != "open":
                         gone.append((e_, why))    # checked BEFORE the claim: not opening it
                     elif claim_launch(sid, decided_at=status.get("seen_at"), refresh=tables,
                                       decided_mono=status.get("seen_mono")):
@@ -3932,6 +3970,9 @@ def restore(argv):
             for e_, _ in starting:
                 print(f"already starting: {_named(e_)}"
                       " - another ccwho is opening it")
+            for e_, away in windowless:
+                print(f"not reopened: {_named(e_)} - {away}. To open it in a window:"
+                      f" ccwho open {_one_line(e_.get('sessionId', ''))}")
             for e_, why in gone:
                 print(f"ccwho restore: not reopening {_named(e_)}"
                       f" - {_one_line(why)}", file=sys.stderr)
@@ -3986,6 +4027,12 @@ def restore(argv):
                     windows = sum(1 for e_ in group if engine.restore_command(e_)
                                   and not fill.get(e_.get("sessionId", "")))
                     launches.append((app, group, script, windows))
+            if not launches and windowless and not (unusable or gone or waiting):
+                live_ = len(running) + len(starting)
+                print(f"nothing to reopen in a window: {len(windowless)} ran in Claude Desktop"
+                      " or a program"
+                      + (f", {live_} already running or starting" if live_ else "") + ".")
+                return 0
             if not launches and (running or starting) and not (unusable or gone or waiting):
                 print(f"all {len(running) + len(starting)} session(s) in that manifest"
                       " are already running or starting.")

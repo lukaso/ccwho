@@ -2470,6 +2470,16 @@ class TestOOffersTheSaves(UiTest):
         return "\n".join(str(box.get_option_at_index(i).prompt)
                          for i in range(box.option_count))
 
+    async def test_the_head_says_what_a_restore_leaves(self):
+        # a save of two Claude Desktop sessions reads "2 sessions · 0 to
+        # reopen": the screen says why (review 4 of env-panes)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            head = str(app.screen.query_one("#saveshead").content)
+            self.assertIn("Sessions still running, and those Claude Desktop or a program ran,"
+                          " are left alone.", head)
+
     async def test_o_opens_the_menu_while_sessions_are_running(self):
         app = self.app()
         async with app.run_test() as pilot:

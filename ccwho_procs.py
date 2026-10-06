@@ -117,6 +117,33 @@ def parse_auth(buf):
     return _nothing_found(chunks, argc)
 
 
+_PANE_KEY = b"ITERM_SESSION_ID="
+# iTerm2's own shape, w<window>t<tab>p<pane>:<unique id>: anything else is not
+# a pane id a restore could find again
+_ITERM_PANE = re.compile(rb"w\d+t\d+p\d+:([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})")
+
+
+def parse_iterm_pane(buf):
+    """The iTerm2 pane a process runs in, from its KERN_PROCARGS2 buffer: the
+    unique id in its ITERM_SESSION_ID, which iTerm2 sets in every session it
+    starts and AppleScript calls `unique id`. "" when the environment names
+    none (or not in iTerm2's shape); None if it is unreadable or hidden.
+
+    No Apple Event: a save learns each pane even while iTerm2 is not asked
+    (2026-10-03, a stuck gate: 9 of 12 sessions saved with no pane). The first
+    entry wins, as getenv sees it; only the id leaves. Never raises."""
+    parts = _procargs_strings(buf)
+    if parts is None:
+        return None
+    chunks, argc = parts
+    env = _after_argv(chunks, argc)
+    for chunk in env if any(env) else chunks:
+        if chunk.startswith(_PANE_KEY):
+            m = _ITERM_PANE.fullmatch(chunk[len(_PANE_KEY):])
+            return m.group(1).decode() if m else ""
+    return "" if any(env) else None
+
+
 # Control characters (C0, DEL, C1): escape sequences that retitle a window or
 # repaint a list. Nothing ccwho prints or saves from these sources may carry one.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")

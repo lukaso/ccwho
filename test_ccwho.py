@@ -2428,13 +2428,50 @@ class SavePoints(unittest.TestCase):
         self.assertIsNone(points[0]["count"])
 
     def test_a_damaged_session_id_does_not_stop_the_menu(self):
-        bad = _man(_local(2026, 9, 26, 10, 20), self.A)
-        bad["sessions"].append({"sessionId": [1], "cwd": "/p"})
-        points = ccwho.save_points(self.saves()[1:2] + [("2026-09-26T1020.json", bad)])
-        self.assertEqual([p["count"] for p in points], [3, 1])
+        for ep in (None, "claude-desktop", "sdk-cli"):         # review 3: one a restore leaves
+            for sid in ([1], {"a": 1}):
+                bad = _man(_local(2026, 9, 26, 10, 20), self.A)
+                bad["sessions"].append({"sessionId": sid, "cwd": "/p", "entrypoint": ep})
+                points = ccwho.save_points(self.saves()[1:2] + [("2026-09-26T1020.json", bad)])
+                self.assertEqual([(p["count"], p["to_open"], p["left"]) for p in points],
+                                 [(3, 3, 0), (1, 1, 0)], (ep, sid))
+
+    def test_a_session_saved_twice_counts_as_its_first_entry(self):
+        # as restore opens it: the first entry of an id (review 3)
+        man = _man(_local(2026, 9, 26, 10, 20), self.A, self.A)
+        man["sessions"][1]["entrypoint"] = "claude-desktop"
+        p = ccwho.save_points([("2026-09-26T1020.json", man)])[0]
+        self.assertEqual((p["count"], p["to_open"], p["left"]), (1, 1, 0))
+        man["sessions"][0]["entrypoint"] = "claude-desktop"
+        man["sessions"][1]["entrypoint"] = "cli"
+        p = ccwho.save_points([("2026-09-26T1020.json", man)])[0]
+        self.assertEqual((p["count"], p["to_open"], p["left"]), (1, 0, 1))
 
     def test_anything_not_a_manifest_name_is_left_out(self):
         self.assertEqual(ccwho.save_points([("notes.md", _man(1, self.A))]), [])
+
+    def with_desktop(self):
+        """A, B and C saved; B ran in Claude Desktop, which a restore leaves."""
+        man = _man(_local(2026, 9, 26, 10, 20), self.A, self.B, self.C)
+        man["sessions"][1]["entrypoint"] = "claude-desktop"
+        return [("2026-09-26T1020.json", man)]
+
+    def test_one_a_restore_leaves_is_not_to_reopen(self):
+        # review 2 of env-panes: the menu said "1 to reopen", and the restore
+        # it chose opened nothing
+        p = ccwho.save_points(self.with_desktop(), live_ids={self.A})[0]
+        self.assertEqual((p["count"], p["running"], p["to_open"], p["left"]), (3, 1, 1, 1))
+
+    def test_one_with_no_resume_line_is_not_left(self):
+        # --open cannot reopen it at all - wherever it ran (left_by_restore)
+        man = self.with_desktop()
+        man[0][1]["sessions"][1]["cwd"] = ""
+        p = ccwho.save_points(man)[0]
+        self.assertEqual((p["left"], p["to_open"]), (0, 3))
+
+    def test_a_running_one_is_running_wherever_it_ran(self):              # control
+        p = ccwho.save_points(self.with_desktop(), live_ids={self.B})[0]
+        self.assertEqual((p["running"], p["to_open"], p["left"]), (1, 2, 0))
 
 
 class SavePointLine(unittest.TestCase):
@@ -2459,6 +2496,29 @@ class SavePointLine(unittest.TestCase):
     def test_says_what_reopening_it_would_do(self):
         self.assertIn("1 running, 11 to reopen", self.line(running=1, to_open=11))
         self.assertIn("all running", self.line(running=12, to_open=0))
+
+    def test_what_a_restore_leaves_is_not_to_reopen(self):
+        # review 2 of env-panes: it said "1 to reopen", and the restore opened
+        # nothing - nor "all running" while one is not
+        text = self.line(count=2, running=1, to_open=0, left=1)
+        self.assertIn("2 sessions · 1 running, 0 to reopen", text)
+        self.assertNotIn("all running", text)
+        self.assertIn("2 sessions · 1 to reopen", self.line(count=2, running=0, to_open=1, left=1))
+        self.assertIn("2 sessions · 0 to reopen", self.line(count=2, running=0, to_open=0, left=2))
+
+    def test_the_line_is_no_longer_for_it(self):
+        # review 3: the menu shows 94 cells, and the mark is how you choose the
+        # save before the restart - words for what it leaves pushed it off
+        line = self.line(at=_local(2026, 9, 24, 0, 21), count=14, running=1, to_open=11,
+                         left=2, before_reboot=True)
+        self.assertEqual(line, self.line(at=_local(2026, 9, 24, 0, 21), count=14, running=1,
+                                         to_open=11, before_reboot=True))
+        end = line.index("last save before the restart") + len("last save before the restart")
+        self.assertLessEqual(ccwho.visible_len(line[:end]), 94)
+
+    def test_nothing_left_says_what_it_said(self):                         # control
+        self.assertNotIn("·", self.line())
+        self.assertIn("all running", self.line(running=12, to_open=0, left=0))
 
     def test_marks_the_last_save_before_the_restart_with_its_time(self):
         text = self.line(before_reboot=True)
@@ -2517,6 +2577,75 @@ class RenderRestore(unittest.TestCase):
     def test_junk_does_not_crash(self):
         for junk in (None, [], "nope", {"sessions": "nope"}):
             self.assertTrue(ccwho.render_restore(junk, color=False).strip(), repr(junk))
+
+    def test_a_damaged_value_renders_as_text(self):
+        # a manifest is read off disk (review 9: a tty, a topic, an ask that is
+        # not text, and a skipped count that is not a number, raised)
+        for field in ("project", "tty", "first", "topic", "ask", "sessionId", "cwd",
+                      "configDir", "entrypoint", "pane", "tabTitle", "terminal"):
+            for bad in ([1], {"a": 1}, 5, True, None):
+                m = self.man()
+                m["sessions"][0][field] = bad
+                with self.subTest(field=field, bad=bad):
+                    out = ccwho.render_restore(m, color=False)
+                    self.assertIn("2 sessions to restore", out)
+                    if field == "project":                  # shown as no name, not as "[1]"
+                        self.assertTrue(out.splitlines()[1].startswith(" 1. ?  "), out)
+        for top in ("skipped", "skippedWhy", "savedAt"):
+            for bad in ("x", [1], {"a": 1}, None):
+                m = dict(self.man(), **{top: bad})
+                with self.subTest(top=top, bad=bad):
+                    self.assertIn("2 sessions to restore", ccwho.render_restore(m, color=False))
+
+    def test_one_with_no_resume_line_is_not_marked_left(self):
+        m = self.man()
+        m["sessions"][1].update(tty="", entrypoint="claude-desktop", cwd="")
+        line = next(l for l in ccwho.render_restore(m, color=False).splitlines() if "football" in l)
+        self.assertNotIn("leaves it", line)
+
+    def test_a_session_with_no_terminal_window_says_open_leaves_it(self):
+        m = self.man()
+        m["sessions"][1].update(tty="", entrypoint="claude-desktop")
+        lines = ccwho.render_restore(m, color=False).splitlines()
+        line = next(l for l in lines if "football" in l)
+        self.assertIn("it ran in Claude Desktop - --open leaves it", line)
+        self.assertNotIn("leaves it", next(l for l in lines if "liveapp" in l))   # control
+
+
+class TestASessionWithNoTerminalWindowIsNotReopened(unittest.TestCase):
+    """2026-10-05: after a reboot, `o` opened two Claude Desktop sessions, idle
+    for days, in new iTerm2 windows - "closed windows popped to the fore". A
+    restore puts back what was in a terminal; one that ran in no terminal
+    window is left where it was, and `ccwho open <id>` opens it if you want it
+    (the owner's choice A).
+
+    Only what started it says so: Claude Desktop, or a program. A saved tty
+    that is empty proves nothing - ps that could not be read saves every
+    session with none (review 1 of env-panes) - and reopens as before."""
+
+    def why(self, **entry):
+        return ccwho.no_window(dict({"sessionId": "s", "cwd": "/x"}, **entry))
+
+    def test_claude_desktop(self):
+        self.assertEqual(self.why(tty="", entrypoint="claude-desktop"), "it ran in Claude Desktop")
+
+    def test_a_program_even_in_a_terminal(self):
+        self.assertEqual(self.why(tty="ttys001", entrypoint="sdk-cli"), "a program ran it")
+
+    def test_no_tty_saved_is_no_proof(self):
+        self.assertEqual(self.why(tty=""), "")
+        self.assertEqual(self.why(tty="  ", entrypoint="cli"), "")
+
+    def test_a_terminal_session(self):                                        # control
+        self.assertEqual(self.why(tty="ttys005", entrypoint="cli"), "")
+
+    def test_no_tty_key_is_not_known(self):                                   # control
+        self.assertEqual(self.why(), "")
+
+    def test_junk_is_not_known(self):
+        self.assertEqual(self.why(tty=None), "")
+        self.assertEqual(self.why(tty=5, entrypoint=["claude-desktop"]), "")
+        self.assertEqual(ccwho.no_window("not a dict"), "")
 
 
 class AppleScriptQuoting(unittest.TestCase):
@@ -2867,6 +2996,29 @@ class RestoreLabelling(unittest.TestCase):
         self.assertNotIn("latest:", out2)
 
 
+class TestDamagedSavedValues(unittest.TestCase):
+    """A manifest is read off disk: a value of the wrong type is no session to
+    reopen and no title to match, never a traceback (review 8 of env-panes)."""
+
+    def test_an_id_that_is_a_number_builds_no_resume_line(self):
+        # str(12345678) passes the id check, and transcript_path then raises
+        self.assertIsNone(ccwho.restore_command({"sessionId": 12345678, "cwd": "/x"}))
+        self.assertTrue(ccwho.restore_command({"sessionId": "12345678", "cwd": "/x"}))  # control
+
+    def test_a_pane_that_is_not_text_fills_nothing(self):
+        panes = {"ttys050": {"pane": "G-1", "name": "t"}}
+        for pane in ([1], {"a": 1}, 5):
+            self.assertEqual(ccwho.match_panes([{"sessionId": "s1", "pane": pane}], panes,
+                                               {"ttys050"}), {}, pane)
+        self.assertEqual(ccwho.match_panes([{"sessionId": "s1", "pane": "G-1"}], panes,
+                                           {"ttys050"}), {"s1": "G-1"})                   # control
+
+    def test_a_title_that_is_not_text_has_no_key(self):
+        self.assertEqual(ccwho.title_key(5), "")
+        self.assertEqual(ccwho.title_key(["t"]), "")
+        self.assertEqual(ccwho.title_key("✳ topic"), "topic")                          # control
+
+
 class CheckManifest(unittest.TestCase):
     """The point of a restore manifest is that you find out it works BEFORE the
     reboot, not after. --check answers that without opening anything."""
@@ -2875,9 +3027,11 @@ class CheckManifest(unittest.TestCase):
             "project": "liveapp", "first": "f", "topic": "t", "ask": ""}
 
     def check(self, sessions, dirs=("/p/liveapp",), transcripts=("4f2b91ac-1111-4222-8333-abcdefabcdef",)):
-        return ccwho.check_manifest({"version": 1, "sessions": list(sessions)},
-                                    cwd_exists=lambda p: p in dirs,
-                                    transcript_for=lambda sid: "/tx" if sid in transcripts else None)
+        ok, problems, _left, _ready = ccwho.check_manifest(
+            {"version": 1, "sessions": list(sessions)},
+            problem_of=lambda e: ccwho.entry_problem(
+                e, lambda p: p in dirs, lambda sid: "/tx" if sid in transcripts else None))
+        return ok, problems
 
     def test_a_healthy_manifest_has_no_problems(self):
         ok, problems = self.check([self.GOOD])
@@ -2924,9 +3078,30 @@ class CheckManifest(unittest.TestCase):
 
     def test_junk_does_not_crash(self):
         for junk in (None, [], "nope", {"sessions": "nope"}):
-            ok, problems = ccwho.check_manifest(junk, cwd_exists=lambda p: True,
-                                                transcript_for=lambda s: "/tx")
+            ok, problems, left, ready = ccwho.check_manifest(junk, problem_of=lambda e: "")
             self.assertFalse(ok, repr(junk))
+            self.assertEqual((left, ready), ([], []), repr(junk))
+
+    def test_it_sorts_each_session_as_restore_open_does(self):
+        # the owner, 2026-10-06: --check says what --open does (engine.sort_saved)
+        desk = dict(self.GOOD, sessionId="44444444-4444-4444-8444-444444444444", project="cofs",
+                    entrypoint="claude-desktop")
+        gone = dict(self.GOOD, sessionId="66666666-6666-4666-8666-666666666666", cwd="/gone",
+                    project="wt")
+        ok, problems, left, ready = ccwho.check_manifest(
+            {"sessions": [self.GOOD, desk, gone, dict(self.GOOD, cwd="/gone")]},
+            problem_of=lambda e: ccwho.entry_problem(e, lambda p: p == "/p/liveapp",
+                                                     lambda sid: "/tx"))
+        self.assertEqual((ok, [n for n, _ in problems], [e["project"] for e, _ in left],
+                          [e["project"] for e in ready]), (False, ["wt"], ["cofs"], ["liveapp"]))
+
+    def test_each_session_is_asked_about_on_its_own(self):
+        # problem_of gets the entry - its own config dir, as --open asks (review 8)
+        asked = []
+        ccwho.check_manifest({"sessions": [self.GOOD, dict(self.GOOD, sessionId="5" * 8,
+                                                           configDir="/alt")]},
+                             problem_of=lambda e: asked.append(e.get("configDir")) or "")
+        self.assertEqual(asked, [None, "/alt"])
 
 
 class TestSessionSourceAvailability(MachinelessCollect):
@@ -5187,15 +5362,17 @@ class TestAnIsolatedSessionIsReadLikeAnyOther(MachinelessCollect):
 
     def test_restore_check_finds_a_saved_isolated_transcript(self):
         man = {"sessions": [{"sessionId": SID_ISO, "cwd": self.dir, "configDir": self.dir}]}
-        ok, problems = ccwho.check_manifest(man, cwd_exists=os.path.isdir,
-                                            transcript_for=ccwho.manifest_transcript_finder(man))
+        ok, problems, _left, _ready = ccwho.check_manifest(
+            man, problem_of=lambda e: ccwho.entry_problem(
+                e, os.path.isdir, ccwho.manifest_transcript_finder({"sessions": [e]})))
         self.assertTrue(ok, problems)
 
     def test_restore_check_still_fails_a_gone_transcript(self):       # control
         man = {"sessions": [{"sessionId": "eeee5555-0000-4000-8000-000000000005",
                              "cwd": self.dir, "configDir": self.dir}]}
-        ok, _ = ccwho.check_manifest(man, cwd_exists=os.path.isdir,
-                                     transcript_for=ccwho.manifest_transcript_finder(man))
+        ok, _p, _left, _ready = ccwho.check_manifest(
+            man, problem_of=lambda e: ccwho.entry_problem(
+                e, os.path.isdir, ccwho.manifest_transcript_finder({"sessions": [e]})))
         self.assertFalse(ok)
 
     def test_without_a_config_dir_nothing_is_invented(self):         # control
@@ -5360,6 +5537,32 @@ class TestReadProcargsOnARealProcess(unittest.TestCase):
 
     def test_the_auth_of_a_pid_that_does_not_exist_is_none(self):     # control
         self.assertIsNone(ccwho.read_auth(99999999))
+
+    def test_the_iterm2_pane_of_a_real_process_is_its_unique_id(self):
+        # a save reads each session's pane this way, with no Apple Event: on
+        # the real kernel the id comes back, and nothing else of the environment
+        import sys
+        import time
+        if sys.executable.startswith(("/usr/bin/", "/bin/", "/System/")):
+            self.skipTest("the test's own Python is a system binary: its env is hidden")
+        pane = "510D3545-DC2F-46FF-8669-B8CC8B209E6A"
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"],
+                                 env={"ITERM_SESSION_ID": f"w6t0p4:{pane}",
+                                      "ANTHROPIC_API_KEY": self.TOKEN, "PATH": "/bin"})
+        try:
+            got = None
+            for _ in range(50):             # until it has exec'd: before that the
+                got = ccwho.read_iterm_pane(child.pid)       # fork holds OUR env
+                if got == pane:
+                    break
+                time.sleep(0.05)
+        finally:
+            child.kill()
+            child.wait()
+        self.assertEqual(got, pane)
+
+    def test_the_iterm2_pane_of_a_pid_that_does_not_exist_is_none(self):   # control
+        self.assertIsNone(ccwho.read_iterm_pane(99999999))
 
     def test_a_system_binary_is_unread_not_unmarked(self):
         # the environment macOS hides is unknown: "no session started it" would
@@ -7224,7 +7427,8 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
     of them filled its 512-thread pool and froze it. So: one event in flight at
     a time, the lock held by the osascript child itself until it exits, never
     killed; and an event that timed out inside iTerm2 (-1712) stops every
-    background ask to that iTerm2 until it restarts."""
+    background ask to that iTerm2 for a while (TestAStuckITerm2IsAskedAgainLater),
+    or until it restarts."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -7374,9 +7578,9 @@ class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
         self.stub('sleep 0.5; echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1')
         self.assertIsNone(self.ask(timeout=0.2))
         self.assertTrue(self.ended())
-        why = {}
-        self.assertIsNone(self.ask(now=time.time() + 3600, why=why))
-        self.assertIsNone(self.ask(now=time.time() + 86400))
+        why, t = {}, time.time() + 3600
+        self.assertIsNone(self.ask(now=t, why=why))
+        self.assertIsNone(self.ask(now=t + ccwho.terms.STUCK_RETRY - 1))
         self.assert_launches(1)
         self.assertEqual(why.get("refused"), "stuck")
 
@@ -7980,6 +8184,190 @@ class TestTheGateAfterASlowOrFailedAsk(unittest.TestCase):
         self.assertGreaterEqual(wait, start + ccwho.terms.ASK_WAIT_AFTER_ERROR + 0.4)
 
 
+class TestAStuckITerm2IsAskedAgainLater(unittest.TestCase):
+    """2026-10-03 19:24: one ask went unanswered for 2 minutes (-1712), and the
+    gate asked that iTerm2 nothing more until it quit - two days, through 190
+    saves, while it worked fine for its owner. The tab names in the list froze
+    and new sessions were saved with no pane. So a quarantine lasts a while:
+    10 minutes, doubled after each ask that times out again, up to 2 hours. The
+    ask that tries again is the only one in flight (the lock), as every ask is:
+    a stuck iTerm2 gets at most one more event each wait, not 509."""
+
+    _F = TestBackgroundAsksNeverPileUpInITerm2
+    stub, launches, table, state, ask, until, ended, assert_launches = (
+        _F.stub, _F.launches, _F.table, _F.state, _F.ask, _F.until, _F.ended, _F.assert_launches)
+    TIMED_OUT = 'echo "execution error: AppleEvent timed out. (-1712)" >&2; exit 1'
+
+    def setUp(self):
+        self._F.setUp(self)
+        self.addCleanup(setattr, ccwho.terms, "boot_id", ccwho.terms.boot_id)
+        ccwho.terms.boot_id = lambda: "THIS-BOOT"
+        self.t = time.time()
+
+    def gate(self):
+        with open(self.state("json")) as f:
+            return json.load(f)
+
+    def write_gate(self, **state):
+        os.makedirs(ccwho.terms.STATE_DIR, exist_ok=True)
+        with open(self.state("json"), "w") as f:
+            json.dump(dict({"quarantine": 100, "asked_pid": 100, "last_error": "-1712",
+                            "boot": "THIS-BOOT"}, **state), f)
+
+    def timed_out(self):
+        """An ask at t that iTerm2 left unanswered: quarantined from t."""
+        self.stub(self.TIMED_OUT)
+        self.assertIsNone(self.ask(now=self.t))
+
+    def test_it_is_asked_again_after_ten_minutes(self):
+        self.timed_out()
+        why = {}
+        self.assertIsNone(self.ask(now=self.t + 599, why=why))
+        self.assertEqual((why.get("refused"), why.get("retry_at")), ("stuck", self.t + 600))
+        self.stub("echo ok")
+        self.assertEqual(self.ask(now=self.t + 600), "ok\n")
+        self.assert_launches(2)
+
+    def test_an_answer_ends_the_quarantine(self):
+        self.timed_out()
+        self.stub("echo ok")
+        self.assertEqual(self.ask(now=self.t + 600), "ok\n")
+        self.assertEqual(self.ask(now=self.t + 601), "ok\n")
+        self.assertFalse({"quarantine", "retry_at", "strikes"} & set(self.gate()), self.gate())
+
+    def test_each_timeout_doubles_the_wait(self):
+        self.timed_out()                                        # strike 1: t + 600
+        self.assertIsNone(self.ask(now=self.t + 600))           # strike 2: + 1200
+        self.assertIsNone(self.ask(now=self.t + 1799))
+        self.assertIsNone(self.ask(now=self.t + 1800))          # strike 3: + 2400
+        self.assertIsNone(self.ask(now=self.t + 4199))
+        self.assert_launches(3)
+        self.assertEqual(self.gate().get("retry_at"), self.t + 4200)
+
+    def test_the_wait_stops_growing_at_two_hours(self):
+        self.write_gate(strikes=9, retry_at=self.t)
+        self.stub(self.TIMED_OUT)
+        self.assertIsNone(self.ask(now=self.t))
+        self.assert_launches(1)
+        self.assertEqual((self.gate().get("strikes"), self.gate().get("retry_at")),
+                         (10, self.t + ccwho.terms.STUCK_RETRY_LONGEST))
+
+    def test_while_the_ask_that_tries_again_is_out_no_second_is_sent(self):
+        self.timed_out()
+        self.stub("sleep 1.5; " + self.TIMED_OUT)
+        self.assertIsNone(self.ask(now=self.t + 600, timeout=0.3))
+        why = {}
+        self.assertIsNone(self.ask(now=self.t + 700, why=why))
+        self.assertIn(why.get("refused"), ("busy", "waiting"))
+        self.assert_launches(2)
+        self.assertTrue(self.ended())
+
+    def test_it_timing_out_again_is_the_next_strike(self):
+        # the try ran past its caller's wait and then timed out inside iTerm2:
+        # settled by the next ask, it doubles the wait from then
+        self.timed_out()
+        self.stub("sleep 0.5; " + self.TIMED_OUT)
+        self.assertIsNone(self.ask(now=self.t + 600, timeout=0.1))
+        self.assertTrue(self.ended())
+        why = {}
+        self.assertIsNone(self.ask(now=self.t + 900, why=why))
+        self.assertEqual((why.get("refused"), why.get("retry_at")), ("stuck", self.t + 2100))
+
+    def test_another_error_ends_the_quarantine(self):
+        # an error came back: iTerm2 (or macOS for it) answered - not stuck
+        self.timed_out()
+        self.stub('echo "Not authorized to send Apple events to iTerm2. (-1743)" >&2; exit 1')
+        self.assertIsNone(self.ask(now=self.t + 600))
+        self.assertFalse({"quarantine", "retry_at", "strikes"} & set(self.gate()), self.gate())
+        self.stub("echo ok")
+        self.assertEqual(self.ask(now=self.t + 600 + ccwho.terms.ASK_WAIT_AFTER_ERROR), "ok\n")
+
+    def test_a_try_that_ends_with_no_answer_keeps_the_quarantine(self):
+        # killed, or no error code: no proof the app answers - review 1 of
+        # env-panes. The wait starts again, at the same length
+        self.write_gate(strikes=3, retry_at=self.t)
+        self.stub("exit 1")
+        self.assertIsNone(self.ask(now=self.t))
+        self.assertEqual((self.gate().get("quarantine"), self.gate().get("strikes"),
+                          self.gate().get("retry_at")), (100, 3, self.t + 2400))
+        # and what shut it stays on record: doctor still says stuck (review 3)
+        self.assertEqual(self.gate().get("last_error"), "-1712")
+        self.assertEqual(ccwho.terms.gate_says(ccwho.terms.ITERM2, procs=self.table()), "stuck")
+
+    def test_a_try_whose_wrapper_died_keeps_the_quarantine(self):
+        # pending, and neither a status nor an error came back
+        self.write_gate(strikes=2, retry_at=self.t - 1, pending=True)
+        self.stub("echo ok")
+        why = {}
+        self.assertIsNone(self.ask(now=self.t, why=why))
+        self.assertEqual((why.get("refused"), why.get("retry_at")), ("stuck", self.t + 1200))
+        self.assert_launches(0)
+
+    def test_the_strikes_stop_counting_where_the_wait_stops_growing(self):
+        # a count past what the gate file keeps would drop it, and the wait
+        # would fall back to 20 minutes after days stuck
+        self.write_gate(strikes=64, retry_at=self.t)
+        self.stub(self.TIMED_OUT)
+        self.assertIsNone(self.ask(now=self.t))
+        self.assertIsNone(self.ask(now=self.t + 7200))
+        self.assertEqual(self.gate().get("retry_at"), self.t + 14400)
+
+    def test_a_quarantine_from_before_this_change_waits_one_round(self):
+        # its gate file has no retry time: the first wait starts when it is read
+        self.write_gate()
+        self.stub("echo ok")
+        why = {}
+        self.assertIsNone(self.ask(now=self.t, why=why))
+        self.assertEqual(why.get("refused"), "stuck")
+        self.assertEqual(self.gate().get("retry_at"), self.t + 600)
+        self.assertIsNone(self.ask(now=self.t + 599))
+        self.assertEqual(self.ask(now=self.t + 600), "ok\n")
+
+    def test_a_retry_time_past_the_longest_wait_is_a_clock_set_back(self):
+        # a clock set back by a day would hold the gate shut that much longer:
+        # the wait starts again from now
+        self.write_gate(strikes=1, retry_at=self.t + 86400)
+        self.stub("echo ok")
+        self.assertIsNone(self.ask(now=self.t))
+        self.assertEqual(self.ask(now=self.t + 600), "ok\n")
+
+    def test_a_retry_time_at_the_longest_wait_holds(self):                     # control
+        # one strike: started again, its wait would be over at t + 600
+        self.write_gate(strikes=1, retry_at=self.t + ccwho.terms.STUCK_RETRY_LONGEST)
+        self.stub("echo ok")
+        self.assertIsNone(self.ask(now=self.t))
+        self.assertIsNone(self.ask(now=self.t + 600))
+        self.assertEqual(self.ask(now=self.t + ccwho.terms.STUCK_RETRY_LONGEST), "ok\n")
+
+    def test_damaged_retry_values_wait_one_round(self):
+        self.stub("echo ok")
+        for bad in ({"retry_at": "x"}, {"retry_at": None}, {"retry_at": float("nan")},
+                    {"strikes": "2"}, {"strikes": 0}, {"strikes": -3}, {"strikes": 1e9},
+                    {"strikes": 65}, {"strikes": True}):
+            with self.subTest(bad=bad):
+                self.write_gate(**bad)
+                self.assertIsNone(self.ask(now=self.t))
+                self.assertEqual(self.ask(now=self.t + 600), "ok\n")
+
+    def test_a_restart_forgets_the_strikes(self):
+        self.write_gate(strikes=6, retry_at=self.t + 7000)
+        self.stub("echo ok")
+        self.assertEqual(self.ask(pid=200, now=self.t), "ok\n")
+        self.assertFalse({"quarantine", "retry_at", "strikes"} & set(self.gate()), self.gate())
+        self.stub(self.TIMED_OUT)
+        self.assertIsNone(self.ask(pid=200, now=self.t + 1))
+        self.assertEqual(self.gate().get("retry_at"), self.t + 601)
+
+    def test_a_reboot_forgets_the_strikes(self):
+        self.write_gate(strikes=6, retry_at=self.t + 7000, boot="ANOTHER-BOOT")
+        self.stub("echo ok")
+        self.assertEqual(self.ask(now=self.t), "ok\n")
+        self.assertFalse({"quarantine", "retry_at", "strikes"} & set(self.gate()), self.gate())
+        self.stub(self.TIMED_OUT)
+        self.assertIsNone(self.ask(now=self.t + 1))
+        self.assertEqual(self.gate().get("retry_at"), self.t + 601)
+
+
 class TestAPaneRestoreThatTimesOutSaysSo(unittest.TestCase):
     """The pane-filling script catches errors so one closed pane does not stop
     the rest. A write that timed out (-1712) is not a closed pane: caught, it
@@ -8114,6 +8502,63 @@ class TestOnlyAnITerm2RowCarriesAPane(unittest.TestCase):
 
     def test_a_row_no_app_shows_carries_it_as_before(self):                 # control
         self.assertEqual(self.pane(""), "G-OLD")
+
+
+class TestASaveThatCannotAskReadsThePaneFromTheProcess(unittest.TestCase):
+    """2026-10-03 19:24: iTerm2 did not answer one ask, and the gate asked it
+    nothing more for two days. Every session started after that, and every one
+    a /clear gave a new id, was saved with no pane: after the reboot 9 of 12
+    opened in new windows. The pane a process runs in is in its environment
+    (procs.parse_iterm_pane), so a save that cannot ask still knows it.
+
+    `env_panes`: pid -> the pane its environment names. Only for a row ps
+    places in iTerm2 - a terminal started from an iTerm2 shell may inherit the
+    variable - and only when iTerm2 was not asked: its answer, when it gives
+    one, is what is there now."""
+
+    ROW = dict(TestACarriedPaneIsText.ROW, terminal="iterm2")
+    KNOWN = TestOnlyAnITerm2RowCarriesAPane.KNOWN          # the same process, pane G-OLD
+
+    def saved(self, row=None, panes=None, known=None, env_panes=None):
+        man = ccwho.manifest_from_rows([dict(self.ROW, **(row or {}))], panes=panes,
+                                       known=known, env_panes=env_panes)
+        return man["sessions"][0]["pane"]
+
+    def test_a_session_the_last_save_never_saw_gets_its_pane(self):
+        self.assertEqual(self.saved(env_panes={"4100": "P-ENV"}), "P-ENV")
+
+    def test_its_process_beats_the_last_save(self):
+        # /clear: the same process, a new session id - and a pane the carry,
+        # by session id, would not find
+        self.assertEqual(self.saved(known=self.KNOWN, env_panes={"4100": "P-ENV"}), "P-ENV")
+
+    def test_a_pid_read_back_as_text_still_matches(self):
+        self.assertEqual(self.saved(row={"pid": "4100"}, env_panes={"4100": "P-ENV"}), "P-ENV")
+
+    def test_no_pane_in_its_environment_keeps_the_carry(self):              # control
+        self.assertEqual(self.saved(known=self.KNOWN, env_panes={"4100": ""}), "G-OLD")
+        self.assertEqual(self.saved(known=self.KNOWN, env_panes={}), "G-OLD")
+
+    def test_another_process_s_pane_is_not_taken(self):
+        self.assertEqual(self.saved(env_panes={"5200": "P-ENV"}), "")
+
+    def test_a_terminal_app_row_takes_none(self):
+        self.assertEqual(self.saved(row={"terminal": "terminal"}, env_panes={"4100": "P-ENV"}), "")
+
+    def test_a_row_no_app_shows_takes_none(self):
+        # VS Code's terminal, tmux: started from an iTerm2 shell, they keep its
+        # ITERM_SESSION_ID - and a restore would write into that pane
+        self.assertEqual(self.saved(row={"terminal": ""}, env_panes={"4100": "P-ENV"}), "")
+
+    def test_a_pane_that_is_not_text_is_not_taken(self):
+        self.assertEqual(self.saved(env_panes={"4100": ["P-ENV"]}), "")
+
+    def test_iterm2_s_answer_wins_when_it_gave_one(self):
+        asked = {"ttys022": {"pane": "G-ASKED", "name": "t"}}
+        self.assertEqual(self.saved(panes=asked, env_panes={"4100": "P-ENV"}), "G-ASKED")
+
+    def test_iterm2_s_answer_wins_when_it_names_no_pane(self):
+        self.assertEqual(self.saved(panes={}, env_panes={"4100": "P-ENV"}), "")
 
 
 class TestATableFromAPsThatFailedIsNone(unittest.TestCase):

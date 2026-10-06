@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """ccwho - which Claude Code session needs you, and what is it about.
 
-This file is the RUNNER and is meant to stay small. All logic lives in
-ccwho_engine.py, which is reloaded on every tick of --watch, so you can edit the
-engine while a watch is running and the next tick picks it up without a restart.
-Same model as network_check_ruby: thin loop, hot-reloaded engine, state carried
-between iterations rather than held inside the engine.
+On a terminal, `ccwho` with no arguments opens the live list. With options, or
+piped, it prints the table (--json: the rows as JSON).
 """
+# The runner and the commands. The rules live in ccwho_engine.py and the modules
+# it imports, reloaded on every tick of --watch and of the live list, so you can
+# edit them while a watch runs and the next tick picks them up without a restart.
+# Same model as network_check_ruby: thin loop, hot-reloaded engine, state carried
+# between iterations rather than held inside the engine. --help prints the
+# docstring above.
 from __future__ import annotations
 
 import contextlib
@@ -4195,26 +4198,26 @@ def main(argv=None):
         print("       ccwho restore --list                       every saved manifest, and what it holds")
         print("       ccwho ls [words] [--all]                   the table, or every session matching")
         print("                                                  (--all includes sessions a program started)")
-        print("       ccwho show <anything>                      what that session was working on")
+        print("       ccwho show <anything> [--all] [--json]     what that session was working on")
         print("       ccwho ps [--port N] [--all] [--json] [--full]  what agents started, and their ports")
-        print("       ccwho kill <pid>|:<port>|<session> [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
+        print("       ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
         print("       ccwho stop <session> [--and-procs] [--dry-run] [--yes]  stop a background session (its conversation is kept) - asks")
         print("       ccwho clean [--mine] [--dry-run] [--yes] [--force]      kill what ended sessions left - lists, then asks")
         print("       ccwho reap [pattern] [--older-than 1h] [--kill]  leaked helpers, dry run unless --kill")
         print("       ccwho accounts [--json]                    subscription usage, per account")
         print("       ccwho accounts name <id> <label>           a display name for an account")
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
-        print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
-        print("       ↓ on pace, ↑ faster than time passes; ↻ when it resets")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
-        print("       ccwho setup [--yes] [--hotkey KEY]         install what ccwho needs, once")
+        print("       ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]  install what ccwho needs, once")
         print("       ccwho setup --no-usage | --usage           turn usage info off / back on")
         print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
+        print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
+        print("       ↓ on pace, ↑ faster than time passes; ↻ when it resets")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")
         print("each project name in `ccwho restore` - that one reopens the session if")
         print("its window is gone, and focuses it if it is still up.")
-        print("Run install-handler.sh once to register the ccwho:// scheme; --no-links opts out.")
+        print("`ccwho setup` registers the ccwho:// scheme; --no-links opts out.")
         return 0
 
     bad = unknown_flags(argv)

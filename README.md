@@ -3,12 +3,12 @@
 Which Claude Code session needs you, and what is it about.
 
 ```
-16 sessions: 2 waiting · 2 busy · 12 idle
-16 detached processes under your home on PID 1
+16 sessions: 2 blocked · 12 stopped · 2 busy
+usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 12%↓/30% ↻Thu
 
-liveapp       NEEDS YOU   liveapp-4e     let's fix 1-3. 4 doesn't need a fix.        4d
-liveapp       busy        liveapp-06     yes, let's do that. create a directory…    23h
-chiefofstaff  idle        chiefofstaff-08  commit and push                          10d
+liveapp-4e       s071  NEEDS YOU   ✳ Fix the gate       Bash: run the gate        4d
+liveapp-06       s012  busy        ◐ Landing page       Edit: index.html         23h
+chiefofstaff-08  s040  STOPPED     ✳ Commit and push    Bash: git push           10d
 ```
 
 No daemon, no hooks, no tmux, no config. Reads only what Claude Code already writes
@@ -17,7 +17,7 @@ and `uv` fetches that for you.
 
 On a terminal, `ccwho` opens the **live list**: every session, what needs you at the
 top, the harness's own recap under each row, and Enter to go to its window. Piped,
-or with a subcommand, it is the one-shot table above.
+or with options, it prints the table above.
 
 ## Install
 
@@ -41,7 +41,8 @@ ccwho setup
 ```
 
 `ccwho setup` does the rest once, and says what it did: the `ccwho://` link
-handler, the autosave job, the iTerm2 hotkey window, and the Accessibility
+handler, the autosave job, the usage statusLine in each config dir where you run
+claude (it shows the change and asks first), the iTerm2 hotkey window, and the Accessibility
 permission the hotkey needs to reach you from another app (asked for when setup runs
 directly in an iTerm2 window, not in tmux: macOS gives it to the app setup runs in). It writes nothing on a
 machine that cannot work, and a second run changes nothing that is already right.
@@ -91,8 +92,10 @@ inside the same script, that the app runs.
   Terminal.app also reopens its old windows at a bare prompt, so you get both
   ([#30](https://github.com/lukaso/ccwho/issues/30)).
 - Each ccwho process asks each app for its tab names at most once a minute while it
-  answers, and again 30 s after an ask that failed; several open lists and commands
-  ask more often ([#31](https://github.com/lukaso/ccwho/issues/31)).
+  answers, again 30 s after an ask that failed, and 10 minutes after an ask it did
+  not answer in 2 minutes (doubling to 2 hours while it stays stuck; `ccwho doctor`
+  says when). Several open lists and commands ask more often
+  ([#31](https://github.com/lukaso/ccwho/issues/31)).
 - The hotkey window is an iTerm2 feature.
 
 ### Adding iTerm2 later
@@ -109,8 +112,9 @@ sessions are auto-named `liveapp-4e`, `liveapp-b3`, `liveapp-cd` — two of them
 sometimes identical — the name tells you nothing, and switching tools does not fix
 it because it is a data problem, not a display problem.
 
-`ccwho` shows the **last thing you actually said** to each session, pulled from its
-transcript. That is the column no tool has.
+`ccwho` shows what each session is about: its title and Claude Code's own recap -
+and, with → or `--prompt`, the **last thing you actually said** to it, pulled from
+its transcript.
 
 ## ccwho and herdr
 
@@ -130,15 +134,15 @@ Compared with herdr v0.9.3 and [its docs](https://herdr.dev/docs/), on 2026-10-0
 | Agents | Claude Code, Codex, Cursor, OpenCode, Grok, Copilot CLI and more | Claude Code. Codex: its open threads, their processes and its usage |
 | How it gets state | It reads the bottom of the pane screen and the terminal title, and compares them with rules. It shows `blocked` only when a known approval, question or permission prompt is on screen. The Claude hook tells herdr which session runs in the pane, for resume; it does not report state | It starts from Claude Code's own status (`claude agents --json`) and corrects it from the transcript: a tool call with no answer, the last line of a finished turn, turn-end records. It also reads the process tree ([what actually needs you](#what-actually-needs-you), [busy, but the turn is over](#busy-but-the-turn-is-over)) |
 | States | blocked, working, done (not seen yet), idle, unknown | NEEDS YOU, ASKED YOU, FINISHED, STUCK, STOPPED, busy, running, program. FINISHED: a turn ended, nothing runs under it, and you have not gone to the session from the list since. The live list puts it in NEEDS YOU |
-| What a row tells you | The state, the agent, and the workspace and tab names. A config line adds the agent's terminal title. Scripts and plugins can add fields | Live list: state, name, title, age, ports, account (with two or more), and Claude's recap with its age (with no recap, the last tool call). → adds the last thing you said and what Claude said last. `ccwho ls` shows the last tool call, or the question it asks |
+| What a row tells you | The state, the agent, and the workspace and tab names. A config line adds the agent's terminal title. Scripts and plugins can add fields | Live list: state, name, title, age, ports, account (with two or more Claude accounts), and Claude's recap with its age (with no recap, the last tool call). → adds the last thing you said and what Claude said last. `ccwho ls` shows the last tool call, or the question it asks |
 | Go to a session | Click an agent in the sidebar, or use the Goto picker (`prefix+g`), which filters agents by state | ⌥/ opens the list from any app (an iTerm2 hotkey window). Enter brings the session's window to the front, or opens a window that attaches a background session. Not for Codex threads ([finding the window](#finding-the-window)) |
 | Client closes or SSH drops | Processes keep running in the herdr server | Closing ccwho does not touch the sessions. If the terminal app quits or SSH drops, the sessions in it end, as without ccwho. `claude --bg` sessions keep running |
-| Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window. `restore --check` says whether each saved session that `--open` would reopen can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
+| Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window, and sessions that Claude Desktop or a program ran stay where they ran. `restore --check` says whether each saved session that `--open` would reopen can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
 | Processes and ports | Not built in | `ps`, `ps --port`, `kill`, `clean`, `reap`. It shows which session started each process ([processes and ports](#processes-and-ports)) |
 | Stuck work | Not built in | Finds a wait loop on a task that has ended (`until grep …; do sleep …; done`) and stdin readers that can never end, and gives you a box to kill them ([busy, but the turn is over](#busy-but-the-turn-is-over)) |
-| Old sessions | Not built in (the `memex` plugin searches transcripts) | `ls` and `show` search an index of every transcript in `~/.claude`, in the `CLAUDE_CONFIG_DIR` ccwho runs with, and in the dirs you list in `~/.ccwho/roots` (Claude Code keeps 30 days by default) ([finding an old session](#finding-an-old-session)) |
+| Old sessions | Not built in (the `memex` plugin searches transcripts) | `ls`, `show` and the live list's `/` search an index of every transcript in `~/.claude`, in the `CLAUDE_CONFIG_DIR` ccwho runs with, and in the dirs you list in `~/.ccwho/roots` (Claude Code keeps 30 days by default); `/` also greps what was said ([finding an old session](#finding-an-old-session)) |
 | Usage limits | Plugins (`herdr-agent-usage`) | 5h and 7d use for each account used in the last two weeks, with pace and age, after `ccwho setup` adds its statusLine. Also Codex's ([subscription usage](#subscription-usage)) |
-| Agents control agents | Yes. With the socket API and CLI, an agent can open panes, send prompts, read output, wait until another agent is blocked, and show notifications | No. An agent cannot send a prompt to a session or read its screen. It can read the state of every Claude Code session with `ccwho --json`. When an agent runs `kill` or `clean`, they take only what its own session started |
+| Agents control agents | Yes. With the socket API and CLI, an agent can open panes, send prompts, read output, wait until another agent is blocked, and show notifications | No. An agent cannot send a prompt to a session or read its screen. It can read the state of every Claude Code session with `ccwho --json`. When an agent runs `kill` or `clean`, they take only what its own session started. An agent stops no session |
 | Remote machines | Yes: several SSH hosts in one window. A phone works through any SSH client | No. Local Mac only |
 | Platforms | macOS, Linux, Windows; any terminal | macOS. It lists sessions in any terminal; only iTerm2 and Terminal.app windows can be brought to the front |
 | Extensions | Plugin marketplace, more than 1,400 plugins | None |
@@ -153,15 +157,16 @@ ccwho                         # on a terminal
 | key | does |
 |---|---|
 | ↑ ↓ / `j` `k` | move |
-| Enter | go to the session's window - or give it one (see below) |
+| Enter | go to the session's window - or give it one (see below). On a Codex row it says where the thread runs |
+| click | a click on a row goes to the session; a click on the `\ /` at the row's right edge opens its brief |
 | → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
-| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show last, under ENDED, found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session) - and lists the sessions only that finds under SAID, last |
+| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session) - and lists the sessions only that finds under SAID, last |
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
-| `x` | on a process (after `p`): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
-| `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
-| `o` | a menu of every save, newest first, with how many of its sessions run now; the last save before the restart is marked. Running sessions, and those Claude Desktop or a program ran, are left alone |
+| `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
+| `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. In the box: `l` the stuck items, `p` its processes, `s` stop. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
+| `o` | a menu of every save, newest first, with how many of its sessions run now and how many it would reopen; the last save before the restart is marked. Running sessions, and those Claude Desktop or a program ran, are left alone |
 | `r` | restart the list |
 | `q` | quit |
 
@@ -196,7 +201,7 @@ seconds when it is unhappy and a list that freezes when you reach for it is the
 problem this exists to solve.
 
 **The hotkey.** `ccwho setup` adds an iTerm2 hotkey window running the list, on ⌥/
-by default (`ccwho setup --hotkey option-w` to change it). A hotkey is only global if
+by default (`ccwho setup --hotkey option-w` to change it: `option-slash`, `option-space` or `option-w`). A hotkey is only global if
 iTerm2 had Accessibility when it registered the key; setup asks for it, and says
 when iTerm2 must be restarted for it to take.
 
@@ -221,8 +226,23 @@ running fine, while `--resume` correctly refuses it: every way in fails and the
 session looks lost.
 
 To end one: `claude stop <short id>` (the conversation is kept, and `--resume` works
-after), or `claude rm <short id>` to delete it. The session keeps the directory it
+after), or `claude rm <short id>` to delete it. `ccwho stop <id>`, or `x` then `s` in
+the list, does the same stop, and asks first. The session keeps the directory it
 was started in wherever you attach from; `--resume` uses the directory you are in.
+
+### Codex threads
+
+An open Codex thread is a row in the live list: `Title (codex) · 3m · VS Code` - its
+name, its age, where it was typed (VS Code, the codex CLI, the ChatGPT app), its
+folder and its ports. A thread is open while a Codex process holds its lock file;
+for its row ccwho reads only `session_index.jsonl`, the first line of its transcript
+and its last turn. Its state: ASKED YOU, FINISHED or "waiting? (maybe an approval)"
+(a turn quiet for 2 minutes on a tool call - Codex writes no approval request, so
+ccwho cannot tell which) - all in the NEEDS YOU group - busy, STOPPED, or, for a
+`codex exec` thread, program under PROGRAMS. Enter says
+where it runs: ccwho cannot bring a Codex window forward. `x` kills its processes,
+after the usual box; end the thread in its app. `ccwho ls` and `--json` list Claude
+Code sessions only.
 
 ## Subscription usage
 
@@ -231,14 +251,14 @@ usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu  │  ant:1a2b 5h 
 ```
 
 One dim line under the header, one entry per account read in the last two weeks: the
-machine login by its email, a `CLAUDE_CODE_OAUTH_TOKEN` by the first hex of its
-fingerprint. An account stays when no session spends it any more - switch accounts and
+machine login by the name in its email (`ant:work` for work@…; more of it when two
+names clash), a `CLAUDE_CODE_OAUTH_TOKEN` by the first 4 hex of its fingerprint. An account stays when no session spends it any more - switch accounts and
 the one you left is still there, with its age - and leaves two weeks after its last
 reading. `5h 42%↓/60%` is 42% of the 5-hour budget used with 60% of the 5 hours
 gone: `↓` (green) is on pace, `↑` (red) is faster than time passes. The used number
 turns yellow at 80% and bold at 95%. A window past its reset says `expired`; a window
 whose newest reading is older than 15 minutes says how old, and an entry whose windows
-have all expired ends with the age of its newest reading. With two or more accounts on
+have all expired ends with the age of its newest reading. With two or more Claude accounts on
 the line, each row ends with the account it spends, in the line's own words (`· ant:work`; `?`:
 no reading yet), and the entry of the selected row's account is bright. The same line
 and tags are in `ccwho`, `ccwho ls` and `--watch`, and each session's own status bar
@@ -248,8 +268,9 @@ Where it comes from: Claude Code hands a statusLine command the rate limits of t
 account the session spends. `ccwho setup` offers to add `ccwho statusline` in each
 config dir where you run claude yourself - it shows the change and asks - and
 `ccwho statusline` records one small file per session in `~/.ccwho/usage/`. ccwho
-never logs in and never reads a credential: a token account is a fingerprint of the
-token, computed inside the session and never stored. A session reports after its next
+never logs in. A token account is named by a hash of the token: Claude Code does not
+pass the token to the statusLine, so `ccwho statusline` reads it from its claude
+process's environment and keeps only the hash. A session reports after its next
 reply - including sessions that were already running when setup added the line
 (measured: they reload the settings). `ccwho accounts` lists every account seen in the last
 two weeks; `ccwho accounts name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
@@ -279,7 +300,9 @@ stored pasted logs whole and came to 177 MB; entries are now capped, since you
 recognise a line by its front.
 
 In the live list, `/` searches the same index: the ended sessions it finds show
-under the running ones, under ENDED (ten at most, the heading says how many).
+under the running ones, under ENDED (ten at most, the heading says how many). Half a
+second after the last key it also greps what was said; sessions only that finds show
+under SAID (ten at most).
 
 ## ccwho doctor
 
@@ -296,6 +319,9 @@ so each gets a check. Read-only by design: a tool that rewrites another tool's
 config without asking is how that happened in the first place. `ccwho --watch`
 shows the first fault in its header.
 
+It has a Terminal.app line once the list has asked that app. After an ask of iTerm2
+or Terminal.app timed out, its line says when ccwho asks again (`asks it again in 7m`).
+
 ## Sources
 
 | What | Where |
@@ -306,6 +332,10 @@ shows the first fault in its header.
 | old sessions | the index, `~/.ccwho/` |
 | processes an agent started | the session id in each process's environment (`sysctl`) |
 | ports | `lsof -iTCP -sTCP:LISTEN` |
+| open Codex threads | the lock files in `~/.codex/thread-writer-locks` (`lsof`), `session_index.jsonl`, each transcript's first line and last turn |
+| usage | `~/.ccwho/usage/` (from `ccwho statusline`); Codex's from its transcripts |
+| a session's iTerm2 pane (save) | iTerm2, by Apple Event; while iTerm2 is not asked, `ITERM_SESSION_ID` in its process's environment, else the last save of this boot |
+| Terminal.app tabs | `ps` (the `login` on each tty); their names by Apple Event |
 
 `sessionId` from the agents feed **is** the transcript filename, which is what makes
 the topic column possible.
@@ -317,8 +347,8 @@ environment, and each config dir keeps a small file per live session, so ccwho r
 those as well (read-only: pointed at another dir, `claude agents` writes into it). A
 file counts only while its process is alive and is still the same process - its start
 time, as `ps` prints it in UTC, must match the one the file recorded. From the
-environment ccwho keeps five named variables and drops the rest: it holds tokens, and
-ccwho's output is read by agents. `ccwho doctor` says if those files stop parsing.
+environment ccwho keeps five named variables, the iTerm2 pane id and a hash of an
+OAuth token, and drops the rest: it holds tokens, and ccwho's output is read by agents. `ccwho doctor` says if those files stop parsing.
 
 ## Processes and ports
 
@@ -362,7 +392,8 @@ opens Docker Desktop has not made Docker its work. Exit 3 means "not known": ps 
 lsof failed, no environment could be read, or the port's holder could not be read.
 
 What ccwho can and cannot see: the environment is read with `sysctl` and only five
-named variables are kept - it holds tokens, and ccwho's output is read by agents.
+named variables are kept, with the iTerm2 pane id and a hash of an OAuth token - it
+holds tokens, and ccwho's output is read by agents.
 A command line is printed short: the program, and only the arguments whose place
 says they are harmless - flags, file names with a code or config extension, short
 words of letters and small numbers before the first flag (`npm run dev`), the value
@@ -432,6 +463,10 @@ ccwho clean                 # every process tree a session that ended left behin
 ccwho kill :3000 --dry-run  # the list only
 ccwho kill :3000 --yes      # no question (a script)
 ccwho kill 4412 --force     # SIGKILL what SIGTERM did not end
+ccwho kill liveapp-4e       # what that live session started (its id, name or tty)
+ccwho kill 4412 --pid       # 4412 as a pid, not the start of a session id
+ccwho stop liveapp-4e              # stop a background session; its conversation is kept
+ccwho stop liveapp-4e --and-procs  # ...and kill what it started
 ```
 
 Every kill lists each process it takes - who started it and what ccwho doubts
@@ -454,6 +489,14 @@ nothing that carries a doubt: `ccwho clean --mine` cleans up after itself.
 Exit codes: 0 all killed, 1 not all (or nothing to kill), 2 usage, 3 needs `--yes`,
 130 interrupted before any signal (nothing killed). A `--dry-run` exits as the kill
 would: 1 when part of the target would be refused.
+
+`ccwho stop` stops only a background session, with `claude stop`; `claude attach`
+brings it back. A session started in a window is never stopped: end it there
+(`/exit`). A background session attached in a window is stopped, and the question
+says it is open there. An agent stops no session. Exit codes: 0 stopped, 1 not (or
+not all), 2 usage, several matches, or (with `--yes`) a word that is not its id, name
+or tty, 3 needs `--yes`, 130 interrupted - after `claude stop` began, the session may
+be stopped (run `ccwho ls`). A `--dry-run` exits as the stop would.
 
 ## ccwho reap - killing only the stale ones
 
@@ -643,12 +686,14 @@ ccwho jump <tty|pid|title>  # focus that window
 ccwho open <session-id> # focus it, give it a window, or reopen it
 ccwho --watch           # the plain table, redrawn every 5s (and autosaving)
 ccwho --watch 2         # ...every 2s  (also -w 2, --watch=2)
-ccwho --blocked         # only what needs you or holds detached work
+ccwho --blocked         # what Claude Code reports as waiting (a program's only when STUCK), and any with detached work
 ccwho --prompt          # add the last thing you said, under each row
 ccwho --json            # machine-readable, for a status line or key binding
 ccwho save              # record the live fleet (before a reboot)
 ccwho restore [--open]  # list it back, or reopen the windows
-ccwho kill <pid>|:<port>|<session>  # a process tree, a port's holder, or what a session started - lists, then asks
+ccwho restore --check   # would it restore? before a reboot
+ccwho accounts [name <id> <label>]  # usage per account, Codex too
+ccwho kill <pid>|:<port>|<session> [--pid]  # a process tree, a port's holder, or what a session started - lists, then asks
 ccwho clean [--mine]    # kill what ended sessions left behind - lists, then asks
 ccwho stop <session> [--and-procs]  # stop a background session, keep its conversation - asks
 ccwho reap              # leaked helper processes, dry run
@@ -660,16 +705,13 @@ ccwho setup             # install what it needs, once
 
 | Column | Where it comes from |
 |---|---|
-| project | cwd, with worktrees reported under their parent repo |
+| name | the address you message the session by; its project when it has none |
+| tty | where it runs; a link that jumps there |
 | status | derived, see below - NEEDS YOU sorts to the top |
-| title | Claude Code's own `ai-title` entry, not the auto-generated session name |
+| title | the tab's name (iTerm2 or Terminal.app); `~` + Claude Code's own `ai-title` when no tab gives one. A renamed session's project comes first |
 | doing | the last tool call, using Bash's human `description` when present |
 | since | time since the last real **turn**, from its `timestamp` - see below |
-
-The session *name* is deliberately not a column here. `liveapp-4e` told you
-nothing about the work, which is what started this. The live list does show it,
-next to the title: there it is not a description but the address you message the
-session by.
+| account | the account it spends, with two or more of one brand on the usage line |
 
 ### What actually needs you
 
@@ -691,6 +733,7 @@ So `ccwho` derives the state instead:
 | blocked | an unanswered `tool_use` in the transcript | NEEDS YOU |
 | asks | the closing line of an **ended** turn is a question or a request - even while the harness says busy. Text in quotation marks does not count: a question put to someone else is not one put to you | ASKED YOU |
 | stuck | not asking you, not mid-turn, and a wait loop or stdin reader under it can never end | STUCK |
+| review | stopped, its turn ended, and you have not gone to it from the list since | FINISHED |
 | stopped | not busy, and **nothing running under it** | STOPPED |
 | busy | harness says busy, mid-turn | busy |
 | running | background work is in flight: not busy, or busy with the turn over | running |
@@ -785,7 +828,8 @@ last, quiet PROGRAMS group. It is never in NEEDS YOU; `--blocked` shows it only
 when it is STUCK while waiting, or left detached work behind. Its row says
 `· program` where a row would say `· no window`. Enter, `ccwho open` and the link handler do not attach it. A loop
 that can never end still makes it STUCK. Every row in `--json` carries its
-`entrypoint`.
+`entrypoint`. A Codex thread that `codex exec` started is a program's too: it shows
+under PROGRAMS.
 
 ### Why `since` does not use file mtime
 
@@ -845,9 +889,10 @@ fleet may go days without producing one.
 
 ## Hot reload
 
-`ccwho.py` is a thin runner; all logic is in `ccwho_engine.py`, which is
-`importlib.reload`ed on every tick of `--watch`. Edit the engine while a watch is
-running and the next tick picks it up - no restart. Same model as
+`ccwho.py` is the runner and the commands. The rules are in `ccwho_engine.py` and
+the modules it imports (text, processes, terminal apps, brief, index, usage); all of
+them are re-read on every tick of `--watch` and of the live list. Edit
+the engine while a watch is running and the next tick picks it up - no restart. Same model as
 `network_check_ruby`: thin loop, hot-reloaded engine, state carried between ticks
 rather than held inside the engine.
 
@@ -868,8 +913,10 @@ such as a launch claim naming Terminal.app, by its old rules.
 - **Harness-injected "user" turns are not topics.** Skill preambles, compaction
   notices, `<task-notification>` blocks and the local-command caveat are filtered.
   In strict mode the search window widens rather than printing noise.
-- **macOS has hundreds of system daemons on PID 1.** The orphan count is scoped to
-  `$HOME`, or it reports 582 and means nothing.
+- **macOS has hundreds of system daemons on PID 1.** A process is a session's work
+  only by the session id in its environment, or by running under that session's
+  claude - never because it sits on PID 1: counting PID 1's children reported 582
+  and meant nothing.
 - **`age()` guards epoch 0**, because `if not started_ms` swallows a valid timestamp.
 
 ## Tests
@@ -878,10 +925,9 @@ such as a launch claim naming Terminal.app, by its old rules.
 ./test
 ```
 
-2487 tests: 2146 for the engine, processes, kill, usage, runner, brief, index and
-setup (stdlib only), and 341 for the live list, which `uv` runs with Textual. If uv cannot fetch Textual the
-UI tests FAIL rather than skip - "OK (skipped=12)" while the screen is broken is a
-green light for nothing. Every guard has been mutation-checked: reverting the fix it
+The engine's tests use the standard library only; `uv` runs the live list's tests
+with Textual. If uv cannot fetch Textual the UI tests FAIL rather than skip -
+"OK (skipped=N)" while the screen is broken is a green light for nothing. Every guard has been mutation-checked: reverting the fix it
 defends turns its test red. An assertion that cannot fail is not an assertion.
 
 ## License

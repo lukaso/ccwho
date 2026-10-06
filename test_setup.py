@@ -121,7 +121,8 @@ class TestEachFault(unittest.TestCase):
 
     def test_an_unregistered_handler_means_the_links_do_nothing(self):
         r = self.bad("ccwho:// handler", handler_registered=False)
-        self.assertIn("install-handler.sh", r["fix"])
+        # setup builds it; a brew user has no install-handler.sh where they are
+        self.assertEqual(r["fix"], "ccwho setup")
 
     def test_the_autosave_job_not_loaded_is_a_reboot_you_cannot_undo(self):
         r = self.bad("autosave job", launchd_loaded=False)

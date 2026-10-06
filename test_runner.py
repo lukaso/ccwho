@@ -3314,7 +3314,7 @@ class TestDoctorVerb(unittest.TestCase):
         self.facts["handler_registered"] = False
         rc, out = self._doctor()
         self.assertEqual(rc, 1)
-        self.assertIn("install-handler.sh", out)
+        self.assertIn("ccwho setup", out)
 
     def test_it_repairs_nothing(self):
         self.facts["cc_status_hook"] = False
@@ -6039,6 +6039,36 @@ class TestUsageWords(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             runner.main(["--help"])
         self.assertIn("5h 42%↓/60%", out.getvalue())
+
+    def help_text(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["--help"])
+        return out.getvalue()
+
+    def test_help_says_what_ccwho_alone_does(self):
+        # it printed the runner's developer note (release 0.5.0 doc check)
+        out = self.help_text()
+        self.assertIn("On a terminal, `ccwho` with no arguments opens the live list. With options,"
+                      " or piped, it prints the table (--json: the rows as JSON).",
+                      " ".join(out.split()))
+        self.assertNotIn("This file is the RUNNER", out)
+
+    def test_help_names_every_flag_a_command_takes(self):
+        out = self.help_text()
+        self.assertRegex(out, r"ccwho kill <pid>\|:<port>\|<session> \[--pid\]")
+        self.assertIn("ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]", out)
+        self.assertIn("ccwho show <anything> [--all] [--json]", out)
+
+    def test_the_usage_legend_follows_the_commands(self):
+        out = self.help_text()
+        self.assertGreater(out.index("usage: 5h 42%"), out.index("ccwho url "))
+
+    def test_help_names_setup_for_the_links(self):
+        # a brew user has no install-handler.sh where they run it
+        out = self.help_text()
+        self.assertIn("`ccwho setup` registers the ccwho:// scheme", out)
+        self.assertNotIn("install-handler.sh", out)
 
     def test_help_names_every_command(self):
         # The commands come from main's own dispatch, so a new one that --help

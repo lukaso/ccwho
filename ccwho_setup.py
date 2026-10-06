@@ -119,7 +119,7 @@ def doctor_checks(facts):
         "ccwho:// handler", bool(facts.get("handler_registered")),
         "registered" if facts.get("handler_registered") else
         "not registered - the clickable links in the list do nothing",
-        "bash install-handler.sh"))
+        "ccwho setup"))
 
     out.append(_check(
         "autosave job", bool(facts.get("launchd_loaded")),

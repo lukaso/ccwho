@@ -1005,10 +1005,62 @@ def hotkey_current(home, wanted):
     Same rule as the autosave job: "it is installed" is not "it works the way
     this version means it to". Without this, a settings change never reaches a
     machine that ran setup once - the profile has our Guid and a hotkey, so it
-    reads as done for ever.
+    reads as done for ever. The window's size is not a setting: q wrote it.
     """
     mine = _our_profile(profile_path(home))
-    return bool(mine) and mine == wanted["Profiles"][0]
+    return bool(mine) and ({k: v for k, v in mine.items() if k not in SIZE_KEYS}
+                           == wanted["Profiles"][0])
+
+
+# q ends the hotkey window, and the key makes a new one at the profile's
+# Columns x Rows (iTermProfileHotKey reads the profile by Guid for each new
+# window) - Default's 80 x 25, not the size you dragged it to. So q writes the
+# size it had into our profile, and setup keeps it.
+SIZE_KEYS = ("Columns", "Rows")
+
+
+def window_size(text):
+    """The size our profile in this file's text opens at, as profile keys:
+    {"Columns": c, "Rows": r}, or {} when it has none."""
+    mine = next((p for p in profiles_in(text) if p.get("Guid") == PROFILE_GUID), {})
+    return {k: mine[k] for k in SIZE_KEYS if _a_size(mine.get(k))}
+
+
+def _a_size(n):
+    return isinstance(n, int) and not isinstance(n, bool) and n > 0
+
+
+def in_hotkey_window(env):
+    """Is this the hotkey window? iTerm2 names a session's profile in its
+    environment. `ccwho` in any other window is a list you opened yourself."""
+    return env.get("ITERM_PROFILE") == PROFILE_NAME
+
+
+def with_window_size(text, columns, rows):
+    """The file's text with our profile opening at columns x rows, or None when
+    there is nothing to write: no profile of ours (q is no install), one that
+    still runs setup's proof (setup is replacing it - a write from this text
+    would put the proof back), not a size, or the size it has already. Most
+    q's are that last one, and every write makes iTerm2 reload all of its
+    profiles."""
+    if not (_a_size(columns) and _a_size(rows)):
+        return None
+    try:
+        doc = json.loads(text or "")
+    except (ValueError, RecursionError):
+        return None
+    found = doc.get("Profiles") if isinstance(doc, dict) else None
+    if not isinstance(found, list):
+        return None
+    mine = next((p for p in found if isinstance(p, dict)
+                 and p.get("Guid") == PROFILE_GUID), None)
+    if mine is None or not str(mine.get("Command", "")).endswith(" " + HOTKEY_VERB):
+        return None
+    size = {"Columns": columns, "Rows": rows}
+    if all(mine.get(k) == v for k, v in size.items()):
+        return None
+    mine.update(size)
+    return json.dumps(doc, indent=2)
 
 
 def profile_entries(text):

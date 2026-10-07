@@ -31,7 +31,7 @@ import ccwho_setup as setup
 def is_panel(env):
     """Only the hotkey window watches. `ccwho` in an ordinary window is a list
     you opened yourself, and nothing about the key applies to it."""
-    return env.get("ITERM_PROFILE") == setup.PROFILE_NAME
+    return setup.in_hotkey_window(env)
 
 
 def session_uuid(env):

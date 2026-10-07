@@ -203,7 +203,9 @@ problem this exists to solve.
 **The hotkey.** `ccwho setup` adds an iTerm2 hotkey window running the list, on ⌥/
 by default (`ccwho setup --hotkey option-w` to change it: `option-slash`, `option-space` or `option-w`). A hotkey is only global if
 iTerm2 had Accessibility when it registered the key; setup asks for it, and says
-when iTerm2 must be restarted for it to take.
+when iTerm2 must be restarted for it to take. `q` closes the window, and the key
+opens the next one at the size it had: `q` writes its columns and rows into the
+hotkey profile, and setup keeps them.
 
 If the hotkey stops working after a crash, an app has probably left macOS Secure
 Input on, and then no global hotkey works. The live list (click iTerm2, or run

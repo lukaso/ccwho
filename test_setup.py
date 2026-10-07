@@ -1047,6 +1047,94 @@ class TestAnInstalledProfileIsNotNecessarilyTheRightProfile(unittest.TestCase):
         self.assertTrue(setup.hotkey_current(self.home, self.current()),
                         "we compare ours, not the file")
 
+    def test_the_size_the_window_was_left_at_is_not_a_stale_setting(self):
+        sized = self.current()
+        sized["Profiles"][0].update({"Columns": 132, "Rows": 41})
+        self.write(sized)
+        self.assertTrue(setup.hotkey_current(self.home, self.current()),
+                        "q wrote that size; setup must not undo it")
+
+
+class TestTheHotkeyWindowKeepsItsSize(unittest.TestCase):
+    """q ends the hotkey window, and the next key press makes a new one at
+    the profile's Columns x Rows - 80 x 25 from Default - not the size you
+    dragged it to. So the size at q goes into our profile."""
+
+    OTHER = {"Guid": "someone-elses", "Name": "theirs", "Columns": 10}
+
+    def text(self, **size):
+        doc = setup.hotkey_profile("/x/ccwho hotkey")
+        doc["Profiles"][0].update(size)
+        doc["Profiles"].insert(0, dict(self.OTHER))
+        return json.dumps(doc, indent=2)
+
+    def ours(self, text):
+        return next(p for p in json.loads(text)["Profiles"]
+                    if p.get("Guid") == setup.PROFILE_GUID)
+
+    def test_the_size_goes_into_our_profile(self):
+        new = setup.with_window_size(self.text(), 132, 41)
+        self.assertEqual((self.ours(new)["Columns"], self.ours(new)["Rows"]), (132, 41))
+
+    def test_nothing_else_in_the_file_changes(self):
+        before = json.loads(self.text())
+        after = json.loads(setup.with_window_size(self.text(), 132, 41))
+        self.assertEqual(after["Profiles"][0], self.OTHER, "not ours to resize")
+        mine = {k: v for k, v in self.ours(json.dumps(after)).items()
+                if k not in ("Columns", "Rows")}
+        self.assertEqual(mine, before["Profiles"][1])
+
+    def test_the_size_it_already_has_writes_nothing(self):
+        # every write makes iTerm2 reload its profiles; most q's change nothing
+        self.assertIsNone(setup.with_window_size(self.text(Columns=132, Rows=41), 132, 41))
+
+    def test_a_new_size_replaces_the_old_one(self):                  # control
+        new = setup.with_window_size(self.text(Columns=132, Rows=41), 100, 30)
+        self.assertEqual((self.ours(new)["Columns"], self.ours(new)["Rows"]), (100, 30))
+
+    def test_one_edge_dragged_is_a_new_size(self):
+        # only the bottom edge, or only the side: one of the two is unchanged
+        for cols, rows in ((132, 30), (100, 41)):
+            new = setup.with_window_size(self.text(Columns=132, Rows=41), cols, rows)
+            self.assertIsNotNone(new, (cols, rows))
+            self.assertEqual((self.ours(new)["Columns"], self.ours(new)["Rows"]), (cols, rows))
+
+    def test_a_file_without_our_profile_gets_none(self):
+        text = json.dumps({"Profiles": [dict(self.OTHER)]})
+        self.assertIsNone(setup.with_window_size(text, 132, 41),
+                          "q is no install: a profile setup removed stays removed")
+
+    def test_a_file_that_is_not_a_profile_document_is_left_alone(self):
+        for text in ("", "{not json", "[]", '{"Profiles": 3}', None):
+            self.assertIsNone(setup.with_window_size(text, 132, 41), repr(text))
+
+    def test_a_size_that_is_not_a_size_is_not_written(self):
+        for cols, rows in ((0, 41), (132, 0), (-1, 41), (True, 41), (132.0, 41), (None, 41)):
+            self.assertIsNone(setup.with_window_size(self.text(), cols, rows),
+                              (cols, rows))
+
+    def test_the_size_is_read_back(self):
+        self.assertEqual(setup.window_size(self.text(Columns=132, Rows=41)),
+                         {"Columns": 132, "Rows": 41})
+        self.assertEqual(setup.window_size(self.text()), {})
+        self.assertEqual(setup.window_size(None), {})
+
+    def test_a_profile_that_runs_the_proof_gets_none(self):
+        # setup is about to replace it with the plain one; a write made from
+        # its text would put the proof command back under the key
+        doc = setup.hotkey_profile(setup.proof_command("/x/ccwho", "n0m1"))
+        self.assertIsNone(setup.with_window_size(json.dumps(doc), 132, 41))
+
+    def test_only_the_hotkey_window_is_the_hotkey_window(self):
+        self.assertTrue(setup.in_hotkey_window({"ITERM_PROFILE": "ccwho"}))
+        self.assertFalse(setup.in_hotkey_window({"ITERM_PROFILE": "Default"}))
+        self.assertFalse(setup.in_hotkey_window({}))
+
+    def test_a_size_that_is_not_a_size_is_not_read_back(self):
+        # setup carries what this returns into the profile it writes
+        self.assertEqual(setup.window_size(self.text(Columns="wide", Rows=41)), {"Rows": 41})
+        self.assertEqual(setup.window_size(self.text(Columns=0, Rows=True)), {})
+
 
 class TestTheHotkeyOnlyReachesYouWithPermission(unittest.TestCase):
     """A global hotkey - one that fires while another app is in front - needs

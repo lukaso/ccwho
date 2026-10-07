@@ -4216,6 +4216,11 @@ class SetupHarness(unittest.TestCase):
         self.real_usage_roots = runner.usage_roots
         self.usage_dirs = ([], [])
         runner.usage_roots = lambda: self.usage_dirs
+        # The proof window's q reads the terminal the tests run in: not here
+        # (TestTheHotkeyWindowComesBackTheSizeYouLeftIt tests that q).
+        no_tty = mock.patch.object(runner, "terminal_size", new=lambda: None)
+        no_tty.start()
+        self.addCleanup(no_tty.stop)
 
     def tearDown(self):
         runner.usage_roots = self.real_usage_roots
@@ -4783,7 +4788,11 @@ class TestTheListStartsFromAWindowWithNoPath(unittest.TestCase):
         self.assertEqual(runner.find_uv(), "")
 
 
-class TestAHotkeyWindowNeverDiesWithTheReasonUnread(unittest.TestCase):
+class HotkeyWindowHarness(unittest.TestCase):
+    """`ccwho hotkey` as the hotkey window runs it. q there writes the size
+    into the hotkey profile - so every run here has a temp home, and the
+    terminal's size is pinned rather than read from whatever runs the tests."""
+
     def setUp(self):
         self.real_ui = runner.run_ui
         self.addCleanup(setattr, runner, "run_ui", self.real_ui)
@@ -4791,6 +4800,18 @@ class TestAHotkeyWindowNeverDiesWithTheReasonUnread(unittest.TestCase):
         self.real_wait = runner.wait_for_a_key
         runner.wait_for_a_key = lambda: self.waited.append(True)
         self.addCleanup(setattr, runner, "wait_for_a_key", self.real_wait)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        env = mock.patch.dict(os.environ, {"HOME": self.home,
+                                           runner.TEST_HOME_VAR: self.home,
+                                           "ITERM_PROFILE": runner.setup.PROFILE_NAME})
+        env.start()
+        self.addCleanup(env.stop)
+        self.size = (132, 41)
+        size = mock.patch.object(runner, "terminal_size", create=True,
+                                 new=lambda: self.size)
+        size.start()
+        self.addCleanup(size.stop)
 
     def run_hotkey(self):
         out = io.StringIO()
@@ -4798,6 +4819,8 @@ class TestAHotkeyWindowNeverDiesWithTheReasonUnread(unittest.TestCase):
             rc = runner.main(["hotkey"])
         return rc, out.getvalue()
 
+
+class TestAHotkeyWindowNeverDiesWithTheReasonUnread(HotkeyWindowHarness):
     def test_a_list_that_cannot_start_holds_the_window_open(self):
         runner.run_ui = lambda: 1
         rc, out = self.run_hotkey()
@@ -4819,6 +4842,173 @@ class TestAHotkeyWindowNeverDiesWithTheReasonUnread(unittest.TestCase):
         with open(runner.setup.profile_path(home)) as fh:
             command = json.load(fh)["Profiles"][0]["Command"]
         self.assertTrue(command.endswith(" hotkey"), command)
+
+
+class TestTheHotkeyWindowComesBackTheSizeYouLeftIt(HotkeyWindowHarness):
+    """Asked for: q, then the key, brought the list back at 80 x 25 every
+    time - iTerm2 makes the new hotkey window at the profile's Columns x Rows
+    (iTermProfileHotKey reads the profile by its Guid for each new window).
+    So q puts the window's size there."""
+
+    THEIRS = {"Guid": "someone-elses", "Name": "theirs"}
+
+    def setUp(self):
+        super().setUp()
+        self.path = runner.setup.profile_path(self.home)
+        os.makedirs(os.path.dirname(self.path))
+        doc = runner.setup.hotkey_profile("/x/ccwho hotkey")
+        doc["Profiles"].insert(0, dict(self.THEIRS))
+        self.write(json.dumps(doc, indent=2))
+
+    def write(self, text):
+        with open(self.path, "w") as fh:
+            fh.write(text)
+
+    def read(self):
+        with open(self.path, "rb") as fh:
+            return fh.read()
+
+    def doc(self):
+        return json.loads(self.read())
+
+    def ours(self):
+        return next(p for p in self.doc()["Profiles"]
+                    if p.get("Guid") == runner.setup.PROFILE_GUID)
+
+    def test_q_leaves_the_size_in_the_profile(self):
+        runner.run_ui = lambda: 0
+        rc, _ = self.run_hotkey()
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.ours().get("Columns"), self.ours().get("Rows")), (132, 41))
+
+    def test_a_list_that_could_not_start_leaves_the_profile_alone(self):   # control
+        runner.run_ui = lambda: 1
+        before = self.read()
+        self.run_hotkey()
+        self.assertEqual(self.read(), before, "no q was pressed")
+
+    def test_the_other_profiles_in_the_file_are_kept(self):
+        runner.run_ui = lambda: 0
+        self.run_hotkey()
+        self.assertEqual((self.ours().get("Columns"), self.ours().get("Rows")), (132, 41),
+                         "a write happened")
+        self.assertEqual(self.doc()["Profiles"][0], self.THEIRS)
+
+    def test_ccwho_hotkey_in_another_window_leaves_the_profile_alone(self):
+        # run by hand to try it - in a tmux pane, an ordinary tab - its size is
+        # not the hotkey window's, and setup could never take it back out
+        runner.run_ui = lambda: 0
+        before = self.read()
+        for env in ({"ITERM_PROFILE": "Default"}, {}):
+            with mock.patch.dict(os.environ, env):
+                if not env:
+                    del os.environ["ITERM_PROFILE"]          # not in iTerm2 at all
+                rc, _ = self.run_hotkey()
+            self.assertEqual((rc, self.read()), (0, before), env)
+
+    def run_proof(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch.object(runner, "ccwho_dir", new=lambda: d), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return runner.setup_cmd(["--proof", "n0m1"])
+
+    def test_the_first_window_after_setup_keeps_its_size_too(self):
+        # the proof window: by its q, setup has put the plain profile back
+        runner.run_ui = lambda: 0
+        self.assertEqual(self.run_proof(), 0)
+        self.assertEqual((self.ours().get("Columns"), self.ours().get("Rows")), (132, 41))
+
+    def test_q_while_the_profile_still_runs_the_proof_writes_nothing(self):
+        # setup is still waiting; a write made from this text would put the
+        # proof command back after setup replaced it
+        doc = runner.setup.hotkey_profile(runner.setup.proof_command("/x/ccwho", "n0m1"))
+        self.write(json.dumps(doc, indent=2))
+        before = self.read()
+        runner.run_ui = lambda: 0
+        self.assertEqual(self.run_proof(), 0)
+        self.assertEqual(self.read(), before)
+
+    def test_outside_a_terminal_nothing_is_written(self):
+        runner.run_ui = lambda: 0
+        self.size = None
+        before = self.read()
+        rc, _ = self.run_hotkey()
+        self.assertEqual((rc, self.read()), (0, before))
+
+    def test_without_our_profile_none_is_made(self):
+        os.remove(self.path)
+        runner.run_ui = lambda: 0
+        rc, _ = self.run_hotkey()
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(self.path),
+                         "q is no install: a profile setup removed stays removed")
+
+    def test_a_profile_that_cannot_be_written_does_not_fail_q(self):
+        runner.run_ui = lambda: 0
+        tried = []
+
+        def refuse(*a, **k):
+            tried.append(a[0])
+            raise PermissionError(13, "Permission denied")
+        with mock.patch.object(runner, "write_atomic", new=refuse):
+            rc, out = self.run_hotkey()
+        self.assertEqual(tried, [self.path], "the write was tried")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.waited, [], "q closes the window, as before")
+
+    def test_a_profile_that_is_not_text_does_not_fail_q(self):
+        with open(self.path, "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8")
+        runner.run_ui = lambda: 0
+        rc, out = self.run_hotkey()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read(), b"\xff\xfe not utf-8")
+
+
+class TestTheTerminalSize(unittest.TestCase):
+    def test_a_terminal_gives_its_columns_and_rows(self):            # control
+        with mock.patch.object(runner.os, "get_terminal_size",
+                               new=lambda *a: os.terminal_size((132, 41))):
+            self.assertEqual(runner.terminal_size(), (132, 41))
+
+    def test_no_terminal_gives_none(self):
+        # never shutil's 80 x 24 fallback: that would shrink the next window
+        def no_tty(*a):
+            raise OSError(25, "Inappropriate ioctl for device")
+        with mock.patch.object(runner.os, "get_terminal_size", new=no_tty):
+            self.assertIsNone(runner.terminal_size())
+
+
+class TestAnAtomicWriteHidesItsTempFile(unittest.TestCase):
+    """iTerm2 reads every file in DynamicProfiles except dotfiles. A temp copy
+    named ccwho.json.<pid>.tmp, seen in the middle of a write, is a second
+    profile with our Guid, and iTerm2 stops on a modal "Two dynamic profiles
+    have the same Guid" (iTermDynamicProfileManager.m, 3.7.3)."""
+
+    def test_the_temp_file_is_a_dotfile_in_the_same_folder(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "ccwho.json")
+        with open(path, "w") as fh:
+            fh.write("old")
+        seen, real = [], os.replace
+
+        def spy(src, dst):
+            seen.append((os.path.dirname(src), os.path.basename(src),
+                         sorted(n for n in os.listdir(d) if not n.startswith("."))))
+            return real(src, dst)
+        with mock.patch.object(runner.os, "replace", new=spy):
+            runner.write_atomic(path, "new")
+        self.assertEqual(len(seen), 1, seen)
+        folder, name, visible = seen[0]
+        self.assertEqual(folder, d, "another folder makes the replace a copy")
+        self.assertTrue(name.startswith("."), name)
+        self.assertEqual(visible, ["ccwho.json"])
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "new")
+        self.assertEqual(os.listdir(d), ["ccwho.json"], "no temp is left behind")
 
 
 class TestSetupAsksForTheHotkeyPermission(SetupHarness):
@@ -5304,6 +5494,81 @@ class TestChangingTheHotkeyActuallyChangesIt(SetupHarness):
     def test_a_first_install_just_writes_it(self):                    # control
         self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
         self.assertEqual([k for k, _ in self.events], ["write"])
+
+    def left_at(self, **change):
+        """The profile as q leaves it: the window's size in it."""
+        with open(self.profile()) as fh:
+            doc = json.load(fh)
+        doc["Profiles"][0].update({"Columns": 132, "Rows": 41}, **change)
+        with open(self.profile(), "w") as fh:
+            json.dump(doc, fh)
+
+    def size(self):
+        with open(self.profile()) as fh:
+            p = json.load(fh)["Profiles"][0]
+        return p.get("Columns"), p.get("Rows")
+
+    def test_a_remembered_size_is_not_a_reason_to_rewrite(self):
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.left_at()
+        self.events.clear()
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.assertEqual([k for k, _ in self.events], [])
+        self.assertEqual(self.size(), (132, 41))
+
+    def test_a_settings_change_keeps_the_size(self):
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.left_at(**{"HotKey Window Floats": True})     # an older ccwho's profile
+        self.events.clear()
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.assertEqual([k for k, _ in self.events], ["write"], "the setting is stale")
+        self.assertEqual(self.size(), (132, 41))
+
+    def test_a_new_key_keeps_the_size(self):
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-w"])
+        self.left_at()
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.assertEqual(self.key_code(), runner.setup.HOTKEYS["option-slash"]["code"])
+        self.assertEqual(self.size(), (132, 41),
+                         "the file goes away for the new key; the size comes back with it")
+
+    def command(self):
+        with open(self.profile()) as fh:
+            return json.load(fh)["Profiles"][0]["Command"]
+
+    def prove(self, works):
+        """install_hotkey with a key press that does (or does not) arrive.
+        Returns its rc and what the proof profile looked like meanwhile."""
+        seen = []
+
+        def press(*a, **k):
+            seen.append((self.command(), self.size()))
+            return works
+        with mock.patch.object(runner.setup, "wait_for_proof", new=press), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = runner.install_hotkey(self.home, "option-slash", prove=True)
+        return rc, seen
+
+    def test_the_proof_and_the_profile_after_it_keep_the_size(self):
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.left_at(**{"HotKey Window Floats": True})
+        rc, seen = self.prove(works=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("--proof", seen[0][0], "that was the proof profile")
+        self.assertEqual(seen[0][1], (132, 41), "the proof window opens at the size too")
+        self.assertNotIn("--proof", self.command())
+        self.assertEqual(self.size(), (132, 41))
+
+    def test_a_proof_that_fails_puts_the_profile_back_with_its_size(self):
+        self.run_setup(["--yes", "--no-list", "--hotkey", "option-slash"])
+        self.left_at(**{"HotKey Window Floats": True})
+        with open(self.profile(), "rb") as fh:
+            before = fh.read()
+        rc, _ = self.prove(works=False)
+        self.assertEqual(rc, 1)
+        with open(self.profile(), "rb") as fh:
+            self.assertEqual(fh.read(), before, "the hotkey was left as it was")
 
 
 

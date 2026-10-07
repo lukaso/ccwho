@@ -444,11 +444,44 @@ def hotkey_window(argv):
     shell prompt afterwards. If the list cannot start, the window would close
     with the reason unread, and iTerm2 would report only "a session ended very
     soon after starting" - which is what it did.
+
+    q ends the window, so the size it had goes into the profile for the next.
     """
     rc = run_ui()
     if rc:
         wait_for_a_key()
+    else:
+        remember_window_size()
     return rc
+
+
+def terminal_size():
+    """(columns, rows) of the terminal this runs in, None when it is not one.
+    The hotkey profile never opens in a tab, so this is the window's size (a
+    pane's, if you split the window)."""
+    try:
+        size = os.get_terminal_size()
+    except (OSError, ValueError):
+        return None
+    return size.columns, size.lines
+
+
+def remember_window_size():
+    """Put the window's size into the hotkey profile - only from the hotkey
+    window: `ccwho hotkey` tried by hand in a tmux pane is another size, and
+    setup keeps whatever size is there. Nothing here may stop q: a profile
+    that cannot be read or written is left as it is."""
+    size = terminal_size()
+    if not size or not setup.in_hotkey_window(os.environ):
+        return
+    path = setup.profile_path(setup_home())
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = setup.with_window_size(fh.read(), *size)
+        if text is not None:
+            write_atomic(path, text)
+    except (OSError, UnicodeDecodeError):
+        pass
 
 
 def run_ui():
@@ -765,8 +798,11 @@ def install_autosave(home):
 def write_atomic(path, text, mode=None):
     """Temp + replace. A crash half way through must not leave half a file, and
     must never lose the one that was there. With `mode`, the temp file has it
-    from the start: a private file is never readable for a moment."""
-    tmp = f"{path}.{os.getpid()}.tmp"
+    from the start: a private file is never readable for a moment. The temp
+    is a dotfile: iTerm2 reads every other file in DynamicProfiles, and a
+    second copy of our profile there stops it on a "same Guid" alert."""
+    folder, name = os.path.split(path)
+    tmp = os.path.join(folder, f".{name}.{os.getpid()}.tmp")
     try:
         if mode is None:
             fh = open(tmp, "w", encoding="utf-8")
@@ -809,6 +845,7 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0, iterm
     if os.path.exists(path):
         with open(path) as fh:
             before = fh.read()
+    size = setup.window_size(before)    # what q left; read before a new key removes it
 
     def key_of(text):
         for p in setup.profiles_in(text):       # any shape: it is iTerm2's folder
@@ -831,8 +868,8 @@ def install_hotkey(home, hotkey, prove=True, iterm_ok=True, deadline=30.0, iterm
         # with our Guid and keep every other one exactly as it was.
         keep = [p for p in setup.profile_entries(before)
                 if not (isinstance(p, dict) and p.get("Guid") == setup.PROFILE_GUID)]
-        write_atomic(path, json.dumps({"Profiles": keep + doc["Profiles"]},
-                                      indent=2))
+        ours = [dict(p, **size) for p in doc["Profiles"]]
+        write_atomic(path, json.dumps({"Profiles": keep + ours}, indent=2))
 
     plain = setup.hotkey_profile(setup.window_command(ccwho_bin()),
                                  hotkey=hotkey)

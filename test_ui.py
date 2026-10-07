@@ -457,6 +457,25 @@ class TestTheCollectorAsksDoctor(unittest.TestCase):
         self.assertEqual(fleet.doctor, "claude: not found")
 
 
+class TestTheListsStopIsACommandCcwhoTakes(unittest.TestCase):
+    """`x` then `s` runs `ccwho stop <id> --yes` as its own process: the rules
+    of every command (COMMAND_TAKES) take that argv as it is (review 1 of the
+    CLI revamp, slice 3a)."""
+
+    def test_its_argv_passes_the_rules(self):
+        import ccwho as runner
+        ran = []
+
+        def run(argv, **k):
+            ran.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(ui.subprocess, "run", side_effect=run):
+            ui.Collector().stop_session({"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef"})
+        argv = ran[0][2:]                         # past the python and ccwho.py
+        self.assertEqual(argv[0], "stop")
+        self.assertEqual(runner.command_args(argv[0], argv[1:]), argv[1:])
+
+
 class TestTheCollectorLooksForSecureInput(unittest.TestCase):
     def fleet_with(self, holder):
         import ccwho_setup as setup

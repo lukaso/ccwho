@@ -693,6 +693,10 @@ ccwho doctor            # is everything ccwho needs in place?
 ccwho setup             # install what it needs, once
 ```
 
+Every command takes `--help` (or `-h`): it prints that command's usage and runs
+nothing. An option or word a command does not take is refused (exit 2), never
+ignored. `--flag=value` is `--flag value`, and `-y` is `--yes`.
+
 ## Columns
 
 | Column | Where it comes from |

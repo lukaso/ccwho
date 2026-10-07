@@ -4141,6 +4141,84 @@ def restore(argv):
     return 0
 
 
+# What each command takes, in one place, so every command keeps the same rules
+# (the owner's CLI revamp, 2026-10-06): --help or -h prints its usage, exit 0,
+# and runs nothing; an unknown flag, a stray word, or a flag without its value
+# exits 2 and runs nothing; --x=v is --x v; -y is --yes wherever --yes is.
+# (flags, flags that take a value, words: None any, n exactly n; usage)
+CLEAN_USAGE = "usage: ccwho clean [--mine] [--dry-run] [--yes] [--force]"
+COMMAND_TAKES = {
+    "ls": (LS_FLAGS, (), None, LS_USAGE),
+    "show": (("--all", "--json"), (), None,
+             "usage: ccwho show <session> [--all] [--json]   what that session was working on"),
+    "open": ((), (), None, OPEN_USAGE),
+    "restore": (("--open", "--check", "--list", "--no-color", "--no-links"), ("--from",), 0,
+                "usage: ccwho restore [--open | --check | --list] [--from PATH] [--no-color] [--no-links]"),
+    "ps": (("--helpers", "--json", "--full"), ("--port",), 0, PS_USAGE),
+    "kill": (("--pid",) + KILL_FLAGS, (), 1, KILL_USAGE.splitlines()[0]),
+    "clean": (("--mine",) + KILL_FLAGS, (), 0, CLEAN_USAGE),
+    "stop": (STOP_FLAGS, (), 1, STOP_USAGE),
+    "usage": (("--json",), (), None,
+              "usage: ccwho usage [--json]          subscription usage, per account\n"
+              "       ccwho usage name <id> <label>  a display name for an account"),
+    "doctor": (("--json",), (), 0, "usage: ccwho doctor [--json]   is everything ccwho needs in place?"),
+    "setup": (("--yes", "--no-hotkey", "--no-list", "--usage", "--no-usage"), ("--hotkey", "--proof"), 0,
+              "usage: ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list] [--usage | --no-usage]\n"
+              "       KEY: one of " + ", ".join(
+                  f"{k} (the default)" if k == setup.DEFAULT_HOTKEY else k for k in setup.HOTKEYS)),
+    # --out: where a test writes its manifest
+    "save": ((), ("--out",), 0, "usage: ccwho save   record the live fleet (launchd runs it every 15 minutes)"),
+    "statusline": ((), (), 0, "usage: ccwho statusline   Claude Code's statusLine command: its JSON on stdin"),
+    "hotkey": ((), (), 0, "usage: ccwho hotkey   the live list, as the iTerm2 hotkey window starts it"),
+    "url": ((), (), 1, "usage: ccwho url <ccwho://...>   what the clickable links call"),
+}
+
+
+def command_args(cmd, argv):
+    """`argv` as `cmd` reads it - --x=v as --x v, -y as --yes - or the exit
+    code when it is not to run: 0 after its usage (--help), 2 after why."""
+    flags, values, count, usage_ = COMMAND_TAKES[cmd]
+
+    def refuse(why):
+        print(f"ccwho {cmd}: {why}", file=sys.stderr)
+        print(usage_, file=sys.stderr)
+        return 2
+    if "--help" in argv or "-h" in argv:
+        print(usage_)
+        return 0
+    out, words, i = [], [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-y" and "--yes" in flags:
+            a = "--yes"
+        name, eq, value = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in values:
+            if not eq:
+                if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                    return refuse(f"{name} needs a value")
+                i, value = i + 1, argv[i + 1]
+            if not value:
+                return refuse(f"{name} needs a value")          # --from= is no file
+            out += [name, value]
+        elif a.startswith("-"):
+            if a not in flags:
+                return refuse(f"unknown option {a}")
+            out.append(a)
+        else:
+            words.append(a)
+            out.append(a)
+        i += 1
+    if cmd == "usage" and words:
+        if words[0] != "name":
+            return refuse(f"unexpected word {words[0]!r}")
+        if len(words) != 3 or len(out) != 3:
+            return refuse("name takes an id and a label, and no option:"
+                          " ccwho usage name <id> <label>")
+    if count is not None and len(words) > count:
+        return refuse(f"unexpected word {words[count]!r}")
+    return out
+
+
 def _arg(argv, flag, default):
     if flag in argv:
         i = argv.index(flag)
@@ -4173,6 +4251,11 @@ def main(argv=None):
     # is `ccwho ls` - the table scripts and agents read.
     if not argv and sys.stdout.isatty():
         return run_ui()
+    if argv and argv[0] in COMMAND_TAKES:
+        args = command_args(argv[0], argv[1:])
+        if isinstance(args, int):
+            return args                     # its usage (--help), or why it does not run
+        argv = [argv[0]] + args
     if argv and argv[0] == "kill":
         return kill_cli(argv[1:])
     if argv and argv[0] == "clean":
@@ -4238,6 +4321,9 @@ def main(argv=None):
         print("                                                  an ended one. <session>: its id, name, tty,")
         print("                                                  pid, or words of its title")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
+        print("\nEvery command: --help (or -h) prints its usage and runs nothing; an")
+        print("unknown option or word is refused (exit 2); --flag=value is --flag value;")
+        print("-y is --yes.")
         print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
         print("       ↓ on pace, ↑ faster than time passes; ↻ when it resets")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")
@@ -4245,7 +4331,8 @@ def main(argv=None):
         print("its window is gone, and focuses it if it is still up.")
         print("`ccwho setup` registers the ccwho:// scheme; --no-links opts out.")
         return 0
-    return ls(argv)
+    args = command_args("ls", argv)          # `ccwho` with options, or piped, is `ccwho ls`
+    return args if isinstance(args, int) else ls(args)
 
 
 def _exit(rc):

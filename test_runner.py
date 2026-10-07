@@ -8353,6 +8353,184 @@ class TestTheOneTable(unittest.TestCase):
         self.assertEqual(calls, [["--json"]])
 
 
+class TestEveryCommandKeepsTheSameRules(unittest.TestCase):
+    """The rules of the CLI revamp (owner, 2026-10-06), for every command:
+    --help (or -h) prints that command's usage, exit 0, and runs nothing; an
+    unknown flag, a stray word, or a flag without its value exits 2 and runs
+    nothing; --x=v is --x v; -y is --yes where --yes is. Whatever would reach
+    the machine is a tripwire here: a red run records, never runs."""
+
+    COMMANDS = ("ls", "show", "open", "restore", "ps", "kill", "clean", "stop", "usage",
+                "doctor", "setup", "save", "statusline", "hotkey", "url")
+    NO_WORDS = ("restore", "ps", "clean", "doctor", "setup", "save", "statusline", "hotkey")
+    ONE_WORD = {"kill": "1234", "stop": "liveapp-b2", "url": "ccwho://jump/s032"}
+
+    def setUp(self):
+        self.reached = []
+
+        def trip(name):
+            def tripped(*a, **k):
+                self.reached.append(name)
+                raise AssertionError(f"{name} ran")
+            return tripped
+        for owner, name in ((runner, "scan"), (runner, "run_ui"), (runner.setup, "gather"),
+                            (runner.subprocess, "run"), (runner.os, "kill"),
+                            (runner, "matches"), (runner, "known_entries")):
+            self.addCleanup(setattr, owner, name, getattr(owner, name))
+            setattr(owner, name, trip(f"{owner.__name__}.{name}"))
+        self.addCleanup(setattr, sys, "stdin", sys.stdin)
+        sys.stdin = io.StringIO("")
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = runner.main(list(argv))
+        except AssertionError as ex:
+            rc = f"raised: {ex}"
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_help_prints_the_usage_and_runs_nothing(self):
+        for cmd in self.COMMANDS:
+            for flag in ("--help", "-h"):
+                with self.subTest(cmd=cmd, flag=flag):
+                    self.reached = []
+                    rc, out, err = self.main(cmd, flag)
+                    self.assertEqual((rc, self.reached, err), (0, [], ""), out)
+                    self.assertTrue(out.startswith(f"usage: ccwho {cmd}"), out)
+
+    def test_help_among_other_words_still_runs_nothing(self):
+        rc, out, err = self.main("kill", "1234", "--yes", "--help")
+        self.assertEqual((rc, self.reached), (0, []))
+        self.assertTrue(out.startswith("usage: ccwho kill"), out)
+
+    def test_an_unknown_flag_is_refused(self):
+        for cmd in self.COMMANDS:
+            with self.subTest(cmd=cmd):
+                self.reached = []
+                rc, out, err = self.main(cmd, "--frobnicate")
+                self.assertEqual((rc, self.reached), (2, []), err)
+                self.assertTrue(err.startswith(f"ccwho {cmd}: unknown option --frobnicate"), err)
+                self.assertIn(f"usage: ccwho {cmd}", err)
+
+    def test_bare_ccwho_with_options_keeps_the_rules_of_ls(self):
+        # it is `ccwho ls` (with options, or piped)
+        rc, out, err = self.main("--frobnicate")
+        self.assertEqual((rc, self.reached), (2, []), err)
+        self.assertTrue(err.startswith("ccwho ls: unknown option --frobnicate"), err)
+
+    def test_a_stray_word_is_refused(self):
+        cases = [(cmd, [cmd, "stray"]) for cmd in self.NO_WORDS]
+        cases += [(cmd, [cmd, word, "stray"]) for cmd, word in self.ONE_WORD.items()]
+        cases += [("usage", ["usage", "stray"])]
+        for cmd, argv in cases:
+            with self.subTest(argv=argv):
+                self.reached = []
+                rc, out, err = self.main(*argv)
+                self.assertEqual((rc, self.reached), (2, []), err)
+                self.assertTrue(err.startswith(f"ccwho {cmd}: "), err)
+                self.assertIn("'stray'", err)
+
+    def test_a_flag_without_its_value_is_refused(self):
+        for argv in (["ps", "--port"], ["restore", "--from"], ["setup", "--hotkey"]):
+            with self.subTest(argv=argv):
+                self.reached = []
+                rc, out, err = self.main(*argv)
+                self.assertEqual((rc, self.reached), (2, []), err)
+                self.assertIn(f"{argv[1]} needs a value", err)
+
+    def test_a_value_after_an_equals_sign(self):
+        self.assertEqual(runner.command_args("restore", ["--from=/x/m.json", "--check"]),
+                         ["--from", "/x/m.json", "--check"])
+        self.assertEqual(runner.command_args("setup", ["--hotkey=cmd+opt+space"]),
+                         ["--hotkey", "cmd+opt+space"])
+        self.assertEqual(runner.command_args("ps", ["--port", "3000"]), ["--port", "3000"])
+
+    def test_what_its_callers_run_is_taken(self):
+        # built by the code that writes it (review 1 of the CLI revamp, slice
+        # 3a): the hotkey profile's proof and window, Claude Code's statusLine,
+        # the launchd job
+        import shlex
+        for line in (runner.setup.proof_command("/x/ccwho", "0a1b2c3d4e5f"),
+                     runner.setup.window_command("/x/ccwho"),
+                     runner.setup.statusline_command("/x/ccwho")):
+            argv = shlex.split(line)[1:]
+            with self.subTest(line=line):
+                self.assertEqual(runner.command_args(argv[0], argv[1:]), argv[1:])
+        path = os.path.join(os.path.dirname(os.path.abspath(runner.__file__)),
+                            runner.setup.PLIST_TEMPLATE_NAME)
+        with open(path) as fh:
+            text = fh.read()
+        program = text[text.index("<key>ProgramArguments</key>"):]
+        words = re.findall(r"<string>([^<]*)</string>", program[:program.index("</array>")])
+        argv = words[words.index("{{CCWHO}}") + 1:]
+        self.assertEqual(runner.command_args(argv[0], argv[1:]), argv[1:])
+
+    def test_every_option_its_usage_names_is_taken(self):
+        # read from the usage line: `--from PATH` takes a value, `--json` none
+        words = {"kill": ["1234"], "stop": ["x"], "url": ["ccwho://jump/s032"]}
+        read = {(cmd, flag, bool(value)) for cmd, (_f, _v, _c, usage_) in runner.COMMAND_TAKES.items()
+                for flag, value in re.findall(r"(--[a-z][a-z-]*)( [A-Z]+)?", usage_)}
+        # control: the reading finds a value flag and a plain one (review 2 of
+        # the CLI revamp, slice 3a)
+        self.assertLessEqual({("restore", "--from", True), ("ps", "--port", True),
+                              ("setup", "--hotkey", True), ("ls", "--json", False)}, read)
+        for cmd, flag, value in sorted(read):                 # the very reading the control checked
+            argv = [flag] + (["v"] if value else []) + words.get(cmd, [])
+            with self.subTest(cmd=cmd, flag=flag):
+                self.assertEqual(runner.command_args(cmd, argv), argv)
+
+    def test_setup_s_usage_names_its_keys(self):
+        # every key it takes, and which is the default - not "if none is
+        # given": --hotkey without a key is refused (review 2 of the CLI
+        # revamp, slice 3a)
+        usage_ = runner.COMMAND_TAKES["setup"][3]
+        for key in runner.setup.HOTKEYS:
+            self.assertIn(key, usage_)
+        self.assertIn(f"{runner.setup.DEFAULT_HOTKEY} (the default)", usage_)
+        self.assertEqual(usage_.count("(the default)"), 1, "one key is the default")
+        self.assertNotIn("if none is given", usage_)
+
+    def test_the_options_no_usage_names_are_taken(self):
+        # setup --proof: the hotkey window's proof; save --out: a test's manifest
+        for cmd, argv in (("setup", ["--proof", "0a1b2c3d4e5f"]), ("save", ["--out", "/x/m.json"])):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(runner.command_args(cmd, argv), argv)
+
+    def test_words_where_any_are_taken(self):
+        for cmd in ("ls", "show", "open"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(runner.command_args(cmd, ["w1", "w2"]), ["w1", "w2"])
+
+    def test_an_empty_value_is_no_value(self):
+        # `ccwho restore --from "$M" --open` with $M empty must not reopen the
+        # newest manifest (review 1 of the CLI revamp, slice 3a)
+        for argv in (["restore", "--from="], ["restore", "--from", ""], ["ps", "--port="]):
+            with self.subTest(argv=argv):
+                rc, out, err = self.main(*argv)
+                self.assertEqual((rc, self.reached), (2, []), err)
+                self.assertIn(f"{argv[1].rstrip('=')} needs a value", err)
+
+    def test_usage_name_needs_its_id_and_label_and_nothing_else(self):
+        for argv in (["usage", "name"], ["usage", "name", "abc"],
+                     ["usage", "--json", "name", "abc", "work"]):
+            with self.subTest(argv=argv):
+                rc, out, err = self.main(*argv)
+                self.assertEqual(rc, 2, err)
+                self.assertIn("ccwho usage name <id> <label>", err)
+                self.assertNotIn("unexpected word", err)
+
+    def test_y_is_yes_where_yes_is(self):
+        for cmd, argv in (("kill", ["-y", "1234"]), ("clean", ["-y"]), ("stop", ["x", "-y"]),
+                          ("setup", ["-y"])):
+            with self.subTest(cmd=cmd):
+                self.assertIn("--yes", runner.command_args(cmd, argv))
+                self.assertNotIn("-y", runner.command_args(cmd, argv))
+        rc, out, err = self.main("ls", "-y")                       # control: no --yes there
+        self.assertEqual(rc, 2, err)
+        self.assertIn("unknown option -y", err)
+
+
 class TestTheTableLetsGoOfWhatItSeesRunning(unittest.TestCase):
     """`ccwho ls` scans like any other: what it sees running lets go of its
     launch claim."""
@@ -13804,12 +13982,14 @@ class TestACtrlCSaysWhatItStopped(unittest.TestCase):
         self.assertIn("nothing was sent", said)
 
     def test_open_and_restore_go_through_it(self):
-        for name, attr in (("open", "open_session"), ("restore", "restore")):
+        # restore takes no word (a stray one is refused before it runs)
+        for argv, attr in ((["open", "x"], "open_session"), (["restore"], "restore")):
+            name = argv[0]
             with self.subTest(name=name):
                 with mock.patch.object(runner, attr, side_effect=KeyboardInterrupt):
                     with contextlib.redirect_stderr(io.StringIO()):
                         try:
-                            rc = runner.main([name, "x"])
+                            rc = runner.main(argv)
                         except KeyboardInterrupt:
                             self.fail(f"{name}: a Ctrl-C left main - a traceback")
                 self.assertEqual(rc, 130)

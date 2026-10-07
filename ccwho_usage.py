@@ -879,15 +879,15 @@ def append_shown(path, records, last, now=None, keep=5000):
     """Append what changed; keep the file bounded. Returns the new key. A write
     that fails is dropped: this log must never cost the list anything.
 
-    The last key is kept beside the log, so the list, --watch and `ccwho ls`
+    The last key is kept beside the log, so the list and `ccwho ls`
     (separate processes) do not each write the same lines. Appending never
     reads the log; only a log past its size bound is read, once, to trim it."""
     key = json.dumps([{k: v for k, v in r.items() if k != "age"} for r in records],
                      sort_keys=True)
     if not records:
         return key
-    # the file, not this process's memory: the list and --watch each run for
-    # hours, and a change one of them logged is not news to the other
+    # the file, not this process's memory: a list runs for hours, and a
+    # change another list or `ccwho ls` logged is not news to it
     try:
         with open(path + ".key", encoding="utf-8") as fh:
             last = fh.read()

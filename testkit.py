@@ -32,7 +32,7 @@ def pin_ccwho_dir(runner):
 
 
 def pin_codex_home():
-    """Point CODEX_HOME at an empty temp dir for the module. `ccwho accounts`
+    """Point CODEX_HOME at an empty temp dir for the module. `ccwho usage`
     reads Codex's transcripts (D20): a test that set no CODEX_HOME read the
     user's own ~/.codex (2026-10-01). One the shell exported is put back after.
     Returns the undo, for tearDownModule."""

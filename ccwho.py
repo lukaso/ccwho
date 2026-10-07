@@ -5,8 +5,8 @@ On a terminal, `ccwho` with no arguments opens the live list. With options, or
 piped, it prints the table (--json: the rows as JSON).
 """
 # The runner and the commands. The rules live in ccwho_engine.py and the modules
-# it imports, reloaded on every tick of --watch and of the live list, so you can
-# edit them while a watch runs and the next tick picks them up without a restart.
+# it imports, reloaded on every tick of the live list, so you can edit them while
+# the list is open and the next tick picks them up without a restart.
 # Same model as network_check_ruby: thin loop, hot-reloaded engine, state carried
 # between iterations rather than held inside the engine. --help prints the
 # docstring above.
@@ -28,7 +28,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 import uuid
 
 import ccwho_engine as engine
@@ -36,88 +35,7 @@ import ccwho_index as index
 import ccwho_setup as setup
 import ccwho_usage as usage
 
-CLEAR_HOME = "\033[H\033[2J"
-DIM, RESET, RED = "\033[2m", "\033[0m", "\033[31m"
-AMBER = "\033[33;1m"
-
-
-def reload_engine(state):
-    """Re-read the engine. A broken edit keeps the last good module and says so.
-
-    engine.reload_all does the work - the rule modules first, in the order of
-    engine.RELOAD_FIRST - and is shared with the list, so the two cannot drift.
-    What stays here is the runner's own handle on the index, rebound below.
-    """
-    try:
-        engine.reload_all(engine)
-        # and rebind OUR handles: sys.modules is what the next import sees, but
-        # this module's globals still point at the objects loaded at startup
-        globals()["index"] = sys.modules[index.__name__]
-        globals()["usage"] = sys.modules[usage.__name__]
-        state["engine_error"] = ""
-    except Exception:
-        state["engine_error"] = traceback.format_exc(limit=2).strip().splitlines()[-1]
-    return engine
-
-
-def tick(state, argv, color):
-    eng = reload_engine(state) if state["watch"] else engine
-    rows, fleet = scan(cache=state.setdefault("cache", {}), eng=eng)
-    fleet = with_usage(rows, fleet)
-    if "--blocked" in argv:
-        rows = eng.only_blocked(rows)
-    out = eng.render(rows, fleet, color=color,
-                     show_prompt="--prompt" in argv or "-p" in argv,
-                     links=state.get("links", False))
-    state["ticks"] += 1
-    return out, rows
-
-
-WATCH_FLAGS = ("--watch", "-w")
-KNOWN_FLAGS = {"--watch", "-w", "--blocked", "--prompt", "-p", "--json",
-               "--no-color", "--no-links", "--help", "-h"}
-MIN_INTERVAL = 1.0
-
-
-def watch_requested(argv):
-    return any(a in WATCH_FLAGS or a.startswith("--watch=") for a in argv)
-
-
-def parse_interval(argv, default=5.0):
-    """Accepts --watch N, --watch=N and -w N. A missing or unparseable value is
-    the default, never a silent no-op."""
-    for i, a in enumerate(argv):
-        if a.startswith("--watch="):
-            raw = a.split("=", 1)[1]
-        elif a in WATCH_FLAGS and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-            raw = argv[i + 1]
-        else:
-            continue
-        try:
-            return max(MIN_INTERVAL, float(raw.rstrip("s")))
-        except ValueError:
-            return default
-    return default
-
-
-def unknown_flags(argv):
-    """Anything dash-prefixed we do not recognise. Silently ignoring a flag is how
-    `--watch=3` used to run one-shot and look like a broken loop."""
-    bad, skip = [], False
-    for i, a in enumerate(argv):
-        if skip:
-            skip = False
-            continue
-        if not a.startswith("-"):
-            continue
-        if a.startswith("--watch="):
-            continue
-        if a in KNOWN_FLAGS:
-            if a in WATCH_FLAGS and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                skip = True
-            continue
-        bad.append(a)
-    return bad
+DIM, RESET = "\033[2m", "\033[0m"
 
 
 # Things you asked for (jump, open, restore) go straight to the terminal app -
@@ -404,7 +322,7 @@ def scan(cache=None, status=None, eng=None, session_apps=True):
     scan STARTED: a claim made while `claude agents` was being read may be a
     new launch of a session that has ended since. That moment is
     status["seen_at"]: what a caller decides from these rows, it decided then.
-    `eng` is the engine to scan with - the watch loop's reloaded one.
+    `eng` is the engine to scan with (a test's stand-in; ccwho's own by default).
     `session_apps`: engine.collect's."""
     eng = engine if eng is None else eng
     seen_at, seen_mono = time.time(), _mono()
@@ -487,8 +405,6 @@ def show(argv):
         for line in engine.pick_lines(hits):
             print(f"  {line}", file=sys.stderr)
         return 2
-    if not hits:
-        return 1
     row = hits[0]
     head, tail, _mtime = engine.read_windows(row.get("sessionId", ""), cache=cache)
     b = engine.brief.build(head, tail, session=row,
@@ -1014,23 +930,53 @@ def matches(query, rows, everything=False):
     return hits, ended
 
 
+LS_FLAGS = ("--all", "--needs-you", "--json", "--no-color", "--no-links")
+LS_USAGE = "usage: ccwho ls [words] [--all] [--needs-you] [--json] [--no-color] [--no-links]"
+
+
 def ls(argv):
-    """The table. With words, the sessions that match - including ended ones."""
+    """The table - the only one: `ccwho` with options, or piped, is this. With
+    words, the sessions that match - including ended ones. --needs-you: the
+    sessions the live list puts on top (engine.needs_you; like the table, Claude
+    Code sessions only - no Codex thread). --json: the rows, for a script or an
+    agent; with words, the ended ones too, marked "ended"."""
+    bad = [a for a in argv if a.startswith("-") and a not in LS_FLAGS]
+    if bad:
+        print(f"ccwho ls: unknown option(s): {' '.join(bad)}", file=sys.stderr)
+        print(LS_USAGE, file=sys.stderr)
+        return 2
     query = " ".join(a for a in argv if not a.startswith("-"))
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
+    # links on a terminal unless refused: one that cannot render OSC 8 shows
+    # the label anyway, so the downside is nil
+    links = sys.stdout.isatty() and "--no-links" not in argv
     rows, fleet = scan(cache={})
-    if not query:
-        sys.stdout.write(engine.render(rows, with_usage(rows, fleet), color=color))
-        return 0
-    live, ended = matches(query, rows, everything="--all" in argv)
-    if not live and not ended:
-        print(f"ccwho: no session matches {query!r}", file=sys.stderr)
+    needs_you = "--needs-you" in argv
+    # words first, over every row: the index tells a running session from an
+    # ended one by the rows it is given
+    live, ended = matches(query, rows, everything="--all" in argv) if query else (rows, [])
+    if query and not live and not ended:
+        print(f"ccwho ls: no session matches {query!r}", file=sys.stderr)
         return 1
-    if live:
-        # the fleet too: without it the filtered table lost its ports, and now
-        # its usage and account tags
-        sys.stdout.write(engine.render(live, with_usage(live, fleet, record=False),
-                                       color=color))
+    running = len(live)
+    if needs_you:
+        live, ended = engine.needs_you(live), []     # an ended session needs nothing of you
+    if "--json" in argv:
+        print(json.dumps(list(live) + [dict(e, ended=True) for e in ended], indent=2))
+        return 0
+    if needs_you and not live and (query or running):
+        # not "no sessions found", nor "no session matches": an agent that
+        # polls this would read that nothing runs
+        # and "Claude Code": a Codex thread can be asking in the list
+        print(f"no {'matching ' if query else ''}Claude Code session needs you"
+              f" ({running} running)")
+        return 0
+    if live or not query:
+        # the fleet too: without it the table lost its ports, its usage and its
+        # account tags. A part of the table (words, --needs-you) records no usage
+        sys.stdout.write(engine.render(live, with_usage(live, fleet,
+                                                        record=not query and not needs_you),
+                                       color=color, links=links))
     if ended:
         print(f"\n{DIM if color else ''}ended sessions{RESET if color else ''}")
         for r in ended[:10]:
@@ -1068,22 +1014,36 @@ def doctor(argv):
     return rc
 
 
-# Drift happens over weeks, not seconds, and each check is a subprocess. A watch
-# that re-ran them every tick would spend more time diagnosing than listing.
+# Drift happens over weeks, not seconds, and each check is a subprocess. A list
+# that re-ran them every scan would spend more time diagnosing than listing.
 DOCTOR_TTL = 300.0
+# Not on the list's line: iTerm2's own Claude Code hook is not ccwho's, and
+# ccwho does not depend on it (setup.cc_status_hook). Without iTerm2's
+# integration it would be the line for good, over every fault after it.
+# `ccwho doctor` still names it.
+LIST_LEAVES_OUT = ("iTerm2 status hook",)
 
 
 def doctor_banner_cached(state, now=None):
-    """One line for the watch header when something drifted, at most every
+    """One line for the live list's warning line when something drifted, at most every
     DOCTOR_TTL. Empty when everything ccwho needs is in place. A line may lag
-    by up to DOCTOR_TTL - a prompt answered, a permission given: the next
-    look says so."""
+    by up to DOCTOR_TTL - a prompt answered, a permission given: the next look
+    says so."""
     now = time.time() if now is None else now
     ts, line = state.get("_doctor", (None, ""))
-    if ts is None or now - ts >= DOCTOR_TTL:
-        facts = setup.gather(ccwho_dir=ccwho_dir())
+    # a clock set back makes the last look "later than now": look again
+    if ts is None or not 0 <= now - ts < DOCTOR_TTL:
+        # taken before the checks run: checks that fail are not run again on
+        # every scan, and the last answer stands until they are
+        state["_doctor"] = (now, line)
+        # no probe that shows a macOS dialog: nobody asked the list for one
+        facts = setup.gather(ccwho_dir=ccwho_dir(), prompts=False)
+        # nor Secure Input: the list reads it on every scan (its own line), and
+        # this copy would say it twice, and up to DOCTOR_TTL after it was let go
+        facts["secure_input"] = None
         facts.update(usage_facts(now))
-        line = setup.doctor_banner(setup.doctor_checks(facts))
+        line = setup.doctor_banner([c for c in setup.doctor_checks(facts)
+                                    if c["name"] not in LIST_LEAVES_OUT])
         state["_doctor"] = (now, line)
     return line
 
@@ -2374,39 +2334,8 @@ def url(argv):
     return 1
 
 
-def parse_age(text, default=3600):
-    """--older-than 90m / 2h / 3d / 600 (seconds)."""
-    t = (text or "").strip().lower()
-    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    if t and t[-1] in mult:
-        try:
-            return int(float(t[:-1]) * mult[t[-1]])
-        except ValueError:
-            return default
-    try:
-        return int(t)
-    except ValueError:
-        return default
-
-
-VALUE_FLAGS = ("--older-than",)
-
-
-def positional(argv, value_flags, default):
-    """First real positional. A flag's VALUE is not one - taking it as the pattern
-    is how `reap --older-than 1h` came to match PeopleViewService."""
-    skip = False
-    for a in argv:
-        if skip:
-            skip = False
-            continue
-        if a in value_flags:
-            skip = True
-            continue
-        if a.startswith("-"):
-            continue
-        return a
-    return default
+PS_FLAGS = ("--port", "--helpers", "--json", "--full")
+PS_USAGE = "usage: ccwho ps [--port N] [--helpers] [--json] [--full]"
 
 
 def ps(argv):
@@ -2414,8 +2343,14 @@ def ps(argv):
 
     The plain view of what the list shows - for a terminal, a script, or an
     agent told to clean up after itself (--json). Helpers (MCP servers and the
-    like) only with --all; `--port N` answers "who holds :N".
+    like) only with --helpers; `--port N` answers "who holds :N".
     """
+    bad = [a for a in argv if a.startswith("-") and a not in PS_FLAGS
+           and not a.startswith("--port=")]
+    if bad:
+        print(f"ccwho ps: unknown option(s): {' '.join(bad)}", file=sys.stderr)
+        print(PS_USAGE, file=sys.stderr)
+        return 2
     port = None
     given = [a for a in argv if a.startswith("--port=")]
     if "--port" in argv or given:
@@ -2436,7 +2371,7 @@ def ps(argv):
               file=sys.stderr)
         return 3
     # a port question asks about every holder, helpers included
-    listed = engine.ps_listing(rows, fleet, show_all="--all" in argv or port is not None)
+    listed = engine.ps_listing(rows, fleet, show_all="--helpers" in argv or port is not None)
     known = fleet.get("ports_ok", True)
     if port is not None:
         if not known:
@@ -2891,48 +2826,15 @@ def stop_cli(argv, seams=None):
     return 1 if refused else 0
 
 
-def reap(argv):
-    """Kill leaked helper processes older than a threshold. Dry run by default."""
-    pattern = positional(argv, VALUE_FLAGS, "liveapp-pty-guards")
-    age = parse_age(_arg(argv, "--older-than", "1h"))
-    ps = engine.ps_snapshot_elapsed()
-    hits = engine.reap_candidates(ps, pattern, min_age=age)
-    if not hits:
-        print(f"nothing matching {pattern!r} older than {age}s")
-        return 0
-    roots = [h for h in hits if h["ppid"] == 1]
-    print(f"{len(hits)} processes match {pattern!r} and are older than {age}s "
-          f"({len(roots)} orphaned roots)")
-    for h in sorted(hits, key=lambda x: -x["age"])[:5]:
-        # a command line can carry a token; this output reaches agents too
-        print(f"  {h['pid']:<8} {h['age'] // 3600}h  "
-              f"{engine.procs.safe_command(h['command'])[:88]}")
-    if len(hits) > 5:
-        print(f"  ... and {len(hits) - 5} more")
-    if "--kill" not in argv:
-        print("\ndry run. add --kill to actually terminate them.")
-        return 0
-    killed = 0
-    for h in sorted(hits, key=lambda x: x["ppid"] != 1):   # orphan roots first
-        try:
-            os.kill(h["pid"], signal.SIGTERM)
-            killed += 1
-        except (ProcessLookupError, PermissionError):
-            pass
-    print(f"sent SIGTERM to {killed} processes")
-    return 0
-
-
-AUTOSAVE_SECS = float(os.environ.get("CCWHO_AUTOSAVE", "300"))
 KEEP_MANIFESTS = 20
 
 
 def should_autosave(last, now, interval):
-    """True when a watch should refresh the restore manifest.
+    """True when a periodic job is due (the autosave log's daily trim).
 
-    Fires on the FIRST tick (last is None) so a watch is useful straight away, and
-    treats a backwards clock as due rather than never-due: an ntp step must not
-    wedge the one file that makes an unplanned reboot survivable.
+    Fires the first time (last is None), and treats a backwards clock as due
+    rather than never-due: an ntp step must not wedge the one file that makes an
+    unplanned reboot survivable.
     """
     if not interval or interval <= 0:
         return False
@@ -2996,9 +2898,9 @@ def statusline_claude(env):
 
 def statusline(argv):
     """Claude Code runs this in every session, on every status update, with the
-    session's JSON on stdin. It records the usage it is handed and prints
-    nothing. Whatever arrives, it exits 0: a statusLine that errors is noise in
-    every session the user has open."""
+    session's JSON on stdin. It records the usage it is handed and prints the
+    session's status line. Whatever arrives, it exits 0: a statusLine that
+    errors is noise in every session the user has open."""
     try:
         payload = json.loads(sys.stdin.read() or "null")
         sid = payload.get("session_id") if isinstance(payload, dict) else None
@@ -3140,18 +3042,18 @@ def accounts(argv):
         pass
     if argv and argv[0] == "name":
         if len(argv) != 3:
-            print("usage: ccwho accounts name <id> <label>", file=sys.stderr)
+            print("usage: ccwho usage name <id> <label>", file=sys.stderr)
             return 2
         if ":" in argv[2]:
             # "work:home" reads as the brand "work" where a narrow line drops
             # the brand ("ant:work" -> "work")
-            print("ccwho accounts: a label cannot hold ':' - it reads as a brand",
+            print("ccwho usage: a label cannot hold ':' - it reads as a brand",
                   file=sys.stderr)
             return 2
         aid = usage.resolve_id(argv[1], [r["id"] for r in rows])
         if not aid:
-            print(f"ccwho accounts: no single account matches {argv[1]!r}"
-                  " - `ccwho accounts --json` lists the ids", file=sys.stderr)
+            print(f"ccwho usage: no single account matches {argv[1]!r}"
+                  " - `ccwho usage --json` lists the ids", file=sys.stderr)
             return 2
         labels = read_labels()
         labels[aid] = argv[2]
@@ -4147,15 +4049,12 @@ def _interruptible(command, args):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    # Bare `ccwho` on a terminal is the live list. Piped, redirected, or under
-    # launchd it is the one-shot table, which is what scripts and the autosave
-    # job read - and `ls` asks for the table by name.
+    # Bare `ccwho` on a terminal is the live list. With options, or piped, it
+    # is `ccwho ls` - the table scripts and agents read.
     if not argv and sys.stdout.isatty():
         return run_ui()
     if argv and argv[0] == "jump":
         return jump(argv[1:])
-    if argv and argv[0] == "reap":
-        return reap(argv[1:])
     if argv and argv[0] == "kill":
         return kill_cli(argv[1:])
     if argv and argv[0] == "clean":
@@ -4174,7 +4073,7 @@ def main(argv=None):
         return ps(argv[1:])
     if argv and argv[0] == "statusline":
         return statusline(argv[1:])
-    if argv and argv[0] == "accounts":
+    if argv and argv[0] == "usage":
         return accounts(argv[1:])
     if argv and argv[0] == "doctor":
         return doctor(argv[1:])
@@ -4188,24 +4087,31 @@ def main(argv=None):
         return _interruptible(open_session, argv[1:])
     if argv and argv[0] == "url":
         return url(argv[1:])
+    if argv and not argv[0].startswith("-"):
+        # a word is no search: a mistyped or removed command must not run as one
+        print(f"ccwho: unknown command {argv[0]!r} - `ccwho --help` lists them",
+              file=sys.stderr)
+        return 2
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
-        print("\nusage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]")
+        print("\nusage: ccwho                                      the live list (on a terminal)")
         print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2, Terminal.app)")
         print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
         print("       ccwho restore [--open] [--from PATH]       list it back / reopen them, in their old panes")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
-        print("       ccwho ls [words] [--all]                   the table, or every session matching")
-        print("                                                  (--all includes sessions a program started)")
+        print("       ccwho ls [words] [--all] [--needs-you] [--json]  the table, or every session matching;")
+        print("                                                  `ccwho` with options, or piped, is this")
+        print("                                                  (--all: sessions a program started too;")
+        print("                                                  --needs-you: the sessions the list puts on top;")
+        print("                                                  Claude Code sessions only, no Codex thread)")
         print("       ccwho show <anything> [--all] [--json]     what that session was working on")
-        print("       ccwho ps [--port N] [--all] [--json] [--full]  what agents started, and their ports")
+        print("       ccwho ps [--port N] [--helpers] [--json] [--full]  what agents started, and their ports")
         print("       ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
         print("       ccwho stop <session> [--and-procs] [--dry-run] [--yes]  stop a background session (its conversation is kept) - asks")
         print("       ccwho clean [--mine] [--dry-run] [--yes] [--force]      kill what ended sessions left - lists, then asks")
-        print("       ccwho reap [pattern] [--older-than 1h] [--kill]  leaked helpers, dry run unless --kill")
-        print("       ccwho accounts [--json]                    subscription usage, per account")
-        print("       ccwho accounts name <id> <label>           a display name for an account")
+        print("       ccwho usage [--json]                       subscription usage, per account")
+        print("       ccwho usage name <id> <label>              a display name for an account")
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]  install what ccwho needs, once")
@@ -4219,64 +4125,7 @@ def main(argv=None):
         print("its window is gone, and focuses it if it is still up.")
         print("`ccwho setup` registers the ccwho:// scheme; --no-links opts out.")
         return 0
-
-    bad = unknown_flags(argv)
-    if bad:
-        print(f"ccwho: unknown option(s): {' '.join(bad)}", file=sys.stderr)
-        print("usage: ccwho [--watch [secs]] [--blocked] [--prompt] [--json] [--no-color]",
-              file=sys.stderr)
-        return 2
-
-    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    # Links are on for a terminal unless refused: a terminal that cannot render
-    # OSC 8 shows the label anyway, so the downside is nil.
-    links = sys.stdout.isatty() and "--no-links" not in argv
-    state = {"ticks": 0, "engine_error": "", "watch": watch_requested(argv),
-             "links": links}
-
-    if "--json" in argv:
-        rows, _ = scan(cache={})
-        print(json.dumps(rows, indent=2))
-        return 0
-
-    if not state["watch"]:
-        out, _ = tick(state, argv, color)
-        sys.stdout.write(out)
-        if sys.stdout.isatty():
-            hint = "\033[2mone shot. `ccwho --watch` to keep it live.\033[0m\n" if color \
-                else "one shot. `ccwho --watch` to keep it live.\n"
-            sys.stdout.write(hint)
-        return 0
-
-    interval = parse_interval(argv)
-    try:
-        while True:
-            started = time.time()
-            out, _ = tick(state, argv, color)
-            banner = ""
-            if state["engine_error"]:
-                banner = f"{RED if color else ''}engine reload failed: {state['engine_error']}{RESET if color else ''}\n"
-            drift = doctor_banner_cached(state)
-            if drift:
-                # The failure this whole tool is about was silent. A watch that
-                # can see something drifted and says nothing repeats it.
-                banner += f"{AMBER if color else ''}⚠ {drift}{RESET if color else ''}\n"
-            footer = (f"{DIM if color else ''}tick {state['ticks']} · every {interval:g}s · "
-                      f"{time.strftime('%H:%M:%S')} · ctrl-c to stop{RESET if color else ''}\n")
-            saved = ""
-            if should_autosave(state.get("last_save"), time.time(), AUTOSAVE_SECS):
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    if save([]) == 0:
-                        state["last_save"] = time.time()
-                saved = (f"{DIM if color else ''} · restore manifest saved"
-                         f"{RESET if color else ''}")
-            sys.stdout.write(CLEAR_HOME + banner + out + "\n" + footer.rstrip("\n") + saved + "\n")
-            sys.stdout.flush()
-            time.sleep(max(0.0, interval - (time.time() - started)))
-    except KeyboardInterrupt:
-        sys.stdout.write("\n")
-        return 0
+    return ls(argv)
 
 
 def _exit(rc):

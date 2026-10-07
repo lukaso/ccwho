@@ -87,7 +87,6 @@ REAL_RUN, REAL_TIME, REAL_KILL = subprocess.run, time.time, os.kill
 # ccwho's names as imported: a test that replaced one - a function, a clock,
 # a constant - and did not put it back is named at the end (tearDownModule)
 AT_IMPORT = dict(vars(runner))
-MOVES_ITSELF = {"index", "usage"}                    # ccwho rebinds these (reload_engine)
 
 
 _TERM_PROGRAM = []
@@ -165,7 +164,7 @@ def tearDownModule():
                                      ("os.kill", os.kill, REAL_KILL)) if now is not real]
     subprocess.run, time.time, os.kill = REAL_RUN, REAL_TIME, REAL_KILL
     for name, real in AT_IMPORT.items():
-        if name not in MOVES_ITSELF and vars(runner).get(name) is not real:
+        if vars(runner).get(name) is not real:
             leaked.append(f"ccwho.{name}")
             setattr(runner, name, real)
     assert not leaked, f"left replaced by a test: {leaked}"
@@ -194,116 +193,6 @@ class TestASearchFindsTheJobForItsParkedTerminal(unittest.TestCase):
     def test_with_its_job_gone_it_ended(self):                       # control
         live, ended = runner.matches("paste", [])
         self.assertEqual((live, [e["sessionId"] for e in ended]), ([], [self.PARKED]))
-
-
-class TestWatchRequested(unittest.TestCase):
-    def test_long_flag(self):
-        self.assertTrue(runner.watch_requested(["--watch"]))
-
-    def test_short_flag(self):
-        self.assertTrue(runner.watch_requested(["-w"]))
-
-    def test_equals_form(self):
-        self.assertTrue(runner.watch_requested(["--watch=3"]))
-
-    def test_absent(self):
-        self.assertFalse(runner.watch_requested(["--blocked"]))
-
-
-class TestInterval(unittest.TestCase):
-    def test_default_when_bare(self):
-        self.assertEqual(runner.parse_interval(["--watch"], default=5.0), 5.0)
-
-    def test_space_form(self):
-        self.assertEqual(runner.parse_interval(["--watch", "3"]), 3.0)
-
-    def test_equals_form(self):
-        self.assertEqual(runner.parse_interval(["--watch=3"]), 3.0)
-
-    def test_short_flag_with_value(self):
-        self.assertEqual(runner.parse_interval(["-w", "2"]), 2.0)
-
-    def test_trailing_s_is_tolerated(self):
-        self.assertEqual(runner.parse_interval(["--watch", "10s"]), 10.0)
-
-    def test_next_flag_is_not_an_interval(self):
-        self.assertEqual(runner.parse_interval(["--watch", "--blocked"], default=5.0), 5.0)
-
-    def test_floor_of_one_second(self):
-        self.assertEqual(runner.parse_interval(["--watch", "0.1"]), 1.0)
-
-    def test_garbage_falls_back_to_default(self):
-        self.assertEqual(runner.parse_interval(["--watch", "abc"], default=5.0), 5.0)
-
-
-class TestUnknownFlags(unittest.TestCase):
-    def test_accepts_every_known_flag(self):
-        known = ["--watch", "3", "--blocked", "--prompt", "--json", "--no-color", "-p", "-w"]
-        self.assertEqual(runner.unknown_flags(known), [])
-
-    def test_reports_a_typo(self):
-        self.assertEqual(runner.unknown_flags(["--wathc"]), ["--wathc"])
-
-    def test_reports_several(self):
-        self.assertEqual(runner.unknown_flags(["--nope", "--zzz"]), ["--nope", "--zzz"])
-
-    def test_equals_form_is_known(self):
-        self.assertEqual(runner.unknown_flags(["--watch=3"]), [])
-
-    def test_bare_values_are_not_flags(self):
-        self.assertEqual(runner.unknown_flags(["--watch", "3"]), [])
-
-    def test_main_refuses_an_unknown_flag(self):
-        self.assertEqual(runner.main(["--wathc"]), 2)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class TestPositional(unittest.TestCase):
-    """A flag's VALUE is not a positional argument. `reap --older-than 1h` took
-    "1h" as the pattern and matched an unrelated system process."""
-
-    VALUE_FLAGS = ("--older-than",)
-
-    def test_flag_value_is_not_the_positional(self):
-        got = runner.positional(["--older-than", "1h"], self.VALUE_FLAGS, "default")
-        self.assertEqual(got, "default")
-
-    def test_real_positional_after_a_flag_and_value(self):
-        got = runner.positional(["--older-than", "1h", "mypattern"], self.VALUE_FLAGS, "d")
-        self.assertEqual(got, "mypattern")
-
-    def test_positional_before_the_flag(self):
-        got = runner.positional(["mypattern", "--older-than", "1h"], self.VALUE_FLAGS, "d")
-        self.assertEqual(got, "mypattern")
-
-    def test_bare_flags_are_skipped(self):
-        self.assertEqual(runner.positional(["--kill"], self.VALUE_FLAGS, "d"), "d")
-
-    def test_kill_flag_does_not_swallow_the_pattern(self):
-        self.assertEqual(runner.positional(["--kill", "pat"], self.VALUE_FLAGS, "d"), "pat")
-
-    def test_empty(self):
-        self.assertEqual(runner.positional([], self.VALUE_FLAGS, "d"), "d")
-
-
-class TestParseAge(unittest.TestCase):
-    def test_units(self):
-        self.assertEqual(runner.parse_age("90m"), 5400)
-        self.assertEqual(runner.parse_age("2h"), 7200)
-        self.assertEqual(runner.parse_age("3d"), 259200)
-        self.assertEqual(runner.parse_age("45s"), 45)
-
-    def test_bare_number_is_seconds(self):
-        self.assertEqual(runner.parse_age("600"), 600)
-
-    def test_garbage_uses_the_default(self):
-        self.assertEqual(runner.parse_age("abc", default=99), 99)
-
-    def test_empty_uses_the_default(self):
-        self.assertEqual(runner.parse_age("", default=99), 99)
 
 
 class TestRestoreDir(unittest.TestCase):
@@ -3090,99 +2979,6 @@ class TestOpenUsesTheLaunchClaim(unittest.TestCase):
         self.assertIn("already starting", out)
 
 
-class TestHotReloadCoversTheBriefModule(unittest.TestCase):
-    """The engine is reloaded every tick so an edit lands in a running watch.
-    The brief moved half the extraction rules into a second module; if only the
-    engine reloads, a fix to those rules looks like it did nothing."""
-
-    def tearDown(self):
-        # a reload re-executes the engine and rebinds the real functions
-        install_guards()
-
-    def test_editing_the_brief_module_lands_on_the_next_tick(self):
-        import ccwho_brief
-        path = ccwho_brief.__file__
-        original = open(path).read()
-        marker = "def _hot_reload_probe():\n    return 'edited'\n"
-        try:
-            with open(path, "w") as fh:
-                fh.write(original + "\n\n" + marker)
-            runner.reload_engine({"engine_error": ""})
-            self.assertTrue(hasattr(runner.engine.brief, "_hot_reload_probe"),
-                            "the brief module was not re-read")
-        finally:
-            with open(path, "w") as fh:
-                fh.write(original)
-            runner.reload_engine({"engine_error": ""})
-
-    def test_an_edit_that_blows_up_at_import_leaves_the_old_rules_working(self):
-        """A syntax error is the easy case: nothing runs. The one that bites is an
-        edit that RUNS and then raises - half the module's new definitions are
-        already in place, and catching the error leaves that half live. The next
-        tick then extracts with a module that is neither version."""
-        import ccwho_brief
-        path = ccwho_brief.__file__
-        original = open(path).read()
-        state = {"engine_error": ""}
-        try:
-            with open(path, "w") as fh:
-                fh.write(original.replace(
-                    'MAX_PROGRESS = 5', 'MAX_PROGRESS = 5\nLOW_SIGNAL = set()\n'
-                    'raise RuntimeError("boom")'))
-            runner.reload_engine(state)
-            self.assertTrue(state["engine_error"], "the error has to reach the banner")
-            self.assertTrue(
-                runner.engine.brief.LOW_SIGNAL,
-                "the half-applied edit must not become the live rule set")
-            self.assertFalse(runner.engine.brief.is_substantive("continue"),
-                             "extraction still works, with the last good rules")
-        finally:
-            with open(path, "w") as fh:
-                fh.write(original)
-            runner.reload_engine({"engine_error": ""})
-
-    def test_every_hot_module_is_re_read_not_just_the_engine(self):
-        # every rule module the engine imports; a module left out of the reload is
-        # a module whose fix silently does not land in a running watch
-        for mod in ("ccwho_brief", "ccwho_index", "ccwho_procs", "ccwho_terms"):
-            with self.subTest(module=mod):
-                m = __import__(mod)
-                path = m.__file__
-                original = open(path).read()
-                try:
-                    with open(path, "w") as fh:
-                        fh.write(original + "\n\ndef _hot_probe():\n    return 1\n")
-                    runner.reload_engine({"engine_error": ""})
-                    self.assertTrue(hasattr(__import__(mod), "_hot_probe"), mod)
-                    # and the runner's own handle has to be the new module too,
-                    # or `ccwho ls` keeps calling yesterday's code
-                    handle = {"ccwho_brief": runner.engine.brief,
-                              "ccwho_index": runner.index,
-                              "ccwho_procs": runner.engine.procs,
-                              "ccwho_terms": runner.engine.terms}[mod]
-                    self.assertTrue(hasattr(handle, "_hot_probe"),
-                                    f"runner still holds the old {mod}")
-                finally:
-                    with open(path, "w") as fh:
-                        fh.write(original)
-                    runner.reload_engine({"engine_error": ""})
-
-    def test_a_broken_brief_edit_does_not_kill_the_loop(self):
-        import ccwho_brief
-        path = ccwho_brief.__file__
-        original = open(path).read()
-        state = {"engine_error": ""}
-        try:
-            with open(path, "w") as fh:
-                fh.write(original + "\nthis is not python(")
-            runner.reload_engine(state)
-            self.assertTrue(state["engine_error"], "the error has to reach the banner")
-        finally:
-            with open(path, "w") as fh:
-                fh.write(original)
-            runner.reload_engine({"engine_error": ""})
-
-
 class TestShowVerb(unittest.TestCase):
     """`ccwho show <anything>` answers "what was this session doing" without
     opening it."""
@@ -3334,7 +3130,7 @@ class TestDoctorVerb(unittest.TestCase):
         self.assertEqual(got["ok"], True)
 
 
-class TestWatchShowsTheWorstFault(unittest.TestCase):
+class TestTheListShowsTheWorstFault(unittest.TestCase):
     def test_the_header_carries_one_banner_line(self):
         checks = runner.setup.doctor_checks(
             {"claude": "", "iterm_ok": True, "handler_registered": True,
@@ -3358,17 +3154,17 @@ class TestDoctorSaysUsage(TestDoctorVerb):
         self.assertIn("ccwho setup", out.getvalue())
 
 
-class TestWatchBannerIsCheap(unittest.TestCase):
-    """The watch header should say when something drifted, but the checks shell
-    out to launchctl, osascript and plutil. At a 5s tick that is three processes
-    a second for an answer that changes about once a month."""
+class TestTheListsDoctorLineIsCheap(unittest.TestCase):
+    """The live list says when something drifted, but the checks shell out to
+    launchctl, osascript and plutil. On every scan that is processes every few
+    seconds for an answer that changes about once a month."""
 
     def setUp(self):
-        self.calls = []
+        self.calls, self.asked = [], []
         self.real = runner.setup.gather
         self.real_usage_facts = runner.usage_facts
         runner.usage_facts = lambda now=None: {"usage_roots": [], "usage_newest_age": None}
-        runner.setup.gather = lambda **kw: self.calls.append(1) or {
+        runner.setup.gather = lambda **kw: self.calls.append(1) or self.asked.append(kw) or {
             "claude": "", "iterm_ok": True, "handler_registered": True,
             "launchd_loaded": True, "last_run_age": 10.0,
             "newest_manifest_age": 10.0, "cc_status_hook": True,
@@ -3382,11 +3178,109 @@ class TestWatchBannerIsCheap(unittest.TestCase):
         state = {}
         self.assertIn("claude", runner.doctor_banner_cached(state, now=1000.0))
 
+    HEALTHY = {"claude": "/bin/claude", "iterm_ok": True, "handler_registered": True,
+               "launchd_loaded": True, "last_run_age": 10.0, "newest_manifest_age": 10.0,
+               "cc_status_hook": True, "settings_path": "/x", "iterm_use": "in use",
+               "iterm_host": True}
+
+    def looks(self, *facts):
+        """The list's line after one look per set of facts, DOCTOR_TTL apart."""
+        state, line = {}, None
+        for i, over in enumerate(facts):
+            runner.setup.gather = lambda _over=over, **kw: dict(self.HEALTHY, **_over)
+            line = runner.doctor_banner_cached(state, now=1000.0 + i * (runner.DOCTOR_TTL + 1))
+        return line
+
+    def test_a_healthy_machine_in_iterm2_shows_nothing(self):             # control
+        self.assertEqual(self.looks({}, {}), "")
+
+    def test_a_stale_save_shows_at_the_first_look(self):
+        # awake for hours and the job has not run: a fault now, not 5 minutes
+        # from now (review 6 of the CLI revamp, slice 1)
+        self.assertIn("autosave freshness",
+                      self.looks({"last_run_age": 9 * 3600.0, "awake_for": 5 * 3600.0}))
+
+    def test_a_save_not_yet_due_after_a_wake_is_not_shown(self):
+        self.assertEqual(self.looks({"last_run_age": 9 * 3600.0, "awake_for": 300.0}), "")
+
+    def test_a_clock_set_back_looks_again(self):
+        # NTP or a hand set the clock back: the last look is "in the future",
+        # which is no reason to wait for it (review 6 of the CLI revamp, slice 1)
+        state = {}
+        runner.doctor_banner_cached(state, now=5000.0)
+        runner.doctor_banner_cached(state, now=5000.0 - 3600.0)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_lasting_fault_shows_at_the_first_look(self):
+        # a new list, or `R`, starts with no look before: what does not change
+        # at wake is not held back 5 minutes (review 4 of the CLI revamp, slice 1)
+        self.assertIn("autosave job", self.looks({"launchd_loaded": False}))
+        self.assertIn("claude", self.looks({"claude": ""}))
+
+    def test_the_list_leaves_out_iterm2_s_own_hook(self):
+        # not ccwho's, and ccwho does not depend on it (cc_status_hook): on a
+        # Mac without iTerm2's own integration it was the list's line for good,
+        # over every fault after it (review 3 of the CLI revamp, slice 1)
+        no_hook = {"cc_status_hook": False}
+        self.assertEqual(self.looks(no_hook, no_hook), "")
+
+    def test_ccwho_doctor_still_names_iterm2_s_hook(self):                # control
+        runner.setup.gather = lambda **kw: dict(self.HEALTHY, cc_status_hook=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.doctor([])
+        self.assertRegex(out.getvalue(), r"BAD +iTerm2 status hook")
+
     def test_it_does_not_re_check_every_tick(self):
         state = {}
-        for t in range(0, 20, 5):        # four ticks of a 5s watch
+        for t in range(0, 20, 5):        # four scans, 5 s apart
             runner.doctor_banner_cached(state, now=1000.0 + t)
         self.assertEqual(len(self.calls), 1)
+
+    def test_a_doctor_that_fails_is_not_re_run_every_scan(self):
+        # its checks failed: the next scan must not run them all again
+        # (review 1 of the CLI revamp, slice 1)
+        def failing(**kw):
+            self.calls.append(1)
+            raise OSError("launchctl moved")
+        runner.setup.gather = failing
+        state = {}
+        for t in range(0, 20, 5):
+            try:
+                runner.doctor_banner_cached(state, now=1000.0 + t)
+            except OSError:
+                pass
+        self.assertEqual(len(self.calls), 1)
+
+    def test_the_list_s_look_shows_no_permission_dialog(self):
+        # the Accessibility probe IS macOS's request: the list asks for no
+        # permission it was not told to (review 1 of the CLI revamp, slice 1)
+        runner.doctor_banner_cached({}, now=1000.0)
+        self.assertIs(self.asked[0].get("prompts"), False)
+
+    def test_ccwho_doctor_still_looks_at_everything(self):                # control
+        with contextlib.redirect_stdout(io.StringIO()):
+            runner.doctor([])
+        self.assertIsNot(self.asked[0].get("prompts", True), False)
+
+    SECURE = {"claude": "/bin/claude", "iterm_ok": True, "handler_registered": True,
+              "launchd_loaded": True, "last_run_age": 10.0, "newest_manifest_age": 10.0,
+              "cc_status_hook": True, "settings_path": "/x", "iterm_use": "in use",
+              "iterm_host": True, "secure_input": {"pid": 123, "app": "Foo"}}
+
+    def test_secure_input_is_not_said_twice(self):
+        # the list reads it on every scan (Fleet.secure); doctor's copy would
+        # show it twice, and stay up to DOCTOR_TTL after it was let go (review
+        # 2 of the CLI revamp, slice 1)
+        held = {"secure_input": {"pid": 123, "app": "Foo"}}
+        self.assertNotIn("Secure Input", self.looks(held, held))
+
+    def test_ccwho_doctor_still_says_it(self):                            # control
+        runner.setup.gather = lambda **kw: dict(self.SECURE)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.doctor([])
+        self.assertIn("Foo (pid 123) holds Secure Input", out.getvalue())
 
     def test_it_re_checks_eventually(self):
         state = {}
@@ -3570,7 +3464,7 @@ class TestPlainCcwhoOpensTheUi(unittest.TestCase):
         self.assertEqual(self.runs, [])
 
     def test_a_flag_still_means_the_one_shot(self):
-        for flag in ("--json", "--blocked", "--prompt"):
+        for flag in ("--json", "--needs-you", "--no-links", "--no-color"):
             self.runs.clear()
             self._main([flag], tty=True)
             self.assertEqual(self.runs, [], flag)
@@ -4808,8 +4702,14 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
     def test_helpers_only_with_all(self):
         _, out, _ = self.run_ps()
         self.assertNotIn("some-mcp", out)
-        _, out_all, _ = self.run_ps("--all")
+        _, out_all, _ = self.run_ps("--helpers")
         self.assertIn("some-mcp", out_all)
+
+    def test_all_is_now_helpers_and_is_refused(self):
+        # --all meant "with program sessions" in ls and "with helpers" here
+        rc, out, err = self.run_ps("--all")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("unknown option", err)
 
     def test_a_port_filter(self):
         rc, out, _ = self.run_ps("--port", "3000")
@@ -4978,33 +4878,6 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         procs = json.loads(out)
         self.assertEqual(sorted(p["pid"] for p in procs), [11, 20, 30])
         self.assertEqual({p["group"] for p in procs}, {"session", "left behind", "codex"})
-
-
-class TestReapNeverPrintsASecret(unittest.TestCase):
-    """reap prints the commands it would kill; a command line can carry a token
-    (a node process can spill its environment into it). eng D5."""
-
-    def test_the_token_is_masked(self):
-        real = runner.engine.ps_snapshot_elapsed
-        runner.engine.ps_snapshot_elapsed = lambda: (
-            f"  4242     1 2-00:00:00 node leak.js --token={TOKEN_R}\n")
-        self.addCleanup(setattr, runner.engine, "ps_snapshot_elapsed", real)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            runner.main(["reap", "leak.js", "--older-than", "1h"])
-        self.assertIn("leak.js", out.getvalue())
-        self.assertNotIn(TOKEN_R, out.getvalue())
-
-    def test_a_token_with_no_known_shape_is_not_printed(self):
-        real = runner.engine.ps_snapshot_elapsed
-        runner.engine.ps_snapshot_elapsed = lambda: (
-            "  4242     1 2-00:00:00 node leak.js k8Hq2vX9pLm3nR7tW1yZ4bC6dF0gJ5sA\n")
-        self.addCleanup(setattr, runner.engine, "ps_snapshot_elapsed", real)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            runner.main(["reap", "leak.js", "--older-than", "1h"])
-        self.assertIn("leak.js", out.getvalue())                            # control
-        self.assertNotIn("k8Hq2vX9pLm3nR7tW1yZ4bC6dF0gJ5sA", out.getvalue())
 
 
 class TestStatusline(unittest.TestCase):
@@ -5215,7 +5088,7 @@ class TestStatusline(unittest.TestCase):
         self.run_with(self.payload())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = runner.main(["accounts"])
+            rc = runner.main(["usage"])
         self.assertEqual(rc, 0)
         self.assertIn("a@example.com", out.getvalue())
         self.assertIn("7d", out.getvalue())
@@ -5224,14 +5097,14 @@ class TestStatusline(unittest.TestCase):
         self.run_with(self.payload())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            runner.main(["accounts", "--json"])
+            runner.main(["usage", "--json"])
         rows = json.loads(out.getvalue())
         self.assertEqual(rows[0]["id"], "login:uuid-a")
 
     def test_accounts_with_nothing_recorded_says_how_it_gets_data(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = runner.main(["accounts"])
+            rc = runner.main(["usage"])
         self.assertEqual(rc, 0)
         self.assertIn("statusline", out.getvalue())
 
@@ -5239,8 +5112,8 @@ class TestStatusline(unittest.TestCase):
         self.run_with(self.payload())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(runner.main(["accounts", "name", "login:uuid", "work"]), 0)
-            runner.main(["accounts"])
+            self.assertEqual(runner.main(["usage", "name", "login:uuid", "work"]), 0)
+            runner.main(["usage"])
         self.assertIn("work", out.getvalue())
 
     def test_accounts_name_refuses_a_label_with_a_colon(self):
@@ -5248,7 +5121,7 @@ class TestStatusline(unittest.TestCase):
         self.run_with(self.payload())
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(runner.main(["accounts", "name", "login:uuid", "work:home"]), 2)
+            self.assertEqual(runner.main(["usage", "name", "login:uuid", "work:home"]), 2)
         self.assertIn(":", err.getvalue())
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "ccwho", "accounts.json")))
 
@@ -5256,7 +5129,7 @@ class TestStatusline(unittest.TestCase):
         self.run_with(self.payload())
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(runner.main(["accounts", "name", "nope", "work"]), 2)
+            self.assertEqual(runner.main(["usage", "name", "nope", "work"]), 2)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "ccwho", "accounts.json")))
 
     def test_housekeeping_prunes_old_readings(self):
@@ -5767,15 +5640,20 @@ class TestUsageInTheTable(unittest.TestCase):
     def tearDown(self):
         runner.engine.collect, runner.usage_snapshot = self.real
 
+    def table(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.ls(["--no-color"])
+        return out.getvalue()
+
     def test_the_table_has_the_usage_line(self):
-        out, _ = runner.tick({"watch": False, "ticks": 0}, [], False)
-        self.assertIn("usage  waiting", out)
+        self.assertIn("usage  waiting", self.table())
 
     def test_a_usage_failure_is_unknown_and_the_rows_survive(self):
         def boom(rows, now=None, record=True, codex_threads=()):
             raise OSError("disk")
         runner.usage_snapshot = boom
-        out, rows = runner.tick({"watch": False, "ticks": 0}, [], False)
+        out = self.table()
         self.assertIn("usage  unknown", out)
         self.assertIn("liveapp", out)
 
@@ -5874,20 +5752,6 @@ class TestEachShownLogKeepsItsOwnLast(unittest.TestCase):
             self.assertEqual(len(fh.read().splitlines()), 1)
 
 
-class TestReloadRebindsUsage(unittest.TestCase):
-    def tearDown(self):
-        # a reload re-executes the engine and rebinds the real functions; left
-        # unguarded, every later save test asked the real iTerm2 for its panes
-        install_guards()
-
-    def test_the_runner_uses_the_reloaded_usage_module(self):
-        state = {"engine_error": ""}
-        runner.reload_engine(state)
-        self.assertEqual(state["engine_error"], "")
-        self.assertIs(runner.usage, sys.modules["ccwho_usage"])
-        self.assertIs(runner.engine.ccwho_usage, sys.modules["ccwho_usage"])
-
-
 class TestCodexUsageInTheSnapshot(unittest.TestCase):
     THREAD = "019a8f2c-0000-7000-8000-00000000000a"
     """D20: the Codex entry is read and shown for two weeks after its last
@@ -5897,7 +5761,7 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
     def setUp(self):
         import ccwho_usage
         import datetime
-        # the real clock: `ccwho accounts` reads it, and a reading is placed by it
+        # the real clock: `ccwho usage` reads it, and a reading is placed by it
         self.now = time.time()
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -5953,25 +5817,25 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
         # the whole listing: every account with a reading, Codex's limit too
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(runner.main(["accounts"]), 0)
+            self.assertEqual(runner.main(["usage"]), 0)
         line = next(l for l in out.getvalue().splitlines() if l.startswith("codex"))
         self.assertIn("7d 65%", line)
         self.assertIn("1 session", line)                  # the rollouts that said so
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            runner.main(["accounts", "--json"])
+            runner.main(["usage", "--json"])
         self.assertIn("codex:codex", [r["id"] for r in json.loads(out.getvalue())])
         # a label names it there too
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(runner.main(["accounts", "name", "oai:codex", "chatgpt"]), 0)
+            self.assertEqual(runner.main(["usage", "name", "oai:codex", "chatgpt"]), 0)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            runner.main(["accounts"])
+            runner.main(["usage"])
         self.assertTrue(any(l.startswith("chatgpt ") for l in out.getvalue().splitlines()),
                         out.getvalue())
 
     def test_a_codex_read_that_fails_costs_only_codex(self):
-        # the Claude entries stay on the line, and `ccwho accounts` still lists
+        # the Claude entries stay on the line, and `ccwho usage` still lists
         mod = sys.modules["ccwho_usage"]
         real = mod.codex_rows
         def boom(*a, **k):
@@ -5983,10 +5847,10 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
         self.assertEqual(on["state"], off["state"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(runner.main(["accounts"]), 0)
+            self.assertEqual(runner.main(["usage"]), 0)
 
     def test_accounts_finds_a_resumed_thread_in_an_old_folder(self):
-        # the list finds an open thread's rollout by its id; `ccwho accounts`,
+        # the list finds an open thread's rollout by its id; `ccwho usage`,
         # one-shot, reads every rollout by when it was written
         src = self.rollout()
         old = os.path.join(self.tmp, "codex", "sessions",
@@ -6003,7 +5867,7 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
     def accounts_json(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            runner.main(["accounts", "--json"])
+            runner.main(["usage", "--json"])
         return out.getvalue()
 
     def test_ls_shows_it_a_thread_open_or_not(self):
@@ -6063,6 +5927,14 @@ class TestUsageWords(unittest.TestCase):
     def test_the_usage_legend_follows_the_commands(self):
         out = self.help_text()
         self.assertGreater(out.index("usage: 5h 42%"), out.index("ccwho url "))
+
+    def test_help_names_what_the_cli_is_now(self):
+        out = self.help_text()
+        for gone in ("--watch", "--blocked", "--prompt", "ccwho reap", "ccwho accounts"):
+            self.assertNotIn(gone, out)
+        self.assertIn("ccwho ls [words] [--all] [--needs-you] [--json]", out)
+        self.assertIn("ccwho usage [--json]", out)
+        self.assertIn("ccwho ps [--port N] [--helpers] [--json] [--full]", out)
 
     def test_help_names_setup_for_the_links(self):
         # a brew user has no install-handler.sh where they run it
@@ -7665,30 +7537,183 @@ class TestEveryScanLetsGoOfWhatItSeesRunning(unittest.TestCase):
         self.assertEqual(outside, [])
 
 
-class TestTheWatchLoopLetsGoOfWhatItSeesRunning(unittest.TestCase):
-    """`ccwho` and `ccwho --watch` scan through tick(), with the engine they
-    reload - a scan like any other."""
+class TestTheOneTable(unittest.TestCase):
+    """`ccwho ls` is the table; `ccwho` with options, or piped, is `ccwho ls`.
+    There were two: the bare one had --json, links and --blocked, `ls` had none.
+    `--needs-you` is what the list puts on top (the owner's CLI revamp,
+    2026-10-06). --watch, --prompt, --blocked and reap are gone: they are
+    refused, never run as something else."""
+
+    ROWS = [dict(TestUsageInTheTable.ROWS[0], sessionId=f"4f2b91ac-1111-4222-8333-00000000000{i}",
+                 attention=a, project=f"p{i}")
+            for i, a in enumerate(("asks", "stopped", "stuck", "busy", "review", "program"))]
+
+    _Captured = TestPlainCcwhoOpensTheUi._Captured
+
+    def setUp(self):
+        self.addCleanup(setattr, runner.engine, "collect", runner.engine.collect)
+        runner.engine.collect = lambda cache=None, status=None: (
+            (status or {}).update(source_ok=True) or ([dict(r) for r in self.ROWS], {}))
+        self.addCleanup(setattr, runner, "usage_snapshot", runner.usage_snapshot)
+        runner.usage_snapshot = (lambda rows, now=None, record=True, codex_threads=():
+                                 {"state": "unknown"})
+        self.addCleanup(setattr, runner, "run_ui", runner.run_ui)
+        self.ui = []
+        runner.run_ui = lambda: self.ui.append(1) or 0
+
+    def main(self, argv, tty=False):
+        out, err = self._Captured(), io.StringIO()
+        out.tty = tty
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def projects(self, argv):
+        rc, out, err = self.main(argv)
+        self.assertEqual(rc, 0, err)
+        return [r.get("project") for r in json.loads(out)]
+
+    def test_ls_json_is_the_rows(self):
+        self.assertEqual(self.projects(["ls", "--json"]), ["p0", "p1", "p2", "p3", "p4", "p5"])
+
+    def test_ccwho_json_is_ls_json(self):
+        self.assertEqual(self.main(["--json"]), self.main(["ls", "--json"]))
+
+    def test_needs_you_is_the_list_s_top(self):
+        self.assertEqual(self.projects(["ls", "--needs-you", "--json"]), ["p0", "p2", "p4"])
+        self.assertEqual(self.projects(["--needs-you", "--json"]), ["p0", "p2", "p4"])
+
+    def test_the_table_too(self):
+        rc, out, _ = self.main(["ls", "--needs-you", "--no-color"])
+        self.assertIn("p0", out)
+        self.assertNotIn("p1", out)
+
+    def test_piped_ccwho_is_ls(self):
+        self.assertEqual(self.main([])[:2], self.main(["ls"])[:2])
+        self.assertEqual(self.ui, [])
+
+    def test_on_a_terminal_its_rows_link(self):
+        seen = []
+        real = runner.engine.render
+        self.addCleanup(setattr, runner.engine, "render", real)
+        runner.engine.render = lambda *a, **k: seen.append(k.get("links")) or ""
+        self.main(["ls"], tty=True)
+        self.main(["ls", "--no-links"], tty=True)
+        self.main(["ls"], tty=False)
+        self.assertEqual(seen, [True, False, False])
+
+    def test_words_and_json_are_the_matches(self):
+        real = runner.matches
+        self.addCleanup(setattr, runner, "matches", real)
+        ended = {"sessionId": "e", "project": "gone", "title": "t", "topic": "", "since": "2d"}
+        runner.matches = lambda query, rows, everything=False: ([rows[0]], [ended])
+        rc, out, _ = self.main(["ls", "p0", "--json"])
+        got = json.loads(out)
+        self.assertEqual([(r["project"], r.get("ended", False)) for r in got],
+                         [("p0", False), ("gone", True)])
+        rc, out, _ = self.main(["ls", "p0", "--needs-you", "--json"])
+        self.assertEqual([r["project"] for r in json.loads(out)], ["p0"],
+                         "an ended session needs nothing of you")
+
+    def test_nothing_needing_you_is_not_nothing_running(self):
+        # an agent that polls --needs-you must not read "no sessions" while
+        # sessions run (review 1 of the CLI revamp, slice 1)
+        self.ROWS = [r for r in TestTheOneTable.ROWS if r["attention"] in ("busy", "stopped")]
+        rc, out, _ = self.main(["ls", "--needs-you", "--no-color"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no Claude Code session needs you (2 running)", out)
+        self.assertNotIn("no Claude Code sessions found", out)
+
+    def test_no_sessions_is_still_no_sessions(self):                    # control
+        self.ROWS = []
+        rc, out, _ = self.main(["ls", "--needs-you", "--no-color"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no Claude Code sessions found", out)
+
+    def by_project(self):
+        real = runner.matches
+        self.addCleanup(setattr, runner, "matches", real)
+        runner.matches = lambda query, rows, everything=False: (
+            [r for r in rows if r["project"] == query], [])
+
+    def test_words_that_find_only_what_needs_nothing(self):
+        # p3 runs, busy: it matches, and needs nothing of you - not "no session
+        # matches" (review 2 of the CLI revamp, slice 1)
+        self.by_project()
+        rc, out, err = self.main(["ls", "p3", "--needs-you", "--no-color"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("no matching Claude Code session needs you (1 running)", out)
+        rc, out, err = self.main(["ls", "p3", "--needs-you", "--json"])
+        self.assertEqual((rc, json.loads(out)), (0, []))
+
+    def test_words_that_find_nothing_are_still_no_match(self):           # control
+        self.by_project()
+        rc, out, err = self.main(["ls", "p9", "--needs-you"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no session matches 'p9'", err)
+
+    def test_only_the_whole_table_records_usage(self):
+        # a usage reading is recorded from the whole fleet; a part of it is not
+        # the fleet (with_usage's record)
+        recorded = []
+        runner.usage_snapshot = (lambda rows, now=None, record=True, codex_threads=():
+                                 recorded.append(record) or {"state": "unknown"})
+        self.main(["ls", "--no-color"])
+        self.main(["ls", "--needs-you", "--no-color"])
+        self.assertEqual(recorded, [True, False])
+
+    def test_what_is_gone_is_refused(self):
+        for argv in (["--watch"], ["-w", "2"], ["--watch=2"], ["--prompt"], ["-p"],
+                     ["--blocked"], ["ls", "--blocked"], ["ls", "--prompt"], ["ls", "--frobnicate"]):
+            with self.subTest(argv=argv):
+                rc, out, err = self.main(argv)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("unknown option", err)
+
+    def test_an_unknown_word_is_no_command_and_no_search(self):
+        scans = []
+        runner.engine.collect = lambda cache=None, status=None: scans.append(1) or ([], {})
+        for word in ("reap", "accounts", "liveapp"):
+            with self.subTest(word=word):
+                rc, out, err = self.main([word])
+                self.assertEqual(rc, 2)
+                self.assertIn(f"unknown command {word!r}", err)
+        self.assertEqual(scans, [])
+
+    def test_usage_is_what_accounts_was(self):
+        calls = []
+        real = runner.accounts
+        self.addCleanup(setattr, runner, "accounts", real)
+        runner.accounts = lambda argv: calls.append(argv) or 0
+        self.assertEqual(self.main(["usage", "--json"])[0], 0)
+        self.assertEqual(calls, [["--json"]])
+
+
+class TestTheTableLetsGoOfWhatItSeesRunning(unittest.TestCase):
+    """`ccwho ls` scans like any other: what it sees running lets go of its
+    launch claim."""
 
     _F = TestEveryScanLetsGoOfWhatItSeesRunning
     SID, JOB, setUp, rows, free = _F.SID, _F.JOB, _F.setUp, _F.rows, _F.free
 
-    def tick(self):
+    def table(self):
         real = runner.usage_snapshot
         runner.usage_snapshot = (lambda rows, now=None, record=True, codex_threads=():
                                  {"state": "unknown"})
         try:
-            return runner.tick({"watch": False, "ticks": 0}, [], False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return runner.ls(["--no-color"])
         finally:
             runner.usage_snapshot = real
 
-    def test_a_tick_that_sees_it(self):
+    def test_a_table_that_sees_it(self):
         self.rows([dict(TestUsageInTheTable.ROWS[0], sessionId=self.SID)])
-        self.tick()
+        self.table()
         self.assertTrue(self.free())
 
-    def test_a_tick_that_does_not(self):                                   # control
+    def test_a_table_that_does_not(self):                                  # control
         self.rows([dict(TestUsageInTheTable.ROWS[0], sessionId=self.JOB)])
-        self.tick()
+        self.table()
         self.assertFalse(self.free())
 
 

@@ -8,8 +8,10 @@ python3 -m unittest test_setup -v
 """
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -139,6 +141,44 @@ class TestEachFault(unittest.TestCase):
                      newest_manifest_age=None)
         self.assertIn("never", r["detail"].lower())
 
+    def test_a_save_not_yet_due_after_a_wake_is_no_fault(self):
+        # launchd fires the job only while the Mac is awake, and its man page
+        # says a firing that a sleep missed is missed: after a wake (or a boot)
+        # the next run can be one interval away (review 6 of the CLI revamp,
+        # slice 1)
+        r = by_name(setup.doctor_checks(facts(last_run_age=9 * 3600.0,
+                                              awake_for=10 * 60.0)))["autosave freshness"]
+        self.assertTrue(r["ok"], r)
+        self.assertIn("woke 10m ago", r["detail"])
+
+    def test_a_save_not_run_well_after_a_wake_is_a_fault(self):
+        self.bad("autosave freshness", last_run_age=9 * 3600.0, awake_for=20 * 60.0)
+
+    def test_not_knowing_when_it_woke_keeps_the_rule(self):            # control
+        self.bad("autosave freshness", last_run_age=9 * 3600.0, awake_for=None)
+
+    def test_the_wake_allowance_is_one_timer_window_and_a_little(self):
+        # launchd's next run comes within one StartInterval of awake time after
+        # a wake: no less (a false alarm at minute 11-15), no more (review 7 of
+        # the CLI revamp, slice 1)
+        r = by_name(setup.doctor_checks(facts(last_run_age=9 * 3600.0, awake_for=16 * 60.0)))
+        self.assertTrue(r["autosave freshness"]["ok"], r["autosave freshness"])
+        self.bad("autosave freshness", last_run_age=9 * 3600.0, awake_for=17 * 60.0)
+
+    def test_the_thresholds_follow_the_job_s_timer(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(setup.__file__)),
+                            setup.PLIST_TEMPLATE_NAME)
+        with open(path) as fh:
+            found = re.search(r"<key>StartInterval</key>\s*<integer>(\d+)</integer>", fh.read())
+        interval = int(found.group(1))
+        # longer than the timer's windows, and not much longer: a shorter timer
+        # must shorten them too (review 8 of the CLI revamp, slice 1)
+        margin = 5 * 60
+        self.assertTrue(interval < setup.AUTOSAVE_WAKE_GRACE <= interval + margin,
+                        (interval, setup.AUTOSAVE_WAKE_GRACE))
+        self.assertTrue(2 * interval < setup.AUTOSAVE_STALE_AFTER <= 2 * interval + margin,
+                        (interval, setup.AUTOSAVE_STALE_AFTER))
+
     def test_a_run_inside_two_timer_windows_is_fine(self):            # control
         r = by_name(setup.doctor_checks(facts(last_run_age=25 * 60)))
         self.assertTrue(r["autosave freshness"]["ok"])
@@ -201,6 +241,47 @@ class TestHandlerDetection(unittest.TestCase):
         with open(os.path.join(self.app, "Contents", "Info.plist"), "w") as fh:
             fh.write("not a plist")
         self.assertFalse(setup.handler_registered(app_path=self.app))
+
+
+class TestHowLongTheMacIsAwake(unittest.TestCase):
+    """Since the last wake, or the boot when it has not slept since: sysctl's
+    kern.boottime and kern.waketime (0 until the first sleep)."""
+
+    BOOT = "{ sec = 1000, usec = 390838 } Mon Oct  5 22:02:54 2026\n"
+    NO_WAKE = "{ sec = 0, usec = 0 } Thu Jan  1 01:00:00 1970\n"
+
+    def answer(self, out, rc=0):
+        testkit.patch(self, setup.subprocess, "run",
+                      lambda cmd, **k: subprocess.CompletedProcess(cmd, rc, out, ""))
+
+    def test_since_the_boot_when_it_never_slept(self):
+        self.answer(self.BOOT + self.NO_WAKE)
+        self.assertEqual(setup.awake_for(now=1600.0), 600.0)
+
+    def test_since_the_last_wake(self):
+        self.answer(self.BOOT + "{ sec = 1500, usec = 0 } Mon Oct  5 22:11:14 2026\n")
+        self.assertEqual(setup.awake_for(now=1600.0), 100.0)
+
+    def test_what_cannot_be_read_is_not_known(self):
+        for out, rc in (("", 1), (self.BOOT, 1), ("sysctl: unknown oid", 0),
+                        (self.NO_WAKE + self.NO_WAKE, 0), (self.BOOT + self.NO_WAKE, 0)):
+            with self.subTest(out=out):
+                self.answer(out, rc)
+                now = 500.0 if out == self.BOOT + self.NO_WAKE else 1600.0   # a boot ahead of now
+                self.assertIsNone(setup.awake_for(now=now))
+
+    def test_a_sysctl_that_cannot_run_is_not_known(self):
+        def failing(cmd, **k):
+            raise OSError("no sysctl")
+        testkit.patch(self, setup.subprocess, "run", failing)
+        self.assertIsNone(setup.awake_for(now=1600.0))
+
+    def test_on_this_mac(self):
+        # read-only: the real sysctl answers, in seconds, never ahead of now
+        got = setup.awake_for()
+        if sys.platform == "darwin":
+            self.assertIsNotNone(got)
+            self.assertGreaterEqual(got, 0.0)
 
 
 class TestFactGatherersSurviveTheMachine(unittest.TestCase):
@@ -788,6 +869,7 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
                              ("launchd_loaded", True),
                              ("cc_status_hook", True),
                              ("secure_input_holder", None),
+                             ("awake_for", None),
                              ("accessibility_ok", True),
                              ("accessibility_granted_at", None),
                              ("iterm_started_at", None)):
@@ -806,6 +888,10 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
         self.addCleanup(setattr, setup.engine, "live_file_sessions",
                         setup.engine.live_file_sessions)
         setup.engine.live_file_sessions = lambda *a, **k: ([], 0)
+
+    def test_how_long_the_mac_is_awake_reaches_doctor(self):
+        setup.awake_for = lambda now=None: 123.0          # restored by setUp's cleanup
+        self.assertEqual(setup.gather(ccwho_dir=self.tmp)["awake_for"], 123.0)
 
     def test_the_gates_reason_reaches_doctor(self):
         def refused(timeout=5.0, why=None):
@@ -869,12 +955,12 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
     ITERM2_FACTS = ("iterm_scriptable", "accessibility_ok", "accessibility_granted_at",
                     "iterm_started_at", "secure_input_holder")
 
-    def looked_at(self):
+    def looked_at(self, **kw):
         called = []
         for name in self.ITERM2_FACTS:
             self.addCleanup(setattr, setup, name, getattr(setup, name))
             setattr(setup, name, lambda *a, _n=name, **k: called.append(_n))
-        facts = setup.gather(ccwho_dir=self.tmp, home="/h")
+        facts = setup.gather(ccwho_dir=self.tmp, home="/h", **kw)
         return facts, called
 
     def test_iterm2_not_in_use_is_not_looked_at(self):
@@ -899,6 +985,17 @@ class TestGatherFindsClaudeTheSameWayTheEngineDoes(unittest.TestCase):
         self.assertNotIn("accessibility_ok", called)
         self.assertIsNone(facts["accessibility"])
         self.assertIs(facts["iterm_host"], False)
+
+    def test_the_list_s_look_shows_no_permission_dialog(self):
+        # the Accessibility probe IS the request: macOS shows its dialog to an
+        # app without the permission. `ccwho doctor` may show it; the live
+        # list, which looks every few minutes unasked, never does (review 1 of
+        # the CLI revamp, slice 1). The other iTerm2 facts are still read
+        testkit.patch(self, setup.os, "environ", dict(os.environ, TERM_PROGRAM="iTerm.app"))
+        facts, called = self.looked_at(prompts=False)
+        self.assertEqual(sorted(called),
+                         sorted(n for n in self.ITERM2_FACTS if n != "accessibility_ok"))
+        self.assertIsNone(facts["accessibility"])
 
     def test_terminal_app_s_facts_reach_doctor(self):
         setup.terminal_facts = lambda: {"terminal_says": "refused", "terminal_age": 60.0}
@@ -1003,6 +1100,30 @@ class TestTheHotkeyOnlyReachesYouWithPermission(unittest.TestCase):
     def test_iterm_not_running_is_not_a_fault_either(self):
         check = setup.hotkey_reach(self.facts(iterm_started_at=None))
         self.assertTrue(check["ok"])
+
+    def test_a_grant_after_the_start_is_seen_without_the_probe(self):
+        # the grant time is only there when it was granted (TCC auth_value=2):
+        # the live list, which runs no Accessibility probe (accessibility None),
+        # sees it too (review 3 of the CLI revamp, slice 1)
+        check = setup.hotkey_reach(self.facts(accessibility=None, iterm_granted_at=3000.0))
+        self.assertEqual(check["do"], "restart")
+
+    def test_no_probe_and_no_grant_time_is_no_fault(self):             # control
+        self.assertTrue(setup.hotkey_reach(self.facts(accessibility=None,
+                                                      iterm_granted_at=None))["ok"])
+
+    def test_a_grant_after_the_start_is_seen_from_another_terminal(self):
+        # the grant time is iTerm2's own row in TCC: true from any terminal
+        # (review 4 of the CLI revamp, slice 1)
+        check = setup.hotkey_reach(self.facts(accessibility=None, iterm_host=False,
+                                              iterm_granted_at=3000.0))
+        self.assertEqual(check["do"], "restart")
+
+    def test_from_another_terminal_no_grant_time_is_not_checked(self):  # control
+        check = setup.hotkey_reach(self.facts(accessibility=None, iterm_host=False,
+                                              iterm_granted_at=None))
+        self.assertTrue(check["ok"])
+        self.assertIn("not checked from here", check["detail"])
 
 
 class TestAnAppHoldingSecureInputBlocksEveryHotkey(unittest.TestCase):

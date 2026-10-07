@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-"""ccwho engine - all the logic. HOT-RELOADED by the runner on every tick.
+"""ccwho engine - all the logic. HOT-RELOADED by the live list before each scan.
 
-Keep this module free of long-lived objects: the runner calls importlib.reload()
-each iteration so edits land in a running watch without restarting it. Only pure
-functions and plain dicts cross the boundary; state lives in the runner and is
+Keep this module free of long-lived objects: the list calls reload_all() before
+each scan so edits land in a running list without restarting it. Only pure
+functions and plain dicts cross the boundary; state lives in the caller and is
 passed back in, the way network_check_ruby carries @options between ticks.
 
 Reads only what Claude Code already writes to disk. No daemon, no hooks, no tmux.
@@ -37,8 +36,8 @@ import ccwho_procs as procs
 import ccwho_terms as terms
 
 # The rule modules the engine imports, in the order they are re-read. One list,
-# used by the watch loop and the list alike: a module named in only one of two
-# lists is a fix that lands in one window and not the other.
+# so a rule module cannot be left out of the reload: a module not named here
+# is a fix that does not land in a running list.
 # Dependencies first: ccwho_text before ccwho_usage (which imports it), procs
 # before brief (which imports procs).
 # ccwho_terms after ccwho_procs: it reads procs.ps_rows.
@@ -933,48 +932,6 @@ def topic_for(session_id, tail_bytes=4 * 1024 * 1024, head_lines=400):
     return {"first": first, "last": last}
 
 
-_ETIME = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$|^(\d+)$")
-
-
-def etime_seconds(etime):
-    """ps ELAPSED -> seconds. Shapes: SS, MM:SS, HH:MM:SS, DD-HH:MM:SS.
-
-    Anything unparseable is 0, so a filter of "older than N" spares it rather
-    than reaping it. Wrong here means killing live work.
-    """
-    m = _ETIME.match((etime or "").strip())
-    if not m:
-        return 0
-    if m.group(5):
-        return int(m.group(5))
-    days = int(m.group(1) or 0)
-    hours = int(m.group(2) or 0)
-    return ((days * 24 + hours) * 60 + int(m.group(3))) * 60 + int(m.group(4))
-
-
-def reap_candidates(ps_output, pattern, min_age=0):
-    """Processes whose command contains `pattern` and that are at least min_age old.
-
-    An empty pattern matches nothing - a reaper that defaults to everything is a
-    footgun, not a convenience.
-    """
-    if not pattern:
-        return []
-    out = []
-    for line in (ps_output or "").splitlines():
-        f = line.strip().split(None, 3)
-        if len(f) < 4 or not f[0].isdigit() or not f[1].isdigit():
-            continue
-        pid, ppid, etime, cmd = int(f[0]), int(f[1]), f[2], f[3]
-        if pattern not in cmd:
-            continue
-        age = etime_seconds(etime)
-        if age < min_age:
-            continue
-        out.append({"pid": pid, "ppid": ppid, "age": age, "command": cmd})
-    return out
-
-
 def parse_tty_map(ps_output):
     """pid -> controlling terminal. `??` means no terminal, so it is omitted."""
     out = {}
@@ -1127,14 +1084,6 @@ def resolve_open(session_id, live_rows, entries, source_ok=True):
     return ("missing", "")
 
 
-def parse_jump_url(url):
-    """Extract the target from ccwho://jump/<target>, or "" if it is not one."""
-    if not isinstance(url, str) or not url.startswith("ccwho://jump/"):
-        return ""
-    target = url[len("ccwho://jump/"):].strip().rstrip("/")
-    return target if _JUMP_TARGET.match(target) else ""
-
-
 def short_tty(tty):
     """ttys032 -> s032. Short enough for a column, still unambiguous."""
     t = (tty or "").rsplit("/", 1)[-1]
@@ -1220,10 +1169,6 @@ def idle_snapshot():
 def tty_snapshot():
     # the executable last: it may hold spaces ("Application Support")
     return _ps(["-eo", "pid,tty,uid,ucomm"]) or ""
-
-
-def ps_snapshot_elapsed():
-    return _ps(["-eo", "pid,ppid,etime,command"]) or ""
 
 
 def ps_snapshot():
@@ -2951,11 +2896,14 @@ def entrypoint_of(session, head, tail):
     return ""
 
 
-def only_blocked(rows):
-    """`--blocked`: what waits on you, or left something behind. A program's
-    session waits on the program."""
-    return [r for r in rows if (r.get("status") == "waiting"
-                                and r.get("attention") != "program") or r.get("orphans")]
+def needs_you(rows):
+    """`ccwho ls --needs-you`: the rows the live list shows in NEEDS YOU and
+    STUCK, by ccwho's own state (UI_GROUPS) - a program's session waits on the
+    program, and work left running alone is no question to you (the owner's
+    CLI revamp, 2026-10-06)."""
+    groups = dict(UI_GROUPS)
+    wanted = set(groups.get("NEEDS YOU", ())) | set(groups.get("STUCK", ()))
+    return [r for r in rows if r.get("attention") in wanted]
 
 
 def is_program(row):
@@ -3959,7 +3907,7 @@ def _plural(n, word):
     return f"{n} {word}" + ("" if n == 1 else ("es" if word.endswith("s") else "s"))
 
 
-def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=False):
+def render(rows, fleet=None, color=True, width=None, links=False):
     """The one-shot table. `fleet` is collect()'s second answer: the ports agents
     hold, and what was left behind; anything else (an old caller's 0) is none."""
     fleet = fleet if isinstance(fleet, dict) else {}
@@ -4044,8 +3992,6 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
         if r["orphans"]:
             line += _paint(f"  +{r['orphans']} detached", "waiting", color)
         out.append(line)
-        if show_prompt and r["topic"]:
-            out.append(_paint(f"{' ' * (w_name + w_tty + 16)}\u21b3 {truncate(r['topic'], width - w_name - 18)}", "dim", color))
     bottom = bottom_lines(fleet)
     if bottom:
         out.append("")
@@ -4055,7 +4001,7 @@ def render(rows, fleet=None, color=True, width=None, show_prompt=False, links=Fa
 
 # ------------------------------------------------ what agents started, and hold
 #
-# One set of lines for every surface: the table (`ccwho ls`, --watch), `ccwho ps`
+# One set of lines for every surface: the table (`ccwho ls`), `ccwho ps`
 # and the live list all say it the same way, from the same fleet.
 
 def ports_line(fleet, width=None):
@@ -4316,20 +4262,3 @@ def session_procs_lines(fleet, sid):
         pid = p.get("pid")
         out.append(f"{'?' if pid is None else pid!s:<7} {ports:<13} {p.get('command', '')}")
     return out
-
-
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    rows, fleet = collect()
-    if "--json" in argv:
-        print(json.dumps(rows, indent=2))
-        return 0
-    if "--blocked" in argv:
-        rows = only_blocked(rows)
-    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
-    sys.stdout.write(render(rows, fleet, color=color))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

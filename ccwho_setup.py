@@ -35,6 +35,10 @@ import ccwho_engine as engine
 # The launchd timer is 15 minutes. Two windows of grace before calling it stale:
 # StartInterval only fires while the Mac is awake, so one skipped window is normal.
 AUTOSAVE_STALE_AFTER = 31 * 60
+# After a wake or a boot: launchd's man page says a firing that a sleep missed
+# is missed, so the next run can be one window (and a little) away. A job that
+# has not run since the Mac woke is not stale before this.
+AUTOSAVE_WAKE_GRACE = 17 * 60
 
 _AGE_UNITS = ((86400.0, "d"), (3600.0, "h"), (60.0, "m"))
 
@@ -133,11 +137,17 @@ def doctor_checks(facts):
     # you had nothing open - not that the timer is dead. The job writes a line to
     # its log either way, so the log's age is the honest signal.
     ran = facts.get("last_run_age")
-    fresh = ran is not None and ran < AUTOSAVE_STALE_AFTER
+    awake = facts.get("awake_for")
+    # not run since the Mac woke (or booted), and that was a moment ago
+    waking = (ran is not None and awake is not None and ran > awake
+              and awake < AUTOSAVE_WAKE_GRACE)
+    fresh = ran is not None and (ran < AUTOSAVE_STALE_AFTER or waking)
     man = facts.get("newest_manifest_age")
     out.append(_check(
         "autosave freshness", fresh,
         f"job ran {age_words(ran)} ago, newest manifest {age_words(man)} old"
+        + (f" - the Mac woke {age_words(awake)} ago: it runs within"
+           f" {age_words(AUTOSAVE_WAKE_GRACE)}" if waking and ran >= AUTOSAVE_STALE_AFTER else "")
         + ("" if fresh else " - the job is loaded but not running"),
         "check the job: launchctl print gui/$(id -u)/com.lukaso.ccwho.save"))
 
@@ -365,7 +375,10 @@ def doctor_banner(results):
 # Everything below reaches the world. Each one answers with a plain value and
 # never raises: a doctor that dies on the machine it is diagnosing is no use.
 
-def gather(ccwho_dir=None, settings_path=None, now=None, home=None):
+def gather(ccwho_dir=None, settings_path=None, now=None, home=None, prompts=True):
+    """What doctor and setup decide from. prompts=False: no probe that shows a
+    macOS dialog - the live list looks every few minutes, unasked, and the
+    Accessibility probe IS the request (accessibility is then None: not known)."""
     why = {}
     # iTerm2 is not looked at while it is not in use (D14): its Accessibility
     # probe alone is an osascript to System Events
@@ -387,11 +400,12 @@ def gather(ccwho_dir=None, settings_path=None, now=None, home=None):
         "handler_registered": handler_registered(),
         "launchd_loaded": launchd_loaded(),
         "last_run_age": last_run_age(ccwho_dir, now=now),
+        "awake_for": awake_for(now=now),
         "newest_manifest_age": newest_manifest_age(ccwho_dir, now=now),
         "cc_status_hook": cc_status_hook(settings_path),
         # the hotkey is only global if iTerm2 had Accessibility when it
         # registered the key grab - see hotkey_reach
-        "accessibility": accessibility_ok() if iterm and host else None,
+        "accessibility": accessibility_ok() if iterm and host and prompts else None,
         "iterm_host": host,
         "iterm_granted_at": accessibility_granted_at() if iterm else None,
         "iterm_started_at": iterm_started_at() if iterm else None,
@@ -470,6 +484,25 @@ def iterm_scriptable(timeout=5.0, why=None):
     if why.get("error") == engine.terms.AE_NOT_PERMITTED or why.get("refused") == "not-running":
         return False
     return None         # stuck, silent, busy, waiting, its state dir unwritable, or no process list
+
+
+def awake_for(now=None, timeout=5.0):
+    """Seconds since the Mac last woke - or booted, when it has not slept since
+    (kern.waketime is 0 until the first sleep). None when not known."""
+    try:
+        done = subprocess.run(["sysctl", "-n", "kern.boottime", "kern.waketime"],
+                              capture_output=True, text=True, errors="replace",
+                              timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    # "{ sec = 1791234174, usec = 390838 } Mon Oct  5 ..." - not the usec
+    since = max((int(s) for s in re.findall(r"\bsec = (\d+)", done.stdout or "")), default=0)
+    if since <= 0:
+        return None
+    awake = (time.time() if now is None else now) - since
+    return awake if awake >= 0 else None
 
 
 def handler_candidates(app_path=None):
@@ -766,7 +799,9 @@ def hotkey_reach(facts):
                       " so no hotkey reaches any app",
                       "lock the screen (Ctrl+Cmd+Q) and log back in")
     granted, started = facts.get("iterm_granted_at"), facts.get("iterm_started_at")
-    if allowed and granted and started and granted > started:
+    # a grant time is only read when it was granted (TCC auth_value=2): it
+    # proves the permission without the probe the live list leaves out
+    if granted and started and granted > started:
         return _reach(False, "restart",
                       "iTerm2 was granted Accessibility after it started, so"
                       " the hotkey only works while iTerm2 is in front",
@@ -979,7 +1014,7 @@ def hotkey_current(home, wanted):
 def profile_entries(text):
     """The entries of a Dynamic Profiles file's text, as they are: [] when it
     is not that shape - it is iTerm2's folder, anything may be in it, and
-    doctor (--watch's banner too) and setup read it (reviews of slices 4-5)."""
+    doctor (the live list's banner too) and setup read it (reviews of slices 4-5)."""
     try:
         doc = json.loads(text or "")
     except (ValueError, RecursionError):

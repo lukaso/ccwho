@@ -28,9 +28,10 @@
     <string>{{PATH}}</string>
   </dict>
 
-  <!-- StartInterval fires only while the Mac is AWAKE; it never wakes it, and
-       after a sleep launchd runs the job once if the interval elapsed. That is
-       exactly "every 15 minutes when awake". -->
+  <!-- StartInterval fires only while the Mac is AWAKE; it never wakes it. That
+       is exactly "every 15 minutes when awake". Its man page says a firing a
+       sleep missed is missed, so after a wake the next run can be up to 15
+       minutes away; doctor allows for that (AUTOSAVE_WAKE_GRACE). -->
   <key>StartInterval</key>
   <integer>900</integer>
 

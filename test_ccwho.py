@@ -2120,102 +2120,6 @@ class TestOsc8(unittest.TestCase):
         self.assertEqual(ccwho.visible_len("\033[2ms032\033[0m"), 4)
 
 
-class TestJumpUrl(unittest.TestCase):
-    def test_prefers_tty(self):
-        self.assertEqual(ccwho.jump_url({"tty": "ttys032", "pid": 19576}),
-                         "ccwho://jump/s032")
-
-    def test_falls_back_to_pid(self):
-        self.assertEqual(ccwho.jump_url({"tty": "", "pid": 19576}),
-                         "ccwho://jump/19576")
-
-    def test_empty_when_neither(self):
-        self.assertEqual(ccwho.jump_url({"tty": "", "pid": None}), "")
-
-    def test_parse_round_trip(self):
-        self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032"), "s032")
-
-    def test_parse_tolerates_trailing_slash(self):
-        self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032/"), "s032")
-
-    def test_parse_rejects_other_schemes(self):
-        self.assertEqual(ccwho.parse_jump_url("http://evil/jump/s032"), "")
-
-    def test_parse_rejects_a_scheme_crafted_to_survive_the_slice(self):
-        # "https://evil/" is exactly as long as "ccwho://jump/", so without the
-        # scheme check this yields a perfectly valid-looking target
-        self.assertEqual(ccwho.parse_jump_url("https://evil/s032"), "")
-
-    def test_parse_rejects_shell_metacharacters(self):
-        self.assertEqual(ccwho.parse_jump_url("ccwho://jump/s032;rm -rf /"), "")
-
-    def test_parse_empty(self):
-        self.assertEqual(ccwho.parse_jump_url(""), "")
-
-
-class TestEtimeSeconds(unittest.TestCase):
-    """ps etime has four shapes and getting it wrong silently kills live work."""
-
-    def test_seconds_only(self):
-        self.assertEqual(ccwho.etime_seconds("39"), 39)
-
-    def test_mm_ss(self):
-        self.assertEqual(ccwho.etime_seconds("02:30"), 150)
-
-    def test_hh_mm_ss(self):
-        self.assertEqual(ccwho.etime_seconds("01:00:00"), 3600)
-
-    def test_days_hh_mm_ss(self):
-        self.assertEqual(ccwho.etime_seconds("01-20:48:59"), 161339)
-
-    def test_multi_digit_days(self):
-        self.assertEqual(ccwho.etime_seconds("11-00:00:00"), 950400)
-
-    def test_garbage_is_zero_so_nothing_is_reaped_by_accident(self):
-        self.assertEqual(ccwho.etime_seconds("nonsense"), 0)
-        self.assertEqual(ccwho.etime_seconds(""), 0)
-
-
-class TestReapCandidates(unittest.TestCase):
-    PS = "\n".join([
-        "  PID  PPID ELAPSED COMMAND",
-        " 100     1 01-20:48:59 script -q /dev/null /tmp/vr-A/liveapp-pty-guards-x/ptyrun.1",
-        " 101   100 01-20:48:59 bash /tmp/vr-A/liveapp-pty-guards-x/ptyrun.1",
-        " 200     1 00:30 script -q /dev/null /tmp/vr-B/liveapp-pty-guards-y/ptyrun.2",
-        " 300   999 05:00:00 node vitest",
-        " 400     1 03:00:00 claude",
-    ])
-
-    def test_matches_only_the_pattern(self):
-        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=0)
-        self.assertEqual({r["pid"] for r in got}, {100, 101, 200})
-
-    def test_age_filter_spares_the_recent_one(self):
-        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=3600)
-        self.assertEqual({r["pid"] for r in got}, {100, 101})
-
-    def test_age_filter_can_spare_everything(self):
-        self.assertEqual(ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=10**9), [])
-
-    def test_never_matches_unrelated_work(self):
-        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=0)
-        self.assertNotIn(300, {r["pid"] for r in got})
-        self.assertNotIn(400, {r["pid"] for r in got})
-
-    def test_empty_pattern_matches_nothing(self):
-        self.assertEqual(ccwho.reap_candidates(self.PS, "", min_age=0), [])
-
-    def test_candidates_carry_age_and_command(self):
-        got = ccwho.reap_candidates(self.PS, "liveapp-pty-guards", min_age=3600)
-        r = [x for x in got if x["pid"] == 100][0]
-        self.assertEqual(r["age"], 161339)
-        self.assertIn("ptyrun", r["command"])
-
-
-# ------------------------------------------------------------ restore manifest
-# A reboot is a one-way door today: the sessions survive on disk but nothing says
-# which was which. These cover the capture, the resume line, and the read-back.
-
 class InTempDir(unittest.TestCase):
     ROOTS = ["/private/var/folders", "/private/tmp"]
 
@@ -3204,6 +3108,26 @@ class TestOpenUrls(unittest.TestCase):
         for bad in ("https://example.com", "ccwho://delete/all", "ccwho://open/nope",
                     "", None, "ccwho://open/", "file:///etc/passwd"):
             self.assertEqual(ccwho.parse_ccwho_url(bad), ("", ""), repr(bad))
+
+    # each row's link in `ccwho ls` on a terminal (TestJumpUrl's, kept when
+    # parse_jump_url went: review 1 of the CLI revamp, slice 1)
+    def test_a_jump_link_prefers_the_tty(self):
+        self.assertEqual(ccwho.jump_url({"tty": "ttys032", "pid": 19576}), "ccwho://jump/s032")
+
+    def test_a_jump_link_falls_back_to_the_pid(self):
+        self.assertEqual(ccwho.jump_url({"tty": "", "pid": 19576}), "ccwho://jump/19576")
+
+    def test_no_jump_link_with_neither(self):
+        self.assertEqual(ccwho.jump_url({"tty": "", "pid": None}), "")
+
+    def test_a_jump_link_tolerates_a_trailing_slash(self):
+        self.assertEqual(ccwho.parse_ccwho_url("ccwho://jump/s032/"), ("jump", "s032"))
+
+    def test_a_jump_link_with_more_after_its_target_is_refused(self):
+        # the URL comes from LaunchServices, which any app can call (review 7
+        # of the CLI revamp, slice 1: this went with TestJumpUrl)
+        for bad in ("ccwho://jump/s032;rm -rf /", "ccwho://jump/s032x"):
+            self.assertEqual(ccwho.parse_ccwho_url(bad), ("", ""), bad)
 
 
 class TestResolveOpen(unittest.TestCase):
@@ -4899,25 +4823,47 @@ class TestASessionAProgramStartedNeverNeedsYou(unittest.TestCase):
     def test_enter_on_yours_still_says_resume(self):                      # control
         self.assertIn("claude --resume a", ccwho.no_window_note(self.row("cli")))
 
-    def test_the_engine_main_blocked_leaves_it_out_too(self):
-        import contextlib, io
-        rows = [self.row("cli"), dict(self.row("sdk-cli"), title="PROGRAMROW")]
-        for r in rows:
-            r["title"] = r["title"] or r["name"]
-        saved = ccwho.collect
-        ccwho.collect = lambda *a, **k: (rows, {})
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                ccwho.main(["--blocked", "--no-color"])
-        finally:
-            ccwho.collect = saved
-        self.assertNotIn("PROGRAMROW", buf.getvalue())
-        self.assertIn("1 sessions", buf.getvalue(), "control: yours is listed")
-
-    def test_blocked_leaves_it_out(self):
+    def test_needs_you_leaves_it_out(self):
         rows = [self.row("cli"), self.row("sdk-cli")]
-        self.assertEqual([r["attention"] for r in ccwho.only_blocked(rows)], ["blocked"])
+        self.assertEqual([r["attention"] for r in ccwho.needs_you(rows)], ["blocked"])
+
+
+class TestNeedsYouIsWhatTheListPutsOnTop(unittest.TestCase):
+    """`ccwho ls --needs-you`: the rows the live list shows in NEEDS YOU and
+    STUCK - by ccwho's own state, as the list sorts them. It was `--blocked`,
+    which kept Claude Code's raw `waiting` (a finished turn that needs nothing
+    is `waiting` too) and missed ASKED YOU and FINISHED, which it reports `idle`
+    (the owner, 2026-10-06)."""
+
+    STATES = ("blocked", "waiting", "asks", "review", "stuck", "stopped", "ready", "shell",
+              "idle", "busy", "running", "program", "ended")
+
+    def kept(self, rows):
+        return [r["attention"] for r in ccwho.needs_you(rows)]
+
+    def test_the_list_s_top_groups(self):
+        rows = [{"sessionId": a, "attention": a} for a in self.STATES]
+        self.assertEqual(self.kept(rows), ["blocked", "waiting", "asks", "review", "stuck"])
+
+    def test_by_ccwho_s_state_not_claude_code_s(self):
+        # asks and review are reported idle; a turn that ended with nothing
+        # pending, and you have seen, is reported waiting
+        rows = [{"sessionId": "a", "attention": "asks", "status": "idle"},
+                {"sessionId": "b", "attention": "review", "status": "idle"},
+                {"sessionId": "c", "attention": "stopped", "status": "waiting"}]
+        self.assertEqual(self.kept(rows), ["asks", "review"])
+
+    def test_detached_work_alone_is_not_a_question(self):
+        # `ccwho ps` and the list's "left behind" line show it
+        self.assertEqual(self.kept([{"sessionId": "a", "attention": "stopped", "orphans": 2}]), [])
+
+    def test_it_follows_the_list_s_groups(self):
+        # one definition: a state the list moves into NEEDS YOU is kept here too
+        real = ccwho.UI_GROUPS
+        self.addCleanup(setattr, ccwho, "UI_GROUPS", real)
+        ccwho.UI_GROUPS = (("NEEDS YOU", ("busy",)),) + tuple(g for g in real if g[0] != "NEEDS YOU")
+        self.assertEqual(self.kept([{"sessionId": "a", "attention": "busy"},
+                                    {"sessionId": "b", "attention": "asks"}]), ["busy"])
 
 
 class TestOpeningASessionAProgramRuns(unittest.TestCase):
@@ -5614,6 +5560,61 @@ class TestReloadPutsEarlierModulesBackWhenALaterOneFails(unittest.TestCase):
             # a reload re-executes the engine, which rebinds the real function:
             # the module's guard has to go back, or every later test is unguarded
             install_guards()
+
+
+class TestTheListsReloadCoversEveryRuleModule(unittest.TestCase):
+    """The live list re-reads the engine before each scan, so an edit lands in a
+    window that stays open for days. Half the rules live in modules the engine
+    imports; if only the engine is re-read, a fix to those looks like it did
+    nothing. (These were the --watch loop's tests; the list is the reloader now.)"""
+
+    # the engine's own handle on each rule module: `ccwho ls` and the list call
+    # through these, so a new module they do not point at is yesterday's code
+    HANDLES = {"ccwho_text": "ccwho_text", "ccwho_procs": "procs", "ccwho_terms": "terms",
+               "ccwho_brief": "brief", "ccwho_index": "ccwho_index",
+               "ccwho_usage": "ccwho_usage"}
+
+    def tearDown(self):
+        # a reload re-executes the engine and rebinds the real functions
+        install_guards()
+
+    def edit(self, module, text):
+        import sys
+        path = sys.modules[module].__file__
+        original = open(path).read()
+        with open(path, "w") as fh:
+            fh.write(text(original))
+        self.addCleanup(self.put_back, path, original)
+
+    def put_back(self, path, original):
+        with open(path, "w") as fh:
+            fh.write(original)
+        ccwho.reload_all(ccwho)
+        install_guards()
+
+    def test_every_rule_module_is_re_read_not_just_the_engine(self):
+        import sys
+        for mod, handle in self.HANDLES.items():
+            with self.subTest(module=mod):
+                self.edit(mod, lambda s: s + "\n\ndef _hot_probe():\n    return 1\n")
+                ccwho.reload_all(ccwho)
+                self.assertTrue(hasattr(sys.modules[mod], "_hot_probe"), mod)
+                self.assertTrue(hasattr(getattr(ccwho, handle), "_hot_probe"),
+                                f"the engine still holds the old {mod}")
+
+    def test_an_edit_that_blows_up_at_import_leaves_the_old_rules_working(self):
+        """A syntax error is the easy case: nothing runs. The one that bites is an
+        edit that RUNS and then raises - half the module's new definitions are
+        already in place, and catching the error leaves that half live. The next
+        scan then extracts with a module that is neither version."""
+        self.edit("ccwho_brief", lambda s: s.replace(
+            "MAX_PROGRESS = 5", 'MAX_PROGRESS = 5\nLOW_SIGNAL = set()\nraise RuntimeError("boom")'))
+        with self.assertRaises(RuntimeError):
+            ccwho.reload_all(ccwho)
+        self.assertTrue(ccwho.brief.LOW_SIGNAL,
+                        "the half-applied edit must not become the live rule set")
+        self.assertFalse(ccwho.brief.is_substantive("continue"),
+                         "extraction still works, with the last good rules")
 
 
 class TestAttachUsesTheSessionsOwnConfigDir(unittest.TestCase):
@@ -8600,7 +8601,7 @@ class TestNoPsReaderTrustsAPsThatFailed(unittest.TestCase):
     ROWS = "  PID TTY UID UCOMM\n  100 ttys001 501 iTerm2\n"
 
     def test_each_of_them(self):
-        for fn in (ccwho.tty_snapshot, ccwho.ps_snapshot, ccwho.ps_snapshot_elapsed):
+        for fn in (ccwho.tty_snapshot, ccwho.ps_snapshot):
             self.assertEqual(self.run_ps(fn, -9, self.ROWS), "", fn.__name__)
         self.assertEqual(self.run_ps(ccwho.idle_snapshot, 1, "  PID TTY COMMAND\n  1 ttys001 -zsh\n"), set())
         self.assertEqual(self.run_ps(REAL["ps_table"], 1, "  1 Tue Sep 22 14:45:15 2026 /sbin/launchd\n"), {})

@@ -249,7 +249,7 @@ def save(idx, path):
     runs is the old one or the new one, never half of each."""
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
-    # A temp file per writer: a watch, a one-shot and the launchd save can all be
+    # A temp file per writer: the list, a one-shot and the launchd save can all be
     # writing at once, and a shared name means one truncates the other's file and
     # publishes half an index.
     tmp = ""

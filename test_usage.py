@@ -629,7 +629,7 @@ class TestLabels(unittest.TestCase):
 
 class TestACopiedTagNamesTheAccount(unittest.TestCase):
     def test_the_brand_of_a_tag_is_no_part_of_the_id(self):
-        # "ant:d0a0" is what a row says: `ccwho accounts name ant:d0a0 work`
+        # "ant:d0a0" is what a row says: `ccwho usage name ant:d0a0 work`
         ids = ["login:a", "token:d0a0beef"]
         self.assertEqual(usage.resolve_id("ant:d0a0", ids), "token:d0a0beef")
         self.assertEqual(usage.resolve_id("d0a0", ids), "token:d0a0beef")      # control

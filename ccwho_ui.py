@@ -123,8 +123,11 @@ class Fleet:
     """One snapshot of the world, and the questions the screen asks of it."""
 
     def __init__(self, rows=(), source_ok=True, at="", error="", procs=None,
-                 secure="", usage=None):
+                 secure="", usage=None, doctor=""):
         self.source_ok, self.at, self.error = source_ok, at, error
+        # doctor's first fault, or "": the list is where a drift shows without
+        # `ccwho doctor` (it was the watch's header, and the watch is gone)
+        self.doctor = doctor
         # subscription usage, as ccwho_usage.snapshot built it; None = not read
         self.usage = usage
         self.procs = procs if isinstance(procs, dict) else {"collected": False}
@@ -1399,8 +1402,9 @@ class CcwhoUi(App):
             f"{sessions} sessions" + (f" + {codex} codex" if codex else "")
             + (f": {counts}" if counts else "")
             + when + searching + ("  " + self.status if self.status else ""))
-        trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure, self.note)
-                            if line)
+        doctor = f"⚠ {self.fleet.doctor}" if self.fleet.doctor else ""
+        trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure, doctor,
+                                              self.note) if line)
         banner.update(trouble)
         banner.display = bool(trouble)
         self.paint_procs_lines()
@@ -2412,6 +2416,9 @@ class Collector:
         self.reload_error = ""
         self.digest = None      # what the files said at the last look
         self.rows = []          # the ids the check watches, from the last scan
+        self.doctor_state = {}  # doctor's answer and when (ccwho.doctor_banner_cached)
+        self.doctor_line = ""   # its last answer in
+        self.doctor_thread = None
 
     def changed(self):
         """Has anything happened that could change the list?
@@ -2442,8 +2449,8 @@ class Collector:
         return True
 
     def reload(self):
-        """Re-read the engine and the modules it imports, the same way the watch
-        loop does. This window stays open for days; a fix on disk that it cannot
+        """Re-read the engine and the modules it imports (engine.reload_all).
+        This window stays open for days; a fix on disk that it cannot
         see is a fix that did not happen.
 
         A failed reload keeps the working modules: the candidate is built beside
@@ -2468,7 +2475,7 @@ class Collector:
             rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
             return Fleet([], False, "", f"could not read the fleet ({type(ex).__name__})",
-                         secure=self.secure_input())
+                         secure=self.secure_input(), doctor=self.doctor())
         self.release(rows, seen_at, seen_mono)
         # The scan's own answer to the cheap question, so the next cheap check
         # does not see a changed world and scan all over again.
@@ -2479,7 +2486,8 @@ class Collector:
         self.rows = rows
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble, procs=procs,
-                     secure=self.secure_input(), usage=self.usage(rows, procs))
+                     secure=self.secure_input(), usage=self.usage(rows, procs),
+                     doctor=self.doctor())
 
     def release(self, rows, seen_at, seen_mono=None):
         """The sessions on the list let go of their launch claims (ccwho's
@@ -2500,6 +2508,28 @@ class Collector:
             return runner.usage_snapshot(rows, codex_threads=runner.open_codex_threads(procs))
         except Exception:
             return {"state": "unknown"}
+
+    def doctor(self):
+        """Doctor's first fault, or "" - its last answer in. Its checks are
+        subprocesses and an ask of iTerm2, seconds when one is slow: they run
+        on a thread of their own, one at a time, so a scan never waits for
+        them. At most every DOCTOR_TTL (ccwho.doctor_banner_cached, in this
+        collector's own state), and never the reason the list goes down."""
+        if self.doctor_thread is None or not self.doctor_thread.is_alive():
+            self.doctor_thread = threading.Thread(target=self._doctor, name="ccwho-doctor",
+                                                  daemon=True)
+            try:
+                self.doctor_thread.start()
+            except RuntimeError:                # can't start new thread: the next scan tries
+                self.doctor_thread = None
+        return self.doctor_line
+
+    def _doctor(self):
+        try:
+            import ccwho as runner
+            self.doctor_line = runner.doctor_banner_cached(self.doctor_state) or ""
+        except Exception:
+            pass                                    # the last answer stands
 
     def secure_input(self):
         """The Secure Input line, or "". 18ms, on the collecting thread, and

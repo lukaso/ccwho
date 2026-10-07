@@ -52,8 +52,8 @@ doctor say "not used" and what to do to add it ([Adding iTerm2 later](#adding-it
 
 ## Terminal.app
 
-ccwho runs in Terminal.app as it does in iTerm2 - the list, `--watch`, the live
-list, `setup` and `doctor` - and knows the sessions in Terminal.app's tabs:
+ccwho runs in Terminal.app as it does in iTerm2 - the table, the live list, `setup`
+and `doctor` - and knows the sessions in Terminal.app's tabs:
 
 - a row in a Terminal.app tab has a window to go to, and Enter (or `ccwho jump`)
   brings that tab to the front;
@@ -113,7 +113,7 @@ sometimes identical — the name tells you nothing, and switching tools does not
 it because it is a data problem, not a display problem.
 
 `ccwho` shows what each session is about: its title and Claude Code's own recap -
-and, with → or `--prompt`, the **last thing you actually said** to it, pulled from
+and, with → or `ccwho show`, the **last thing you actually said** to it, pulled from
 its transcript.
 
 ## ccwho and herdr
@@ -138,11 +138,11 @@ Compared with herdr v0.9.3 and [its docs](https://herdr.dev/docs/), on 2026-10-0
 | Go to a session | Click an agent in the sidebar, or use the Goto picker (`prefix+g`), which filters agents by state | ⌥/ opens the list from any app (an iTerm2 hotkey window). Enter brings the session's window to the front, or opens a window that attaches a background session. Not for Codex threads ([finding the window](#finding-the-window)) |
 | Client closes or SSH drops | Processes keep running in the herdr server | Closing ccwho does not touch the sessions. If the terminal app quits or SSH drops, the sessions in it end, as without ccwho. `claude --bg` sessions keep running |
 | Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window, and sessions that Claude Desktop or a program ran stay where they ran. `restore --check` says whether each saved session that `--open` would reopen can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
-| Processes and ports | Not built in | `ps`, `ps --port`, `kill`, `clean`, `reap`. It shows which session started each process ([processes and ports](#processes-and-ports)) |
+| Processes and ports | Not built in | `ps`, `ps --port`, `kill`, `clean`. It shows which session started each process ([processes and ports](#processes-and-ports)) |
 | Stuck work | Not built in | Finds a wait loop on a task that has ended (`until grep …; do sleep …; done`) and stdin readers that can never end, and gives you a box to kill them ([busy, but the turn is over](#busy-but-the-turn-is-over)) |
 | Old sessions | Not built in (the `memex` plugin searches transcripts) | `ls`, `show` and the live list's `/` search an index of every transcript in `~/.claude`, in the `CLAUDE_CONFIG_DIR` ccwho runs with, and in the dirs you list in `~/.ccwho/roots` (Claude Code keeps 30 days by default); `/` also greps what was said ([finding an old session](#finding-an-old-session)) |
 | Usage limits | Plugins (`herdr-agent-usage`) | 5h and 7d use for each account used in the last two weeks, with pace and age, after `ccwho setup` adds its statusLine. Also Codex's ([subscription usage](#subscription-usage)) |
-| Agents control agents | Yes. With the socket API and CLI, an agent can open panes, send prompts, read output, wait until another agent is blocked, and show notifications | No. An agent cannot send a prompt to a session or read its screen. It can read the state of every Claude Code session with `ccwho --json`. When an agent runs `kill` or `clean`, they take only what its own session started. An agent stops no session |
+| Agents control agents | Yes. With the socket API and CLI, an agent can open panes, send prompts, read output, wait until another agent is blocked, and show notifications | No. An agent cannot send a prompt to a session or read its screen. It can read the state of every Claude Code session with `ccwho ls --json`. When an agent runs `kill` or `clean`, they take only what its own session started. An agent stops no session |
 | Remote machines | Yes: several SSH hosts in one window. A phone works through any SSH client | No. Local Mac only |
 | Platforms | macOS, Linux, Windows; any terminal | macOS. It lists sessions in any terminal; only iTerm2 and Terminal.app windows can be brought to the front |
 | Extensions | Plugin marketplace, more than 1,400 plugins | None |
@@ -261,7 +261,7 @@ whose newest reading is older than 15 minutes says how old, and an entry whose w
 have all expired ends with the age of its newest reading. With two or more Claude accounts on
 the line, each row ends with the account it spends, in the line's own words (`· ant:work`; `?`:
 no reading yet), and the entry of the selected row's account is bright. The same line
-and tags are in `ccwho`, `ccwho ls` and `--watch`, and each session's own status bar
+and tags are in the live list and `ccwho ls`, and each session's own status bar
 shows its entry.
 
 Where it comes from: Claude Code hands a statusLine command the rate limits of the
@@ -272,15 +272,15 @@ never logs in. A token account is named by a hash of the token: Claude Code does
 pass the token to the statusLine, so `ccwho statusline` reads it from its claude
 process's environment and keeps only the hash. A session reports after its next
 reply - including sessions that were already running when setup added the line
-(measured: they reload the settings). `ccwho accounts` lists every account seen in the last
-two weeks; `ccwho accounts name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
+(measured: they reload the settings). `ccwho usage` lists every account seen in the last
+two weeks; `ccwho usage name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
 off again: the line goes, Codex's entry with it, once no running session spends an account on it.
 
 Codex has an entry too, after the Claude accounts, named by its limit:
 `oai:codex 7d 69%↑/60% ↻Sun (42m ago)`. It is kept two weeks after its last reading, the same
 as an account, a Codex thread open or not. ccwho reads it from Codex's own transcripts - the
 `rate_limits` of their `token_count` events - with no app-server and no credential, and it
-never parses what was said. `ccwho accounts` lists it, and `ccwho accounts name oai:codex
+never parses what was said. `ccwho usage` lists it, and `ccwho usage name oai:codex
 <label>` names it.
 
 ## Finding an old session
@@ -316,8 +316,15 @@ said so: its hook had been dropped from `~/.claude/settings.json` by another too
 rewrite. Every dependency ccwho has can fail that quietly - an autosave job loaded
 but not run since Tuesday, a link handler calling a copy of ccwho that was deleted -
 so each gets a check. Read-only by design: a tool that rewrites another tool's
-config without asking is how that happened in the first place. `ccwho --watch`
-shows the first fault in its header.
+config without asking is how that happened in the first place. The live list
+shows the first fault on its warning line, and looks every 5 minutes. It leaves
+out two checks that `ccwho doctor` makes: Accessibility (that check is also
+macOS's request for it, and the list does not ask for a permission unasked) and
+iTerm2's own status hook (ccwho does not need it).
+
+Right after the Mac wakes, it gives the autosave job one 15-minute window to run
+before it says the job is not running: launchd does not run a job for the time
+the Mac slept.
 
 It has a Terminal.app line once the list has asked that app. After an ask of iTerm2
 or Terminal.app timed out, its line says when ccwho asks again (`asks it again in 7m`).
@@ -366,12 +373,12 @@ So ccwho can say who started what:
 ```sh
 ccwho ps                    # every process an agent started, its session, its ports
 ccwho ps --port 3000        # who holds :3000 - exit 1 if no agent does, 3 if that is not known
-ccwho ps --all              # ...including helpers (MCP servers and the like)
+ccwho ps --helpers          # ...including helpers (MCP servers and the like)
 ccwho ps --json             # for scripts, and for agents told to clean up
 ccwho ps --full             # the whole command line, not the short form
 ```
 
-The live list and the table (`ccwho ls`, `ccwho --watch`) say it in one dim line
+The live list and the table (`ccwho ls`) say it in one dim line
 each, never louder than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
 ports on each row, and at the bottom `left behind: N processes` (sessions that have
 ended) and `codex: N processes` (processes of a Codex thread that is not open: whether
@@ -498,33 +505,6 @@ not all), 2 usage, several matches, or (with `--yes`) a word that is not its id,
 or tty, 3 needs `--yes`, 130 interrupted - after `claude stop` began, the session may
 be stopped (run `ccwho ls`). A `--dry-run` exits as the stop would.
 
-## ccwho reap - killing only the stale ones
-
-Leaked helper processes accumulate: liveapp's vitest PTY-guard tests spawn a
-`script` holding a real pseudo-terminal per run and never reap it. After a few days
-that is hundreds of processes and a large share of the machine's ptys.
-
-Killing them by name is dangerous, because a current test run looks identical to a
-two-day-old one. `reap` filters by age and is a **dry run by default**:
-
-```sh
-ccwho reap                          # what would go, older than 1h
-ccwho reap --older-than 6h          # be stricter
-ccwho reap --older-than 6h --kill   # actually do it
-ccwho reap somepattern --older-than 1d
-```
-
-Orphaned roots (ppid 1) are signalled first so their children die with them.
-
-**Why the age parsing has its own tests.** `ps` ELAPSED has four shapes - `SS`,
-`MM:SS`, `HH:MM:SS`, `DD-HH:MM:SS` - and getting the day field wrong means reaping
-live work. Anything unparseable returns 0, so the "older than N" filter spares it
-rather than killing it. An empty pattern matches nothing, deliberately.
-
-The dry-run default earned itself immediately: the first version took `1h` as the
-*pattern* (a flag's value is not a positional argument) and matched
-`PeopleViewService`. It printed that instead of killing it.
-
 ## ccwho save / restore - a reboot stops being a one-way door
 
 The sessions always survived a reboot. `~/.claude/projects/<slug>/<sessionId>.jsonl`
@@ -591,17 +571,16 @@ restore put two Claude Desktop sessions, idle for days, in new iTerm2 windows. A
 made before this version does not record what started a session, and reopens them
 all, as before.
 
-**It saves itself.** Two ways, because the reboot this exists for is usually the one
-you did not plan. `ccwho --watch` writes a manifest every 5 minutes
-(`CCWHO_AUTOSAVE` seconds, `0` disables) - but only while a watch is open in some
-window, which on 2026-09-05 meant a crash found a manifest five days old. So
-`ccwho setup` puts it on a 15-minute launchd timer as well. The job is rendered from
+**It saves itself.** The reboot this exists for is usually the one you did not plan:
+on 2026-09-05 a crash found a manifest five days old. So `ccwho setup` puts
+`ccwho save` on a 15-minute launchd timer. The job is rendered from
 `com.lukaso.ccwho.save.plist.template` for this machine - its home, its ccwho, the
 directory its `claude` is in, because launchd's `PATH` has none of them - and
 `ccwho doctor` says when the installed job no longer matches what setup would write.
 
-`StartInterval` fires only while the Mac is awake and never wakes it, and after a
-sleep launchd runs the job once if the interval elapsed. Manifests live in
+`StartInterval` fires only while the Mac is awake and never wakes it; a firing
+that falls in a sleep is missed, so after a wake the next run can be up to one
+interval away (doctor allows for that). Manifests live in
 `~/.ccwho/restore/` - under `$HOME`, never a temp dir, since outliving the reboot is
 the entire point - and the newest 20 are kept, because a tool built for a full disk
 does not get to fill one.
@@ -679,24 +658,20 @@ result.
 
 ```sh
 ccwho                   # the live list (on a terminal)
-ccwho ls [words] [--all]  # the one-shot table, or every session matching
+ccwho ls [words] [--all]  # the table, or every session matching (with options, or piped, `ccwho` is this)
+ccwho ls --needs-you    # only the Claude Code sessions the live list puts on top: NEEDS YOU and STUCK
+ccwho ls --json         # the rows, for a script, a status line or an agent
 ccwho show <anything>   # what that session was working on
-ccwho ps [--port N] [--full]  # what agents started, and their ports
+ccwho ps [--port N] [--helpers] [--full]  # what agents started, and their ports
 ccwho jump <tty|pid|title>  # focus that window
 ccwho open <session-id> # focus it, give it a window, or reopen it
-ccwho --watch           # the plain table, redrawn every 5s (and autosaving)
-ccwho --watch 2         # ...every 2s  (also -w 2, --watch=2)
-ccwho --blocked         # what Claude Code reports as waiting (a program's only when STUCK), and any with detached work
-ccwho --prompt          # add the last thing you said, under each row
-ccwho --json            # machine-readable, for a status line or key binding
 ccwho save              # record the live fleet (before a reboot)
 ccwho restore [--open]  # list it back, or reopen the windows
 ccwho restore --check   # would it restore? before a reboot
-ccwho accounts [name <id> <label>]  # usage per account, Codex too
+ccwho usage [name <id> <label>]  # usage per account, Codex too
 ccwho kill <pid>|:<port>|<session> [--pid]  # a process tree, a port's holder, or what a session started - lists, then asks
 ccwho clean [--mine]    # kill what ended sessions left behind - lists, then asks
 ccwho stop <session> [--and-procs]  # stop a background session, keep its conversation - asks
-ccwho reap              # leaked helper processes, dry run
 ccwho doctor            # is everything ccwho needs in place?
 ccwho setup             # install what it needs, once
 ```
@@ -816,7 +791,7 @@ question, then a finished turn you have not looked at - and inside each kind the
 **oldest** is first: you take the top one, so newest-first let each
 fresh ask go above the one that had waited longest. An ask with no known time
 comes after the ones that have one. The other groups, and the table (`ccwho ls`,
-`--watch`, `--json`), sort each state most recent first.
+`--json`), sort each state most recent first.
 
 ### Started by a program
 
@@ -824,8 +799,8 @@ A session that a program started with the SDK (entrypoint `sdk-cli`, `sdk-py`,
 `sdk-ts`, `sdk`) never needs you: mid tool call, its unanswered `tool_use` reads
 like a permission prompt, but the program answers its own prompts, and it has no
 window because it never had one. Such a session has its own state, `program`, in a
-last, quiet PROGRAMS group. It is never in NEEDS YOU; `--blocked` shows it only
-when it is STUCK while waiting, or left detached work behind. Its row says
+last, quiet PROGRAMS group. It is never in NEEDS YOU; `ccwho ls --needs-you` shows it
+only when it is STUCK. Its row says
 `· program` where a row would say `· no window`. Enter, `ccwho open` and the link handler do not attach it. A loop
 that can never end still makes it STUCK. Every row in `--json` carries its
 `entrypoint`. A Codex thread that `codex exec` started is a program's too: it shows
@@ -849,7 +824,7 @@ back to mtime only when no turn carries one.
 ### Cost
 
 A tick costs **~0.05s warm, ~0.26s cold** over 15 sessions. Two things make that so,
-and both were regressions I had to fix after `--watch` burned half a core:
+and both were regressions I had to fix after the old `--watch` loop burned half a core:
 
 - **One parse per tick, not per extractor.** The extractors took 5.2 full JSON
   passes over every tail line. They now accept pre-parsed records.
@@ -891,8 +866,8 @@ fleet may go days without producing one.
 
 `ccwho.py` is the runner and the commands. The rules are in `ccwho_engine.py` and
 the modules it imports (text, processes, terminal apps, brief, index, usage); all of
-them are re-read on every tick of `--watch` and of the live list. Edit
-the engine while a watch is running and the next tick picks it up - no restart. Same model as
+them are re-read on every tick of the live list. Edit the engine while the list is
+open and the next tick picks it up - no restart. Same model as
 `network_check_ruby`: thin loop, hot-reloaded engine, state carried between ticks
 rather than held inside the engine.
 

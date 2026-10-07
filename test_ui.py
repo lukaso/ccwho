@@ -17,6 +17,10 @@ import ccwho_ui as ui
 
 
 _UNPIN = []
+# the collector asks doctor every 5 minutes: osascript, launchd, the disk - this
+# machine's. Every test gets a doctor that says nothing; the tests of it call
+# the real one by name, with what it reads stubbed
+REAL_DOCTOR = getattr(ui.Collector, "doctor", None)
 
 
 def setUpModule():
@@ -25,6 +29,9 @@ def setUpModule():
     _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
     # the quick check stats the Codex lock folder: never the user's own
     _UNPIN.append(testkit.pin_codex_home())
+    ui.Collector.doctor = lambda self: ""
+    _UNPIN.append(lambda: setattr(ui.Collector, "doctor", REAL_DOCTOR)
+                  if REAL_DOCTOR is not None else delattr(ui.Collector, "doctor"))
 
 
 def tearDownModule():
@@ -255,6 +262,197 @@ class TestSecureInputShowsInTheList(UiTest):
             text = str(app.query_one("#banner").render())
             self.assertIn("boom", text)
             self.assertIn("Ctrl+Cmd+Q", text)
+
+
+class TestTheListShowsDoctorsFirstFault(UiTest):
+    """`ccwho --watch` showed doctor's first fault in its header - the only
+    place a fault showed without `ccwho doctor`. The watch is gone (the owner's
+    CLI revamp, 2026-10-06); the list shows it on its warning line."""
+
+    LINE = "autosave job: loaded but not running - run `ccwho doctor`"
+
+    async def test_it_is_shown_above_the_list(self):
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([LIVE], True, "12:00:00",
+                                                              doctor=self.LINE)))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            banner = app.query_one("#banner")
+            self.assertTrue(banner.display)
+            self.assertIn("⚠ autosave job: loaded but not running", str(banner.render()))
+
+    async def test_a_healthy_machine_shows_nothing(self):                 # control
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([LIVE], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#banner").display)
+
+    async def test_it_hides_neither_a_fleet_error_nor_secure_input(self):
+        fleet = ui.Fleet([], False, "12:00:00", "could not read the fleet: boom",
+                         secure=TestSecureInputShowsInTheList.LINE, doctor=self.LINE)
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = str(app.query_one("#banner").render())
+            for part in ("boom", "Ctrl+Cmd+Q", "autosave job"):
+                self.assertIn(part, text)
+
+
+class TestTheCollectorAsksDoctor(unittest.TestCase):
+    """At most every DOCTOR_TTL (ccwho.doctor_banner_cached), on a thread of its
+    own - a scan never waits for its checks - and never the reason the list
+    goes down."""
+
+    def collector(self, answer):
+        import ccwho as runner
+        c = ui.Collector()
+        c.reload = lambda: None
+        c.doctor = lambda: REAL_DOCTOR(c)
+        self.states = []
+        real = runner.doctor_banner_cached
+        self.addCleanup(setattr, runner, "doctor_banner_cached", real)
+        runner.doctor_banner_cached = lambda state, now=None: self.states.append(state) or answer(state)
+        real_collect = ui.engine.collect
+        self.addCleanup(setattr, ui.engine, "collect", real_collect)
+        ui.engine.collect = lambda cache=None, status=None: (
+            status.update(source_ok=True) or ([LIVE], {}))
+        self.addCleanup(self.settle, c)
+        return c
+
+    def settle(self, c):
+        """Doctor's answer is in once its thread has ended."""
+        thread = getattr(c, "doctor_thread", None)
+        if thread is not None:
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "doctor's thread did not end")
+
+    def test_its_line_reaches_the_fleet(self):
+        c = self.collector(lambda state: "autosave job: not loaded")
+        c.fleet()
+        self.settle(c)
+        self.assertEqual(c.fleet().doctor, "autosave job: not loaded")
+
+    def test_a_slow_doctor_does_not_hold_the_rows(self):
+        # its checks are subprocesses and an ask of iTerm2: seconds when one
+        # is slow. The rows come first, its line on a later scan (review 1 of
+        # the CLI revamp, slice 1)
+        import time
+        go = threading.Event()
+        self.addCleanup(go.set)
+        c = self.collector(lambda state: go.wait(3) and "autosave job: not loaded")
+        began = time.monotonic()
+        first = c.fleet()
+        self.assertLess(time.monotonic() - began, 0.5)
+        self.assertEqual((len(first.rows), first.doctor), (1, ""))
+        go.set()
+        self.settle(c)
+        self.assertEqual(c.fleet().doctor, "autosave job: not loaded")
+
+    def test_one_doctor_at_a_time(self):
+        # a slow one is not joined by another on every scan
+        go = threading.Event()
+        self.addCleanup(go.set)
+        c = self.collector(lambda state: go.wait(3) and "")
+        for _ in range(3):
+            c.fleet()
+        go.set()
+        self.settle(c)
+        self.assertEqual(len(self.states), 1)
+
+    def test_one_cache_across_scans(self):
+        # the TTL lives in the state it is given: a new one each scan would
+        # run doctor's checks every 20 seconds
+        c = self.collector(lambda state: "")
+        c.fleet()
+        self.settle(c)
+        c.fleet()
+        self.settle(c)
+        self.assertEqual(len(self.states), 2)
+        self.assertIs(self.states[0], self.states[1])
+
+    def test_a_failing_doctor_never_takes_the_fleet_down(self):
+        # nor prints its traceback over the screen: an error a thread does not
+        # catch goes to threading.excepthook, which writes it to stderr
+        def boom(state):
+            raise RuntimeError("launchctl moved")
+        uncaught = []
+        self.addCleanup(setattr, threading, "excepthook", threading.excepthook)
+        threading.excepthook = uncaught.append
+        c = self.collector(boom)
+        c.fleet()
+        self.settle(c)
+        fleet = c.fleet()
+        self.assertEqual((len(fleet.rows), fleet.doctor), (1, ""))
+        self.assertEqual(uncaught, [])
+
+    def test_a_doctor_thread_that_cannot_start_never_takes_the_fleet_down(self):
+        # "can't start new thread": the scan keeps its rows (review 2 of the
+        # CLI revamp, slice 1), and the next scan tries again
+        c = self.collector(lambda state: "autosave job: not loaded")
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            fleet = c.fleet()
+        self.assertEqual((len(fleet.rows), fleet.doctor), (1, ""))
+        c.fleet()
+        self.settle(c)
+        self.assertEqual(c.fleet().doctor, "autosave job: not loaded")
+
+    def test_a_failing_doctor_keeps_its_last_answer(self):
+        # "could not tell" is not "fixed"
+        answers = iter(["autosave job: not loaded"])
+
+        def first_then_failing(state):
+            return next(answers)                     # StopIteration the second time
+        c = self.collector(first_then_failing)
+        c.fleet()
+        self.settle(c)
+        c.fleet()                                    # its checks fail this time
+        self.settle(c)
+        self.assertEqual(len(self.states), 2)
+        self.assertEqual(c.fleet().doctor, "autosave job: not loaded")
+
+    def test_a_failed_scan_says_why_after_doctor_s_first_look(self):
+        # the real doctor line, not a stand-in: "claude: not found" explains
+        # the error once doctor's first look is in, not 5 minutes later
+        # (review 4 of the CLI revamp, slice 1)
+        import ccwho as runner
+        c = ui.Collector()
+        c.reload = lambda: None
+        c.doctor = lambda: REAL_DOCTOR(c)
+        facts = {"claude": "", "iterm_ok": True, "handler_registered": True,
+                 "launchd_loaded": True, "last_run_age": 10.0, "newest_manifest_age": 10.0,
+                 "cc_status_hook": True, "settings_path": "/x", "iterm_use": "in use",
+                 "iterm_host": True}
+        for owner, name, value in (
+                (runner.setup, "gather", lambda **kw: dict(facts)),
+                (runner, "usage_facts", lambda now=None: {"usage_roots": [],
+                                                          "usage_newest_age": None})):
+            self.addCleanup(setattr, owner, name, getattr(owner, name))
+            setattr(owner, name, value)
+        self.addCleanup(setattr, ui.engine, "collect", ui.engine.collect)
+
+        def failing(cache=None, status=None):
+            raise OSError("no claude")
+        ui.engine.collect = failing
+        self.addCleanup(self.settle, c)
+        c.fleet()
+        self.settle(c)
+        fleet = c.fleet()
+        self.assertIn("could not read the fleet", fleet.error)
+        self.assertIn("claude", fleet.doctor)
+
+    def test_a_scan_that_failed_still_says_what_doctor_found(self):
+        # doctor's line is what explains the error: "claude: not found"
+        # (review 1 of the CLI revamp, slice 1)
+        c = self.collector(lambda state: "claude: not found")
+
+        def failing(cache=None, status=None):
+            raise OSError("no claude")
+        ui.engine.collect = failing
+        c.fleet()
+        self.settle(c)
+        fleet = c.fleet()
+        self.assertIn("could not read the fleet", fleet.error)
+        self.assertEqual(fleet.doctor, "claude: not found")
 
 
 class TestTheCollectorLooksForSecureInput(unittest.TestCase):
@@ -3075,9 +3273,9 @@ class TestYouCanSeeWhichRowIsBeingOpened(UiTest):
                               if w.has_class("acting")], [bg["sessionId"]])
 
 
-class TestTheListReloadsLikeTheWatch(unittest.TestCase):
-    """The hotkey window stays open for days and re-reads its rules, as the watch
-    loop does - through the SAME routine. It used to keep its own copy of the
+class TestTheListReloadsThroughTheOneRoutine(unittest.TestCase):
+    """The hotkey window stays open for days and re-reads its rules through
+    engine.reload_all, the one routine. It used to keep its own copy of the
     module list, and that copy did not put the working modules back when a new
     file raised half way: the window then ran rules that were neither version."""
 

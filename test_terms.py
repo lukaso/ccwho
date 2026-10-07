@@ -1151,12 +1151,13 @@ class TestGuardsHoldWhenModulesShareAProcess(unittest.TestCase):
                           "test_ccwho.TestTheGateWritesOneIterm2AsOnePid.test_one")
 
     def test_the_runner_s_guards_come_off(self):
-        self.run_in_order("test_runner.TestInterval",
+        self.run_in_order("test_runner.TestRestoreDir",
                           "test_ccwho.TestBackgroundAsksNeverPileUpInITerm2.test_an_answer_comes_back")
 
     def test_a_brief_reload_then_a_scan(self):
         self.run_in_order(
-            "test_runner.TestHotReloadCoversTheBriefModule.test_a_broken_brief_edit_does_not_kill_the_loop",
+            "test_ccwho.TestTheListsReloadCoversEveryRuleModule"
+            ".test_an_edit_that_blows_up_at_import_leaves_the_old_rules_working",
             "test_ccwho.TestCollectTakesWindowsFromPsNotFromTabNames"
             ".test_a_scan_runs_ps_once_even_when_iterm2_is_not_asked")
 
@@ -1304,7 +1305,7 @@ class TestAModuleLeavesTheTerminalModuleUntouched(unittest.TestCase):
         self.after("test_panel.ThePanelWindowIsABackgroundAsk")
 
     def test_after_the_runner_s_tests(self):
-        self.after("test_runner.TestInterval")
+        self.after("test_runner.TestRestoreDir")
 
     def test_after_the_engine_s_tests(self):
         self.after("test_ccwho.TestParseSessions")

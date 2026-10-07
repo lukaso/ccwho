@@ -2061,7 +2061,8 @@ def carry_out(mode, target, confirmed, force=False, mine=None, act=None):
     world, d, trouble = read(confirmed)
     if trouble:
         why = f"{trouble} - nothing killed"
-        return dict(out, spare=[dict(e, why=why) for e in confirmed], why=why)
+        # unread: the machine could not be read again - could not tell (exit 4)
+        return dict(out, spare=[dict(e, why=why) for e in confirmed], why=why, unread=True)
     out["spare"], out["new"] = list(d["spare"]), d["new"]
     own = {os.getpid(), world["own"]}
 
@@ -4235,8 +4236,9 @@ def _kill_line(e):
     return f"  {e['pid']:<7} {ports:<12} {truncate(e.get('command') or '', 50):<50}  {who}"
 
 
-def kill_list_lines(plan):
-    """What a kill would take and what it spares, as `ccwho kill` prints it."""
+def kill_list_lines(plan, lead="ccwho"):
+    """What a kill would take and what it spares, as `ccwho kill` prints it.
+    `lead` starts a line of why: a command names itself (`ccwho kill`)."""
     kill, out = plan.get("kill") or [], []
     if kill:
         out.append(f"{len(kill)} process{'es' if len(kill) != 1 else ''} to kill:")
@@ -4246,11 +4248,11 @@ def kill_list_lines(plan):
                 out.append(f"          ! {e['note']}")
     out += [f"not killed: {e['why']}" for e in plan.get("spare") or []]
     if plan.get("why"):
-        out.append(f"ccwho: {plan['why']}")
+        out.append(f"{lead}: {plan['why']}")
     return out
 
 
-def kill_report_lines(r, refused):
+def kill_report_lines(r, refused, lead="ccwho"):
     """What carry_out did, one line each, and the exit: 0 when all of the target
     is gone (and the plan refused no part of it), 130 when an interrupt stopped
     it before any signal, else 1."""
@@ -4266,9 +4268,11 @@ def kill_report_lines(r, refused):
             f" - ccwho kill {e['pid']}" for e in r["new"]]
     out += list(r["ports"])
     if r.get("why"):
-        out.append(f"ccwho: {r['why']}")
+        out.append(f"{lead}: {r['why']}")
     if r.get("why", "").startswith("interrupted") and not (r["killed"] or r["survivors"]):
         return out, 130                     # nothing got a signal
+    if r.get("unread") and not (r["killed"] or r["survivors"]):
+        return out, 4                       # could not tell: nothing got a signal
     # all of the target is gone: nothing left, nothing new, no port not known free,
     # no tree refused
     whole = r["killed"] and not (r["survivors"] or r["spare"] or r["new"] or r.get("why")

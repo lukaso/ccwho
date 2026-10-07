@@ -613,6 +613,23 @@ class TestLoadReadings(unittest.TestCase):
         self.assertEqual(sorted(usage.prune(self.dir, NOW)), ["old.json", "old.json.1.tmp"])
 
 
+class TestEveryIdAQueryNames(unittest.TestCase):
+    """`ccwho usage name` tells no account (1) from several (2): matching_ids
+    gives them all (review 3 of the CLI revamp, slice 3b)."""
+
+    def test_an_exact_id_is_that_one_alone(self):
+        # though it is also the start of another
+        self.assertEqual(usage.matching_ids("token:abc", ["token:abc", "token:abcd"]),
+                         ["token:abc"])
+
+    def test_no_query_names_none(self):
+        self.assertEqual(usage.matching_ids("", ["login:a"]), [])
+
+    def test_a_start_names_every_id_it_starts(self):                       # control
+        self.assertEqual(usage.matching_ids("token:ab", ["token:abc", "token:abd", "login:x"]),
+                         ["token:abc", "token:abd"])
+
+
 class TestLabels(unittest.TestCase):
     def test_name_by_exact_id_or_unique_prefix(self):
         ids = ["token:0123456789abcdef", "login:uuid-a"]

@@ -365,7 +365,7 @@ class TestSaveAndRestore(unittest.TestCase):
         with open(bad, "w") as fh:
             fh.write("{not json")
         rc, out = self._restore()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertIn("cannot read", out)
 
     def test_restore_picks_the_newest_manifest(self):
@@ -903,7 +903,7 @@ class TestRestoreCheck(unittest.TestCase):
     def test_a_damaged_id_is_still_a_problem_not_a_crash(self):
         rc, out = self.checked([self.entry(self.GOOD, "good"), self.entry([1], "bad")])
         self.assertEqual(rc, 1, out)
-        self.assertIn("NOT fully restorable: 1 of 2 session(s)", out)
+        self.assertIn("ccwho restore: NOT fully restorable: 1 of 2 session(s)", out)
 
     def test_a_save_that_is_not_an_object_fails_without_a_traceback(self):
         d = runner.restore_dir()
@@ -927,7 +927,7 @@ class TestRestoreCheck(unittest.TestCase):
         # --open takes the first entry of an id - no id too (review 7)
         rc, out = self.checked([self.entry(self.GOOD, "good"), {"cwd": self.tmp, "project": "a"},
                                 {"cwd": self.tmp, "project": "b"}])
-        self.assertIn("NOT fully restorable: 1 of 2 session(s)", out)
+        self.assertIn("ccwho restore: NOT fully restorable: 1 of 2 session(s)", out)
 
     def test_damaged_entries_are_problems_not_a_crash(self):
         rc, out = self.checked([self.entry(self.GOOD, "good"), {"sessionId": 5, "cwd": self.tmp},
@@ -963,7 +963,8 @@ class TestRestoreCheck(unittest.TestCase):
         lines = [l for l in out.splitlines() if "cwd is gone" in l]
         self.assertEqual(len(lines), 1, out)
         self.assertIn("  x?ccwho restore: y: cwd is gone: /not/here?ccwho restore: z", lines[0])
-        self.assertFalse([l for l in out.splitlines() if l.startswith("ccwho restore: ")], out)
+        self.assertFalse([l for l in out.splitlines() if l.startswith("ccwho restore: ")
+                          and not l.startswith("ccwho restore: NOT fully restorable: ")], out)
 
     def test_one_with_no_project_is_named_by_its_whole_id(self):
         # as --open names it (engine.saved_name)
@@ -1040,7 +1041,7 @@ class TestSaveRefusesAnUnsourcedManifest(unittest.TestCase):
     def test_an_unreachable_source_fails_loudly_and_writes_nothing(self):
         self.source_ok = False
         rc, out = self._save()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertEqual(self._manifests(), [])
         self.assertIn("claude", out.lower())
 
@@ -1054,7 +1055,7 @@ class TestSaveRefusesAnUnsourcedManifest(unittest.TestCase):
                 fh.write("{}")
         self.source_ok = False
         for _ in range(20):
-            self.assertEqual(self._save()[0], 1)
+            self.assertEqual(self._save()[0], 4)
         self.assertEqual(self._manifests(), good)
 
     def test_a_working_source_with_nothing_open_writes_nothing_and_succeeds(self):
@@ -1657,7 +1658,7 @@ class TestOpenNeverForksALiveSession(unittest.TestCase):
     def test_an_unreadable_fleet_opens_nothing(self):
         self.source_ok = False
         rc, out = self._open(self.SID)
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertEqual(self.runs, [], "an empty list we could not trust is not 'dead'")
         self.assertIn("not reopening", out)
 
@@ -1827,7 +1828,7 @@ class TestOpenGoesToASessionByAnyName(unittest.TestCase):
         self.ended = [{"sessionId": self.SID, "project": "liveapp",
                        "title": "fix the hotkey window", "topic": "", "since": "2d"}]
         rc, out = self._main("open", "hotkey", "window")
-        self.assertEqual(rc, 1, out)
+        self.assertEqual(rc, 4, out)                    # could not tell
         self.assertIn("not reopening", out)
         self.assertEqual(self.runs, [])
 
@@ -2580,7 +2581,7 @@ class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
     def test_an_unreadable_fleet_opens_nothing_at_all(self):
         self.source_ok = False
         rc, out = self._restore_open()
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertEqual(self.runs, [], "17 windows on a guess is the worst outcome")
         self.assertIn("not reopening", out)
 
@@ -2803,7 +2804,8 @@ class TestRestoreOpenLeavesWhatHadNoTerminalWindow(unittest.TestCase):
         ok_open = {e_["sessionId"] for e_ in sessions if isinstance(e_.get("sessionId"), str)
                    and "claude --resume " + e_["sessionId"] in script}
         # --check names no restorable session, it counts them
-        m = re.search(r"^restorable: (\d+)|^NOT fully restorable: (\d+) of (\d+)", check, re.M)
+        m = re.search(r"^restorable: (\d+)|^ccwho restore: NOT fully restorable: (\d+) of (\d+)",
+                      check, re.M)
         ok_check = (0 if m is None else int(m.group(1)) if m.group(1)
                     else int(m.group(3)) - int(m.group(2)))
         return ((left(check), bad_check, ok_check), (left(opened), bad_open, len(ok_open)))
@@ -3383,11 +3385,11 @@ class TestARestoreOfTwoAppsSendsEachOnItsOwn(unittest.TestCase):
         self.wrote, self.fails, self.stop_after = "", ("terminal",), 2
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = runner._interruptible(runner.restore, ["--open"])
+            rc = runner._interruptible(runner.restore, ["--open"], "restore")
         self.assertEqual(rc, 130)
         self.assertEqual(self.sent, ["iterm2", "terminal", "iterm2"])
         self.assertIn("Terminal.app did not answer", err.getvalue())
-        self.assertTrue(err.getvalue().strip().splitlines()[-1].startswith("ccwho: stopped"))
+        self.assertTrue(err.getvalue().strip().splitlines()[-1].startswith("ccwho restore: stopped"))
 
     def test_an_app_the_restore_does_not_know_goes_where_you_are(self):
         # a record's app from a module reloaded meanwhile, with an app this
@@ -3404,10 +3406,10 @@ class TestARestoreOfTwoAppsSendsEachOnItsOwn(unittest.TestCase):
         self.refuses, self.stops = "iterm2", "terminal"
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = runner._interruptible(runner.restore, ["--open"])
+            rc = runner._interruptible(runner.restore, ["--open"], "restore")
         self.assertEqual(rc, 130)
         self.assertIn("iTerm2 refused", err.getvalue())
-        self.assertTrue(err.getvalue().strip().splitlines()[-1].startswith("ccwho: stopped"))
+        self.assertTrue(err.getvalue().strip().splitlines()[-1].startswith("ccwho restore: stopped"))
 
     def test_ctrl_c_in_terminal_app_s_send(self):
         self.stops = "terminal"
@@ -4603,7 +4605,7 @@ class TestSetupDoesNotPesterOrHalfWrite(SetupHarness):
     def test_a_proof_with_no_nonce_is_refused_not_a_traceback(self):
         rc, out = self.run_setup(["--proof"])
         self.assertEqual(rc, 2)
-        self.assertIn("nonce", out.lower())
+        self.assertIn("ccwho setup: --proof needs the nonce", out)
 
 
 class TestSetupLeavesNothingWorseThanItFoundIt(SetupHarness):
@@ -5367,6 +5369,15 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         _, out_all, _ = self.run_ps("--helpers")
         self.assertIn("some-mcp", out_all)
 
+    def test_json_names_the_session_sessionId(self):
+        # as every --json does (the CLI revamp, 2026-10-06), each its own
+        rc, out, err = self.run_ps("--json")
+        self.assertEqual(rc, 0, err)
+        rows = json.loads(out)
+        self.assertTrue(all("session" not in r for r in rows), rows[0])
+        self.assertEqual({r["pid"]: r["sessionId"] for r in rows if r["pid"] in (11, 20)},
+                         {11: SESSION, 20: "dddd"})
+
     def test_all_is_now_helpers_and_is_refused(self):
         # --all meant "with program sessions" in ls and "with helpers" here
         rc, out, err = self.run_ps("--all")
@@ -5412,7 +5423,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
                      left_behind=[], codex=[])
         runner.engine.collect = lambda cache=None, status=None: ([], fleet)
         rc, out, err = self.run_ps()
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 4)
         self.assertIn("unknown", err)
         self.assertNotIn("no processes", out)
 
@@ -5422,7 +5433,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         runner.engine.collect = lambda cache=None, status=None: (
             row, dict(fleet, ports_ok=False))
         rc, out, err = self.run_ps("--port", "3000")
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 4)
         self.assertIn("unknown", err)
 
     def test_ports_unknown_shows_a_question_mark(self):
@@ -5459,14 +5470,14 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
             row, dict(fleet, procs_ok=False))
         for args in ((), ("--port", "3000")):
             with self.subTest(args=args):
-                self.assertEqual(self.run_ps(*args)[0], 3)
+                self.assertEqual(self.run_ps(*args)[0], 4)
 
     def test_a_port_held_by_an_unreadable_process_is_unknown(self):
         row, fleet = runner.engine.collect()
         runner.engine.collect = lambda cache=None, status=None: (
             row, dict(fleet, unknown_ports=[8080]))
         rc, _, err = self.run_ps("--port", "8080")
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 4)
         self.assertIn(":8080", err)
         self.assertEqual(self.run_ps("--port", "4444")[0], 1)                # control
 
@@ -5478,7 +5489,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
             row, dict(fleet, unknown_ports=[5000],
                       unknown_holders={5000: [{"pid": 1190, "name": "ControlCenter"}]}))
         rc, _, err = self.run_ps("--port", "5000")
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 4)
         self.assertIn("ControlCenter (pid 1190)", err)
 
     def test_an_unreadable_holders_name_cannot_repaint_the_terminal(self):
@@ -5791,8 +5802,20 @@ class TestStatusline(unittest.TestCase):
         self.run_with(self.payload())
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(runner.main(["usage", "name", "nope", "work"]), 2)
+            self.assertEqual(runner.main(["usage", "name", "nope", "work"]), 1)    # not found
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "ccwho", "accounts.json")))
+
+    def test_accounts_name_that_fits_several_is_refused(self):
+        # several matches: 2; none: 1 (review 2 of the CLI revamp, slice 3b)
+        testkit.patch(self, runner.usage, "accounts",
+                      lambda *a, **k: [{"id": "login:aaa1"}, {"id": "login:aaa2"}])
+        testkit.patch(self, runner.usage, "codex_rows", lambda *a, **k: [])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["usage", "name", "aaa", "work"]), 2)
+            self.assertEqual(runner.main(["usage", "name", "zzz", "work"]), 1)
+        self.assertIn("'aaa' matches 2 accounts", err.getvalue())
+        self.assertIn("no account matches 'zzz'", err.getvalue())
 
     def test_housekeeping_prunes_old_readings(self):
         self.run_with(self.payload())
@@ -6978,7 +7001,7 @@ class TestANewWindowOpensInTheAppTheSessionWasIn(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = runner.restore(["--open", "--from", path])
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertIn("(RecursionError)", err.getvalue())
 
     def test_a_search_that_failed_is_not_a_missing_app(self):
@@ -8529,6 +8552,113 @@ class TestEveryCommandKeepsTheSameRules(unittest.TestCase):
         rc, out, err = self.main("ls", "-y")                       # control: no --yes there
         self.assertEqual(rc, 2, err)
         self.assertIn("unknown option -y", err)
+
+
+class TestEveryCommandSpeaksTheSameWay(unittest.TestCase):
+    """The rest of the CLI revamp's rules (owner, 2026-10-06): every error
+    line starts with `ccwho <command>:`; exit 3 is "needs --yes", 4 is "could
+    not tell - a source could not be read"; --json names a session sessionId;
+    colour is off with --no-color, NO_COLOR, or no terminal, in every command
+    that has colour."""
+
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def main(self, *argv, tty=False):
+        out, err = TestPlainCcwhoOpensTheUi._Captured(), io.StringIO()
+        out.tty = tty
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_no_error_line_says_only_ccwho(self):
+        # a bare "ccwho:" is bare ccwho's own (main, run_ui): every command
+        # names itself
+        import ast
+        import inspect
+        said = []
+        for node in ast.walk(ast.parse(inspect.getsource(runner))):
+            if isinstance(node, ast.FunctionDef):
+                said += [node.name for sub in ast.walk(node)
+                         if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+                         and sub.value.lstrip().startswith("ccwho: ")]
+        self.assertTrue(said, "the scan found nothing: it is broken")
+        self.assertEqual(sorted(set(said) - {"main", "run_ui"}), [])
+
+    def test_a_ctrl_c_names_its_command(self):
+        for argv, attr in ((["open", "x"], "open_session"), (["restore"], "restore")):
+            with self.subTest(cmd=argv[0]):
+                with mock.patch.object(runner, attr, side_effect=KeyboardInterrupt):
+                    rc, out, err = self.main(*argv)
+                self.assertEqual(rc, 130)
+                self.assertTrue(err.startswith(f"ccwho {argv[0]}: stopped"), err)
+
+    def test_a_save_that_cannot_reach_claude_could_not_tell(self):
+        testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
+            status.update(source_ok=False) or ([], {})))
+        rc, out, err = self.main("save")
+        self.assertEqual(rc, 4, err)
+        self.assertIn("ccwho save: cannot reach `claude agents`", err)
+
+    def test_a_manifest_it_cannot_read_could_not_tell(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bad = os.path.join(tmp, "m.json")
+        with open(bad, "w") as fh:
+            fh.write("{not json")
+        rc, out, err = self.main("restore", "--from", bad)
+        self.assertEqual(rc, 4, err)
+        self.assertIn("ccwho restore: cannot read", err)
+
+    def test_show_json_names_the_session_sessionId(self):
+        # the real brief: its id is under "aka" (review 1 of the CLI revamp,
+        # slice 3b - a stand-in brief with a top-level id passed from the start)
+        testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
+            [{"sessionId": self.SID, "title": "t", "project": "p", "tty": "", "pid": 1}], {}))
+        testkit.patch(self, runner.engine, "read_windows", lambda sid, cache=None, **k: ([], [], 0))
+        rc, out, err = self.main("show", "--json")
+        self.assertEqual(rc, 0, err)
+        got = json.loads(out)
+
+        def keys(v):
+            if isinstance(v, dict):
+                return set(v) | {k for x in v.values() for k in keys(x)}
+            return {k for x in v for k in keys(x)} if isinstance(v, list) else set()
+        self.assertNotIn("session_id", keys(got))
+        self.assertEqual((got.get("sessionId"), got["aka"].get("sessionId")), (self.SID, self.SID))
+
+    def test_show_s_text_still_names_the_session(self):                    # control
+        testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
+            [{"sessionId": self.SID, "title": "t", "project": "p", "tty": "", "pid": 1}], {}))
+        testkit.patch(self, runner.engine, "read_windows", lambda sid, cache=None, **k: ([], [], 0))
+        rc, out, err = self.main("show", "--no-color")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(self.SID, out)
+
+    def test_show_and_doctor_take_no_color(self):
+        testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
+            [{"sessionId": self.SID, "title": "t", "project": "p", "tty": "", "pid": 1}], {}))
+        testkit.patch(self, runner.engine, "read_windows", lambda sid, cache=None, **k: ([], [], 0))
+        testkit.patch(self, runner.engine.brief, "build",
+                      lambda head, tail, session=None, **k: {"recap": "", "recap_ts": ""})
+        seen = []
+        testkit.patch(self, runner.engine, "render_brief",
+                      lambda b, row, color=False: seen.append(color) or "")
+        self.main("show", tty=True)
+        self.main("show", "--no-color", tty=True)
+        self.assertEqual(seen, [True, False])
+        testkit.patch(self, runner.setup, "gather", lambda **kw: {"claude": ""})
+        testkit.patch(self, runner, "usage_facts",
+                      lambda now=None: {"usage_roots": [], "usage_newest_age": None})
+        _rc, colour, _err = self.main("doctor", tty=True)                    # control
+        _rc, plain, _err = self.main("doctor", "--no-color", tty=True)
+        self.assertIn("\033[", colour)
+        self.assertNotIn("\033[", plain)
+
+    def test_help_names_the_exit_codes(self):
+        rc, out, err = self.main("--help")
+        for code in ("0 done", "1 not done or not found", "2 a usage error or several matches",
+                     "3 needs --yes", "4 could not tell", "130 interrupted"):
+            self.assertIn(code, out)
 
 
 class TestTheTableLetsGoOfWhatItSeesRunning(unittest.TestCase):
@@ -13922,7 +14052,7 @@ class TestACtrlCSaysWhatItStopped(unittest.TestCase):
     def stopped(self, command):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            rc = runner._interruptible(command, [])
+            rc = runner._interruptible(command, [], "open")
         return rc, err.getvalue()
 
     def test_during_a_send(self):
@@ -14132,7 +14262,7 @@ class TestAHiddenCtrlCEndsTheCommand(unittest.TestCase):
     def test_it(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            rc = runner._interruptible(lambda args: self.launched(interrupted=True), [])
+            rc = runner._interruptible(lambda args: self.launched(interrupted=True), [], "open")
         self.assertEqual(rc, 130)
         self.assertIn(runner.MAY_STILL_RUN, err.getvalue())
 
@@ -14169,7 +14299,7 @@ class TestAStoppedCommandDiesOfSigint(unittest.TestCase):
         def before(args):
             raise KeyboardInterrupt
         with contextlib.redirect_stderr(io.StringIO()):
-            runner._interruptible(before, [])
+            runner._interruptible(before, [], "open")
         self.assertIs(runner._LOCAL.__dict__.get("interrupted"), True)
 
 
@@ -14194,7 +14324,7 @@ class TestACtrlCInOpensAttach(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.object(runner, "scan", return_value=([], 0)), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            rc = runner._interruptible(runner.open_session, ["4f2b91ac-1111-4222-8333-abcdefabcdef"])
+            rc = runner._interruptible(runner.open_session, ["4f2b91ac-1111-4222-8333-abcdefabcdef"], "open")
         self.assertEqual(rc, 130)
         self.assertIn(runner.MAY_STILL_RUN, err.getvalue())
 

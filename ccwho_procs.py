@@ -1854,8 +1854,9 @@ def _kill_plan(mode, target, world):
     codex_note = "ccwho cannot tell whether the Codex session that started it is still running"
     chosen = None           # mode "mine" or "session": the session whose work it is
 
-    def nothing(why):
-        return {"kill": [], "spare": [], "why": why}
+    def nothing(why, unread=False):
+        # unread: a source could not be read - the caller could not tell (exit 4)
+        return {"kill": [], "spare": [], "why": why, "unread": unread}
 
     def cmd_of(pid):
         return table.get(pid, (0, "", ""))[2]
@@ -2157,12 +2158,12 @@ def _kill_plan(mode, target, world):
         what = ("this ccwho run" if hidden & ccwho_chain else "an agent" if hidden & agents
                 else "a process an agent started")
         return nothing(f"the process table was not read whole - a process whose parent"
-                       f" was not read is {what}; nothing killed; run it again")
+                       f" was not read is {what}; nothing killed; run it again", unread=True)
     if agent and mine is None:
         return nothing("the session id given is not one - nothing killed")
     if agent and not marks_read:
         return nothing("the environments were not read - ccwho cannot tell what your"
-                       " session started; nothing killed")
+                       " session started; nothing killed", unread=True)
 
     roots, spared = [], []
     if mode == "pid":
@@ -2188,7 +2189,7 @@ def _kill_plan(mode, target, world):
         if port is None:
             return nothing("not a port number")
         if not ports_read:
-            return nothing("the listening ports were not read - nothing killed")
+            return nothing("the listening ports were not read - nothing killed", unread=True)
         litter = {p["pid"] for p in att["left_behind"] if table.get(p["pid"], (0,))[0] == 1}
         for pid in sorted(p for p, held in ports.items() if port in held and p in table):
             # a holder under an orphan left behind goes with the orphan's tree

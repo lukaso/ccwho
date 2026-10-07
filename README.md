@@ -377,12 +377,12 @@ its session id in its environment (`CLAUDE_CODE_SESSION_ID`; Codex sets
 shell, one of them: so what runs under a listed live `claude` is that session's
 work, mark or not. Once it has left that tree, a process with a hidden environment
 is usually not known (unless its command line names the session) - `ccwho ps
---port` names the holder and exits 3 (`:5000 is held by ControlCenter (pid 1190)`).
+--port` names the holder and exits 4 (`:5000 is held by ControlCenter (pid 1190)`).
 So ccwho can say who started what:
 
 ```sh
 ccwho ps                    # every process an agent started, its session, its ports
-ccwho ps --port 3000        # who holds :3000 - exit 1 if no agent does, 3 if that is not known
+ccwho ps --port 3000        # who holds :3000 - exit 1 if no agent does, 4 if that is not known
 ccwho ps --helpers          # ...including helpers (MCP servers and the like)
 ccwho ps --json             # for scripts, and for agents told to clean up
 ccwho ps --full             # the whole command line, not the short form
@@ -405,8 +405,8 @@ running `claude` that no source lists), when the claude that started it still ru
 (`CLAUDE_PID` - after `/clear` a claude keeps running under a new session id), when
 it is a `claude` itself or runs under one, or when it runs inside an app or tmux
 that an agent opened - the mark is inherited, and the user may work on in there. An app (`….app/Contents/…`) is `not sure` whoever started it: an agent that
-opens Docker Desktop has not made Docker its work. Exit 3 means "not known": ps or
-lsof failed, no environment could be read, or the port's holder could not be read.
+opens Docker Desktop has not made Docker its work. Exit 4 means "could not tell": ps
+or lsof failed, no environment could be read, or the port's holder could not be read.
 
 What ccwho can and cannot see: the environment is read with `sysctl` and only five
 named variables are kept, with the iTerm2 pane id and a hash of an OAuth token - it
@@ -512,7 +512,8 @@ ccwho never asks and takes only what that agent's own session started, and
 nothing that carries a doubt: `ccwho clean --mine` cleans up after itself.
 
 Exit codes: 0 all killed, 1 not all (or nothing to kill), 2 usage, 3 needs `--yes`,
-130 interrupted before any signal (nothing killed). A `--dry-run` exits as the kill
+4 the machine or the session list could not be read (nothing killed), 130
+interrupted before any signal (nothing killed). A `--dry-run` exits as the kill
 would: 1 when part of the target would be refused.
 
 `ccwho stop` stops only a background session, with `claude stop`; `claude attach`
@@ -520,7 +521,8 @@ brings it back. A session started in a window is never stopped: end it there
 (`/exit`). A background session attached in a window is stopped, and the question
 says it is open there. An agent stops no session. Exit codes: 0 stopped, 1 not (or
 not all), 2 usage, several matches, or (with `--yes`) a word that is not its id, name
-or tty, 3 needs `--yes`, 130 interrupted - after `claude stop` began, the session may
+or tty, 3 needs `--yes`, 4 the session list (or, with `--and-procs`, the machine)
+could not be read, 130 interrupted - after `claude stop` began, the session may
 be stopped (run `ccwho ls`). A `--dry-run` exits as the stop would.
 
 ## ccwho save / restore - a reboot stops being a one-way door
@@ -617,7 +619,7 @@ and when it could not be reached at all - and launchd's minimal `PATH` has no
 0-session manifest and printed success. At 20 kept, twenty ticks is five hours to
 evict every manifest that had anything in it: the tool would have deleted the exact
 record it exists to keep. Now an unreachable source is `None`, distinct from a
-genuine `[]`; `save` exits 1 and writes nothing, and it names `PATH` as the thing to
+genuine `[]`; `save` exits 4 and writes nothing, and it names `PATH` as the thing to
 check. A working source with nothing open writes nothing either - an empty manifest
 has no restore value and can only push out one that has.
 
@@ -695,7 +697,18 @@ ccwho setup             # install what it needs, once
 
 Every command takes `--help` (or `-h`): it prints that command's usage and runs
 nothing. An option or word a command does not take is refused (exit 2), never
-ignored. `--flag=value` is `--flag value`, and `-y` is `--yes`.
+ignored. `--flag=value` is `--flag value`, and `-y` is `--yes`. Every error line
+starts with `ccwho <command>:`. Colour is off with `--no-color`, with `NO_COLOR`
+set, or with no terminal. Every `--json` names a session `sessionId`.
+
+| Exit | Means |
+|---|---|
+| 0 | done |
+| 1 | not done, or not found |
+| 2 | a usage error, or several matches |
+| 3 | needs `--yes` (kill, clean, stop) |
+| 4 | could not tell: a source could not be read (`claude agents`, ps, lsof, a manifest) |
+| 130 | interrupted |
 
 ## Columns
 

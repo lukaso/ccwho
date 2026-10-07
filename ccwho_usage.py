@@ -490,21 +490,27 @@ def accounts(readings, now, labels=None):
 
 def resolve_id(query, ids):
     """An account id from an exact id, a unique prefix, or a unique id body."""
+    hits = matching_ids(query, ids)
+    return hits[0] if len(hits) == 1 else None
+
+
+def matching_ids(query, ids):
+    """Every account id `query` names: an exact id (that one alone), a prefix,
+    an id's body, or a row's tag (`ant:d0a0`)."""
     if not query:
-        return None
+        return []
     if query in ids:
-        return query
+        return [query]
     # a row's tag, copied ("ant:d0a0"): the brand is no part of an id
     brand, colon, rest = query.partition(":")
     if colon and brand in BRANDS:
         if not rest:
-            return None
+            return []
         if brand == "oai":              # a Codex limit by the line's own name, whole
-            return f"codex:{rest}" if f"codex:{rest}" in ids else None
+            return [f"codex:{rest}"] if f"codex:{rest}" in ids else []
         ids = [i for i in ids if not i.startswith("codex:")]
         query = rest
-    hits = [i for i in ids if i.startswith(query) or i.split(":", 1)[-1].startswith(query)]
-    return hits[0] if len(hits) == 1 else None
+    return [i for i in ids if i.startswith(query) or i.split(":", 1)[-1].startswith(query)]
 
 
 def _age(secs):

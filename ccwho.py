@@ -403,10 +403,16 @@ def show(argv):
         b["recap_age"] = engine.brief.age_between(b["recap_ts"], engine.now_iso())
         b["turns_since_recap"] = entry.get("turns_since_recap", 0)
     if want_json:
-        print(json.dumps(b, indent=2))
+        # a session is sessionId, as in every --json - also among its names
+        # (aka); the brief itself keeps session_id, which render_brief reads
+        out = dict(b, sessionId=row.get("sessionId", ""))
+        if isinstance(out.get("aka"), dict):
+            out["aka"] = {("sessionId" if k == "session_id" else k): v
+                          for k, v in out["aka"].items()}
+        print(json.dumps(out, indent=2))
         return 0
     print(engine.render_brief(b, row, color=sys.stdout.isatty()
-                              and "NO_COLOR" not in os.environ))
+                              and "NO_COLOR" not in os.environ and "--no-color" not in argv))
     return 0
 
 
@@ -521,7 +527,7 @@ def setup_cmd(argv):
     if "--proof" in argv:
         nonce = _arg(argv, "--proof", "")
         if not nonce:
-            print("ccwho setup --proof needs the nonce setup is waiting for"
+            print("ccwho setup: --proof needs the nonce setup is waiting for"
                   " (setup puts it there itself)", file=sys.stderr)
             return 2
         setup.write_proof(ccwho_dir(), nonce)
@@ -985,7 +991,7 @@ def doctor(argv):
         print(json.dumps({"ok": setup.doctor_verdict(checks) == 0,
                           "checks": checks}, indent=2))
         return setup.doctor_verdict(checks)
-    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
     for c in checks:
         mark = "ok  " if c["ok"] else "BAD "
         if color:
@@ -2407,7 +2413,7 @@ def open_session(argv, from_index=False, live_only=False):
         print(f"ccwho open: {value} - not reopening anything.", file=sys.stderr)
         print("  Check that `claude` is on PATH and `claude agents --json` answers.",
               file=sys.stderr)
-        return 1
+        return 4                            # could not tell
     if action == "resume" and me and sid == me:
         # the caller runs this very command: a resume would fork it
         print(f"ccwho open: not reopening {sid} - it is the session this runs in",
@@ -2486,10 +2492,10 @@ def ps(argv):
     rows, fleet = scan(cache={})
     fleet = fleet if isinstance(fleet, dict) else {}
     if not fleet.get("procs_ok", True):
-        # 3, the unknown exit: 1 is "no agent holds it", and a script acts on 1
+        # 4, could not tell: 1 is "no agent holds it", and a script acts on 1
         print("ccwho ps: processes unknown - ps or the environment read failed",
               file=sys.stderr)
-        return 3
+        return 4
     # a port question asks about every holder, helpers included
     listed = engine.ps_listing(rows, fleet, show_all="--helpers" in argv or port is not None)
     known = fleet.get("ports_ok", True)
@@ -2498,22 +2504,23 @@ def ps(argv):
             # not 1: "nobody holds it" is an answer, and this is not one
             print(f"ccwho ps: ports unknown - lsof could not be asked, so who holds"
                   f" :{port} is not known", file=sys.stderr)
-            return 3
+            return 4
         listed = [p for p in listed if port in p.get("ports", [])]
         if not listed and port in (fleet.get("unknown_ports") or []):
             held = ", ".join(f"{engine.procs.printable(str(h.get('name')))} (pid {h.get('pid')})"
                              for h in (fleet.get("unknown_holders") or {}).get(port) or [])
             print(f"ccwho ps: :{port} is held by {held or 'a process'}, whose environment"
                   f" could not be read - who started it is not known", file=sys.stderr)
-            return 3
+            return 4
         if not listed:
             print(f"ccwho ps: nothing an agent started holds :{port}", file=sys.stderr)
             return 1
     if "--json" in argv:
-        keep = ("pid", "ports", "command", "group", "who", "session", "harness",
+        keep = ("pid", "ports", "command", "group", "who", "harness",
                 "orphan", "helper", "why") + (("command_full",) if full else ())
-        # ports unknown is null, not [] - a script must not read "holds nothing"
-        print(json.dumps([dict({k: p.get(k) for k in keep},
+        # ports unknown is null, not [] - a script must not read "holds nothing";
+        # its session is sessionId, as in every --json
+        print(json.dumps([dict({k: p.get(k) for k in keep}, sessionId=p.get("session"),
                                ports=p.get("ports") if known else None)
                           for p in listed], indent=2))
         return 0
@@ -2600,32 +2607,33 @@ def _names_exactly(row, word):
                         or w in (tty.lower(), engine.short_tty(tty).lower()))
 
 
-def _one_session(word, rows, exact, nothing):
+def _one_session(cmd, word, rows, exact, nothing):
     """(the one live session `word` names, None), or (None, exit code) after
     saying why: none (1), several (2), a loose word when `exact` - nobody
     reads the list, so a word found in a title is no one's choice (2) - or the
-    sessions not read (1; interrupted 130). `nothing` ends each refusal."""
+    sessions not read (4, could not tell; interrupted 130). `nothing` ends each
+    refusal; each line names `cmd`, the command that asked."""
     try:
         hits = engine.match_rows(rows(), word)
     except KeyboardInterrupt:
-        print(f"ccwho: interrupted - {nothing}", file=sys.stderr)
+        print(f"ccwho {cmd}: interrupted - {nothing}", file=sys.stderr)
         return None, 130
     except Exception as err:
-        print(f"ccwho: the sessions could not be read ({type(err).__name__})"
+        print(f"ccwho {cmd}: the sessions could not be read ({type(err).__name__})"
               f" - {nothing}", file=sys.stderr)
-        return None, 1
+        return None, 4
     if not hits:
-        print(f"ccwho: no live session matches {word!r} - what an ended session"
+        print(f"ccwho {cmd}: no live session matches {word!r} - what an ended session"
               f" left: ccwho clean", file=sys.stderr)
         return None, 1
     if len(hits) > 1:
-        print(f"ccwho: {word!r} matches {len(hits)} sessions - be more specific:",
+        print(f"ccwho {cmd}: {word!r} matches {len(hits)} sessions - be more specific:",
               file=sys.stderr)
         for line in engine.pick_lines(hits):
             print(f"  {line}", file=sys.stderr)
         return None, 2
     if exact and not _names_exactly(hits[0], word):
-        print(f"ccwho: {word!r} found {engine.pick_line(hits[0])} - with no one to"
+        print(f"ccwho {cmd}: {word!r} found {engine.pick_line(hits[0])} - with no one to"
               f" confirm, name it exactly: its id, name or tty", file=sys.stderr)
         return None, 2
     print(f"session {engine.pick_line(hits[0])}")
@@ -2651,6 +2659,7 @@ def kill_cli(argv, clean=False, seams=None):
     only its own session's work. Right before each signal the signaller checks
     again (engine.carry_out). Exit 0 all killed, 1 not all (or nothing), 2
     usage, 3 needs --yes. `seams` replaces the machine (tests)."""
+    cmd = "clean" if clean else "kill"
     s = {"build": lambda mine=None, status=None: engine.build_world(mine, status=status),
          "ask": lambda prompt: _ask(prompt), "tty": lambda: _can_ask(sys.stdin, sys.stdout),
          "env": os.environ,
@@ -2667,7 +2676,7 @@ def kill_cli(argv, clean=False, seams=None):
     mine = engine.agent_id(env)             # an agent: its own session's work only
     if mode == "query":
         # a live session: what it started (the owner's D12)
-        row, rc = _one_session(target, s["rows"], "--yes" in argv or mine is not None,
+        row, rc = _one_session(cmd, target, s["rows"], "--yes" in argv or mine is not None,
                                "nothing killed")
         if row is None:
             return rc
@@ -2678,13 +2687,13 @@ def kill_cli(argv, clean=False, seams=None):
     try:
         world = s["build"](mine=mine, status=status)
         if status.get("trouble"):
-            print(f"ccwho: {status['trouble']} - nothing killed", file=sys.stderr)
-            return 1
+            print(f"ccwho {cmd}: {status['trouble']} - nothing killed", file=sys.stderr)
+            return 4                        # could not tell
         starts = [x.get("sessionId") for x in world["sessions"]
                   if asked_digits and (x.get("sessionId") or "").startswith(str(target))]
         if starts:
             # a short id is four hex, often all digits: asked, never guessed
-            print(f"ccwho: {target} is a pid and the start of a session id - the session:",
+            print(f"ccwho {cmd}: {target} is a pid and the start of a session id - the session:",
                   file=sys.stderr)
             for sid in starts:
                 print(f"  ccwho kill {sid}", file=sys.stderr)
@@ -2695,16 +2704,16 @@ def kill_cli(argv, clean=False, seams=None):
             target = {"pid": target, "start": row[1] if row else ""}
         plan = engine.procs.kill_plan(mode, target, world)
     except KeyboardInterrupt:
-        print("ccwho: interrupted - nothing killed", file=sys.stderr)
+        print(f"ccwho {cmd}: interrupted - nothing killed", file=sys.stderr)
         return 130
     except Exception as err:        # its text may hold a command line: the type only
-        print(f"ccwho: failed ({type(err).__name__}) - nothing killed", file=sys.stderr)
+        print(f"ccwho {cmd}: failed ({type(err).__name__}) - nothing killed", file=sys.stderr)
         return 1
     kill, spare = plan["kill"], plan["spare"]
-    for line in engine.kill_list_lines(plan):
+    for line in engine.kill_list_lines(plan, f"ccwho {cmd}"):
         print(line)
     if not kill:
-        return 1
+        return 4 if plan.get("unread") else 1      # 4: a source could not be read
     # a tree refused (not clean's "outside" spares): the real run could not take it all
     refused = any(not e.get("outside") for e in spare)
     if "--dry-run" in argv:
@@ -2720,7 +2729,7 @@ def kill_cli(argv, clean=False, seams=None):
         except EOFError:
             answer = ""
         except KeyboardInterrupt:
-            print("\nccwho: interrupted - nothing killed", file=sys.stderr)
+            print(f"\nccwho {cmd}: interrupted - nothing killed", file=sys.stderr)
             return 130
         if answer.strip().lower() not in ("y", "yes"):
             print("nothing killed")
@@ -2731,19 +2740,19 @@ def kill_cli(argv, clean=False, seams=None):
         interrupted = isinstance(err, KeyboardInterrupt)
         if getattr(err, "ccwho_nothing_signalled", False):
             what = "interrupted" if interrupted else f"failed ({type(err).__name__})"
-            print(f"ccwho: {what} - nothing killed", file=sys.stderr)
+            print(f"ccwho {cmd}: {what} - nothing killed", file=sys.stderr)
             return 130 if interrupted else 1
         # the signaller had started: what it signalled is not known here
-        print(f"ccwho: {'interrupted' if interrupted else f'failed ({type(err).__name__})'}"
+        print(f"ccwho {cmd}: {'interrupted' if interrupted else f'failed ({type(err).__name__})'}"
               f" - some of these may have been signalled; run ccwho ps", file=sys.stderr)
         return 1
     try:
-        lines, rc = engine.kill_report_lines(r, refused)
+        lines, rc = engine.kill_report_lines(r, refused, f"ccwho {cmd}")
         for line in lines:
             print(line)
         return rc
     except (Exception, KeyboardInterrupt):
-        print("\nccwho: stopped while reporting - run ccwho ps to see what still runs",
+        print(f"\nccwho {cmd}: stopped while reporting - run ccwho ps to see what still runs",
               file=sys.stderr)
         return 1
 
@@ -2804,7 +2813,8 @@ def stop_cli(argv, seams=None):
     (kill_plan's "session" list, shown first; one question covers both) -
     after the stop, and only when the stop worked. Without it, what the session
     left running is said. An agent stops no session. Exit 0 done, 1 not (or
-    not all), 2 usage, 3 needs --yes, 130 interrupted."""
+    not all), 2 usage, 3 needs --yes, 4 could not tell (the session list, or
+    with --and-procs the machine, could not be read), 130 interrupted."""
     s = {"build": lambda mine=None, status=None: engine.build_world(mine, status=status),
          "ask": lambda prompt: _ask(prompt), "tty": lambda: _can_ask(sys.stdin, sys.stdout),
          "env": os.environ, "carry": engine.carry_out, "rows": _live_rows,
@@ -2819,9 +2829,9 @@ def stop_cli(argv, seams=None):
         return 2
     word = words[0]
     if engine.agent_id(s["env"]) is not None:
-        print("ccwho: an agent does not stop sessions - nothing stopped", file=sys.stderr)
+        print(f"ccwho stop: an agent does not stop sessions - nothing stopped", file=sys.stderr)
         return 1
-    row, rc = _one_session(word, s["rows"], "--yes" in argv, "nothing stopped")
+    row, rc = _one_session("stop", word, s["rows"], "--yes" in argv, "nothing stopped")
     if row is None:
         return rc
     sid, conf = row.get("sessionId") or "", row.get("configDir") or None
@@ -2830,7 +2840,7 @@ def stop_cli(argv, seams=None):
     tty = engine.short_tty(row.get("tty") or "")
     seen = f" - it is open in a window ({tty})" if tty and row.get("windowed") else ""
     if row.get("kind") != "background":
-        print(f"ccwho: it runs in a window{f' ({tty})' if tty else ''} - ccwho does not"
+        print(f"ccwho stop: it runs in a window{f' ({tty})' if tty else ''} - ccwho does not"
               f" stop it; end it there (/exit). To find it: ccwho open {word}", file=sys.stderr)
         return 1
     procs_ = "--and-procs" in argv
@@ -2840,26 +2850,28 @@ def stop_cli(argv, seams=None):
         try:
             world = s["build"](mine=None, status=status)
             if status.get("trouble"):
-                print(f"ccwho: {status['trouble']} - nothing stopped", file=sys.stderr)
-                return 1
+                print(f"ccwho stop: {status['trouble']} - nothing stopped", file=sys.stderr)
+                return 4                    # could not tell
             plan = engine.procs.kill_plan("session", sid, world)
         except KeyboardInterrupt:
-            print("ccwho: interrupted - nothing stopped", file=sys.stderr)
+            print(f"ccwho stop: interrupted - nothing stopped", file=sys.stderr)
             return 130
         except Exception as err:
-            print(f"ccwho: failed ({type(err).__name__}) - nothing stopped", file=sys.stderr)
+            print(f"ccwho stop: failed ({type(err).__name__}) - nothing stopped", file=sys.stderr)
             return 1
-        for line in engine.kill_list_lines(plan):
+        for line in engine.kill_list_lines(plan, "ccwho stop"):
             print(line)
         kill = plan["kill"]
         # a tree refused, or what it started not known: not all of it can go
         refused = (any(not e.get("outside") for e in plan["spare"])
                    or _not_known(plan))
+    # not all of it can go because the machine could not be read: could not tell
+    no = 4 if plan and plan.get("unread") else 1
     print(f"and stop the session: {job} - its conversation is kept{seen}"
           if kill else f"stop the session: {job} - its conversation is kept{seen}")
     if "--dry-run" in argv:
         print("dry run - nothing stopped")
-        return 1 if refused else 0
+        return no if refused else 0
     if "--yes" not in argv:
         what = (f"stop it and kill these {len(kill)}" if kill else "stop it") + (
             f" - it is open in a window ({tty})" if seen else "")
@@ -2871,7 +2883,7 @@ def stop_cli(argv, seams=None):
         except EOFError:
             answer = ""
         except KeyboardInterrupt:
-            print("\nccwho: interrupted - nothing stopped", file=sys.stderr)
+            print(f"\nccwho stop: interrupted - nothing stopped", file=sys.stderr)
             return 130
         if answer.strip().lower() not in ("y", "yes"):
             print("nothing stopped")
@@ -2879,15 +2891,15 @@ def stop_cli(argv, seams=None):
     try:
         code, _text = s["stop"](sid, conf)  # its text may name paths: not shown
     except KeyboardInterrupt:
-        print("ccwho: interrupted - the session may have been stopped; run ccwho ls",
+        print(f"ccwho stop: interrupted - the session may have been stopped; run ccwho ls",
               file=sys.stderr)
         return 130
     except Exception as err:
-        print(f"ccwho: could not stop it ({type(err).__name__}) - nothing killed",
+        print(f"ccwho stop: could not stop it ({type(err).__name__}) - nothing killed",
               file=sys.stderr)
         return 1
     if code:
-        print(f"ccwho: could not stop it (claude stop exited {code}) - nothing killed",
+        print(f"ccwho stop: could not stop it (claude stop exited {code}) - nothing killed",
               file=sys.stderr)
         return 1
     # claude's word is not enough: what it started is killed only once the
@@ -2899,25 +2911,25 @@ def stop_cli(argv, seams=None):
             if s["clock"]() >= deadline:
                 what = ("its end could not be confirmed" if gone is None
                         else "the session still runs")
-                print(f"ccwho: claude stop said done, but {what} - nothing killed;"
+                print(f"ccwho stop: claude stop said done, but {what} - nothing killed;"
                       f" run ccwho ls", file=sys.stderr)
-                return 1
+                return 4 if gone is None else 1     # 4: could not tell
             s["sleep"](0.5)
     except KeyboardInterrupt:
-        print("ccwho: interrupted - the session may have been stopped; nothing killed;"
+        print(f"ccwho stop: interrupted - the session may have been stopped; nothing killed;"
               " run ccwho ls", file=sys.stderr)
         return 130
     print(f"stopped - its conversation is kept: {engine.attach_command(sid, conf)}")
     if kill:
         try:
             r = s["carry"]("session", sid, kill, force=False, mine=None)
-            lines, rc = engine.kill_report_lines(r, refused)
+            lines, rc = engine.kill_report_lines(r, refused, "ccwho stop")
         except (Exception, KeyboardInterrupt) as err:
             stopped = isinstance(err, KeyboardInterrupt)
             what = "interrupted" if stopped else f"failed ({type(err).__name__})"
             said = ("nothing killed" if getattr(err, "ccwho_nothing_signalled", False)
                     else "some of its processes may have been signalled; run ccwho ps")
-            print(f"ccwho: {what} - {said}", file=sys.stderr)
+            print(f"ccwho stop: {what} - {said}", file=sys.stderr)
             return 130 if stopped else 1
         for line in lines:
             print(line)
@@ -2930,11 +2942,11 @@ def stop_cli(argv, seams=None):
             raise LookupError
         plan = engine.procs.kill_plan("session", sid, world)
     except KeyboardInterrupt:
-        print("ccwho: interrupted - what it left running: run ccwho ps", file=sys.stderr)
+        print(f"ccwho stop: interrupted - what it left running: run ccwho ps", file=sys.stderr)
         return 130
     except Exception:
         print("what it left running: run ccwho ps")
-        return 1 if refused else 0
+        return no if refused else 0
     # what it takes, and what it names apart (a helper, a shell, ...): all still run
     for e in plan["kill"] + [e for e in plan["spare"] if e.get("outside")]:
         print(f"still running: {e['pid']} {e.get('command') or ''} - ccwho kill {e['pid']}")
@@ -2943,7 +2955,7 @@ def stop_cli(argv, seams=None):
     if _not_known(plan):
         print("what it left running: not known - run ccwho ps")
     # --and-procs with a tree refused: as its dry run said, not all of it went
-    return 1 if refused else 0
+    return no if refused else 0
 
 
 KEEP_MANIFESTS = 20
@@ -3170,11 +3182,13 @@ def accounts(argv):
             print("ccwho usage: a label cannot hold ':' - it reads as a brand",
                   file=sys.stderr)
             return 2
-        aid = usage.resolve_id(argv[1], [r["id"] for r in rows])
-        if not aid:
-            print(f"ccwho usage: no single account matches {argv[1]!r}"
-                  " - `ccwho usage --json` lists the ids", file=sys.stderr)
-            return 2
+        hits = usage.matching_ids(argv[1], [r["id"] for r in rows])
+        if len(hits) != 1:
+            print(f"ccwho usage: {argv[1]!r} matches {len(hits)} accounts" if hits else
+                  f"ccwho usage: no account matches {argv[1]!r}",
+                  "- `ccwho usage --json` lists the ids", file=sys.stderr)
+            return 2 if hits else 1         # several: say more; none: not found
+        aid = hits[0]
         labels = read_labels()
         labels[aid] = argv[2]
         os.makedirs(ccwho_dir(), exist_ok=True)
@@ -3512,7 +3526,7 @@ def save(argv):
         print("  kept as the newest and would evict the record of what you had open.",
               file=sys.stderr)
         print("  Check that `claude` is on PATH for whoever ran this.", file=sys.stderr)
-        return 1
+        return 4                            # could not tell
     panes = engine.terms.ITERM2.panes()
     boot = _boot_id()
     # iTerm2 not asked (None): keep the panes the last save knew - only a save of
@@ -3718,8 +3732,7 @@ def reopen_ended(session_id):
     # what it did is its last line; why it did not, its first - the advice after
     # it ("Check that `claude` is on PATH") is not the reason
     said = (lines[-1] if not rc else lines[0]) if lines else ""
-    for lead in ("ccwho open: ", "ccwho: "):
-        said = said.removeprefix(lead)
+    said = said.removeprefix("ccwho open: ")      # its every line names open
     return said or ("reopened it" if not rc else "could not reopen it")
 
 
@@ -3893,7 +3906,7 @@ def restore(argv):
         # hold a path
         print(f"ccwho restore: cannot read {_one_line(path)} ({type(ex).__name__})",
               file=sys.stderr)
-        return 1
+        return 4                            # could not tell
 
     if "--check" in argv:
         # Deliberately BEFORE --open: a check must never launch anything, even if
@@ -3925,7 +3938,7 @@ def restore(argv):
             print(f"restorable: {n} session(s) in {path}")
             print("every cwd exists, every transcript is on disk, every resume line builds.")
             return 0
-        print(f"NOT fully restorable: {len(problems)} of {n} session(s) in {path}",
+        print(f"ccwho restore: NOT fully restorable: {len(problems)} of {n} session(s) in {path}",
               file=sys.stderr)
         for who, why in problems:
             print(f"  {_one_line(who)}: {_one_line(why)}", file=sys.stderr)
@@ -3945,7 +3958,7 @@ def restore(argv):
                   " anything.", file=sys.stderr)
             print("  Reopening a session that is still running forks its conversation,"
                   " and here it would be every one of them.", file=sys.stderr)
-            return 1
+            return 4                        # could not tell
         openable, running, unusable, starting = [], [], [], []
         gone, windowless = [], []
         # why_held's reasons -> the entries held for each (the rest: starting)
@@ -4149,8 +4162,8 @@ def restore(argv):
 CLEAN_USAGE = "usage: ccwho clean [--mine] [--dry-run] [--yes] [--force]"
 COMMAND_TAKES = {
     "ls": (LS_FLAGS, (), None, LS_USAGE),
-    "show": (("--all", "--json"), (), None,
-             "usage: ccwho show <session> [--all] [--json]   what that session was working on"),
+    "show": (("--all", "--json", "--no-color"), (), None,
+             "usage: ccwho show <session> [--all] [--json] [--no-color]   what that session was working on"),
     "open": ((), (), None, OPEN_USAGE),
     "restore": (("--open", "--check", "--list", "--no-color", "--no-links"), ("--from",), 0,
                 "usage: ccwho restore [--open | --check | --list] [--from PATH] [--no-color] [--no-links]"),
@@ -4161,7 +4174,8 @@ COMMAND_TAKES = {
     "usage": (("--json",), (), None,
               "usage: ccwho usage [--json]          subscription usage, per account\n"
               "       ccwho usage name <id> <label>  a display name for an account"),
-    "doctor": (("--json",), (), 0, "usage: ccwho doctor [--json]   is everything ccwho needs in place?"),
+    "doctor": (("--json", "--no-color"), (), 0,
+               "usage: ccwho doctor [--json] [--no-color]   is everything ccwho needs in place?"),
     "setup": (("--yes", "--no-hotkey", "--no-list", "--usage", "--no-usage"), ("--hotkey", "--proof"), 0,
               "usage: ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list] [--usage | --no-usage]\n"
               "       KEY: one of " + ", ".join(
@@ -4227,7 +4241,7 @@ def _arg(argv, flag, default):
     return default
 
 
-def _interruptible(command, args):
+def _interruptible(command, args, name):
     """A command that may send a launch (open, restore): Ctrl-C ends it with
     exit 130 and a line, no traceback - one that came once a send began (in
     it, in what records it, or after it) says the launch may still run (a
@@ -4239,9 +4253,9 @@ def _interruptible(command, args):
     except KeyboardInterrupt:
         _LOCAL.interrupted = True               # _exit: dies of SIGINT
         if _LOCAL.__dict__.pop("send_began", False):
-            print(f"ccwho: stopped - {MAY_STILL_RUN}", file=sys.stderr)
+            print(f"ccwho {name}: stopped - {MAY_STILL_RUN}", file=sys.stderr)
         else:
-            print("ccwho: stopped - nothing was sent", file=sys.stderr)
+            print(f"ccwho {name}: stopped - nothing was sent", file=sys.stderr)
         return 130
 
 
@@ -4267,7 +4281,7 @@ def main(argv=None):
         maybe_trim_log()          # after, so the save's own output is in what we bound
         return rc
     if argv and argv[0] == "restore":
-        return _interruptible(restore, argv[1:])
+        return _interruptible(restore, argv[1:], "restore")
     if argv and argv[0] == "ls":
         return ls(argv[1:])
     if argv and argv[0] == "ps":
@@ -4285,7 +4299,7 @@ def main(argv=None):
     if argv and argv[0] == "show":
         return show(argv[1:])
     if argv and argv[0] == "open":
-        return _interruptible(lambda args: open_session(args, from_index=True), argv[1:])
+        return _interruptible(lambda args: open_session(args, from_index=True), argv[1:], "open")
     if argv and argv[0] == "url":
         return url(argv[1:])
     if argv and not argv[0].startswith("-"):
@@ -4323,7 +4337,9 @@ def main(argv=None):
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nEvery command: --help (or -h) prints its usage and runs nothing; an")
         print("unknown option or word is refused (exit 2); --flag=value is --flag value;")
-        print("-y is --yes.")
+        print("-y is --yes; --no-color, NO_COLOR or no terminal: no colour.")
+        print("Exit codes: 0 done; 1 not done or not found; 2 a usage error or several matches;")
+        print("3 needs --yes; 4 could not tell (a source could not be read); 130 interrupted.")
         print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
         print("       ↓ on pace, ↑ faster than time passes; ↻ when it resets")
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")

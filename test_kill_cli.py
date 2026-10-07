@@ -492,6 +492,125 @@ class TestTargets(unittest.TestCase):
         self.assertEqual(c.carried[0][1], {"pid": 22, "start": T})
 
 
+class TestKillCleanAndStopNameThemselves(unittest.TestCase):
+    """Every error line starts with `ccwho <command>:`, and a machine or a
+    session list that could not be read is "could not tell": exit 4 (the
+    owner's CLI revamp, 2026-10-06)."""
+
+    def test_a_machine_not_read_whole(self):
+        for clean, cmd, argv in ((False, "kill", ("20",)), (True, "clean", ("--yes",))):
+            with self.subTest(cmd=cmd):
+                c = Cli(trouble="a live session's pid could not be read")
+                rc, out = c.run(*argv, clean=clean)
+                self.assertEqual(rc, 4, out)
+                self.assertIn(f"ccwho {cmd}: a live session's pid could not be read"
+                              " - nothing killed", out)
+        c = Cli(rows=BG, trouble="a live session's pid could not be read")
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")        # it reads the machine then
+        self.assertEqual(rc, 4, out)
+        self.assertIn("ccwho stop: a live session's pid could not be read - nothing stopped", out)
+
+    def test_why_nothing_is_killed_names_the_command(self):
+        # the plan's own reason (engine.kill_list_lines), on the command line
+        rc, out = Cli().run(":9", "--yes")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ccwho kill: nothing holds :9", out)
+
+    def test_a_source_the_plan_could_not_read(self):
+        # lsof, the environments (review 1 of the CLI revamp, slice 3b)
+        def unread(c, **gone):
+            real = c.build                       # the machine is whole; what kill reads is not
+            c.build = lambda mine=None, status=None: dict(real(mine=mine, status=status), **gone)
+            return c
+        rc, out = unread(Cli(), ports=None).run(":3000", "--yes")
+        self.assertEqual(rc, 4, out)
+        self.assertIn("ccwho kill: the listening ports were not read", out)
+        rc, out = unread(Cli(env={"CLAUDE_CODE_SESSION_ID": LIVE}, answer=None), marks=None).run(
+            "--mine", "--yes", clean=True)
+        self.assertEqual(rc, 4, out)
+        self.assertIn("ccwho clean: the environments were not read", out)
+
+    def test_the_machine_not_read_again_after_the_yes(self):
+        # what was confirmed is read again before a signal: unread, nothing goes
+        c = Cli()
+        c.ask = lambda prompt: setattr(c.m, "trouble", ("the process table could not be read", None)) or "y"
+        rc, out = c.run("20")
+        self.assertEqual((rc, c.sent()), (4, []), out)
+        self.assertIn("ccwho kill: the process table could not be read - nothing killed", out)
+
+    def test_a_stop_whose_end_cannot_be_confirmed(self):
+        c = Cli(rows=BG)
+        c.gone = lambda row: None
+        rc, out = c.stop("liveapp-b2", "--yes")
+        self.assertEqual(rc, 4, out)
+        self.assertIn("its end could not be confirmed", out)
+        c = Cli(rows=BG)                                                 # control
+        c.gone = lambda row: False
+        rc, out = c.stop("liveapp-b2", "--yes")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the session still runs", out)
+
+    def test_stop_s_own_lines_name_stop(self):
+        # the plan's why and the report, through stop (kill_list_lines' lead)
+        # its session left nothing running: the plan says why
+        rc, out = Cli(w=world(drop=(11,)), rows=BG).stop("liveapp-b2", "--and-procs", "--dry-run")
+        lines = out.splitlines()
+        self.assertTrue(any(line.startswith("ccwho stop: ") for line in lines), out)
+        self.assertFalse([line for line in lines if line.startswith("ccwho: ")], out)
+
+    def test_stop_s_report_names_stop(self):
+        # the machine not read again once the session stopped: its report
+        c = Cli(rows=BG)
+        stop = c.claude_stop
+
+        def stopped_then_unread(sid, config_dir=None):
+            c.m.trouble = ("the process table could not be read", None)
+            return stop(sid, config_dir)
+        c.claude_stop = stopped_then_unread
+        rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
+        self.assertEqual(rc, 4, out)
+        self.assertIn("ccwho stop: the process table could not be read - nothing killed", out)
+        self.assertFalse([line for line in out.splitlines() if line.startswith("ccwho: ")], out)
+
+    def loose(self):
+        # a parent that exited while ps ran left a subtree that holds a session's
+        # work: the table was not read whole (procs.kill_plan)
+        return world(extra={40: (777, T, "node loose.js")}, marks={40: ("claude", LIVE)})
+
+    def test_a_process_table_not_read_whole(self):
+        # review 2 of the CLI revamp, slice 3b
+        for clean, cmd, argv in ((False, "kill", ("20", "--yes")), (True, "clean", ("--yes",))):
+            with self.subTest(cmd=cmd):
+                rc, out = Cli(w=self.loose()).run(*argv, clean=clean)
+                self.assertEqual(rc, 4, out)
+                self.assertIn(f"ccwho {cmd}: the process table was not read whole", out)
+        rc, out = Cli().run("20", "--yes")                                     # control
+        self.assertEqual(rc, 0, out)
+
+    def test_stop_and_procs_on_a_table_not_read_whole(self):
+        for argv in (("--dry-run",), ("--yes",)):
+            with self.subTest(argv=argv):
+                rc, out = Cli(w=self.loose(), rows=BG).stop("liveapp-b2", "--and-procs", *argv)
+                self.assertEqual(rc, 4, out)
+        rc, out = Cli(w=world(drop=(11,)), rows=BG).stop("liveapp-b2", "--and-procs",
+                                                          "--dry-run")         # control
+        self.assertEqual(rc, 0, out)
+
+    def test_a_session_list_not_read(self):
+        c = Cli(rows=OSError("claude agents failed"))
+        rc, out = c.run("liveapp-b2", "--yes")
+        self.assertEqual(rc, 4, out)
+        self.assertIn("ccwho kill: the sessions could not be read", out)
+
+    def test_no_session_matches(self):
+        rc, out = Cli().run("nomatch-x", "--yes")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ccwho kill: no live session matches 'nomatch-x'", out)
+        rc, out = Cli(rows=BG).stop("nomatch-x", "--yes")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ccwho stop: no live session matches 'nomatch-x'", out)
+
+
 class TestASession(unittest.TestCase):
     """`ccwho kill <session>`: what a live session started (the owner's D12),
     named as `ccwho open` names it - a short id or a name."""
@@ -532,7 +651,7 @@ class TestASession(unittest.TestCase):
     def test_the_sessions_not_read_kills_nothing(self):
         c = Cli(rows=OSError("no feed"))
         rc, out = c.run("liveapp")
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertIn("nothing killed", out)
         self.assertNotIn("no feed", out)
         self.assertEqual(c.builds, [])
@@ -644,7 +763,7 @@ class TestASession(unittest.TestCase):
         c = Cli()
         c.read_rows = runner._live_rows
         rc, out = c.run("liveapp")
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 4, "could not tell")
         self.assertIn("could not be read", out)
         self.assertNotIn("no live session matches", out)
 
@@ -1029,7 +1148,7 @@ class TestStop(unittest.TestCase):
         c = Cli(rows=BG)
         c.gone = lambda row: None               # the feed could not be read
         rc, out = c.stop("liveapp-b2", "--and-procs")
-        self.assertEqual((rc, c.sent()), (1, []))
+        self.assertEqual((rc, c.sent()), (4, []), "could not tell")
         self.assertIn("could not be confirmed", out)
         self.assertNotIn("still runs", out)
 
@@ -1229,7 +1348,7 @@ class TestTheReport(unittest.TestCase):
     def test_trouble_kills_nothing(self):
         c = Cli(trouble="a live session's pid could not be read")
         rc, out = c.run("20")
-        self.assertEqual((rc, c.sent(), c.asked), (1, [], []))
+        self.assertEqual((rc, c.sent(), c.asked), (4, [], []), "could not tell")
         self.assertIn("a live session's pid could not be read - nothing killed", out)
 
     def test_a_stop_after_signals_is_said(self):
@@ -1237,7 +1356,7 @@ class TestTheReport(unittest.TestCase):
         c.m.sleep = lambda s: (_ for _ in ()).throw(KeyboardInterrupt)
         rc, out = c.run("20")
         self.assertEqual(rc, 1)
-        self.assertIn("ccwho: interrupted", out)
+        self.assertIn("ccwho kill: interrupted", out)
 
 
 # ------------------------------------------------ what the list shares with it

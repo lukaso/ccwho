@@ -494,7 +494,7 @@ class TestTargets(unittest.TestCase):
 
 class TestASession(unittest.TestCase):
     """`ccwho kill <session>`: what a live session started (the owner's D12),
-    named as `ccwho jump` names it - a short id or a name."""
+    named as `ccwho open` names it - a short id or a name."""
 
     def test_by_short_id_and_by_name(self):
         for word in ("aaaa", "liveapp", "AAAA1111"):
@@ -709,7 +709,7 @@ class TestStop(unittest.TestCase):
                 rc, out = c.stop("liveapp-b2", "--and-procs", "--yes")
                 self.assertEqual((rc, c.stopped(), c.sent(), c.builds), (1, [], [], []))
                 self.assertIn("runs in a window", out)
-                self.assertIn("ccwho jump", out)
+                self.assertIn("ccwho open liveapp-b2", out)
 
     def test_an_agent_stops_no_session(self):
         c = Cli(rows=BG, env={"CLAUDE_CODE_SESSION_ID": LIVE}, answer=None)

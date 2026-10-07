@@ -55,7 +55,7 @@ doctor say "not used" and what to do to add it ([Adding iTerm2 later](#adding-it
 ccwho runs in Terminal.app as it does in iTerm2 - the table, the live list, `setup`
 and `doctor` - and knows the sessions in Terminal.app's tabs:
 
-- a row in a Terminal.app tab has a window to go to, and Enter (or `ccwho jump`)
+- a row in a Terminal.app tab has a window to go to, and Enter (or `ccwho open`)
   brings that tab to the front;
 - a new window - to attach a background session, or to reopen one - opens in the
   app the session was last in; with nothing to say which, in the app ccwho runs in,
@@ -441,20 +441,28 @@ stable.
 So every row carries its **tty**, and:
 
 ```sh
-ccwho jump s032           # focus that window
-ccwho jump 19576          # ...by pid
-ccwho jump "vitest"       # ...by title substring
+ccwho open s032           # focus that window
+ccwho open 19576          # ...by pid
+ccwho open liveapp-f0     # ...by name, or a short id
+ccwho open vitest         # ...by words of its title
 ```
 
 An ambiguous query lists the candidates rather than guessing. It goes to the app
 whose tab shows that tty: iTerm2 (`tty of session` over its windows) or Terminal.app
-(`tty` of each tab).
+(`tty` of each tab). A background session gets a window (`claude attach`). Words
+that match no running session are looked for among the ended ones, as `ccwho ls`
+finds them, and the one they find is reopened in a new window. A running session
+is matched by what the list shows of it; one found only by what was said in it is
+listed with the ended ones, never picked over them. Run by an agent, words never
+name the agent's own session (its title comes from its own conversation). A tty
+names a running session only, and an id is matched by its start, as a short id is.
 
 ### Clickable, without a new UI
 
 The tty column is emitted as an **OSC 8 hyperlink** when stdout is a terminal, so in
 iTerm2 (3.x) it is genuinely clickable. Clicking hands `ccwho://jump/s032` to
-LaunchServices, where a small applet turns it back into `ccwho jump s032`.
+LaunchServices, where a small applet turns it back into `ccwho open s032` - for a
+running session only: this link never reopens one.
 
 ```sh
 ccwho setup                  # once; builds ~/Applications/ccwho-jump.app
@@ -532,7 +540,7 @@ ccwho restore --open       # ...actually reopen them, in their old panes where i
 ccwho restore --check      # would it restore? run this BEFORE you reboot
 ccwho restore --list       # every saved manifest and what it holds
 ccwho restore --from PATH  # an older manifest
-ccwho open <session-id>    # focus that session, or reopen it if its window is gone
+ccwho open <session>       # focus that session, or reopen it if its window is gone
 ```
 
 ```
@@ -673,8 +681,7 @@ ccwho ls --needs-you    # only the Claude Code sessions the live list puts on to
 ccwho ls --json         # the rows, for a script, a status line or an agent
 ccwho show <anything>   # what that session was working on
 ccwho ps [--port N] [--helpers] [--full]  # what agents started, and their ports
-ccwho jump <tty|pid|title>  # focus that window
-ccwho open <session-id> # focus it, give it a window, or reopen it
+ccwho open <session>    # go to it: its window, a window for a background one, or reopen an ended one
 ccwho save              # record the live fleet (before a reboot)
 ccwho restore [--open]  # list it back, or reopen the windows
 ccwho restore --check   # would it restore? before a reboot

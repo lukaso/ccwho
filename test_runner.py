@@ -1078,12 +1078,11 @@ class TestUrlDispatch(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
-        self.real_jump, self.real_open = runner.jump, runner.open_session
-        runner.jump = lambda argv: self.calls.append(("jump", list(argv))) or 0
-        runner.open_session = lambda argv: self.calls.append(("open", list(argv))) or 0
+        self.real_open = runner.open_session
+        runner.open_session = lambda argv, **kw: self.calls.append(("open", list(argv), kw)) or 0
 
     def tearDown(self):
-        runner.jump, runner.open_session = self.real_jump, self.real_open
+        runner.open_session = self.real_open
 
     def _url(self, u):
         err = io.StringIO()
@@ -1095,12 +1094,12 @@ class TestUrlDispatch(unittest.TestCase):
         sid = "4f2b91ac-1111-4222-8333-abcdefabcdef"
         rc, _ = self._url("ccwho://open/" + sid)
         self.assertEqual(rc, 0)
-        self.assertEqual(self.calls, [("open", [sid])])
+        self.assertEqual(self.calls, [("open", [sid], {})])
 
-    def test_a_jump_url_still_reaches_jump(self):
+    def test_a_jump_url_reaches_open_for_a_running_session_only(self):
         rc, _ = self._url("ccwho://jump/s032")
         self.assertEqual(rc, 0)
-        self.assertEqual(self.calls, [("jump", ["s032"])])
+        self.assertEqual(self.calls, [("open", ["s032"], {"live_only": True})])
 
     def test_an_unrecognised_url_runs_nothing(self):
         for bad in ("https://evil.example/x", "ccwho://delete/all",
@@ -1661,6 +1660,668 @@ class TestOpenNeverForksALiveSession(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(self.runs, [], "an empty list we could not trust is not 'dead'")
         self.assertIn("not reopening", out)
+
+
+class TestOpenGoesToASessionByAnyName(unittest.TestCase):
+    """`ccwho open` took `jump`'s place (the owner's CLI revamp, 2026-10-06).
+    <session> is a session id, a name, a tty, a pid or words of its title. A
+    running one: its window, or a window for a background one. Else the one
+    the words find among the ended sessions: reopened. A ccwho://jump link
+    goes to a running session only."""
+
+    SID = TestOpenNeverForksALiveSession.SID
+    ENTRY = TestOpenNeverForksALiveSession.ENTRY
+    OTHER = "9e9e0000-1111-4222-8333-abcdefabcdef"
+
+    def setUp(self):
+        TestOpenNeverForksALiveSession.setUp(self)
+        self.addCleanup(TestOpenNeverForksALiveSession.tearDown, self)
+        # the ended sessions the words find: never this machine's own index
+        self.searched, self.ended = [], []
+        self.addCleanup(setattr, runner, "matches", runner.matches)
+        runner.matches = lambda query, rows, everything=False: (
+            self.searched.append(query) or ([], list(self.ended)))
+        self.addCleanup(setattr, runner, "indexed_entry", runner.indexed_entry)
+        runner.indexed_entry = lambda sid: (
+            {"sessionId": sid, "cwd": "/Users/x/p/other", "project": "other",
+             "configDir": ""} if sid == self.OTHER else None)
+        self.row = {"sessionId": self.SID, "tty": "ttys032", "pid": 4242,
+                    "name": "liveapp-f0", "title": "fix the hotkey window",
+                    "project": "liveapp"}
+
+    def _main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.main(list(argv))
+        return rc, out.getvalue() + err.getvalue()
+
+    def script(self):
+        return " ".join(" ".join(c) for c in self.runs)
+
+    def test_a_running_session_by_tty_pid_name_short_id_or_title_words(self):
+        self.live = [self.row]
+        for name in ("ttys032", "s032", "4242", "liveapp-f0", "hotkey window", "4f2b",
+                     self.SID):
+            with self.subTest(name=name):
+                self.runs = []
+                rc, out = self._main("open", *name.split())
+                self.assertEqual(rc, 0, out)
+                self.assertIn("jump.applescript", self.script(), "its window is focused")
+                self.assertNotIn("--resume", self.script())
+        self.assertEqual(self.searched, [], "a running match needs no search of ended ones")
+
+    def test_a_job_parked_in_a_terminal_goes_to_that_terminal(self):
+        # ctrl+b parks the job: the terminal's row answers for it (resolve_open)
+        self.live = [dict(self.row, sessionId=self.OTHER, parked=[self.SID])]
+        rc, out = self._main("open", self.SID)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def test_a_background_session_by_name_is_attached(self):
+        self.live = [dict(self.row, tty="", kind="background")]
+        rc, out = self._main("open", "liveapp-f0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude attach", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def test_several_running_matches_are_named_and_nothing_opens(self):
+        other = dict(self.row, sessionId=self.OTHER, tty="ttys040", pid=4343,
+                     name="liveapp-f1")
+        self.live = [self.row, other]
+        rc, out = self._main("open", "hotkey")
+        self.assertEqual(rc, 2)
+        self.assertIn("ccwho open: 'hotkey' matches 2 sessions", out)
+        self.assertIn("liveapp-f1", out)
+        self.assertEqual(self.runs, [])
+
+    def test_an_ended_session_the_words_find_is_reopened(self):
+        self.ended = [{"sessionId": self.SID, "project": "liveapp",
+                       "title": "fix the hotkey window", "topic": "", "since": "2d"}]
+        rc, out = self._main("open", "hotkey", "window")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.searched, ["hotkey window"])
+        self.assertIn("claude --resume " + self.SID, self.script())
+
+    def test_several_ended_matches_are_named_and_nothing_opens(self):
+        self.ended = [{"sessionId": sid, "project": "liveapp", "title": "fix the hotkey",
+                       "topic": "", "since": "2d"} for sid in (self.SID, self.OTHER)]
+        rc, out = self._main("open", "hotkey")
+        self.assertEqual(rc, 2)
+        self.assertIn("matches 2 sessions", out)
+        self.assertEqual(self.runs, [])
+
+    def test_one_only_the_session_index_knows_is_reopened_too(self):
+        # you typed it: the command line reopens what the index knows, as the
+        # list's Enter does
+        rc, out = self._main("open", self.OTHER)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+
+    def test_a_link_reopens_only_what_a_save_holds(self):                # control
+        # any app can send a ccwho:// link (LaunchServices)
+        rc, out = self._main("url", "ccwho://open/" + self.OTHER)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+
+    def test_no_match_says_so_and_opens_nothing(self):
+        rc, out = self._main("open", "nothing", "like", "this")
+        self.assertEqual(rc, 1)
+        self.assertIn("ccwho open: no session matches 'nothing like this'", out)
+        self.assertEqual(self.runs, [])
+
+    def test_open_with_nothing_is_a_usage_error(self):
+        rc, out = self._main("open")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: ccwho open <session>", out)
+        self.assertEqual(self.runs, [])
+
+    def test_a_jump_link_goes_to_a_running_session(self):
+        self.live = [self.row]
+        rc, out = self._main("url", "ccwho://jump/s032")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_a_jump_link_never_searches_or_reopens(self):
+        # a pid too: as a word it would find an ended id by its start
+        self.ended = [{"sessionId": sid, "project": "liveapp", "title": "s032",
+                       "topic": "", "since": "2d"}
+                      for sid in (self.SID, "42420000-1111-4222-8333-abcdefabcdef")]
+        for target in ("s032", "4242"):                         # nothing runs on either
+            with self.subTest(target=target):
+                rc, out = self._main("url", "ccwho://jump/" + target)
+                self.assertEqual(rc, 1, out)
+                self.assertNotIn("ccwho ls", out, "a link's miss names no command to type")
+        self.assertEqual((self.searched, self.runs), ([], []))
+
+    def test_a_tty_of_no_running_session_is_never_searched_for(self):
+        # a tty names a running session: the words of an ended one that happen
+        # to hold it are no match (review 1 of the CLI revamp, slice 2)
+        self.ended = [{"sessionId": self.SID, "project": "liveapp",
+                       "title": "why the jump to ttys032 fails", "topic": "", "since": "2d"}]
+        for name in ("s032", "ttys032", "/dev/ttys032"):
+            with self.subTest(name=name):
+                rc, out = self._main("open", name)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"no running session matches {name!r}", out)
+        self.assertEqual((self.searched, self.runs), ([], []))
+
+    def test_part_of_an_id_finds_an_ended_one_by_its_start_only(self):
+        # a pid, or four hex in the middle of an id, is not that session's
+        # short id (review 1 of the CLI revamp, slice 2)
+        self.ended = [{"sessionId": self.OTHER, "project": "other", "title": "x",
+                       "topic": "", "since": "2d"}]
+        for part in ("8333", "19576"):
+            with self.subTest(part=part):
+                rc, out = self._main("open", part)
+                self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+        rc, out = self._main("open", "9e9e")                        # control: its start
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+
+    def test_an_unreadable_session_list_reopens_nothing_the_words_find(self):
+        # a running session looks ended in a list that could not be read:
+        # reopening it would fork it (review 1 of the CLI revamp, slice 2)
+        self.source_ok = False
+        self.ended = [{"sessionId": self.SID, "project": "liveapp",
+                       "title": "fix the hotkey window", "topic": "", "since": "2d"}]
+        rc, out = self._main("open", "hotkey", "window")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("not reopening", out)
+        self.assertEqual(self.runs, [])
+
+    def test_one_the_search_calls_ended_but_that_runs_is_gone_to(self):
+        # decided against the running sessions, never forked
+        self.live = [dict(self.row, title="something else", name="other-f0")]
+        self.ended = [{"sessionId": self.SID, "project": "liveapp",
+                       "title": "parser refactor", "topic": "", "since": "2d"}]
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def test_a_parked_job_the_search_calls_ended_goes_to_its_terminal(self):
+        # the terminal that parked it runs: gone to, never resumed
+        self.live = [dict(self.row, sessionId=self.OTHER, parked=[self.SID],
+                          title="something else", name="other-f0")]
+        self.ended = [{"sessionId": self.SID, "project": "liveapp",
+                       "title": "parser refactor", "topic": "", "since": "2d"}]
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def test_a_jump_link_matches_a_tty_or_a_pid_only(self):
+        # any app can send one: never a title word, never an id's start
+        # (review 1 of the CLI revamp, slice 2)
+        for row, target in (
+                (dict(self.row, sessionId=self.OTHER, tty="", pid=5555, kind="background",
+                      title="watch the logs of ttys032"), "s032"),
+                (dict(self.row, sessionId="42420000-1111-4222-8333-abcdefabcdef", tty="",
+                      pid=999, kind="background", name="build-4242"), "4242")):
+            with self.subTest(target=target):
+                self.live = [row]
+                rc, out = self._main("url", "ccwho://jump/" + target)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual(self.runs, [])
+
+    def test_a_jump_link_by_pid(self):                                    # control
+        self.live = [self.row]
+        rc, out = self._main("url", "ccwho://jump/4242")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_a_short_id_of_a_hex_letter_and_digits_is_no_terminal(self):
+        # a123, f000: about one short id in eleven (review 2 of the CLI
+        # revamp, slice 2) - a tty's letter is never hex. A session each: a
+        # reopen holds its session's launch claim
+        for token, sid in (("a123", "a1239999-1111-4222-8333-abcdefabcdef"),
+                           ("a1230000", "a1230000-1111-4222-8333-abcdefabcdef"),
+                           ("f000", "f0009999-1111-4222-8333-abcdefabcdef"),
+                           ("b7890123", "b7890123-1111-4222-8333-abcdefabcdef")):
+            with self.subTest(token=token):
+                self.runs = []
+                self.ended = [{"sessionId": sid, "project": "p", "title": "x",
+                               "topic": "", "since": "2d"}]
+                runner.indexed_entry = lambda s, _sid=sid: (
+                    {"sessionId": s, "cwd": "/Users/x/p/p", "project": "p",
+                     "configDir": ""} if s == _sid else None)
+                rc, out = self._main("open", token)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("claude --resume " + sid, self.script())
+
+    def test_a_terminal_word_matches_its_terminal_only(self):
+        # not a title that holds it (review 2 of the CLI revamp, slice 2)
+        self.live = [dict(self.row, tty="ttys040", pid=5555, title="watch ttys032 logs")]
+        rc, out = self._main("open", "s032")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no running session matches 's032'", out)
+        self.assertEqual(self.runs, [])
+
+    def test_the_tty_as_tty_prints_it(self):
+        # pasted from `tty` (review 2 of the CLI revamp, slice 2)
+        self.live = [self.row]
+        rc, out = self._main("open", "/dev/ttys032")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_a_word_read_as_a_terminal_or_an_id_says_so(self):
+        # 404a reads as an id's start, s123 as a terminal: `ls` searches every
+        # word (review 2 of the CLI revamp, slice 2)
+        self.ended = [{"sessionId": self.OTHER, "project": "other",
+                       "title": "fix the 404a page on s123", "topic": "", "since": "2d"}]
+        for word, read in (("404a", "the start of an id"), ("s123", "a terminal")):
+            with self.subTest(word=word):
+                rc, out = self._main("open", word)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"read as {read}", out)
+                self.assertIn(f"`ccwho ls {word}`", out)
+        self.assertEqual(self.runs, [])
+
+    def test_a_session_seen_running_in_a_list_read_in_part_is_gone_to(self):
+        # `claude agents` unreadable, its row found another way: it runs, so
+        # it is focused - never "not reopening" (review 2 of the CLI revamp, slice 2)
+        self.source_ok = False
+        self.live = [self.row]
+        rc, out = self._main("open", "liveapp-f0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def test_running_first_when_the_words_match_it_word_by_word(self):
+        # "fix hotkey" is no phrase of its title, each word is in it: the
+        # running one is gone to, the ended one not listed (review 3 of the
+        # CLI revamp, slice 2)
+        self.live = [self.row]                               # "fix the hotkey window"
+        ended = {"sessionId": self.OTHER, "project": "other", "title": "fix hotkey bug",
+                 "topic": "", "since": "2d"}
+        runner.matches = lambda query, rows, everything=False: (
+            self.searched.append(query) or (list(rows), [ended]))
+        rc, out = self._main("open", "fix", "hotkey")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+        self.assertNotIn("fix hotkey bug", out)
+
+    def test_two_running_word_matches_are_named(self):                   # control
+        other = dict(self.row, sessionId="5a3c0000-1111-4222-8333-abcdefabcdef",
+                     tty="ttys040", pid=4343, name="liveapp-f1")
+        self.live = [self.row, other]
+        runner.matches = lambda query, rows, everything=False: (list(rows), [])
+        rc, out = self._main("open", "fix", "hotkey")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(self.runs, [])
+
+    def test_hex_letters_find_an_id_by_its_start_only(self):
+        # bdfe: a short id with no digit - from the middle of another id it is
+        # no match; from a title it is (review 3 of the CLI revamp, slice 2)
+        mid = "9e9ebdfe-1111-4222-8333-abcdefabcdef"
+        self.ended = [{"sessionId": mid, "project": "p", "title": "x", "topic": "", "since": "2d"}]
+        known = runner.indexed_entry                     # the index knows it: it could reopen
+        runner.indexed_entry = lambda s: known(s) or (
+            {"sessionId": s, "cwd": "/Users/x/p/p", "project": "p", "configDir": ""}
+            if s == mid else None)
+        rc, out = self._main("open", "bdfe")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+        self.ended = [{"sessionId": self.OTHER, "project": "other",
+                       "title": "the bdfe parser", "topic": "", "since": "2d"}]
+        rc, out = self._main("open", "bdfe")                          # control: its title
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+
+    def test_an_id_s_start_in_capitals(self):
+        sid = "c0de0000-1111-4222-8333-abcdefabcdef"
+        self.ended = [{"sessionId": sid, "project": "p", "title": "x", "topic": "", "since": "2d"}]
+        runner.indexed_entry = lambda s: ({"sessionId": s, "cwd": "/Users/x/p/p", "project": "p",
+                                           "configDir": ""} if s == sid else None)
+        rc, out = self._main("open", "C0DE")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + sid, self.script())
+
+    def test_a_terminal_name_in_capitals(self):
+        # as the old jump took them (review 3 of the CLI revamp, slice 2)
+        self.live = [self.row]
+        for name in ("S032", "TTYS032", "/DEV/TTYS032"):
+            with self.subTest(name=name):
+                self.runs = []
+                rc, out = self._main("open", name)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("jump.applescript", self.script())
+
+    def test_a_full_id_seen_running_in_a_list_read_in_part_is_gone_to(self):
+        # as its short id is (review 3 of the CLI revamp, slice 2); not seen,
+        # it opens nothing (TestOpenNeverForksALiveSession)
+        self.source_ok = False
+        self.live = [self.row]
+        rc, out = self._main("open", self.SID)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def test_hex_letters_in_an_id_s_middle_and_its_title(self):
+        # the word is in its title: a match (review 4 of the CLI revamp, slice 2)
+        mid = "9e9ebdfe-1111-4222-8333-abcdefabcdef"
+        self.ended = [{"sessionId": mid, "project": "p", "title": "the bdfe parser",
+                       "topic": "", "since": "2d"}]
+        runner.indexed_entry = lambda s: ({"sessionId": s, "cwd": "/Users/x/p/p", "project": "p",
+                                           "configDir": ""} if s == mid else None)
+        rc, out = self._main("open", "bdfe")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + mid, self.script())
+
+    def test_hex_letters_that_start_an_id(self):
+        # a short id with no digit, about one in fifty (review 4 of the CLI revamp, slice 2)
+        sid = "bdfe0000-1111-4222-8333-abcdefabcdef"
+        self.ended = [{"sessionId": sid, "project": "p", "title": "x", "topic": "", "since": "2d"}]
+        runner.indexed_entry = lambda s: ({"sessionId": s, "cwd": "/Users/x/p/p", "project": "p",
+                                           "configDir": ""} if s == sid else None)
+        rc, out = self._main("open", "bdfe")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + sid, self.script())
+
+    def test_hex_letters_in_a_running_one_s_id_middle(self):
+        # found by the search, not by a name it shows: no match
+        self.live = [dict(self.row, sessionId="9e9ebdfe-1111-4222-8333-abcdefabcdef",
+                          title="x", name="n0")]
+        runner.matches = lambda query, rows, everything=False: (list(rows), [])
+        rc, out = self._main("open", "bdfe")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+
+    def test_a_full_id_parked_in_a_list_read_in_part(self):
+        # the terminal that parked it is seen running (review 4 of the CLI revamp, slice 2)
+        self.source_ok = False
+        self.live = [dict(self.row, sessionId=self.OTHER, parked=[self.SID])]
+        rc, out = self._main("open", self.SID)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_an_id_s_middle_in_a_running_one_is_no_match(self):
+        # 8333 is in the middle of its id: no short id of it (review 5 of the
+        # CLI revamp, slice 2)
+        self.live = [self.row]                       # 4f2b91ac-1111-4222-8333-...
+        runner.matches = lambda query, rows, everything=False: (list(rows), [])
+        rc, out = self._main("open", "8333")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+
+    def test_a_letter_and_a_digit_or_two_is_a_word(self):
+        # a tty has three digits: v2 is a word of a title (review 5 of the CLI
+        # revamp, slice 2)
+        for word, title in (("v2", "the api v2 rollout"), ("s3", "the s3 upload")):
+            with self.subTest(word=word):
+                self.runs = []
+                self.live = [dict(self.row, title=title)]
+                rc, out = self._main("open", word)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("jump.applescript", self.script())
+
+    def test_a_long_list_of_matches_shows_ten(self):
+        # as `ccwho ls` does (review 5 of the CLI revamp, slice 2)
+        self.live = [dict(self.row, sessionId=f"{i:04x}0000-1111-4222-8333-abcdefabcdef",
+                          tty=f"ttys{100 + i}", pid=5000 + i, name=f"fix-{i}",
+                          title=f"fix number {i}") for i in range(12)]
+        rc, out = self._main("open", "fix")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("fix-9", out)
+        self.assertNotIn("fix-10", out)
+        self.assertIn("... and 2 more - more words narrow it", out)
+        self.assertNotIn("lists them", out, "ls shows ten ended ones too: no promise of the rest")
+
+    def test_a_word_of_a_letter_and_three_digits_names_a_title(self):
+        # a macOS tty is ttys: h264 is a word (review 6 of the CLI revamp, slice 2)
+        self.live = [dict(self.row, title="the h264 encoder")]
+        rc, out = self._main("open", "h264")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_a_word_too_short_for_a_short_id_is_a_word_of_the_text(self):
+        # 42, e2e, 2fa: ccwho prints a short id as four - shorter, the id is no
+        # match and the title is (review 7 of the CLI revamp, slice 2)
+        for word, sid in (("42", "42ab0000-1111-4222-8333-abcdefabcdef"),
+                          ("e2e", "e2e00000-1111-4222-8333-abcdefabcdef"),
+                          ("add", "add00000-1111-4222-8333-abcdefabcdef")):
+            with self.subTest(word=word):
+                self.runs = []
+                titled = f"5{word[:1]}5{len(word)}0000-1111-4222-8333-abcdefabcdef"
+                self.ended = [
+                    {"sessionId": sid, "project": "p", "title": "tidy the readme",
+                     "topic": "", "since": "2d"},
+                    {"sessionId": titled, "project": "p", "title": f"fix issue {word}",
+                     "topic": "", "since": "2d"}]
+                runner.indexed_entry = lambda s: {"sessionId": s, "cwd": "/Users/x/p/p",
+                                                  "project": "p", "configDir": ""}
+                rc, out = self._main("open", word)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("claude --resume " + titled, self.script())
+                self.assertNotIn("claude --resume " + sid, self.script())
+
+    def test_four_characters_are_a_short_id(self):                       # control
+        sid = "42ab0000-1111-4222-8333-abcdefabcdef"
+        self.ended = [{"sessionId": sid, "project": "p", "title": "tidy the readme",
+                       "topic": "", "since": "2d"}]
+        runner.indexed_entry = lambda s: {"sessionId": s, "cwd": "/Users/x/p/p",
+                                          "project": "p", "configDir": ""}
+        rc, out = self._main("open", "42ab")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + sid, self.script())
+
+    def test_a_full_id_in_capitals(self):
+        # ids print in lowercase; typed in capitals they are the same id
+        # (review 7 of the CLI revamp, slice 2)
+        self.live = [self.row]
+        rc, out = self._main("open", self.SID.upper())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.live, self.runs = [], []
+        rc, out = self._main("open", self.OTHER.upper())               # ended, indexed
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+
+    def test_a_short_word_in_a_running_id_s_middle_is_no_candidate(self):
+        # found by the search through its id: no match for a short word
+        # (review 8 of the CLI revamp, slice 2)
+        self.live = [dict(self.row, sessionId="9e9e4200-1111-4222-8333-abcdefabcdef",
+                          title="x", name="n0", project="p")]
+        runner.matches = lambda query, rows, everything=False: (list(rows), [])
+        rc, out = self._main("open", "42")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+        self.live = [dict(self.live[0], recap="close issue 42")]           # control: its recap
+        rc, out = self._main("open", "42")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_a_short_word_in_an_ended_one_s_topic_or_recap(self):
+        # what it says of itself is more than its title (review 8 of the CLI
+        # revamp, slice 2)
+        for field, mark in (("topic", "00"), ("recap", "11"), ("project", "22")):
+            with self.subTest(field=field):
+                sid = f"7e7e{mark}00-1111-4222-8333-abcdefabcdef"
+                self.ended = [dict({"sessionId": sid, "project": "p", "title": "x",
+                                    "topic": "", "since": "2d"}, **{field: "fix issue 42"})]
+                runner.indexed_entry = lambda s: {"sessionId": s, "cwd": "/Users/x/p/p",
+                                                  "project": "p", "configDir": ""}
+                rc, out = self._main("open", "42")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("claude --resume " + sid, self.script())
+
+    def test_the_jump_command_is_gone(self):
+        self.live = [self.row]
+        rc, out = self._main("jump", "s032")
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown command 'jump'", out)
+        self.assertEqual(self.runs, [])
+
+
+class TestOpenNamesARunningSessionByWhatTheListShows(unittest.TestCase):
+    """A running session is matched by what the list shows of it - its title,
+    name, tab name, project, ids, tty, pid. Words found only in what was said
+    in it (its recap, your prompts) do not make it the one you named: such a
+    session is a candidate as an ended one is (review 4 of the CLI revamp,
+    slice 2 - `ccwho open release gate command`, an ended session's title,
+    focused a running window whose recap held the words). The search here is
+    the real one (matches), over a stand-in index."""
+
+    _F = TestOpenGoesToASessionByAnyName
+    SID, OTHER, ENTRY = _F.SID, _F.OTHER, _F.ENTRY
+
+    def setUp(self):
+        real_matches = runner.matches
+        self._F.setUp(self)
+        runner.matches = real_matches                  # restored by the fixture's cleanup
+        self.index = {}
+        self.addCleanup(setattr, runner, "fresh_index", runner.fresh_index)
+        runner.fresh_index = lambda quiet=False: dict(self.index)
+        self.caller(None)
+
+    _main, script = _F._main, _F.script
+
+    def caller(self, sid):
+        """Who runs ccwho: an agent in session `sid`, or a person (None)."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")}
+        if sid:
+            env["CLAUDE_CODE_SESSION_ID"] = sid
+        testkit.patch(self, runner.os, "environ", env)
+
+    def entry(self, sid, **kw):
+        self.index[sid] = dict({"sessionId": sid, "title": "", "recap": "", "project": "liveapp",
+                                "you_said": "", "last_any": "", "opened": "",
+                                "last_ts": "2026-10-05T10:00:00.000Z",
+                                "cwd": "/Users/x/p/liveapp"}, **kw)
+
+    def test_words_in_a_running_one_s_recap_do_not_outrank_the_ended_one_you_named(self):
+        self.live = [self.row]                                  # "fix the hotkey window"
+        self.entry(self.SID, title="fix the hotkey window", recap="ran the release gate command")
+        self.entry(self.OTHER, title="release gate command")
+        rc, out = self._main("open", "release", "gate", "command")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("9e9e", out, "the ended one you named is listed")
+        self.assertEqual(self.runs, [], "no window on a guess")
+
+    def test_an_agent_s_own_prompt_never_names_its_own_window(self):
+        # it asked to reopen the parser refactor: those words are in its prompt
+        self.caller(self.SID)
+        self.live = [self.row]
+        self.entry(self.SID, title="fix the hotkey window",
+                   last_any="reopen the parser refactor session")
+        self.entry(self.OTHER, title="parser refactor")
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+        self.assertNotIn("jump.applescript", self.script())
+
+    def test_a_running_one_whose_title_holds_each_word_is_gone_to(self):     # control
+        self.live = [self.row]
+        self.entry(self.SID, title="fix the hotkey window")
+        self.entry(self.OTHER, title="fix hotkey bug")
+        rc, out = self._main("open", "fix", "hotkey")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+        self.assertNotIn("--resume", self.script())
+
+    def own_title(self, title):
+        # Claude Code titles a session from its conversation: an agent asked
+        # to reopen the parser refactor works in a session titled so (review 5
+        # of the CLI revamp, slice 2)
+        self.caller(self.SID)
+        self.live = [dict(self.row, title=title)]
+        self.entry(self.SID, title=title)
+        self.entry(self.OTHER, title="parser refactor")
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertNotIn("jump.applescript", self.script(), out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+        self.assertEqual(rc, 0, out)
+
+    def test_an_agent_s_own_title_never_names_its_own_window(self):
+        self.own_title("Reopen parser refactor session")
+
+    def test_nor_its_own_title_word_by_word(self):
+        self.own_title("Find the old refactor of the parser")
+
+    def test_a_person_s_words_go_to_that_window(self):                         # control
+        self.live = [dict(self.row, title="Reopen parser refactor session")]
+        self.entry(self.SID, title="Reopen parser refactor session")
+        self.entry(self.OTHER, title="parser refactor")
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_an_agent_names_its_own_window_by_id_tty_or_pid(self):             # control
+        self.caller(self.SID)
+        self.live = [self.row]
+        rc, out = self._main("open", "4f2b")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_an_agent_names_its_own_window_by_pid(self):
+        # a pid is a name it can give (review 6 of the CLI revamp, slice 2)
+        self.caller(self.SID)
+        self.live = [self.row]                                   # pid 4242
+        rc, out = self._main("open", "4242")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
+
+    def test_a_parked_agent_s_terminal_title_never_names_it(self):
+        # the caller's job is parked in that terminal (review 6 of the CLI
+        # revamp, slice 2): its title words are the caller's own
+        self.caller(self.OTHER)
+        self.live = [dict(self.row, parked=[self.OTHER], title="Reopen parser refactor session")]
+        self.entry(self.SID, title="Reopen parser refactor session")
+        ended = "7e7e0000-1111-4222-8333-abcdefabcdef"
+        self.entry(ended, title="parser refactor")
+        runner.indexed_entry = lambda s: ({"sessionId": s, "cwd": "/Users/x/p/p", "project": "p",
+                                           "configDir": ""} if s == ended else None)
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertNotIn("jump.applescript", self.script(), out)
+        self.assertIn("claude --resume " + ended, self.script())
+
+    def test_an_agent_s_own_session_missed_by_the_scan_is_never_resumed(self):
+        # a scan that missed it calls it ended: resuming it would fork it
+        self.caller(self.SID)
+        self.entry(self.SID, title="parser refactor")
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+
+    def test_nor_is_it_a_candidate_against_the_one_it_named(self):
+        # missed by the scan, its title holds the words: the one it named is
+        # reopened, not listed against it
+        self.caller(self.SID)
+        self.entry(self.SID, title="parser refactor, reopen it")
+        self.entry(self.OTHER, title="parser refactor")
+        rc, out = self._main("open", "parser", "refactor")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("claude --resume " + self.OTHER, self.script())
+        self.assertNotIn("claude --resume " + self.SID, self.script())
+
+    def test_an_agent_s_own_full_id_is_never_resumed(self):
+        # it runs this command: resuming it would fork it, seen or not
+        self.caller(self.SID)
+        rc, out = self._main("open", self.SID)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+        self.assertIn("the session this runs in", out)
+
+    def test_an_agent_parked_in_a_terminal_is_its_own_too(self):
+        # the terminal that parked the caller's job answers for it (answers_for)
+        self.caller(self.OTHER)
+        self.live = [dict(self.row, parked=[self.OTHER])]
+        self.entry(self.SID, title="fix the hotkey window", recap="the gate words")
+        rc, out = self._main("open", "gate", "words")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.runs, [])
+
+    def test_one_running_found_by_what_was_said_and_nothing_else_is_gone_to(self):  # control
+        # a parked job's conversation, say: the one candidate
+        self.live = [self.row]
+        self.entry(self.SID, title="fix the hotkey window", recap="copy paste in the tui")
+        rc, out = self._main("open", "copy", "paste")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("jump.applescript", self.script())
 
 
 class TestRestoreOpenSkipsWhatIsAlreadyRunning(unittest.TestCase):
@@ -2756,11 +3417,12 @@ class TestARestoreOfTwoAppsSendsEachOnItsOwn(unittest.TestCase):
 
 
 class TestTheHelpNamesEveryApp(unittest.TestCase):
-    def test_jump_names_both_apps(self):
+    def test_open_names_both_apps(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             runner.main(["--help"])
-        line = next(x for x in out.getvalue().splitlines() if "ccwho jump" in x)
+        self.assertNotIn("ccwho jump", out.getvalue(), "open took its place")
+        line = next(x for x in out.getvalue().splitlines() if "ccwho open" in x)
         self.assertIn("iTerm2", line)
         self.assertIn("Terminal.app", line)
 
@@ -5949,7 +6611,8 @@ class TestUsageWords(unittest.TestCase):
         import inspect
         import re
         cmds = set(re.findall(r'argv\[0\] == "([a-z]+)"', inspect.getsource(runner.main)))
-        self.assertGreaterEqual(len(cmds), 16)
+        # the regex reads main: commands it must find (a count drifts as commands go)
+        self.assertLessEqual({"ls", "show", "open", "save", "restore", "usage", "doctor"}, cmds)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             runner.main(["--help"])
@@ -6173,10 +6836,11 @@ class TestEveryOsascriptCallHasADeadline(unittest.TestCase):
 
 
 class TestAJumpGoesToTheAppThatShowsIt(unittest.TestCase):
-    """`ccwho jump` asks the app whose tab shows the session (D9), and asks no
-    app at all for a tty none of them shows."""
+    """`ccwho open` to a running session asks the app whose tab shows it (D9),
+    and asks no app at all for a tty none of them shows."""
 
     def jump(self, row, answer=None):
+        row = dict({"sessionId": "4f2b91ac-1111-4222-8333-000000000001"}, **row)   # as every row has
         real_scan, real_run = runner.scan, runner.subprocess.run
         self.addCleanup(setattr, runner, "scan", real_scan)
         self.addCleanup(setattr, runner.subprocess, "run", real_run)
@@ -6186,7 +6850,7 @@ class TestAJumpGoesToTheAppThatShowsIt(unittest.TestCase):
             argv, 0, stdout=answer or f"focused {argv[-1]}\n", stderr="")
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = runner.jump([row["tty"]])
+            rc = runner.open_session([row["tty"]])
         self.out, self.err = out.getvalue(), err.getvalue()
         return rc, out.getvalue() + err.getvalue()
 
@@ -6199,7 +6863,7 @@ class TestAJumpGoesToTheAppThatShowsIt(unittest.TestCase):
     def test_one_that_did_not_is_said_on_stderr(self):
         rc, _said = self.jump({"tty": "ttys024", "terminal": "iterm2", "title": "x"},
                               answer="not found: /dev/ttys024\n")
-        self.assertEqual((rc, self.out, self.err), (1, "", "ccwho: not found: /dev/ttys024\n"))
+        self.assertEqual((rc, self.out, self.err), (1, "", "ccwho open: not found: /dev/ttys024\n"))
 
     def test_to_a_terminal_app_tab(self):
         rc, said = self.jump({"tty": "ttys050", "terminal": "terminal", "title": "x"})
@@ -6488,7 +7152,7 @@ class TestAStuckITerm2IsSaidNotRaised(unittest.TestCase):
                       "title": "t", "name": "n", "project": "liveapp"}]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = runner.jump(["ttys032"])
+            rc = runner.open_session(["ttys032"])
         self.assertEqual(rc, 1)
         self.assertIn("did not answer", out.getvalue() + err.getvalue())
 
@@ -8010,7 +8674,7 @@ class TestJumpSaysARefusalByItsCode(unittest.TestCase):
         runner.subprocess.run = lambda cmd, **kw: Refused()
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = runner.jump(["ttys032"])
+            rc = runner.open_session(["ttys032"])
         text = out.getvalue() + err.getvalue()
         self.assertEqual(rc, 1)
         self.assertIn("(-1728)", text)
@@ -8404,7 +9068,7 @@ class TestAnOsascriptFailureIsWordedTheSameEverywhere(unittest.TestCase):
         runner.subprocess.run = lambda cmd, **kw: Stuck()
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = runner.jump(["ttys032"])
+            rc = runner.open_session(["ttys032"])
         self.assertEqual(rc, 1)
         self.assertNotIn("refused", out.getvalue() + err.getvalue())
         self.assertIn("did not answer", out.getvalue() + err.getvalue())

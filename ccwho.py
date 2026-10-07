@@ -341,35 +341,20 @@ def restore_deadline(windows):
     return 30.0 + 5.0 * max(1, windows)
 
 
-def jump(argv):
-    """Focus the terminal window holding a session: in the app whose tab shows it."""
-    query = " ".join(a for a in argv if not a.startswith("-"))
-    rows, _ = scan(cache={})
-    hits = engine.match_rows(rows, query)
-    if not hits:
-        print(f"ccwho: no session matches {query!r}", file=sys.stderr)
-        return 1
-    if len(hits) > 1:
-        print(f"ccwho: {query!r} matches {len(hits)} sessions - be more specific:",
-              file=sys.stderr)
-        for line in engine.pick_lines(hits):
-            print(f"  {line}", file=sys.stderr)
-        return 2
-    row = hits[0]
+def _focus(row):
+    """Focus the terminal window a running session is in: in the app whose tab
+    shows it (D9). `ccwho open` decided it has one (engine.resolve_open)."""
     tty = row.get("tty", "")
-    if not tty:
-        print(f"ccwho: {row.get('title')} has no controlling terminal", file=sys.stderr)
-        return 1
     # the app whose tab shows it (D9); none for a tty no app ccwho knows shows
     app = engine.terms.app_of(row)
     if app is None:
-        print(f"ccwho: {engine.terms.no_app(tty)}", file=sys.stderr)
+        print(f"ccwho open: {engine.terms.no_app(tty)}", file=sys.stderr)
         return 1
     out = engine.terms.focus(app, tty, ACTION_DEADLINE)
     if out.startswith("focused"):
         print(out)
         return 0
-    print(f"ccwho: {out}", file=sys.stderr)
+    print(f"ccwho open: {out}", file=sys.stderr)
     return 1
 
 
@@ -2251,28 +2236,158 @@ def indexed_entry(session_id):
             "project": e_.get("project", ""), "configDir": conf}
 
 
-def open_session(argv, from_index=False):
-    """Get me to this session: focus its window if it is up, reopen it if not.
+# A terminal's name - s032, ttys032, /dev/ttys032 - names a running session:
+# an ended one has no terminal, and words of one that hold it are no match.
+# macOS names them ttys000 and up (kern.tty.ptmx_max is 511): an s and three
+# digits. a123 is a short id, v2 and h264 are words.
+_TTY_WORD = re.compile(r"(?:/dev/)?(?:tty)?s[0-9]{3}\Z", re.I)
+# One token of hex (a digit in it): a short id, an id's start - or a pid.
+_ID_WORD = re.compile(r"[0-9a-f-]*[0-9][0-9a-f-]*\Z", re.I)
+# One token of hex letters (bdfe): a short id, or a word.
+_HEX_WORD = re.compile(r"[a-f-]+\Z", re.I)
+# One token of hex at all: shorter than a short id as ccwho prints it (four),
+# it is a word - 42, e2e, add - and an id is no match for it.
+_HEX_TOKEN = re.compile(r"[0-9a-f-]+\Z", re.I)
+SHORT_ID = 4
+
+
+def _named_by_words(row, me, query):
+    """Is this row one that words may name? Not the caller's own (engine.
+    agent_id): Claude Code titles a session from its conversation, so an agent
+    sent to find a session works in one titled with the words it was given.
+    By its id, its tty or its pid it is still what the caller named."""
+    if not me or me not in engine.answers_for(row):
+        return True
+    q = query.lower()
+    return bool(engine.match_terminal([row], query)) or any(
+        str(s).lower().startswith(q) for s in engine.answers_for(row) if s)
+
+
+def _named_word_by_word(rows, query):
+    """The running rows whose shown names - title, name, tab name, project -
+    hold every word of `query`, each anywhere (match_rows takes it as one
+    phrase)."""
+    words = query.lower().split()
+
+    def names(r):
+        return " ".join(str(r.get(k) or "") for k in ("title", "name", "tab_title", "project")).lower()
+    return [r for r in rows if words and all(w in names(r) for w in words)]
+
+
+def _text_of(e_):
+    """What a found session says of itself, its id aside, in lowercase."""
+    return " ".join(str(e_.get(k) or "") for k in
+                    ("title", "topic", "project", "name", "recap")).lower()
+
+
+def _not_from_an_id_s_middle(query, found):
+    """The sessions the search found, less those it found only in the middle of
+    an id: a word of hex letters (bdfe) is a short id there - its start - or a
+    word of the title."""
+    q = query.lower()
+
+    def kept(e_):
+        sid = str(e_.get("sessionId") or "").lower()
+        return sid.startswith(q) or q not in sid or q in _text_of(e_)
+    return [e_ for e_ in found if kept(e_)]
+
+OPEN_USAGE = ("usage: ccwho open <session>   its id, a short id, its name, its tty, its pid,"
+              " or words of its title")
+
+
+def open_session(argv, from_index=False, live_only=False):
+    """Get me to this session: focus its window if it is up, give a background
+    one a window, reopen it if it ended.
+
+    <session> is any name a session answers to (engine.match_rows): its id, a
+    short id, its name, its tty, its pid, words of its title. The running
+    sessions first, by what the list shows of them; words that match none of
+    them are looked for as `ccwho ls` finds them - the ended sessions, and a
+    running one found only by what was said in it. Several matches open
+    nothing: they are named, exit 2. `live_only` (a ccwho://jump link, which names a tty or a
+    pid): a running session - no search, no reopen.
 
     The verb is decided HERE, against the world at click time, not baked into the
     link when the list was printed. After a reboot every link in a restore list
     resolves to "reopen"; ten minutes later the same link focuses the window it
     just made.
 
-    It reopens what a save holds. `from_index` (the list's Enter on an ended
-    session, reopen_ended) also reopens what only the session index knows - not
-    the command line's `open`, nor a ccwho:// link from a page.
+    It reopens what a save holds. `from_index` (the command line, and the
+    list's Enter on an ended session, reopen_ended) also reopens what only the
+    session index knows - not a ccwho:// link, which any app can send.
     """
-    sid = (argv[0] if argv else "").strip()
+    query = " ".join(a for a in argv if not a.startswith("-")).strip()
+    if not query:
+        print(OPEN_USAGE, file=sys.stderr)
+        return 2
     status = {}
     rows, _ = scan(cache={}, status=status)
+    source_ok = status.get("source_ok", False)
+    row = None
+    me = engine.agent_id(os.environ)         # an agent's own session, or None
+    if engine._LINK_SESSION_ID.match(query):
+        sid = query.lower()                 # running, parked, saved, or indexed
+        seen = [r for r in rows if r.get("sessionId") == sid or sid in (r.get("parked") or [])]
+        if seen:
+            # seen running: decided from its own row, as a short id is
+            row, rows, source_ok = seen[0], seen[:1], True
+    else:
+        terminal = live_only or _TTY_WORD.match(query)
+        # a terminal's name is matched as one: its tty or its pid, not a title
+        named = [r for r in rows if _named_by_words(r, me, query)]
+        hits = engine.match_terminal(rows, query) if terminal else (
+            engine.match_rows(named, query) or _named_word_by_word(named, query))
+        id_word = not terminal and len(query) >= SHORT_ID and _ID_WORD.match(query)
+        if not hits and not terminal:
+            live, ended = matches(query, rows)
+            # a running session the search found by what was said in it - its
+            # recap, your prompts - was not named by what the list shows: it is
+            # a candidate as an ended one is, and never the caller's own (its
+            # prompt holds the very words it asked for)
+            live = [r for r in live if not (me and me in engine.answers_for(r))]
+            # nor in the ended: a scan that missed it calls it ended
+            ended = [e_ for e_ in ended if not (me and e_.get("sessionId") == me)]
+            if id_word:
+                # an id is matched by its start (match_rows: like a git short
+                # sha) - four hex from its middle, or a pid, is no short id
+                live, ended = [], [e_ for e_ in ended if
+                                   str(e_.get("sessionId") or "").lower().startswith(query.lower())]
+            elif _HEX_TOKEN.match(query) and len(query) < SHORT_ID:
+                # too short for a short id: a word of what it says of itself
+                live = [e_ for e_ in live if query.lower() in _text_of(e_)]
+                ended = [e_ for e_ in ended if query.lower() in _text_of(e_)]
+            elif _HEX_WORD.match(query):
+                live = _not_from_an_id_s_middle(query, live)
+                ended = _not_from_an_id_s_middle(query, ended)
+            hits = list(live) + list(ended)
+        if not hits:
+            read = ("a terminal" if terminal else "the start of an id" if id_word else "")
+            hint = (f" - read as {read}; `ccwho ls {query}` searches every word"
+                    if read and not live_only else "")
+            print(f"ccwho open: no {'running ' if terminal else ''}session matches {query!r}{hint}",
+                  file=sys.stderr)
+            return 1
+        if len(hits) > 1:
+            print(f"ccwho open: {query!r} matches {len(hits)} sessions - be more specific:",
+                  file=sys.stderr)
+            for line in engine.pick_lines(hits[:10]):          # ten, as `ccwho ls` shows
+                print(f"  {line}", file=sys.stderr)
+            if len(hits) > 10:
+                print(f"  ... and {len(hits) - 10} more - more words narrow it", file=sys.stderr)
+            return 2
+        sid = hits[0].get("sessionId", "")
+        if any(hits[0] is r for r in rows):
+            # seen running: what to do with it is decided from its own row
+            row, rows, source_ok = hits[0], [hits[0]], True
     entries = known_entries()
     if from_index and not any(e_.get("sessionId") == sid for e_ in entries):
         entries += [e_ for e_ in (indexed_entry(sid),) if e_]
-    action, value = engine.resolve_open(sid, rows, entries,
-                                        source_ok=status.get("source_ok", False))
+    action, value = engine.resolve_open(sid, rows, entries, source_ok=source_ok)
     if action == "jump":
-        return jump([value])
+        # the row it was seen in - a parked terminal's, for a job it parked
+        row = row or next(r for r in rows if r.get("sessionId") == sid
+                          or sid in (r.get("parked") or []))
+        return _focus(row)
     if action == "attach":
         # Running, with no window: give it one. `claude attach` opens a session
         # that is already running; reopening it would fork the conversation.
@@ -2291,6 +2406,11 @@ def open_session(argv, from_index=False):
     if action == "unknown":
         print(f"ccwho open: {value} - not reopening anything.", file=sys.stderr)
         print("  Check that `claude` is on PATH and `claude agents --json` answers.",
+              file=sys.stderr)
+        return 1
+    if action == "resume" and me and sid == me:
+        # the caller runs this very command: a resume would fork it
+        print(f"ccwho open: not reopening {sid} - it is the session this runs in",
               file=sys.stderr)
         return 1
     if action == "resume":
@@ -2329,7 +2449,7 @@ def url(argv):
     if verb == "open":
         return open_session([target])
     if verb == "jump":
-        return jump([target])
+        return open_session([target], live_only=True)
     print("ccwho url: not a ccwho:// link I understand", file=sys.stderr)
     return 1
 
@@ -2424,7 +2544,7 @@ def _kill_target(argv, clean):
     if len(words) != 1:
         return None
     w = words[0]
-    # a session, as `ccwho jump` names it: a short id or a name - a letter in
+    # a session, as `ccwho open` names it: a short id or a name - a letter in
     # it, so a pid is never read as one - or its full id, or a short id led by
     # a zero (a pid has none)
     if ((re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w) and re.search(r"[A-Za-z]", w))
@@ -2711,7 +2831,7 @@ def stop_cli(argv, seams=None):
     seen = f" - it is open in a window ({tty})" if tty and row.get("windowed") else ""
     if row.get("kind") != "background":
         print(f"ccwho: it runs in a window{f' ({tty})' if tty else ''} - ccwho does not"
-              f" stop it; end it there (/exit). To find it: ccwho jump {word}", file=sys.stderr)
+              f" stop it; end it there (/exit). To find it: ccwho open {word}", file=sys.stderr)
         return 1
     procs_ = "--and-procs" in argv
     plan, kill, refused = None, [], False
@@ -4053,8 +4173,6 @@ def main(argv=None):
     # is `ccwho ls` - the table scripts and agents read.
     if not argv and sys.stdout.isatty():
         return run_ui()
-    if argv and argv[0] == "jump":
-        return jump(argv[1:])
     if argv and argv[0] == "kill":
         return kill_cli(argv[1:])
     if argv and argv[0] == "clean":
@@ -4084,7 +4202,7 @@ def main(argv=None):
     if argv and argv[0] == "show":
         return show(argv[1:])
     if argv and argv[0] == "open":
-        return _interruptible(open_session, argv[1:])
+        return _interruptible(lambda args: open_session(args, from_index=True), argv[1:])
     if argv and argv[0] == "url":
         return url(argv[1:])
     if argv and not argv[0].startswith("-"):
@@ -4095,7 +4213,6 @@ def main(argv=None):
     if "--help" in argv or "-h" in argv:
         print(__doc__.strip())
         print("\nusage: ccwho                                      the live list (on a terminal)")
-        print("       ccwho jump <pid | tty | title substring>   focus that window (iTerm2, Terminal.app)")
         print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
         print("       ccwho restore [--open] [--from PATH]       list it back / reopen them, in their old panes")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
@@ -4116,7 +4233,10 @@ def main(argv=None):
         print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]  install what ccwho needs, once")
         print("       ccwho setup --no-usage | --usage           turn usage info off / back on")
-        print("       ccwho open <session-id>                    focus that session, or reopen it if closed")
+        print("       ccwho open <session>                       go to it: its window (iTerm2, Terminal.app),")
+        print("                                                  a window for a background one, or reopen")
+        print("                                                  an ended one. <session>: its id, name, tty,")
+        print("                                                  pid, or words of its title")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
         print("       ↓ on pace, ↑ faster than time passes; ↻ when it resets")

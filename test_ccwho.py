@@ -2061,6 +2061,10 @@ class TestMatchRows(unittest.TestCase):
     def test_matches_by_tty_short_form(self):
         self.assertEqual(ccwho.match_rows(self.ROWS, "s062")[0]["pid"], 26581)
 
+    def test_matches_the_tty_as_tty_prints_it(self):
+        # pasted from `tty` (review 2 of the CLI revamp, slice 2)
+        self.assertEqual([r["pid"] for r in ccwho.match_rows(self.ROWS, "/dev/ttys062")], [26581])
+
     def test_matches_by_title_substring_case_insensitive(self):
         self.assertEqual(ccwho.match_rows(self.ROWS, "vitest")[0]["pid"], 73336)
 
@@ -6255,7 +6259,7 @@ class TestTheTableNamesEachSession(unittest.TestCase):
 
 
 class TestAPickListNamesEachSession(unittest.TestCase):
-    """`ccwho show x` and `ccwho jump x` list the sessions x matched. Each line
+    """`ccwho show x` and `ccwho open x` list the sessions x matched. Each line
     says the name that matched, or nobody can see why a row is on the list."""
 
     def test_the_line_has_the_name_the_id_and_the_tty(self):

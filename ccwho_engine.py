@@ -1108,7 +1108,8 @@ def match_rows(rows, query):
     hits = []
     for r in rows:
         sid = (r.get("sessionId") or "").lower()
-        if q == str(r.get("pid")) or q in (r.get("tty", ""), short_tty(r.get("tty", ""))):
+        tty = r.get("tty", "")
+        if q == str(r.get("pid")) or q in (tty, short_tty(tty)) or (tty and short_tty(q) == short_tty(tty)):
             hits.append(r)
         elif sid and sid.startswith(q):
             hits.append(r)
@@ -1121,6 +1122,15 @@ def match_rows(rows, query):
         elif q in (r.get("title") or "").lower() or q in (r.get("project") or "").lower():
             hits.append(r)
     return hits
+
+
+def match_terminal(rows, target):
+    """The rows on that tty, or with that pid - and nothing else. A ccwho://jump
+    link names a terminal, and any app can send one: a title word or an id's
+    start is not what it named."""
+    t = (target or "").strip().lower()
+    return [r for r in rows or [] if t and (
+        t == str(r.get("pid")) or (r.get("tty") and short_tty(t) == short_tty(r["tty"].lower())))]
 
 
 # ------------------------------------------------------------ process tables
@@ -1727,7 +1737,7 @@ def _wrap_cells(text, width):
 def codex_rows(fleet, now=None):
     """The list's rows for the open Codex threads (D16), from collect()'s fleet.
     Never collect()'s own rows: those are Claude sessions to everything that
-    reads them (--json, jump, show)."""
+    reads them (--json, open, show)."""
     threads = (fleet or {}).get("codex_threads") if isinstance(fleet, dict) else None
     now = time.time() if now is None else now
     out = []

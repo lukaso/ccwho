@@ -132,13 +132,15 @@ class FakeCollector:
         self.index_calls += 1
         return dict(self.index_value or {})
 
-    # the grep of what was said: {query: session ids}, and each call made
+    # the grep of what was said: {query: {session id: Said}} - or a set of ids,
+    # each then found with no Said - and each call made
     grep_value = None
     grep_calls = None
 
     def grep(self, entries, query, stop=None):
         self.grep_calls = (self.grep_calls or []) + [(query, stop)]
-        return set((self.grep_value or {}).get(query, ()))
+        found = (self.grep_value or {}).get(query, ())
+        return dict(found) if isinstance(found, dict) else dict.fromkeys(found)
 
     reopened = None
     reopen_answer = "reopened 10fe9603-70dd-459c-96dc-05a176242f56"
@@ -6753,6 +6755,69 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 self.assertNotIn("BUSY", text, "not in its group: no name of it matched")
                 self.assertIn("0 of 2 + 1 said", self.header(app))
 
+    async def test_a_said_row_shows_what_was_said_that_matched(self):
+        # the owner, 2026-10-07: the session was in the list, its row about
+        # something else - so it was not found
+        said = {"text": "the flamingo build is green", "who": "claude",
+                "ts": "2026-09-27T16:00:00.000Z", "key": (1, False, 1)}
+        c = self.collector(found={"flamingo": {ENDED_SID: said}})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "flamingo")
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                text = self.screen_text(app)
+                self.assertIn("Claude: the flamingo build is green", text)
+                self.assertNotIn(ENDED_ENTRY["recap"], text, "not its recap")
+
+    async def test_the_ended_ones_stay_when_the_said_group_fails(self):
+        # review-plan1 F3: one try for all three hid ENDED with it
+        c = self.collector(found={"526": {BUSY["sessionId"]}})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1), \
+                mock.patch.object(ui.engine, "ui_said_group",
+                                  mock.Mock(side_effect=KeyError("odd"))):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "526")
+                self.assertTrue(await self.until(pilot, lambda: c.grep_calls))
+                await pilot.pause(0.3)
+                text = self.screen_text(app)
+                self.assertIn("ENDED", text)
+                self.assertIn("liveapp pull request 526", text)
+                self.assertNotIn("SAID", text)
+
+    async def test_a_said_row_changes_with_its_session_at_once(self):
+        # review-plan1 F13: a row copied for SAID would say "review" until the
+        # next scan, after you went to it
+        marks = []
+        real = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: marks.append((sid, ts))
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", real)
+        sid = reviewable()["sessionId"]
+        said = {"text": "the flamingo build is green", "who": "you",
+                "ts": "2026-09-22T10:00:00.000Z", "key": (1, True, 1)}
+        c = self.collector(fleet=ui.Fleet([reviewable(), BUSY], True, "12:00:00"),
+                           found={"flamingo": {sid: said}})
+        adapter = FakeAdapter()
+        app = self.app(collector=c, adapter=adapter)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "flamingo")
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                where = lambda: [w.row["attention"] for w in app.query(ui.Row)   # noqa: E731
+                                 if w.row["sessionId"] == sid]
+                self.assertEqual(where(), ["review"])
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                self.assertTrue(await self.until(pilot, lambda: adapter.asked))
+                self.assertTrue(await self.until(pilot, lambda: where() == ["stopped"]),
+                                f"still {where()}")
+                self.assertIn("you: the flamingo build", self.screen_text(app))
+
     async def test_enter_after_the_grep_goes_to_the_name_match(self):
         # review 1: "release" was said in LIVE too; Enter went to LIVE
         c = self.collector(found={"release": {LIVE["sessionId"], BUSY["sessionId"]}})
@@ -6803,7 +6868,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             if query != "abc":
                 gate.wait(5)                        # and never looks at stop
-            return set(c.grep_value.get(query, ()))
+            return dict.fromkeys(c.grep_value.get(query, ()))
         c.grep = hung
         app = self.app(collector=c)
         with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
@@ -6861,7 +6926,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         def hung(entries, query, stop=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gate.wait(5)                    # a root on a volume that is gone
-            return set()
+            return {}
         c.grep = hung
         app = self.app(collector=c)
         with mock.patch.object(ui, "CONTENT_PAUSE", 0.05), \
@@ -7006,7 +7071,8 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         def slow(entries, query, stop=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gate.wait(5)
-            return set((c.grep_value or {}).get(query, ()))
+            found = (c.grep_value or {}).get(query, ())
+            return dict(found) if isinstance(found, dict) else dict.fromkeys(found)
         c.grep = slow
         return gate
 
@@ -7039,7 +7105,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         def slow(entries, query, stop=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gates[query].wait(5)            # and never looks at stop: it lands late
-            return set(c.grep_value[query])
+            return dict.fromkeys(c.grep_value[query])
         c.grep = slow
         app = self.app(collector=c)
         with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
@@ -7131,7 +7197,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         def hung(entries, query, stop=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gate.wait(5)                    # and never looks at stop
-            return set()
+            return {}
         c.grep = hung
         app = self.app(collector=c)
         with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
@@ -7206,7 +7272,71 @@ class TestTheCollectorGreps(unittest.TestCase):
         asked = []
         stop = lambda: False                        # noqa: E731
         with mock.patch.object(ccwho_index, "grep",
-                               lambda entries, query, stop=None: asked.append(
-                                   (entries, query, stop)) or {"x"}):
-            self.assertEqual(ui.Collector().grep({"e": {}}, "flamingo", stop), {"x"})
+                               lambda entries, query, stop=None, store=None: asked.append(
+                                   (entries, query, stop)) or {"x": None}):
+            self.assertEqual(ui.Collector().grep({"e": {}}, "flamingo", stop), {"x": None})
         self.assertEqual(asked, [({"e": {}}, "flamingo", stop)])
+
+    def test_every_grep_reads_from_one_store_of_what_was_said(self):
+        # read once for the life of the list: the next search reads what was appended
+        import ccwho_index
+        stores = []
+        with mock.patch.object(ccwho_index, "grep",
+                               lambda entries, query, stop=None, store=None: stores.append(
+                                   store) or {}):
+            c = ui.Collector()
+            c.grep({}, "flamingo")
+            c.grep({}, "pelican")
+            self.assertIsInstance(stores[0], ccwho_index.SaidStore)
+            self.assertIs(stores[0], stores[1])
+            # a store other code made holds what other rules read: a new one
+            stores[0].source = "the code before an edit"
+            c.grep({}, "flamingo")
+            self.assertIsNot(stores[2], stores[0])
+            self.assertEqual(stores[2].source, ccwho_index.SOURCE)
+
+    def test_an_edit_not_loaded_yet_keeps_the_store(self):
+        # review-build6 F2: the list compares the code as loaded, not the files
+        import ccwho_index
+        import os
+        import tempfile
+        fd, edited = tempfile.mkstemp(suffix=".py")
+        os.close(fd)
+        self.addCleanup(os.remove, edited)
+        stores = []
+        with mock.patch.object(ccwho_index, "grep",
+                               lambda entries, query, stop=None, store=None: stores.append(
+                                   store) or {}), \
+                mock.patch.object(ccwho_index, "SOURCES", (edited,)):
+            c = ui.Collector()
+            c.grep({}, "flamingo")
+            c.grep({}, "pelican")
+        self.assertIs(stores[0], stores[1], "not a new store at every search")
+
+    def test_a_reload_keeps_what_was_said(self):
+        # review-build1 F1: every scan reloads the engine, and its index module
+        # is a new object - a store tied to the class was read again every time
+        import json
+        import os
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "s.jsonl")
+        line = json.dumps({"type": "user", "timestamp": "2026-10-07T10:00:00.000Z",
+                           "message": {"role": "user", "content": "the flamingo build"}})
+        with open(path, "w") as fh:
+            fh.write(line + "\n")
+        entries = {"s": {"sessionId": "s", "path": path, "entrypoint": "cli"}}
+        c = ui.Collector()
+        self.assertEqual(set(c.grep(entries, "flamingo")), {"s"})
+        store, parsed = c.said_store, c.said_store.parsed
+        c.reload()
+        self.assertEqual(c.reload_error, "")
+        self.assertEqual(set(c.grep(entries, "flamingo")), {"s"})
+        self.assertIs(c.said_store, store)
+        self.assertEqual(c.said_store.parsed, parsed, "nothing read again")
+        with open(path, "a") as fh:                                          # control
+            fh.write(line + "\n")
+        c.grep(entries, "flamingo")
+        self.assertEqual(c.said_store.parsed, parsed + 1, "only the new line")

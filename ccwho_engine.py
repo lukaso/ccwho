@@ -31,6 +31,7 @@ import ccwho_brief as brief
 import ccwho_index
 import ccwho_text
 from ccwho_text import ANSI as _ANSI, cells as _cells, cut as _cut  # noqa: E402,F401
+from ccwho_text import plain_text  # noqa: E402,F401
 import ccwho_usage  # noqa: F401 - in RELOAD_FIRST; the list reads usage through the engine
 import ccwho_procs as procs
 import ccwho_terms as terms
@@ -3368,16 +3369,6 @@ _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
           "ready": "ready", "shell": "shell", "idle": "idle", "program": "program"}
 
 
-# Every escape a session might have printed, as a terminal reads it: an OSC up
-# to what ends it (BEL, ST, a CAN or SUB that aborts it, the next ESC - or, one
-# never ended, its line: a terminal would eat the rest, but the rest of a recap
-# is worth more than that), any CSI - the private ones too (\x1b[?25l hides the
-# cursor) - and the short ones, ESC and a final (tput sgr0 prints \x1b(B). Not
-# the C1 forms: in a str those are code points, and in mojibake they are text.
-_ESCAPES = re.compile(r"\x1b\][^\x07\x1b\x18\x1a\n]*(?:\x07|\x1b\\|[\x18\x1a]|(?=[\x1b\n])|$)"
-                      r"|\x1b\[[0-?]*[ -/]*[@-~]"
-                      r"|\x1b[ -/]*[0-~]")
-
 
 # The fields a brief's values are, in the order brief_parts gives them.
 BRIEF_FIELDS = ("id", "project", "title", "recap", "goal", "you_said", "closing",
@@ -3467,13 +3458,6 @@ def _as_shown(text):
     """A Windows line end is a line end, and a bare \\r starts the line over:
     only what follows the last one is what the pane shows."""
     return "\n".join(line.rsplit("\r", 1)[-1] for line in text.replace("\r\n", "\n").split("\n"))
-
-
-def plain_text(text):
-    """What a terminal would show of `text`, without its escapes: pasted coloured
-    output is common in a prompt, and neither the pane nor a paste wants it."""
-    # and the controls the pane drops (BEL, backspace, VT, FF): a paste drops them too
-    return re.sub(r"[\x1b\x07\x08\x0b\x0c]", "", _ESCAPES.sub("", text))
 
 
 def brief_ansi(text, style):
@@ -3614,7 +3598,9 @@ def ui_row_cells(row, width=100, tag=""):
     Line one is what the session IS: a mark for its state, then plain text.
     Line two is the recap - the harness's own summary, which is the only line
     written to answer "what was this about" - never without its age. No recap
-    yet, and it says so and shows the last thing the session did instead.
+    yet, and it says so and shows the last thing the session did instead. A row
+    found under SAID shows what was said that matched instead, its age and who
+    said it first: that is why the row is there.
     """
     sid = row.get("short") or brief.short_id(row.get("sessionId", ""))
     tail = f" · {row.get('since', '')}"
@@ -3714,6 +3700,12 @@ def ui_row_cells(row, width=100, tag=""):
         ask = "" if row.get("attention") == "program" else row.get("ask")
         body = ("waiting? (maybe an approval)" if row.get("attention") == "waiting"
                 else ask or row.get("folder") or "(no folder yet)")
+    elif row.get("said"):
+        # found under SAID: the message that matched is why it is there
+        said = row["said"]
+        who = {"you": "you", "claude": "Claude"}.get(said.get("who"), said.get("who") or "?")
+        mark = f"{said.get('age') or '?'} · {who}: "
+        body = said.get("text") or ""
     elif row.get("recap"):
         age = row.get("recap_age") or "?"
         turns = row.get("turns_since_recap") or 0
@@ -3833,7 +3825,10 @@ UI_ENDED_SHOWN = 10
 
 def ended_row(entry, now_iso):
     """An index entry in the shape a row is drawn from: a session that has
-    ended, what it was about (its recap, else what you said) and when."""
+    ended, what it was about (its recap, else what you said) and when. Every
+    text as printable as a live row's (build_row): a transcript holds pasted
+    terminal output (review-build1 F3)."""
+    entry = {k: procs.printable(v) if isinstance(v, str) else v for k, v in entry.items()}
     said, last = entry.get("you_said", ""), entry.get("last_ts", "")
     return {"sessionId": entry.get("sessionId", ""), "project": entry.get("project", "?"),
             "title": entry.get("title", ""), "tab_title": "", "name": "",
@@ -3877,13 +3872,20 @@ def ui_ended_groups(idx, query, live_rows, now_iso, limit=UI_ENDED_SHOWN):
 
 def ui_said_group(idx, query, live_rows, found, now_iso, limit=UI_ENDED_SHOWN):
     """The SAID group, last: the sessions the grep of what was said found
-    (`found`, ccwho_index.grep) and nothing else did - running ones first, as
-    their own rows, then ended ones, newest first. A session that matches by a
-    name, or by what the index says it was about, shows where that puts it and
-    never here as well: a common word was said in most sessions, and mixed in
-    they pushed the name matches down (review 1). `limit` of them, the heading
-    saying how many there are. None while you do not search."""
-    found = set(found or ())
+    (`found`, ccwho_index.grep: {id: Said}) and nothing else did. A session that
+    matches by a name, or by what the index says it was about, shows where that
+    puts it and never here as well: a common word was said in most sessions, and
+    mixed in they pushed the name matches down (review 1).
+
+    Each row carries `said` - the message that matched, who said it and its age
+    - and the closest come first: more of the words in one message, then yours,
+    then as typed (Said's key), then running before ended, then the newest. The
+    owner's session was 3rd of 44 by age, its row about something else
+    (2026-10-07). A running row is a copy of the live row, with its state; a row
+    that parked others has the best of what each of them said. An id with no
+    Said shows without one. `limit` of them, the heading saying how many there
+    are. None while you do not search."""
+    found = found if isinstance(found, dict) else dict.fromkeys(found or ())
     if not (query or "").strip() or not found:
         return []
     live_rows = list(live_rows or [])
@@ -3891,16 +3893,38 @@ def ui_said_group(idx, query, live_rows, found, now_iso, limit=UI_ENDED_SHOWN):
     # one the index finds is in that search, its parked terminals with it
     shown = {sid for r in ui_filter(live_rows, query) for sid in answers_for(r) if sid}
     shown |= {e.get("sessionId") for e in ccwho_index.search(idx or {}, query)}
-    running = [r for r in live_rows
-               if found & set(answers_for(r)) and not shown & set(answers_for(r))]
-    ended = sorted((idx[sid] for sid in found - shown - live_ids(live_rows) if sid in (idx or {})),
-                   key=lambda e: str(e.get("last_ts", "")), reverse=True)
-    total = len(running) + len(ended)
-    if not total:
+
+    def best(ids):
+        saids = [found[sid] for sid in ids if isinstance(found.get(sid), dict)]
+        return max(saids, key=lambda s: tuple(s.get("key") or ()), default=None)
+
+    def row_of(base, said):
+        if not said:
+            return base
+        return dict(base, said={"text": procs.printable(str(said.get("text") or "")),
+                                "who": said.get("who", ""),
+                                "age": brief.age_between(said.get("ts", ""), now_iso) or "?"})
+
+    rows = []
+    for r in live_rows:
+        ids = [sid for sid in answers_for(r) if sid]
+        if set(ids) & set(found) and not set(ids) & shown:
+            said = best(ids)
+            last = max((str((idx or {}).get(sid, {}).get("last_ts", "")) for sid in ids),
+                       default="") or str(r.get("ts", ""))
+            rows.append((said, True, last, row_of(r, said)))
+    for sid in set(found) - shown - live_ids(live_rows):
+        if sid in (idx or {}):
+            said = best([sid])
+            rows.append((said, False, str(idx[sid].get("last_ts", "")),
+                         row_of(ended_row(idx[sid], now_iso), said)))
+    if not rows:
         return []
-    rows = (running + [ended_row(e, now_iso) for e in ended[:max(0, limit - len(running))]])[:limit]
+    rows.sort(key=lambda r: (tuple((r[0] or {}).get("key") or ()), r[1], r[2]), reverse=True)
+    total = len(rows)
     heading = "SAID" if total <= limit else f"SAID  {limit} of {total} - type more to narrow"
-    return [{"heading": heading, "rows": rows, "needs_you": False, "said": True, "total": total}]
+    return [{"heading": heading, "rows": [r[3] for r in rows[:limit]], "needs_you": False,
+             "said": True, "total": total}]
 
 
 def _plural(n, word):

@@ -1,8 +1,9 @@
 """Text as the screen draws it: cells, not characters, and cuts that say so.
 
-Shared by the engine (rows) and ccwho_usage (the usage line), which cannot import
-each other: the engine imports ccwho_usage. Pure; stdlib apart from Rich's own
-cell counter, used when it is there so the list and its tests agree with Rich.
+Shared by the engine (rows), ccwho_usage (the usage line) and ccwho_index (what
+was said, as a row shows it), which cannot import each other: the engine imports
+the other two. Pure; stdlib apart from Rich's own cell counter, used when it is
+there so the list and its tests agree with Rich.
 """
 from __future__ import annotations
 
@@ -39,3 +40,21 @@ def cut(text, width):
             break
         out += c
     return out + "…" if width > 0 else ""
+
+
+# Every escape a session might have printed, as a terminal reads it: an OSC up
+# to what ends it (BEL, ST, a CAN or SUB that aborts it, the next ESC - or, one
+# never ended, its line: a terminal would eat the rest, but the rest of a recap
+# is worth more than that), any CSI - the private ones too (\x1b[?25l hides the
+# cursor) - and the short ones, ESC and a final (tput sgr0 prints \x1b(B). Not
+# the C1 forms: in a str those are code points, and in mojibake they are text.
+ESCAPES = re.compile(r"\x1b\][^\x07\x1b\x18\x1a\n]*(?:\x07|\x1b\\|[\x18\x1a]|(?=[\x1b\n])|$)"
+                     r"|\x1b\[[0-?]*[ -/]*[@-~]"
+                     r"|\x1b[ -/]*[0-~]")
+
+
+def plain_text(text):
+    """What a terminal would show of `text`, without its escapes: pasted coloured
+    output is common in a prompt, and neither the pane nor a paste wants it."""
+    # and the controls the pane drops (BEL, backspace, VT, FF): a paste drops them too
+    return re.sub(r"[\x1b\x07\x08\x0b\x0c]", "", ESCAPES.sub("", text))

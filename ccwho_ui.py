@@ -18,8 +18,9 @@ What it does that the one-shot table cannot:
   - / searches every name a session has, plus what it is about - and the
     ended sessions too, from the index `ccwho ls` searches; Enter reopens one.
     Half a second after the last key it also greps what was said in each -
-    your prompts and Claude's replies, any case - and lists what only that
-    finds under SAID, last
+    your prompts and Claude's replies, any case, a word's forms too (woke,
+    woken for wake) - and lists what only that finds under SAID, last: the
+    closest first, each row showing the message that matched
 
 Collection runs in a worker thread. `claude agents --json` can take 30 seconds
 when it is unhappy, and a list that freezes at the moment you reach for it is the
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
@@ -109,14 +111,15 @@ FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
 # not come back by this is asked again at the next `/` - a thread worker cannot
 # be stopped, and one that never returns must not stop every search after it.
 INDEX_PATIENCE = 60.0
-# The search also greps what was said in every session (ccwho_index.grep:
-# 0.2-2.4 s, a word beyond a-z up to ~5 s): once, this long after the last key
-# - not on every key.
+# The search also greps what was said in every session (ccwho_index.grep: the
+# first one reads every transcript, ~5-9 s; then 0.04-0.3 s, measured 2026-10-07
+# over the owner's 125 sessions): once, this long after the last key - not on
+# every key.
 CONTENT_PAUSE = 0.5
 # A grep not back by this is not said to be searching any more: one that hangs
 # (a root on a volume that is gone) said so for good (review 2).
 CONTENT_PATIENCE = 60.0
-NOTHING_SAID = frozenset()      # one object: the cache compares by identity
+NOTHING_SAID = types.MappingProxyType({})   # one object: the cache compares by identity
 
 
 class Fleet:
@@ -1080,19 +1083,37 @@ class CcwhoUi(App):
         got = self.ended_cache
         if (got and got[0][0] == key[0] and got[0][1] is key[1] and got[0][2] is key[2]
                 and got[0][3] is key[3]):
-            return got[1]
+            return got[1][:2] + (self.as_running_now(got[1][2]),)
+        now = engine.now_iso()
         try:
-            now = engine.now_iso()
             found = (engine.ui_found_running(self.ended_index, self.filter_text,
                                              self.fleet.rows),
                      engine.ui_ended_groups(self.ended_index, self.filter_text,
-                                            self.fleet.rows, now),
-                     engine.ui_said_group(self.ended_index, self.filter_text,
-                                          self.fleet.rows, said, now))
+                                            self.fleet.rows, now))
         except Exception:               # an odd index never costs the running ones
-            found = ([], [], [])
+            found = ([], [])
+        try:
+            # its own: an odd answer never costs ENDED or the running ones (review-plan1 F3)
+            said_groups = engine.ui_said_group(self.ended_index, self.filter_text,
+                                               self.fleet.rows, said, now)
+        except Exception:
+            said_groups = []
+        found = found + (said_groups,)
         self.ended_cache = (key, found)
-        return found
+        return found[:2] + (self.as_running_now(found[2]),)
+
+    def as_running_now(self, groups):
+        """The SAID group with each running row as it is NOW: a SAID row is a
+        copy of the live row, and a row changed in place - you went to it, and it
+        left review - must not wait for the next scan to say so (review-plan1 F13)."""
+        live = {r.get("sessionId"): r for r in self.fleet.rows}
+        out = []
+        for g in groups:
+            rows = [dict(live[r.get("sessionId")], **({"said": r["said"]} if r.get("said") else {}))
+                    if r.get("attention") != "ended" and r.get("sessionId") in live else r
+                    for r in g["rows"]]
+            out.append(dict(g, rows=rows))
+        return out
 
     def read_index(self, n=0):
         """The session index, brought up to date: 0.03 s warm - and the first
@@ -1202,7 +1223,7 @@ class CcwhoUi(App):
         if self.content_running == n:
             self.content_running = None
         if n == self.content_n and ids is not None and query == self.filter_text:
-            self.content_found = (query, frozenset(ids))
+            self.content_found = (query, dict(ids))    # {id: Said}
         if self.filter_text:
             self.rebuild()
         else:
@@ -2419,6 +2440,8 @@ class Collector:
         self.doctor_state = {}  # doctor's answer and when (ccwho.doctor_banner_cached)
         self.doctor_line = ""   # its last answer in
         self.doctor_thread = None
+        self.said_store = None  # what was said, for the grep (ccwho_index.SaidStore)
+        self.said_lock = threading.Lock()   # two greps may start at once
 
     def changed(self):
         """Has anything happened that could change the list?
@@ -2566,8 +2589,21 @@ class Collector:
 
     def grep(self, entries, query, stop=None):
         """Grep what the sessions the index knows said (ccwho_index.grep), as
-        the engine's index module has it now - it is reloaded beside the engine."""
-        return engine.ccwho_index.grep(entries, query, stop=stop)
+        the engine's index module has it now - it is reloaded beside the engine -
+        from one store of what was said, kept for the life of the list: the
+        first search reads every transcript, the next only what was appended.
+
+        Every scan reloads the engine, and its index module with it: a new
+        class each time. The store is kept while it was made by the code that
+        runs now (ccwho_index.SOURCE - review-build1 F1); after an edit to that
+        code, the next search reads into a new store, so old and new code never
+        share one (review-build2 F1, review-build5)."""
+        index = engine.ccwho_index
+        with self.said_lock:
+            if getattr(self.said_store, "source", None) != index.SOURCE:
+                self.said_store = index.SaidStore()
+            store = self.said_store
+        return index.grep(entries, query, stop=stop, store=store)
 
     def index(self):
         """The session index `ccwho ls` searches, brought up to date. It raises

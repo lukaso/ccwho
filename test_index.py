@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import ccwho_index as index
 
@@ -505,20 +506,25 @@ class TestGrep(Base):
     def entries(self):
         return self.update()
 
+    def found(self, query, idx=None, **kw):
+        """The ids the grep found, or None when it was stopped."""
+        got = index.grep(self.entries() if idx is None else idx, query, **kw)
+        return None if got is None else set(got)
+
     def test_a_word_in_a_prompt_or_a_reply_any_case(self):
         self.write(self.A, [user("deploy the Flamingo build"), assistant("done")])
         self.write(self.B, [user("hello"), assistant("The FLAMINGO build is green")])
         for q in ("flamingo", "Flamingo", "FLAMINGO", "flam"):
             with self.subTest(q=q):
-                self.assertEqual(index.grep(self.entries(), q), {self.A, self.B})
-        self.assertEqual(index.grep(self.entries(), "pelican"), set())          # control
+                self.assertEqual(self.found(q), {self.A, self.B})
+        self.assertEqual(self.found("pelican"), set())          # control
 
     def test_every_word_in_the_same_session(self):
         self.write(self.A, [user("flamingo"), assistant("ok")])
         self.write(self.B, [assistant("pelican")])
-        self.assertEqual(index.grep(self.entries(), "flamingo pelican"), set())
+        self.assertEqual(self.found("flamingo pelican"), set())
         self.write(self.A, [user("flamingo"), assistant("and a pelican")])     # two records
-        self.assertEqual(index.grep(self.entries(), "pelican flamingo"), {self.A})
+        self.assertEqual(self.found("pelican flamingo"), {self.A})
 
     def test_not_what_claude_code_stored_or_a_tool_printed(self):
         # the skills, CLAUDE.md, a reminder, a tool's output, a key, the branch:
@@ -544,10 +550,10 @@ class TestGrep(Base):
                      "input": {"command": "grep flamingo"}}]}),
             user("something else"),
         ])
-        self.assertEqual(index.grep(self.entries(), "flamingo"), set())
-        self.assertEqual(index.grep(self.entries(), "role"), set(), "a key is not said")
+        self.assertEqual(self.found("flamingo"), set())
+        self.assertEqual(self.found("role"), set(), "a key is not said")
         self.write(self.B, [user("hello"), assistant("the flamingo log is clean")])  # control
-        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.B})
+        self.assertEqual(self.found("flamingo"), {self.B})
 
     TS = "2026-09-18T10:00:00.000Z"
 
@@ -559,10 +565,10 @@ class TestGrep(Base):
                                  "<command-args></command-args>"), assistant("ok")])
         self.write(self.B, [user("<command-name>/review</command-name>\n"
                                  "<command-args>the gate flake</command-args>")])
-        self.assertEqual(index.grep(self.entries(), "args"), set(), "a tag is not said")
-        self.assertEqual(index.grep(self.entries(), "message"), set(), "a tag is not said")
-        self.assertEqual(index.grep(self.entries(), "/compact"), {self.A})        # control
-        self.assertEqual(index.grep(self.entries(), "gate flake"), {self.B})
+        self.assertEqual(self.found("args"), set(), "a tag is not said")
+        self.assertEqual(self.found("message"), set(), "a tag is not said")
+        self.assertEqual(self.found("/compact"), {self.A})        # control
+        self.assertEqual(self.found("gate flake"), {self.B})
 
     def test_a_prompt_typed_while_claude_works_is_said(self):
         # queued: only an attachment, never a user record (review 2: 159 of them
@@ -574,14 +580,14 @@ class TestGrep(Base):
         self.write(self.A, [user("first"), queued("and the flamingo too")])
         self.write(self.B, [user("first"), queued("<task-notification>flamingo</task-notification>",
                                                   commandMode="task-notification")])
-        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A})
+        self.assertEqual(self.found("flamingo"), {self.A})
         self.write(self.B, [user("first"), queued("flamingo from a peer", origin={"kind": "peer"})])
-        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A}, "not a person's")
+        self.assertEqual(self.found("flamingo"), {self.A}, "not a person's")
 
     def test_an_interrupt_is_not_said(self):
         self.write(self.A, [user("deploy it"), user("[Request interrupted by user for tool use]")])
-        self.assertEqual(index.grep(self.entries(), "interrupted"), set())
-        self.assertEqual(index.grep(self.entries(), "deploy"), {self.A})          # control
+        self.assertEqual(self.found("interrupted"), set())
+        self.assertEqual(self.found("deploy"), {self.A})          # control
 
     def test_what_the_harness_writes_as_meta_is_not_said(self):
         self.write(self.A, [user("deploy it"),
@@ -591,9 +597,9 @@ class TestGrep(Base):
                             rec(type="user", isMeta=True, timestamp=self.TS, message={
                                 "role": "user", "content": "(Re-invocation of /land - the skill"
                                 " instructions were previously loaded)"})])
-        self.assertEqual(index.grep(self.entries(), "displayed"), set())
-        self.assertEqual(index.grep(self.entries(), "instructions"), set())
-        self.assertEqual(index.grep(self.entries(), "deploy"), {self.A})          # control
+        self.assertEqual(self.found("displayed"), set())
+        self.assertEqual(self.found("instructions"), set())
+        self.assertEqual(self.found("deploy"), {self.A})          # control
 
     def test_what_the_harness_writes_as_a_reply_is_not_said(self):
         # "No response requested.", an API error, a spend limit: a reply of
@@ -602,7 +608,7 @@ class TestGrep(Base):
             "role": "assistant", "model": "<synthetic>",
             "content": [{"type": "text", "text": "No response requested."}]})])
         self.write(self.B, [user("hello"), assistant("none was requested")])
-        self.assertEqual(index.grep(self.entries(), "requested"), {self.B})
+        self.assertEqual(self.found("requested"), {self.B})
 
     def test_one_odd_record_does_not_cost_the_rest(self):
         self.write(self.A, [user("flamingo")])
@@ -615,59 +621,474 @@ class TestGrep(Base):
                                   rec(type="assistant", timestamp=self.TS, message="flamingo"),
                                   user("flamingo")])
         idx[self.B] = {"sessionId": self.B, "path": odd, "entrypoint": "cli"}
-        self.assertEqual(index.grep(idx, "flamingo"), {self.A, self.B})
+        self.assertEqual(self.found("flamingo", idx=idx), {self.A, self.B})
 
     def test_letters_beyond_a_z_in_any_case(self):
         self.write(self.A, [user("Ärger im Büro"), assistant("ÉCOLE fermée")])
         for q in ("Ärger", "ärger", "ÄRGER", "école", "ÉCOLE", "büro"):
             with self.subTest(q=q):
-                self.assertEqual(index.grep(self.entries(), q), {self.A})
+                self.assertEqual(self.found(q), {self.A})
 
     def test_a_quote_or_a_backslash_as_it_was_said(self):
         # the file has them escaped (\" and \\): what was said has them as typed
         self.write(self.A, [user('run "deploy" now'), assistant("saved to C:\\temp\\new")])
         for q in ('"deploy"', 'deploy"', "c:\\temp", "temp\\new"):
             with self.subTest(q=q):
-                self.assertEqual(index.grep(self.entries(), q), {self.A})
+                self.assertEqual(self.found(q), {self.A})
 
     def test_a_programs_session_only_with_everything(self):
         self.write(self.A, [rec(type="user", entrypoint="sdk-cli", timestamp="2026-09-18T10:00:00.000Z",
                                 message={"role": "user", "content": "flamingo"})])
-        self.assertEqual(index.grep(self.entries(), "flamingo"), set())
-        self.assertEqual(index.grep(self.entries(), "flamingo", everything=True), {self.A})
+        self.assertEqual(self.found("flamingo"), set())
+        self.assertEqual(self.found("flamingo", everything=True), {self.A})
 
     def test_a_stop_asked_for_ends_it_with_no_answer(self):
         self.write(self.A, [user("flamingo")])
         self.write(self.B, [user("flamingo")])
-        self.assertIsNone(index.grep(self.entries(), "flamingo", stop=lambda: True))
-        self.assertEqual(index.grep(self.entries(), "flamingo", stop=lambda: False),
+        self.assertIsNone(self.found("flamingo", stop=lambda: True))
+        self.assertEqual(self.found("flamingo", stop=lambda: False),
                          {self.A, self.B})                                     # control
 
-    def test_a_stop_during_the_last_file_has_no_answer(self):
+    def test_a_stop_while_a_transcript_is_read_has_no_answer(self):
+        # review-plan1 F6: the stop is asked for each line the store reads
         self.write(self.A, [user("one"), user("two"), user("three"), user("flamingo")])
+        store = index.SaidStore()
+        self.assertIsNone(self.found("flamingo", store=store, stop=lambda: store.parsed >= 2))
+        self.assertEqual(store.files, {}, "a stopped read keeps nothing")
+        self.assertEqual(self.found("flamingo", store=store), {self.A})         # control
+
+    def test_a_stop_while_it_searches_what_was_read_has_no_answer(self):
+        self.write(self.A, [user("flamingo")])
+        store = index.SaidStore()
+        idx = self.entries()
+        self.assertEqual(self.found("flamingo", idx=idx, store=store), {self.A})   # read
         asked = []
-        during = lambda: asked.append(1) or len(asked) > 2      # noqa: E731 - inside its lines
-        self.assertIsNone(index.grep(self.entries(), "flamingo", stop=during))
-        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A})    # control
+        # the first ask is before the session; the second before its first message
+        second = lambda: asked.append(1) or len(asked) >= 2         # noqa: E731
+        self.assertIsNone(self.found("flamingo", idx=idx, store=store, stop=second))
+        asked.clear()
+        third = lambda: asked.append(1) or len(asked) >= 3          # noqa: E731
+        self.assertEqual(self.found("flamingo", idx=idx, store=store, stop=third),
+                         {self.A}, "one session, one message: two asks")     # control
 
     def test_a_transcript_gone_unreadable_or_cut_is_passed_over(self):
         self.write(self.A, [user("flamingo")])
         p = self.write(self.B, [user("flamingo")])
         idx = self.entries()
         os.remove(p)
-        self.assertEqual(index.grep(idx, "flamingo"), {self.A})
+        self.assertEqual(self.found("flamingo", idx=idx), {self.A})
         idx[self.A] = dict(idx[self.A], path=None)
-        self.assertEqual(index.grep(idx, "flamingo"), set())
+        self.assertEqual(self.found("flamingo", idx=idx), set())
         cut = self.write(self.B, [user("hello")])
         with open(cut, "a") as fh:
             fh.write('{"type": "user", "message": {"content": "flamingo')     # a line cut off
-        self.assertEqual(index.grep(self.entries(), "flamingo"), {self.A}, "not B")
+        self.assertEqual(self.found("flamingo"), {self.A}, "not B")
 
     def test_no_words_finds_nothing(self):
         self.write(self.A, [user("flamingo")])
         for q in ("", "   ", None):
             with self.subTest(q=q):
-                self.assertEqual(index.grep(self.entries(), q), set())
+                self.assertEqual(self.found(q), set())
+
+
+def queued(prompt, ts="2026-09-18T10:02:00.000Z"):
+    """A prompt typed while Claude worked: only an attachment, never a user record."""
+    return rec(type="attachment", timestamp=ts, attachment={
+        "type": "queued_command", "prompt": prompt, "commandMode": "prompt",
+        "origin": {"kind": "human"}})
+
+
+class TestWordForms(unittest.TestCase):
+    """The owner remembered "wake"; what was said was "it hasn't woken the loop"
+    (2026-10-07). A word also finds its forms - forward only, from the word to
+    its forms: `coding` finding every "Claude Code" took 25 sessions to 102, and
+    `willing`, `said`, `taken` widened the same way (review-plan2 F1)."""
+
+    def test_the_keys(self):
+        same = [("wake", "wakes", "waking", "woke", "woken"),
+                ("merge", "merged", "merges", "merging"),
+                ("fix", "fixes", "fixed", "fixing"),
+                ("run", "runs", "running", "ran"),
+                ("try", "tries", "tried", "trying"),
+                ("use", "used", "uses", "using"),
+                ("plan", "plans", "planned", "planning"),
+                ("hope", "hoped", "hoping"),
+                ("choose", "chose", "chosen", "choosing"),
+                ("apply", "applies", "applied", "applying"),          # y -> i, not in the table
+                ("agree", "agreed", "agrees")]
+        for group in same:
+            with self.subTest(group=group):
+                self.assertEqual({index.word_key(w) for w in group}, {index.word_key(group[0])})
+        for a, b in (("note", "not"), ("use", "us"), ("plan", "plane"), ("hop", "hope"),
+                     ("win", "won"), ("stick", "stuck"), ("leave", "left"), ("lead", "led"),
+                     # left out of the table on purpose: each is a word of its own
+                     ("bite", "bit"), ("make", "made"), ("meet", "met"), ("sit", "sat"),
+                     ("shoot", "shot"), ("light", "lit"), ("feed", "fed"), ("wear", "wore"),
+                     ("tear", "tore"), ("go", "went"), ("go", "gone"), ("see", "saw"),
+                     ("do", "did"), ("get", "got")):
+            with self.subTest(apart=(a, b)):
+                self.assertNotEqual(index.word_key(a), index.word_key(b))
+        # Porter's own 5a: no vowel-consonant pair before the e keeps it
+        self.assertEqual(index.word_key("true"), "true")
+        self.assertEqual(index.word_key("does"), "doe")
+        # Porter's eed: a word that only looks like one keeps it
+        self.assertEqual(index.word_key("speed"), "speed")
+
+    def match(self, word, text):
+        return index.Word(word).match(text.lower())
+
+    def test_a_word_finds_its_forms(self):
+        for word, text in (("wake", "I merged 41 but it hasn't woken the loop"),
+                           ("wake", "it woke."),
+                           ("wake", "it is waking"),
+                           ("merge", "after (merging) it"),
+                           ("code", "coding it"),
+                           ("hope", "hoping so"),
+                           ("choose", "he chose it"),
+                           ("use", "using it"),
+                           ("try", "tried again"),
+                           ("run", "it ran")):
+            with self.subTest(word=word, text=text):
+                self.assertEqual(self.match(word, text), index.FORM)
+
+    def test_a_form_does_not_find_its_word(self):
+        # forward only: type the word itself to find all its forms
+        for word, text in (("woken", "wake the loop"), ("woke", "did not wake."),
+                           ("merged", "we merge it"), ("waking", "it wakes"),
+                           ("coding", "claude code"), ("willing", "I will do it"),
+                           ("living", "it is live"), ("said", "say it"),
+                           ("taken", "take it"), ("chose", "we choose"),
+                           ("running", "run it"), ("tries", "I will try")):
+            with self.subTest(word=word, text=text):
+                self.assertIsNone(self.match(word, text))
+        self.assertEqual(self.match("woken", "it hasn't woken"), index.TYPED)  # control
+
+    def test_an_irregular_form_is_a_whole_word(self):
+        # "ran" is inside "branch", "ate" inside "update" (review-plan2 F7)
+        for word, text in (("run", "the branch"), ("eat", "update it"), ("wake", "awoken")):
+            with self.subTest(word=word):
+                self.assertIsNone(self.match(word, text))
+        self.assertEqual(self.match("run", "it ran"), index.FORM)              # control
+
+    def test_as_typed_is_a_substring_as_before(self):
+        for word, text in (("merge", "I merged 41"), ("flam", "the flamingo"),
+                           ("set", "open settings.json"), ("#41", "merged #41"),
+                           ('"deploy"', 'run "deploy" now'), ("c:\\temp", "saved to c:\\temp"),
+                           ("école", "une école"), ("on", "moon")):
+            with self.subTest(word=word):
+                self.assertEqual(self.match(word, text), index.TYPED)
+
+    def test_no_form_where_it_would_be_another_word(self):
+        for word, text in (("settings", "set the flag"), ("news", "a new one"),
+                           ("win", "this won't work"), ("stick", "it is stuck"),
+                           ("leave", "the left pane"), ("lead", "it led nowhere"),
+                           ("see", "I saw it"), ("done", "do it now"), ("got", "get it"),
+                           ("note", "not now"), ("fixed", "fixing")):
+            with self.subTest(word=word, text=text):
+                self.assertIsNone(self.match(word, text))
+        self.assertEqual(self.match("wake", "it woke"), index.FORM)            # control
+
+    def test_a_long_run_of_letters_is_no_word(self):
+        # review-build3 F1: Porter's y-rule recursed once per "y" - a pasted
+        # blob of them raised, and the grep lost every session with it
+        for blob in ("y" * 5000, "ab" * 3000):
+            with self.subTest(blob=blob[:4]):
+                self.assertEqual(index.word_key(blob), blob)
+        self.assertEqual(self.match("wake", "an awoken loop " + "y" * 1500), None)
+        self.assertEqual(self.match("wake", "it woke"), index.FORM)              # control
+
+    def test_only_letters_a_to_z_have_forms(self):
+        for word, text in (("pr41", "pr41s"), ("wake2", "woke2"), ("éveil", "éveils")):
+            with self.subTest(word=word):
+                self.assertNotEqual(self.match(word, text), index.FORM)
+        self.assertEqual(self.match("wake", "woke"), index.FORM)               # control
+
+
+class TestSearchFindsForms(Base):
+    def entries(self):
+        return {"aaaa1111-0000-4000-8000-000000000001": {
+                    "sessionId": "aaaa1111-0000-4000-8000-000000000001",
+                    "title": "the loop woke up late", "recap": "", "you_said": "x",
+                    "opened": "x", "project": "liveapp", "last_ts": "2026-09-20T10:00:00.000Z"}}
+
+    def test_a_title_found_by_a_form_ranks_as_a_title(self):
+        hits = index.search(self.entries(), "wake")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["rank"], 0, "a title is about the session")
+        self.assertEqual(index.search(self.entries(), "sleep"), [])           # control
+
+
+class TestTheBestMessage(Base):
+    """What the grep answers for each session it finds: the one message that
+    says most of what you typed - so the list can show it, and rank by it."""
+
+    A = "aaaa1111-0000-4000-8000-000000000001"
+    B = "bbbb2222-0000-4000-8000-000000000002"
+
+    def said(self, query, sid=None, **kw):
+        got = index.grep(self.update(), query, **kw)
+        return got[sid or self.A] if got and (sid or self.A) in got else None
+
+    def test_it_says_what_was_said_by_whom_and_when(self):
+        self.write(self.A, [user("hello"), queued("I merged 41 but it hasn't woken the loop")])
+        s = self.said("wake merge")
+        self.assertEqual(s["text"], "I merged 41 but it hasn't woken the loop")
+        self.assertEqual(s["who"], "you", "a queued prompt is yours")
+        self.assertEqual(s["ts"], "2026-09-18T10:02:00.000Z")
+        self.assertEqual(s["key"], (2, True, 1))
+
+    def test_more_words_in_one_message_wins(self):
+        self.write(self.A, [user("the wake"), assistant("wake after the merge")])
+        self.assertEqual(self.said("wake merge")["text"], "wake after the merge")
+
+    def test_yours_before_claudes(self):
+        self.write(self.A, [assistant("wake after the merge"), user("merge, then wake it")])
+        self.assertEqual(self.said("wake merge")["text"], "merge, then wake it")
+
+    def test_as_typed_before_a_form(self):
+        # review-plan1 F1/F2: what holds the word as you typed it says most
+        self.write(self.A, [user("I merged 41 but it hasn't woken the loop"),
+                            user("wake the loop", ts="2026-09-18T11:00:00.000Z")])
+        self.assertEqual(self.said("wake")["text"], "wake the loop", "not the first")
+        self.write(self.A, [user("I merged 41 but it hasn't woken the loop")])   # control
+        self.assertEqual(self.said("wake")["text"], "I merged 41 but it hasn't woken the loop")
+
+    def test_only_short_words_rank_by_them_all(self):
+        # review-plan2 F10: with no word of three letters, every word counts
+        self.write(self.A, [assistant("the pr and ci are green"), user("my pr")])
+        self.assertEqual(self.said("pr ci")["text"], "the pr and ci are green")
+
+    def test_short_words_are_needed_but_do_not_rank(self):
+        # "on", "up", "pr" are inside almost every long message (review-plan1 F1)
+        self.write(self.A, [user("wake the loop"), assistant("on and on, up and up, pr")])
+        self.assertEqual(self.said("on up wake")["text"], "wake the loop")
+        self.write(self.B, [user("wake the loop")])
+        self.assertIsNone(self.said("on up wake", sid=self.B), "no 'on' said in B")
+        self.assertIsNotNone(self.said("wake", sid=self.B))                     # control
+
+    def test_the_first_of_equals(self):
+        self.write(self.A, [user("wake one"), user("wake two")])
+        self.assertEqual(self.said("wake")["text"], "wake one")
+
+    def test_a_long_search_word_is_no_word_either(self):
+        # review-build4 F4: the query word went to Porter uncut
+        for word in ("y" * 1500 + "ing", "ba" + "y" * 1500 + "eed"):
+            with self.subTest(word=word[-6:]):
+                self.assertIsNone(index.Word(word).key)
+                self.assertEqual(index.search({"x": {"sessionId": "x", "title": "wake"}}, word), [])
+        self.assertEqual(index.Word("wake").key, "wake")                         # control
+
+    def test_a_blob_in_one_message_costs_nothing_else(self):
+        self.write(self.A, [user("an awoken loop " + "y" * 1500)])
+        self.write(self.B, [user("it is waking")])
+        self.assertEqual(set(index.grep(self.update(), "wake")), {self.B})
+
+    def test_a_word_twice_counts_once(self):
+        self.write(self.A, [user("wake the loop")])
+        self.assertEqual(self.said("wake wake")["key"], self.said("wake")["key"])
+
+    def test_the_text_starts_near_the_match(self):
+        long = "x" * 490 + " it hasn't woken " + "y" * 100
+        self.write(self.A, [user(long)])
+        s = self.said("wake")
+        self.assertIn("woken", s["text"], "a match by a form is shown too")
+        self.assertTrue(s["text"].startswith("…"))
+        self.assertLessEqual(len(s["text"]), index.TEXT_CAP)
+        self.assertTrue(s["text"].startswith("\u2026it hasn't"), "from a word's start")
+        self.write(self.A, [user("short and woken")])
+        self.assertEqual(self.said("wake")["text"], "short and woken")           # control
+
+    def test_a_short_word_does_not_move_the_text(self):
+        # review-build1 F2: "on" is inside "Long" and "content" - the shown text
+        # began there, and the word that matters was cut off
+        long = "Long preamble about the content of the project. " * 12 + \
+            "but it hasn't woken the loop"
+        self.write(self.A, [user(long)])
+        for q in ("on wake", "pr wake", "wake"):
+            with self.subTest(q=q):
+                text = self.said(q)["text"]
+                self.assertTrue(text.startswith("\u2026"))
+                self.assertIn("woken", text[:60])
+        self.write(self.A, [user("x" * 400 + " the pr and ci")])                  # control
+        self.assertIn("pr and ci", self.said("pr ci")["text"][:40])
+
+    def test_the_first_form_or_word_is_where_the_text_starts(self):
+        # the earliest of what it holds, a form or the word as typed
+        self.write(self.A, [user("x " * 60 + "it woke early. " + "y " * 200 + "then wake again")])
+        self.assertIn("woke early", self.said("wake")["text"][:50])
+
+    def test_escapes_and_controls_are_not_shown(self):
+        self.write(self.A, [queued("\x1b[31mwake\x1b[0m merge\x07 now")])
+        text = self.said("wake merge")["text"]
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        self.assertIn("wake merge now", text)
+
+
+class TestTheSaidStore(Base):
+    """What was said, kept for the life of the list: read once, then only what
+    was appended - so a search is a scan of what was said, not of 1 GB."""
+
+    A = "aaaa1111-0000-4000-8000-000000000001"
+
+    def test_it_reads_only_what_was_appended(self):
+        p = self.write(self.A, [user("one"), assistant("two")])
+        store = index.SaidStore()
+        self.assertEqual([m[2] for m in store.messages(p)], ["one", "two"])
+        self.write(self.A, [user("three")], mode="a")
+        parsed = store.parsed
+        self.assertEqual([m[2] for m in store.messages(p)], ["one", "two", "three"])
+        self.assertEqual(store.parsed, parsed + 1, "only the new line")
+        self.assertEqual([m[0] for m in store.messages(p)], [True, False, True], "yours")
+
+    def test_an_unfinished_line_is_read_once_it_is_finished(self):
+        p = self.write(self.A, [user("one")])
+        line = user("flamingo")
+        with open(p, "a") as fh:
+            fh.write(line[:20])
+        store = index.SaidStore()
+        self.assertEqual([m[2] for m in store.messages(p)], ["one"])
+        with open(p, "a") as fh:
+            fh.write(line[20:] + "\n")
+        self.assertEqual([m[2] for m in store.messages(p)], ["one", "flamingo"])
+
+    def test_a_replaced_or_shorter_file_is_read_again(self):
+        p = self.write(self.A, [user("one"), user("two")])
+        store = index.SaidStore()
+        store.messages(p)
+        tmp = p + ".new"
+        with open(tmp, "w") as fh:
+            fh.write(user("other") + "\n" + user("more") + "\n" + user("again") + "\n")
+        os.replace(tmp, p)                                   # a new inode, longer
+        self.assertEqual([m[2] for m in store.messages(p)], ["other", "more", "again"])
+        with open(p, "w") as fh:                             # same inode, shorter
+            fh.write(user("cut") + "\n")
+        self.assertEqual([m[2] for m in store.messages(p)], ["cut"])
+
+    def test_a_prompt_about_tool_results_is_said(self):
+        # review-plan2 F5: only the quoted marker of a record is passed over
+        p = self.write(self.A, [user("why is tool_result empty"),
+                                user('the "tool_result" key is missing')])
+        store = index.SaidStore()
+        self.assertEqual([m[2] for m in store.messages(p)],
+                         ["why is tool_result empty", 'the "tool_result" key is missing'])
+
+    def test_a_stopped_read_keeps_the_transcripts_read_before_it(self):
+        # review-plan2 F4: else every new search text starts the 5-9 s read again
+        a = self.write(self.A, [user("flamingo")])
+        b = self.write("bbbb2222-0000-4000-8000-000000000002", [user("one"), user("two")])
+        idx = self.update()
+        store = index.SaidStore()
+        order = [e["path"] for e in idx.values()]
+        first = order[0]
+        stop = lambda: first in store.files and store.parsed >= 2      # noqa: E731
+        self.assertIsNone(index.grep(idx, "flamingo", store=store, stop=stop))
+        self.assertEqual(set(store.files), {first})
+        parsed = store.parsed
+        self.assertEqual(set(index.grep(idx, "flamingo", store=store)), {self.A})
+        self.assertEqual(store.parsed - parsed, 2 if first == a else 1,
+                         "only the one not read yet")
+        self.assertEqual(set(store.files), {a, b})
+
+    def test_a_stopped_grep_forgets_no_transcript(self):
+        # review-plan2 F8
+        p = self.write(self.A, [user("flamingo")])
+        store = index.SaidStore()
+        index.grep(self.update(), "flamingo", store=store)
+        os.remove(p)                                       # Claude Code deleted it
+        q = self.write("bbbb2222-0000-4000-8000-000000000002", [user("flamingo")])
+        idx = self.update()
+        self.assertNotIn(p, [e["path"] for e in idx.values()])
+        self.assertIsNone(index.grep(idx, "flamingo", store=store, stop=lambda: True))
+        self.assertIn(p, store.files, "stopped before it saw every transcript")
+        index.grep(idx, "flamingo", store=store)                             # control
+        self.assertEqual(set(store.files), {q})
+
+    def test_a_compact_line_with_a_text_block_is_said(self):
+        # review-build1 F4: real transcripts are compact JSON, the fixtures are not
+        def compact(**kw):
+            return json.dumps(kw, separators=(",", ":"))
+        p = self.write(self.A, [
+            compact(type="user", timestamp="2026-09-18T10:00:00.000Z", message={"role": "user", "content": [
+                {"type": "text", "text": "said beside it"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "log"}]}),
+            compact(type="user", timestamp="2026-09-18T10:00:00.000Z", message={"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a long log"}]})])
+        store = index.SaidStore()
+        self.assertEqual([m[2] for m in store.messages(p)], ["said beside it"])
+        self.assertEqual(store.parsed, 1, "the compact tool output alone is not parsed")
+
+    def test_an_unreadable_transcript_keeps_what_was_read(self):
+        # the failure at open, as root would see it too (review-build2 F2)
+        p = self.write(self.A, [user("one")])
+        store = index.SaidStore()
+        store.messages(p)
+        self.write(self.A, [user("two")], mode="a")
+        with mock.patch.object(index, "open", side_effect=PermissionError(13, "denied"),
+                               create=True):
+            self.assertEqual([m[2] for m in store.messages(p)], ["one"])
+        self.assertEqual([m[2] for m in store.messages(p)], ["one", "two"])        # control
+
+    def test_a_tool_output_is_not_parsed_but_a_text_beside_it_is(self):
+        p = self.write(self.A, [
+            rec(type="user", timestamp="2026-09-18T10:00:00.000Z", message={"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a long log"}]}),
+            rec(type="user", timestamp="2026-09-18T10:00:00.000Z", message={"role": "user", "content": [
+                {"type": "text", "text": "said beside it"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "log"}]})])
+        store = index.SaidStore()
+        self.assertEqual([m[2] for m in store.messages(p)], ["said beside it"])
+        self.assertEqual(store.parsed, 1, "the tool output alone is never parsed")
+
+    def test_a_transcript_that_is_gone_is_dropped(self):
+        p = self.write(self.A, [user("flamingo")])
+        store = index.SaidStore()
+        idx = self.update()
+        index.grep(idx, "flamingo", store=store)
+        self.assertIn(p, store.files)
+        index.grep({}, "flamingo", store=store)
+        self.assertEqual(store.files, {})
+
+    def test_a_store_knows_the_code_that_made_it(self):
+        # the list keeps its store across every reload while this is the same;
+        # an edit to the code that says what was said reads again (review-build5)
+        import ccwho_brief
+        import ccwho_text
+        self.assertEqual(set(index.SOURCES),
+                         {index.__file__, ccwho_text.__file__, ccwho_brief.__file__})
+        self.assertEqual(index.SaidStore().source, index.SOURCE)
+        self.assertEqual(index.SOURCE, index.source_key(), "the code as it was loaded")
+
+    def test_a_store_carries_the_code_as_loaded_not_the_files_now(self):
+        # review-build6 F2: an edit not loaded yet must not name a store
+        a = os.path.join(self.tmp, "edited.py")
+        with open(a, "w") as fh:
+            fh.write("an edit that has landed but is not loaded\n")
+        with mock.patch.object(index, "SOURCES", (a,)):
+            self.assertNotEqual(index.source_key(), index.SOURCE)
+            self.assertEqual(index.SaidStore().source, index.SOURCE)
+
+    def test_the_key_is_the_code_itself(self):
+        a = os.path.join(self.tmp, "a.py")
+        b = os.path.join(self.tmp, "b.py")
+        for path, text in ((a, "x = 1\n"), (b, "y = 2\n")):
+            with open(path, "w") as fh:
+                fh.write(text)
+        key = index.source_key((a, b))
+        self.assertEqual(index.source_key((a, b)), key)                          # control
+        with open(a, "w") as fh:
+            fh.write("x = 3\n")
+        self.assertNotEqual(index.source_key((a, b)), key)
+
+    def test_the_grep_uses_the_store_it_is_given(self):
+        self.write(self.A, [user("flamingo")])
+        store = index.SaidStore()
+        idx = self.update()
+        index.grep(idx, "flamingo", store=store)
+        parsed = store.parsed
+        self.assertEqual(set(index.grep(idx, "flamingo", store=store)), {self.A})
+        self.assertEqual(store.parsed, parsed, "nothing read again")
+
 
 if __name__ == "__main__":
     unittest.main()

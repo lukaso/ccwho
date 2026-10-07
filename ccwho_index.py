@@ -18,12 +18,17 @@ an upgrade that leaves old entries wrong is an upgrade that fixed nothing.
 """
 from __future__ import annotations
 
+import functools
 import glob
+import hashlib
 import json
 import os
+import re
 import tempfile
+import threading
 
 import ccwho_brief as brief
+import ccwho_text
 
 # Bump when a rule in ccwho_brief changes what an entry would say. Entries built
 # by an older version are re-read from the start.
@@ -286,6 +291,204 @@ def load(path):
     return out
 
 
+# ------------------------------------------------------------------ word forms
+
+# The owner remembered "wake"; what was said was "it hasn't woken the loop"
+# (2026-10-07). A word also finds its forms - forward only, from the word to its
+# forms. The other way, from a form to its word, is where a form is another word:
+# measured on the owner's 125 sessions, `settings` took "set" (+51 sessions),
+# `coding` "Claude Code" (25 -> 102), `willing` "will" (7 -> 105), `said` "say".
+# Type the word to find its forms; a form finds itself.
+TYPED, FORM = 2, 1
+
+# Irregular forms, each a whole word: "ran" inside "branch" is no run. Closed on
+# purpose. Left out, each a common word of its own: won (won't), stuck, left, bit,
+# led, saw, made, met, sat, shot, lit, fed, wore, tore - and go, do, see and get,
+# whose forms are in nearly every session (review-plan1 F10).
+_IRREGULAR_GROUPS = (
+    "wake woke woken", "break broke broken", "choose chose chosen", "write wrote written",
+    "freeze froze frozen", "speak spoke spoken", "steal stole stolen", "drive drove driven",
+    "ride rode ridden", "rise rose risen", "hide hid hidden", "forget forgot forgotten",
+    "begin began begun", "ring rang rung", "sing sang sung", "sink sank sunk",
+    "swim swam swum", "throw threw thrown", "grow grew grown", "know knew known",
+    "draw drew drawn", "fly flew flown", "blow blew blown", "shake shook shaken",
+    "take took taken", "give gave given", "fall fell fallen", "eat ate eaten", "run ran",
+    "find found", "send sent", "build built", "catch caught", "think thought",
+    "bring brought", "buy bought", "teach taught", "seek sought", "fight fought",
+    "tell told", "sell sold", "hold held", "keep kept", "sleep slept", "feel felt",
+    "mean meant", "spend spent", "lose lost", "pay paid", "say said", "hang hung",
+    "stand stood", "understand understood", "use used using uses", "try tries tried trying")
+
+_LETTERS = re.compile(r"[a-z]+")
+_TEXT_LETTERS = re.compile(r"[A-Za-z]+")
+
+
+def _consonant(w, i):
+    if w[i] in "aeiou":
+        return False
+    return w[i] != "y" or i == 0 or not _consonant(w, i - 1)
+
+
+def _measure(stem):
+    """Porter's m: the number of vowel-consonant runs in [C](VC)^m[V]."""
+    runs = [_consonant(stem, i) for i in range(len(stem))]
+    m, i = 0, 0
+    while i < len(runs) and runs[i]:
+        i += 1
+    while i < len(runs):
+        while i < len(runs) and not runs[i]:
+            i += 1
+        if i == len(runs):
+            break
+        while i < len(runs) and runs[i]:
+            i += 1
+        m += 1
+    return m
+
+
+def _vowel_in(stem):
+    return any(not _consonant(stem, i) for i in range(len(stem)))
+
+
+def _cvc(w):
+    """Porter's *o: consonant, vowel, consonant - the last not w, x or y."""
+    n = len(w)
+    return (n >= 3 and _consonant(w, n - 3) and not _consonant(w, n - 2)
+            and _consonant(w, n - 1) and w[-1] not in "wxy")
+
+
+def _step1ab(w):
+    """Porter's 1a and 1b - plurals, -ed and -ing: (the stem, whether one went)."""
+    was = w
+    if w.endswith("sses") or w.endswith("ies"):
+        w = w[:-2]
+    elif w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    cut = False
+    if w.endswith("eed"):
+        if _measure(w[:-3]) > 0:
+            w = w[:-1]
+    elif w.endswith("ed") and _vowel_in(w[:-2]):
+        w, cut = w[:-2], True
+    elif w.endswith("ing") and _vowel_in(w[:-3]):
+        w, cut = w[:-3], True
+    if cut:
+        if len(w) >= 2 and w[-1] == w[-2] and _consonant(w, len(w) - 1) and w[-1] not in "lsz":
+            w = w[:-1]
+        elif _measure(w) == 1 and _cvc(w):
+            w += "e"
+    return w, w != was
+
+
+def _porter(w):
+    """Porter's step 1 (1c as Porter2 has it) and 5a: plurals, -ed and -ing, a
+    final y and a final e. Not the rest: -ation, -ness and the like make words of
+    other meanings meet, and a search should not."""
+    w, _ = _step1ab(w)
+    if len(w) > 2 and w[-1] == "y" and _consonant(w, len(w) - 2):
+        w = w[:-1] + "i"
+    if w.endswith("e"):
+        m = _measure(w[:-1])
+        if m > 1 or (m == 1 and not _cvc(w[:-1])):
+            w = w[:-1]
+    return w
+
+
+def _irregular():
+    out = {}
+    for group in _IRREGULAR_GROUPS:
+        forms = group.split()
+        base = _porter(forms[0])
+        for form in forms:
+            out[form] = base
+    return out
+
+
+IRREGULAR = _irregular()
+_IRREGULAR_BASES = frozenset(g.split()[0] for g in _IRREGULAR_GROUPS)
+
+
+# A run of letters longer than this is no word (the longest in the owner's said
+# text, 2026-10-07: 43 letters): it is its own key - never stemmed, never kept in
+# the memo. Porter's y-rule recurses once per "y", and a pasted blob of them
+# raised and cost the grep every session (review-build3 F1).
+LONGEST_WORD = 64
+
+
+def word_key(token):
+    """What a word and its forms have in common: wake, waking, woke -> "wake";
+    merge, merged, merging -> "merg"."""
+    return token if len(token) > LONGEST_WORD else _word_key(token)
+
+
+@functools.lru_cache(maxsize=65536)
+def _word_key(token):
+    if token in IRREGULAR:
+        return IRREGULAR[token]
+    return _porter(token)
+
+
+def _is_word(w):
+    """A word itself, not one of its forms: no plural, -ed or -ing to take off,
+    and no irregular form (woke, ran) - the base of a table group is a word."""
+    if w in IRREGULAR:
+        return w in _IRREGULAR_BASES
+    return not _step1ab(w)[1]
+
+
+class Word:
+    """One word of a search, and how a text holds it: TYPED - inside it as you
+    typed it (any part of a word, as always: `flam` finds flamingo) - or FORM:
+    a word of the text is one of its forms (wake: wakes, waking, woke, woken).
+    Forms only for an a-z word of three letters or more that is a word itself,
+    not a form: `woken` finds "woken" and not "wake" (see TYPED, FORM). Nor
+    for a word whose key is under three letters (age: ag; eye: ey): what its
+    forms have in common is in too many words to look for."""
+
+    def __init__(self, word):
+        self.word = word
+        self.key = (word_key(word) if 3 <= len(word) <= LONGEST_WORD
+                    and _LETTERS.fullmatch(word) and _is_word(word) else None)
+        # what every form contains, so a text without any is passed over
+        # unsplit: the key (merging: merg); the key less its e (waking: wak);
+        # the table's forms (woke). The word itself is TYPED before this is asked.
+        pats = set()
+        if self.key is not None:
+            pats = {self.key, self.key[:-1] if self.key.endswith("e") else self.key}
+            pats |= {f for f, k in IRREGULAR.items() if k == self.key}
+        self.patterns = tuple(p for p in pats if len(p) >= 3)
+
+    def formed_by(self, token):
+        return word_key(token) == self.key
+
+    def match(self, low):
+        """TYPED, FORM or None: how `low` (lowercased) holds this word."""
+        if self.word in low:
+            return TYPED
+        if self.key is None or not any(p in low for p in self.patterns):
+            return None
+        if any(self.formed_by(t) for t in set(_LETTERS.findall(low))):
+            return FORM
+        return None
+
+    def where(self, text):
+        """Where in `text` (any case) this word is first held - typed or by a
+        form - or -1."""
+        at = text.lower().find(self.word)
+        if self.key is not None:
+            for m in _TEXT_LETTERS.finditer(text):
+                if 0 <= at <= m.start():
+                    break
+                if self.formed_by(m.group().lower()):
+                    return m.start()
+        return at
+
+
+def _words(query):
+    """The distinct words of a search, in order: "wake wake" is "wake"."""
+    return [Word(w) for w in dict.fromkeys(w for w in (query or "").lower().split() if w)]
+
+
 # ---------------------------------------------------------------------- search
 
 # Where a word matched says how much it means. A title or a recap is ABOUT the
@@ -313,10 +516,11 @@ def search(idx, query, live_ids=None, everything=False):
     """Entries matching every word, live ones first, then newest.
 
     Every word has to match somewhere in the entry - two words are how you narrow
-    a month of sessions down to the one you mean. Ranking is live before ended,
-    because a session you can still walk into beats one you would have to reopen.
+    a month of sessions down to the one you mean - as typed or by a form (Word).
+    Ranking is live before ended, because a session you can still walk into
+    beats one you would have to reopen.
     """
-    words = [w for w in (query or "").lower().split() if w]
+    words = _words(query)
     if not words:
         return []
     live_ids = live_ids or set()
@@ -326,9 +530,9 @@ def search(idx, query, live_ids=None, everything=False):
             continue
         strong = " ".join(str(entry.get(f, "")) for f in _STRONG).lower()
         whole = strong + " " + " ".join(str(entry.get(f, "")) for f in _WEAK).lower()
-        if not all(w in whole for w in words):
+        if not all(w.match(whole) for w in words):
             continue
-        where = 0 if all(w in strong for w in words) else 1
+        where = 0 if all(w.match(strong) for w in words) else 1
         hits.append(dict(entry, live=entry.get("sessionId") in live_ids, rank=where))
     hits.sort(key=lambda e: (not e["live"], e["rank"], _neg(e.get("last_ts", ""))))
     return hits
@@ -339,58 +543,211 @@ def _neg(ts):
     return tuple(-ord(c) for c in ts)
 
 
-def grep(idx, query, stop=None, everything=False):
-    """The ids of the sessions in which every word of `query` was said - in your
-    prompts or Claude's replies - in any case. Not what Claude Code stores in a
-    transcript (skills, CLAUDE.md, reminders), nor what a tool printed, nor the
-    JSON around it: those are in every session, and a plain grep of the file
-    found a common word in all of them (review 1). Only your sessions, as
-    search() has it, unless `everything`.
+def grep(idx, query, stop=None, everything=False, store=None):
+    """What each session said that holds every word of `query`: {sessionId:
+    Said}, for the sessions in which every word was said - in your prompts or
+    Claude's replies, in any case, as typed or by a form (Word). Not what Claude
+    Code stores in a transcript (skills, CLAUDE.md, reminders), nor what a tool
+    printed, nor the JSON around it: those are in every session, and a plain grep
+    of the file found a common word in all of them (review 1). Only your
+    sessions, as search() has it, unless `everything`.
 
-    Measured 2026-10-05 over the owner's 123 sessions: 0.2-2.4 s a word, and
-    up to ~5 s for a word beyond a-z (its every line is parsed).
-    `stop()`, asked before every line, ends it early with None: a newer search
-    has started."""
-    words = [w for w in (query or "").lower().split() if w]
+    Said is the session's one message that says most of what you typed:
+    {"text", "who" ("you" | "claude"), "ts", "key"}, key = (how many of the words
+    of three letters or more it holds, yours, how many of those as typed) - the
+    list ranks by it. "on" or "pr" must be said, but is inside almost every long
+    message and ranks nothing (review-plan1 F1). The first of equals.
+
+    `store` keeps what was said between searches (SaidStore): the list keeps one
+    for its life, and a search is then a scan of what was said - measured
+    2026-10-07 over the owner's 125 sessions: 0.04-0.26 s, against 1.5-3 s for
+    a grep of the 1.2 GB of transcripts. A new one is read whole: 5-8 s.
+    `stop()`, asked before each session, each line read and every 200 messages,
+    ends it early with None: a newer search has started."""
+    words = _words(query)
     if not words:
-        return set()
-    found = set()
+        return {}
+    store = store if store is not None else SaidStore()
+    ranked = [w for w in words if len(w.word) >= 3] or words
+    found = {}
     for entry in list((idx or {}).values()):
         if not everything and not is_yours(entry):
             continue
-        said = _said_in(entry["path"], words, stop) if entry.get("path") else False
-        if said is None:
+        if stop and stop():
+            return None
+        if not entry.get("path"):
+            continue
+        messages = store.messages(entry["path"], stop)
+        if messages is None:
+            return None
+        said = _best(messages, words, ranked, stop)
+        if said is _STOPPED:
             return None
         if said:
-            found.add(entry.get("sessionId"))
+            found[entry.get("sessionId")] = said
+    # a stopped grep forgets nothing: it may not have seen every transcript
+    store.prune({e.get("path") for e in (idx or {}).values() if e.get("path")})
     return found
 
 
-def _said_in(path, words, stop):
-    """Was every word said in this transcript? A line is parsed only when the
-    bytes of a word not found yet are in it - as the file has them (a quote is
-    \\", a letter beyond a-z as typed), any case for a-z - and a word beyond a-z
-    is looked for in every line. None: a stop was asked for."""
-    left = set(words)
-    marks = {w: json.dumps(w, ensure_ascii=False)[1:-1].encode("utf-8") for w in words}
-    try:
-        with open(path, "rb") as fh:
-            for line in fh:
-                if stop and stop():
-                    return None
-                low = line.lower()
-                if not any(not marks[w].isascii() or marks[w] in low for w in left):
-                    continue
-                try:
-                    text = _said(json.loads(line)).lower()
-                except Exception:
-                    continue            # a line cut off, not JSON, or a record of no known shape
-                left = {w for w in left if w not in text}
-                if not left:
-                    return True
-    except OSError:
-        return False                    # gone, or not readable: not found
-    return False
+_STOPPED = object()
+
+
+def _best(messages, words, ranked, stop):
+    """The Said of one session, None when a word was never said, _STOPPED."""
+    seen, best = set(), None
+    for i, (yours, ts, text) in enumerate(messages):
+        if stop and i % 200 == 0 and stop():
+            return _STOPPED
+        low = text.lower()
+        held = {}
+        for w in words:
+            how = w.match(low)
+            if how:
+                held[w] = how
+        if not held:
+            continue
+        seen.update(held)
+        key = (sum(1 for w in ranked if w in held), yours,
+               sum(1 for w in ranked if held.get(w) == TYPED))
+        if best is None or key > best[0]:
+            best = (key, yours, ts, text, held)
+    if best is None or len(seen) < len(words):
+        return None
+    key, yours, ts, text, held = best
+    # where the text starts: a word that ranks - "on" is inside "Long" and
+    # "content", and the word that matters was cut off (review-build1 F2)
+    shown = [w for w in held if w in ranked]
+    return {"text": _shown(text, shown), "who": "you" if yours else "claude", "ts": ts,
+            "key": key}
+
+
+# How much of what comes before the first word a shown message keeps: enough
+# to read it as a sentence, little enough that the word is on a row.
+LEAD = 30
+
+
+def _shown(text, held):
+    """The message from a little before the first word it holds, `…` where it
+    was cut, at most TEXT_CAP."""
+    at = min((p for p in (w.where(text) for w in held) if p >= 0), default=0)
+    start = max(0, at - LEAD)
+    if start:
+        space = text.find(" ", start, at)
+        start = space + 1 if space >= 0 else start
+    return _clip(("\u2026" if start else "") + text[start:], TEXT_CAP)
+
+
+def source_key(paths=None):
+    """A hash of the bytes of `paths` (SOURCES): the same code, the same key."""
+    digest = hashlib.sha1()
+    for path in SOURCES if paths is None else paths:
+        try:
+            with open(path, "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"unreadable " + str(path).encode())
+    return digest.hexdigest()
+
+
+# The code that says what was said, and so what a SaidStore holds: this module
+# (_said, _typed, the store), ccwho_text (plain_text) and ccwho_brief (what a
+# human prompt is). Not ccwho_procs: brief uses it for tool calls, never for
+# what was said. SOURCE is the code as this module was loaded - a reload loads
+# it again - not the files as they are now: a store made by old code must not
+# carry the key of an edit not loaded yet. Left open on purpose (review-build6
+# F1): an edit to ccwho_brief or ccwho_text that lands in the few to tens of ms
+# between their reload and this one's is in SOURCE and not in the code - about
+# 0.1% of landings; the store is right again at the next edit to one of SOURCES,
+# or a restart. Closing it costs a disk read in ccwho_brief, which is pure, or
+# a hash of the bytes _load_beside compiles - more code than the window is worth.
+SOURCES = (__file__, ccwho_text.__file__, brief.__file__)
+SOURCE = source_key()
+
+
+class SaidStore:
+    """What was said in each transcript, kept: read once, then only what was
+    appended - as the index is - so a search reads what was said (13 MB for
+    the owner's 125 sessions, 2026-10-07), not 1.2 GB of transcripts.
+
+    `files`: path -> {"inode", "offset", "messages"}, one message per record
+    _said gives text for: (yours, ts, text), the text as a terminal shows it,
+    one line. `parsed` counts the lines parsed. A store is shared by the two
+    greps the list may run at once: a lock. A last line is read once it ends
+    with a newline, as the index reads it: one Claude Code never ended is not
+    searched (none of 127 real transcripts, 2026-10-07).
+
+    `source`: the code that made it (SOURCE). The list keeps its store across
+    the engine reload of every scan while that is the code it runs
+    (review-build1 F1); after an edit to it, a search reads into a new store
+    (review-build5)."""
+
+    def __init__(self):
+        self.source = SOURCE
+        self.files = {}
+        self.parsed = 0
+        self._lock = threading.Lock()
+
+    def prune(self, paths):
+        """Forget every transcript not in `paths`: Claude Code deletes them."""
+        with self._lock:
+            for gone in set(self.files) - set(paths):
+                del self.files[gone]
+
+    def messages(self, path, stop=None):
+        """The messages of `path`, brought up to date - or None when `stop()`
+        said so, and then nothing read is kept. A new inode, or a file shorter
+        than what was read, is read again from the start; a last line not ended
+        yet is read when it is."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return []
+        with self._lock:
+            have = self.files.get(path)
+            if not have or have["inode"] != st.st_ino or st.st_size < have["offset"]:
+                have = {"inode": st.st_ino, "offset": 0, "messages": []}
+            offset, new = have["offset"], []
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(offset)
+                    for line in fh:
+                        if not line.endswith(b"\n"):
+                            break               # not ended: read it when it is
+                        if stop and stop():
+                            return None
+                        offset += len(line)
+                        said = self._said(line)
+                        if said:
+                            new.append(said)
+            except OSError:
+                return have["messages"] if path in self.files else []
+            have = {"inode": st.st_ino, "offset": offset, "messages": have["messages"] + new}
+            self.files[path] = have
+            return have["messages"]
+
+    # A tool's output: most of a transcript's bytes, and never said. Its record
+    # is parsed only if it may hold a text block too (none did in 8,966 measured,
+    # but one that does is said).
+    _TOOL = b'"tool_result"'
+    _TEXT = re.compile(rb'"type": ?"text"')
+
+    def _said(self, line):
+        if self._TOOL in line and not self._TEXT.search(line):
+            return None
+        self.parsed += 1
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            return None                 # a torn or foreign line is not data
+        try:
+            text = _said(rec)
+        except Exception:
+            return None                 # a record of no known shape
+        text = " ".join(ccwho_text.plain_text(text).split()) if text else ""
+        if not text:
+            return None
+        return (rec.get("type") != "assistant", str(rec.get("timestamp") or ""), text)
 
 
 def _said(rec):

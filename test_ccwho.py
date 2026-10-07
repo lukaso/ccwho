@@ -1011,6 +1011,23 @@ class TestStuckOnScreen(unittest.TestCase):
         self.assertIsNone(ccwho.ui_action_at(self._row(), 100, 1, 3))
         self.assertIsNone(ccwho.ui_action_at(self._row("asks", loops=[]), 100, 1, 90))
 
+    def test_what_was_said_does_not_cost_the_kill(self):
+        # a stuck session found under SAID: what it said in place of the recap,
+        # the loop and the kill where they are (review-plan1 F14)
+        row = dict(self._row(), said={"text": "it hasn't woken the loop", "who": "you",
+                                      "age": "2h"})
+        _, second = ccwho.ui_row_cells(row, width=120)
+        text = "".join(t for t, _ in second)
+        self.assertIn("loop 86246", text)
+        self.assertIn("it hasn't woken", text)
+        self.assertNotIn("Goal was moving", text)
+        col = 0
+        for t, role in second:
+            if role == "action":
+                break
+            col += ccwho._cells(t)
+        self.assertEqual(ccwho.ui_action_at(row, 120, 1, col), "kill")
+
 
 class TestTheDetailIsOneClickAway(unittest.TestCase):
     """Reported: "there's no good way to get the detail screen with the mouse".
@@ -8796,7 +8813,8 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
     # the grep of what was said (ccwho_index.grep): the ids it found go to a
     # SAID group of their own, last - never among the name matches (review 1)
     def said(self, idx, query, live=(), found=(), limit=10):
-        return ccwho.ui_said_group(idx, query, list(live), set(found), self.NOW, limit=limit)
+        # found: the grep's {id: Said}; a set of ids (no Said) is taken too
+        return ccwho.ui_said_group(idx, query, list(live), found, self.NOW, limit=limit)
 
     def test_an_ended_session_found_only_by_what_was_said(self):
         idx = self.index(self.entry())                 # no "flamingo" in its names
@@ -8850,3 +8868,121 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
         for q in ("", "  ", None):
             self.assertEqual(self.said(idx, q, found={self.SID}), [])
         self.assertEqual(self.said(idx, "flamingo", found={"not-in-the-index"}), [])
+
+    # what was said that matched (ccwho_index.grep's Said): on the row, and the
+    # order - the owner's session was 3rd of 44, by a title about something else
+    def s(self, key=(1, True, 1), text="it hasn't woken the loop", who="you",
+          ts="2026-10-04T10:00:00.000Z"):
+        return {"text": text, "who": who, "ts": ts, "key": key}
+
+    def sid(self, i):
+        return f"{i:08x}-0000-4000-8000-000000000000"
+
+    def test_a_said_row_carries_what_was_said(self):
+        idx = self.index(self.entry())
+        row = self.said(idx, "wake", found={self.SID: self.s()})[0]["rows"][0]
+        self.assertEqual(row["said"], {"text": "it hasn't woken the loop", "who": "you",
+                                       "age": "2h"})
+        row = self.said(idx, "wake", found={self.SID: self.s(ts="")})[0]["rows"][0]
+        self.assertEqual(row["said"]["age"], "?", "an age not known says so")
+
+    def test_ids_without_a_said_show_without_one(self):
+        # review-plan1 F3: never a raise - it would cost ENDED and the running rows
+        idx = self.index(self.entry())
+        for found in ({self.SID: None}, {self.SID}):
+            with self.subTest(found=found):
+                rows = self.said(idx, "wake", found=found)[0]["rows"]
+                self.assertEqual(rows[0]["sessionId"], self.SID)
+                self.assertFalse(rows[0].get("said"))
+
+    def test_the_closest_first(self):
+        # (a) more words in one message, (b) yours, (c) as typed, then (e) newest
+        idx = self.sessions(5)
+        keys = {0: (2, False, 0), 1: (1, True, 1), 2: (1, True, 0), 3: (1, False, 1),
+                4: (1, False, 1)}
+        found = {self.sid(i): self.s(key=k) for i, k in keys.items()}
+        rows = self.said(idx, "wake", found=found)[0]["rows"]
+        self.assertEqual([r["sessionId"] for r in rows],
+                         [self.sid(0), self.sid(1), self.sid(2), self.sid(4), self.sid(3)])
+
+    def test_running_before_ended_only_when_as_close(self):
+        idx = self.sessions(2)
+        live = {"sessionId": self.sid(0), "attention": "busy"}            # the older one
+        found = {self.sid(0): self.s(), self.sid(1): self.s()}
+        rows = self.said(idx, "wake", live=[live], found=found)[0]["rows"]
+        self.assertEqual([r["sessionId"] for r in rows], [self.sid(0), self.sid(1)])
+        self.assertEqual(rows[0]["attention"], "busy", "the running row, with its state")
+        self.assertEqual(rows[0]["said"]["text"], "it hasn't woken the loop")
+        found[self.sid(0)] = self.s(key=(1, False, 1))                       # control
+        rows = self.said(idx, "wake", live=[live], found=found)[0]["rows"]
+        self.assertEqual([r["sessionId"] for r in rows], [self.sid(1), self.sid(0)])
+
+    def test_a_running_row_can_fall_past_the_ten_shown(self):
+        # review-plan1 F5, the owner's decision D1: closeness before running
+        idx = self.sessions(12)
+        live = {"sessionId": self.sid(11), "attention": "busy"}
+        found = {self.sid(i): self.s() for i in range(11)}
+        found[self.sid(11)] = self.s(key=(1, False, 1))
+        group = self.said(idx, "loop", live=[live], found=found)[0]
+        self.assertNotIn(self.sid(11), [r["sessionId"] for r in group["rows"]])
+        self.assertEqual(group["total"], 12)
+        self.assertIn("10 of 12", group["heading"])
+
+    def test_a_parked_row_shows_what_its_parked_session_said(self):
+        # review-plan1 F4: the best over every id the row stands for
+        idx = self.index(self.entry(), self.entry(self.OTHER, title="other", recap="",
+                                                  you_said="", opened=""))
+        parked = {"sessionId": self.OTHER, "parked": [self.SID], "attention": "busy"}
+        found = {self.OTHER: self.s(key=(1, False, 0), text="its own"),
+                 self.SID: self.s(key=(2, True, 2), text="from the parked one")}
+        rows = self.said(idx, "wake merge", live=[parked], found=found)[0]["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sessionId"], self.OTHER)
+        self.assertEqual(rows[0]["said"]["text"], "from the parked one")
+        del found[self.SID]                                                  # control
+        rows = self.said(idx, "wake merge", live=[parked], found=found)[0]["rows"]
+        self.assertEqual(rows[0]["said"]["text"], "its own")
+
+    ODD = "wake \u009b2J\u009d0;title\u0007 \x0e\x01\x7f done"
+
+    def test_no_control_character_reaches_a_row(self):
+        # review-build1 F3: every field of a live row goes through
+        # procs.printable; what was said, and an ended row, must too
+        controls = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+        idx = self.index(self.entry())
+        row = self.said(idx, "wake", found={self.SID: self.s(text=self.ODD)})[0]["rows"][0]
+        second = ccwho.ui_row_lines(row, width=140)[1]
+        self.assertIsNone(controls.search(second), repr(second))
+        self.assertIn("wake", second)
+        self.assertIn("done", second)
+        odd = self.index(self.entry(recap=self.ODD, you_said=self.ODD, title=self.ODD))
+        ended = self.ended(odd, "10fe")[0]["rows"][0]
+        for line in ccwho.ui_row_lines(ended, width=140):
+            self.assertIsNone(controls.search(line), repr(line))
+        for field in ("recap", "doing", "topic", "title"):
+            self.assertIsNone(controls.search(ended[field]), field)
+        plain = self.said(idx, "wake", found={self.SID: self.s()})[0]["rows"][0]       # control
+        self.assertEqual(plain["said"]["text"], "it hasn't woken the loop")
+
+    def test_running_rows_the_index_has_no_time_for_go_by_their_own(self):
+        # review-build1 F5 (plan F20): the index's last_ts first, else the row's ts
+        idx = self.index(self.entry(self.sid(0), last_ts=""), self.entry(self.sid(1), last_ts=""))
+        old = {"sessionId": self.sid(0), "attention": "busy", "ts": "2026-10-04T09:00:00.000Z"}
+        new = {"sessionId": self.sid(1), "attention": "busy", "ts": "2026-10-04T11:00:00.000Z"}
+        found = {self.sid(0): self.s(), self.sid(1): self.s()}
+        rows = self.said(idx, "wake", live=[old, new], found=found)[0]["rows"]
+        self.assertEqual([r["sessionId"] for r in rows], [self.sid(1), self.sid(0)])
+        idx[self.sid(0)]["last_ts"] = "2026-10-04T11:30:00.000Z"                    # control
+        rows = self.said(idx, "wake", live=[old, new], found=found)[0]["rows"]
+        self.assertEqual([r["sessionId"] for r in rows], [self.sid(0), self.sid(1)])
+
+    def test_the_second_line_is_what_was_said(self):
+        idx = self.index(self.entry())
+        row = self.said(idx, "wake", found={self.SID: self.s()})[0]["rows"][0]
+        second = ccwho.ui_row_lines(row, width=120)[1]
+        self.assertIn("2h · you: it hasn't woken the loop", second)
+        self.assertNotIn("the CI flake", second, "not the recap")
+        row = self.said(idx, "wake", found={self.SID: self.s(who="claude")})[0]["rows"][0]
+        self.assertIn("2h · Claude: it hasn't woken", ccwho.ui_row_lines(row, width=120)[1])
+        plain = self.ended(idx, "10fe")[0]["rows"][0]                          # control
+        self.assertIn("the CI flake", ccwho.ui_row_lines(plain, width=120)[1])

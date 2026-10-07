@@ -134,7 +134,7 @@ Compared with herdr v0.9.3 and [its docs](https://herdr.dev/docs/), on 2026-10-0
 | Agents | Claude Code, Codex, Cursor, OpenCode, Grok, Copilot CLI and more | Claude Code. Codex: its open threads, their processes and its usage |
 | How it gets state | It reads the bottom of the pane screen and the terminal title, and compares them with rules. It shows `blocked` only when a known approval, question or permission prompt is on screen. The Claude hook tells herdr which session runs in the pane, for resume; it does not report state | It starts from Claude Code's own status (`claude agents --json`) and corrects it from the transcript: a tool call with no answer, the last line of a finished turn, turn-end records. It also reads the process tree ([what actually needs you](#what-actually-needs-you), [busy, but the turn is over](#busy-but-the-turn-is-over)) |
 | States | blocked, working, done (not seen yet), idle, unknown | NEEDS YOU, ASKED YOU, FINISHED, STUCK, STOPPED, busy, running, program. FINISHED: a turn ended, nothing runs under it, and you have not gone to the session from the list since. The live list puts it in NEEDS YOU |
-| What a row tells you | The state, the agent, and the workspace and tab names. A config line adds the agent's terminal title. Scripts and plugins can add fields | Live list: state, name, title, age, ports, account (with two or more Claude accounts), and Claude's recap with its age (with no recap, the last tool call). → adds the last thing you said and what Claude said last. `ccwho ls` shows the last tool call, or the question it asks |
+| What a row tells you | The state, the agent, and the workspace and tab names. A config line adds the agent's terminal title. Scripts and plugins can add fields | Live list: state, name, title, age, ports, account (with two or more Claude accounts), and Claude's recap with its age (with no recap, the last tool call; under SAID, the message that matched). → adds the last thing you said and what Claude said last. `ccwho ls` shows the last tool call, or the question it asks |
 | Go to a session | Click an agent in the sidebar, or use the Goto picker (`prefix+g`), which filters agents by state | ⌥/ opens the list from any app (an iTerm2 hotkey window). Enter brings the session's window to the front, or opens a window that attaches a background session. Not for Codex threads ([finding the window](#finding-the-window)) |
 | Client closes or SSH drops | Processes keep running in the herdr server | Closing ccwho does not touch the sessions. If the terminal app quits or SSH drops, the sessions in it end, as without ccwho. `claude --bg` sessions keep running |
 | Reboot | Saves the layout and the directories a few seconds after each change, and restores them. With the herdr integration installed, resumes Claude (`claude --resume <id>`), Codex and other supported agents. Also keeps up to 48 older layouts (at most one per 15 min) to restore by hand | A launchd job saves every 15 min and keeps 20 saves. `restore --open` types the resume line into the panes that iTerm2 restored; other sessions open in a new window, and sessions that Claude Desktop or a program ran stay where they ran. `restore --check` says whether each saved session that `--open` would reopen can be reopened ([save / restore](#ccwho-save--restore---a-reboot-stops-being-a-one-way-door)) |
@@ -162,7 +162,7 @@ ccwho                         # on a terminal
 | → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
-| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session) - and lists the sessions only that finds under SAID, last |
+| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session; a word finds its forms too, `wake` finds woke, woken and waking) - and lists the sessions only that finds under SAID, last: the closest first, each row showing the message that matched |
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. In the box: `l` the stuck items, `p` its processes, `s` stop. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
@@ -301,8 +301,18 @@ recognise a line by its front.
 
 In the live list, `/` searches the same index: the ended sessions it finds show
 under the running ones, under ENDED (ten at most, the heading says how many). Half a
-second after the last key it also greps what was said; sessions only that finds show
-under SAID (ten at most).
+second after the last key it also greps what was said - your prompts and Claude's
+replies. The first search after the list starts reads every transcript once and keeps
+what was said in memory; a later search reads only what was appended. Sessions only
+that finds show under SAID (ten at most), the closest first: most of your words in one
+message, then a message of yours before one of Claude's, then the words as you typed
+them, then running before ended, then the newest. Each SAID row shows that message,
+its age and who said it, in place of the recap.
+
+A word also finds its forms, from the word to its forms: `wake` finds wakes, waking,
+woke and woken; `merge` finds merging. Not the other way: `woken` finds only "woken",
+and `coding` does not find every "Claude Code" - type the word itself. This holds in
+`ls` and `show` too.
 
 ## ccwho doctor
 

@@ -122,7 +122,8 @@ its transcript.
 sessions, and which one needs you. It is a terminal multiplexer, like tmux: your
 agents run in herdr panes, and herdr owns their terminals. ccwho does not run your
 agents: they stay in your usual terminal windows. To know their state, ccwho only
-reads - what Claude Code writes, `claude agents --json`, `ps` and `lsof`.
+reads - what Claude Code writes, `claude agents --json`, `ps` and `lsof` - and, for a
+process that may be stuck reading its input, takes a one-second `sample` of it.
 It acts only when you ask: it brings a window to the front, kills processes after it
 shows you the list, and reopens sessions after a reboot.
 
@@ -355,6 +356,7 @@ or Terminal.app timed out, its line says when ccwho asks again (`asks it again i
 | usage | `~/.ccwho/usage/` (from `ccwho statusline`); Codex's from its transcripts |
 | a session's iTerm2 pane (save) | iTerm2, by Apple Event; while iTerm2 is not asked, `ITERM_SESSION_ID` in its process's environment, else the last save of this boot |
 | Terminal.app tabs | `ps` (the `login` on each tty); their names by Apple Event |
+| stuck work | each task's output file, its wait loop's own `grep`; for a reader: `lsof -U` (its stdin), `lsof` (its other fds), `sample` (its stack), `ps -o time=` (its CPU); verdicts kept in `~/.cache/ccwho/readers.json` |
 
 `sessionId` from the agents feed **is** the transcript filename, which is what makes
 the topic column possible.
@@ -794,10 +796,39 @@ has no end line, is never called dead.
 Bash tool command with `< /dev/null` - except a command with a heredoc: then the
 tool shell's stdin is a socket that the session's claude holds and never writes to.
 A `cat $l` with `$l` empty, in such a command moved to the background, waited 20
-hours while the row said `running`. So a stdin reader (`cat`, `tr`, `cut`, `head`,
-`tail`, `wc`, `sort`, `uniq` with no file) in a Bash tool task, older than two
-minutes, whose fd 0 lsof shows is the claude's socket, makes the row STUCK: `cat N
-waits for input Claude Code never sends`. Never one under an MCP server (Claude Code
+hours while the row said `running`; a `python3` script reading its stdin waited 5.5
+hours. So a process in a Bash tool task, older than two minutes, whose fd 0 lsof
+shows is the claude's socket, and which reads it, makes the row STUCK: `cat N waits
+for input Claude Code never sends`. A stdin reader by its command (`cat`, `tr`,
+`cut`, `head`, `tail`, `wc`, `sort`, `uniq` with no file) reads it. Any other
+program with no live children (a shell or wrapper waits on its child; one that ended
+unreaped, `<defunct>`, does not count) needs
+two more facts. Its read can wait on no other fd: fd 0 is still that socket, fds 1
+and 2 are taken as output, and any other fd is one a read never waits on for data -
+open for writing only, a file, a folder or a device that always answers (zsh holds
+`/dev/null` on fd 10, bash its script on fd 255); a pipe, a socket, a tty or a FIFO
+it holds could be the read. And a one-second `sample` of it (Apple's
+`/usr/bin/sample`) puts every sample of every thread in the kernel's `read`, while
+the process uses no CPU: a read that loops on a file or `/dev/null` uses CPU, a read
+that waits does not. So the tool shell's own `read`, and a bash script's, are found
+too. Not told apart: a read that waits on slow storage - a network volume, an
+external or SD disk, a FUSE mount, a cloud file (iCloud, a File Provider) still
+being downloaded - uses little CPU either. Not found: a program with more than one
+thread (node, Go, Java, a python that started a thread), as every thread must be in
+that `read`. A sample takes about 1.5 s and stops the process for about a
+millisecond at each look. A scan takes at most two, all sessions together; the rest
+wait for the next scan. Only a scan that shows stuck work samples: the list,
+`ccwho ls` and `show`; never `ps`, `save`, `open` or `restore`. A sample's verdict
+is asked again after five minutes (some reads do return: `read -t`, an alarm), and a
+sample or an lsof that fails keeps the last one. That fd 0 is the claude's socket is
+kept for the life of the process, and proven again before each new sample. Two
+`ccwho ls` started at the same moment may each sample the same process. A kill samples again each process
+it was asked about, and what it sees becomes the list's newest verdict. The
+verdicts are kept in `~/.cache/ccwho/readers.json`, under a hash of each process
+(its claude, pid, start and command - no command text), so `ccwho ls`, a new
+process every time, does not sample again what the list or an earlier `ccwho ls`
+already did. A program whose
+name is not a short plain word is called `a program`. Never one under an MCP server (Claude Code
 does write to that socket) or under an agent. Its kill box stops the reader's whole
 task, parents first, so the tool shell cannot go on to its next command (a script
 that traps TERM is not reached); ccwho and any agent in the task are spared.

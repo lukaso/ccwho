@@ -3824,7 +3824,7 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
         real = ui.engine.kill_dead_loops
         asked = []
 
-        def fake(session_pid, pids, started=None, report=None):
+        def fake(session_pid, pids, started=None, report=None, cache=None):
             asked.append((session_pid, pids))
             report.update(report_says or {})
             return killed
@@ -3873,6 +3873,57 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
         self.assertIn("could not read", said)
         self.assertIn("86247 still runs", said)
 
+    def test_what_the_kill_saw_reaches_the_next_scan(self):
+        # its new sample of a reader is the list's newest verdict (review 2) -
+        # handed over: the kill runs in its own thread, beside a scan that may
+        # be walking the cache, so the scan's own thread takes it (review 3)
+        real_kill, real_collect = ui.engine.kill_dead_loops, ui.engine.collect
+        collector = ui.Collector()
+        collector.reload = lambda: None
+        collector.cache["_stacks"] = {"k": [True, 1.0]}
+
+        def kill(session_pid, pids, started=None, report=None, cache=None):
+            cache.setdefault("_stacks", {})["k"] = [False, 2.0]
+            cache["_verdicts_new"] = True
+            return []
+        seen = []
+
+        def collect(cache=None, status=None):
+            seen.append((dict(cache.get("_stacks") or {}), cache.get("_verdicts_new")))
+            status["source_ok"] = True
+            return [], 0
+        ui.engine.kill_dead_loops, ui.engine.collect = kill, collect
+        try:
+            collector.kill_loops(STUCK)
+            self.assertEqual(collector.cache, {"_stacks": {"k": [True, 1.0]}},
+                             "the kill does not write the cache a scan walks")
+            collector.fleet()
+            collector.cache["_stacks"]["k"] = [True, 3.0]      # a newer scan's own look
+            collector.fleet()
+        finally:
+            ui.engine.kill_dead_loops, ui.engine.collect = real_kill, real_collect
+        self.assertEqual(seen[0], ({"k": [False, 2.0]}, True))
+        self.assertEqual(seen[1][0], {"k": [True, 3.0]}, "never over a newer look")
+        self.assertEqual(collector.learned, [], "handed over once: the queue does not grow")
+
+    def test_an_engine_of_before_still_kills(self):
+        # a hot reload onto an older engine, whose kill takes no cache: the kill
+        # still runs, once, and nothing is handed over (review 4)
+        real, calls = ui.engine.kill_dead_loops, []
+
+        def before(session_pid, pids, ps=None, read=None, kill=None, matches=None, unix=None,
+                   own=None, started=None, starts=None, report=None):
+            calls.append(pids)
+            return list(pids)
+        ui.engine.kill_dead_loops = before
+        collector = ui.Collector()
+        try:
+            said = collector.kill_loops(STUCK)
+        finally:
+            ui.engine.kill_dead_loops = real
+        self.assertEqual((calls, collector.learned), ([[86246]], []))
+        self.assertEqual(said, ["killed loop 86246"])
+
     def test_a_loop_that_is_gone_is_still_not_stuck(self):             # control
         self.assertEqual(self.kill([], {})[1], ["nothing killed: no loop there is stuck any more"])
 
@@ -3881,7 +3932,7 @@ class TestTheCollectorKillsOnlyThatSessionsLoops(unittest.TestCase):
                                        "root": 86083, "start": "Sat Sep 26 15:12:13 2026"}])
         real, asked = ui.engine.kill_dead_loops, []
 
-        def fake(session_pid, pids, started=None, report=None):
+        def fake(session_pid, pids, started=None, report=None, cache=None):
             asked.append(started)
             report["spared"] = [54332]
             return [54329]

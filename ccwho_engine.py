@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import calendar
 import glob
+import hashlib
 import json
 import os
 import datetime
@@ -536,7 +537,7 @@ def find_dead_loops(pid, ptable, read=task_file, grace=DEAD_LOOP_GRACE,
 
 def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
                     matches=None, unix=None, own=None, started=None, starts=None,
-                    report=None):
+                    report=None, fds=None, stack=None, cache=None, now=None):
     """SIGTERM each of `pids` that is STILL a dead loop of that session - and
     for a dead reader, its whole task: the tool shell under the claude and all
     below it, parents first. Never ccwho (`own`) or what runs it, and never an
@@ -549,7 +550,10 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
     was not killed is not "not stuck": report["unconfirmed"] has each asked-for
     loop or reader that still runs but did not look stuck, and report["unread"]
     is True when ps, or the start table, said nothing; report["failed"] has
-    each stuck loop the signal was not permitted to reach.
+    each stuck loop the signal was not permitted to reach. `cache`: a dict of the
+    caller's that learns what this kill's new look saw (adopt_verdicts) - a
+    reader no longer reading is not offered again on the list's older verdict
+    (review 2). The list adopts it in its scan thread (review 3).
     """
     rows = [(int(pid), ppid, cmd) for pid, ppid, cmd in procs.ps_rows((ps or ps_snapshot)())
             if pid.isdigit()]
@@ -567,8 +571,17 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
     # both looked for on the one snapshot, before anything is signalled
     loops = [d["pid"] for d in find_dead_loops(session_pid, ptable, read, matches=matches)
              if d["pid"] in wanted]
-    readers = [d for d in find_dead_readers(session_pid, ptable, unix=unix, grace=0)
+    # a program not named a reader is sampled again - only one asked about. Its
+    # verdicts go to the list's cache under the keys of the list's scan: with
+    # the start times (the table this kill reads anyway), as the scan has them
+    seen = None if cache is None else {}
+    keyed = ptable if cache is None else {
+        pid: (ppid, (table().get(pid) or ("",))[0], cmd) for pid, (ppid, _s, cmd) in ptable.items()}
+    readers = [d for d in find_dead_readers(session_pid, keyed, unix=unix, grace=0, cache=seen,
+                                            fds=fds, stack=stack, only=wanted, now=now)
                if d["pid"] in wanted]
+    if seen:
+        adopt_verdicts(cache, seen)
     if readers:
         killed = _stop_reader_tasks(session_pid, readers, rows, send, own, started,
                                     table, report, hit)
@@ -615,8 +628,10 @@ def _unconfirmed(session_pid, pids, ptable, started, table, report):
             if c not in tree:
                 tree.add(c)
                 stack.append(c)
+    # a reader listed by its stack is listed with its start, as every reader is
     out = [p for p in sorted(pids) if p in tree
-           and (procs.wait_loop(ptable[p][2]) or procs.stdin_reader(ptable[p][2]))]
+           and (procs.wait_loop(ptable[p][2]) or procs.stdin_reader(ptable[p][2])
+                or p in (started or {}))]
     listed = {p: s for p, s in (started or {}).items() if p in out}
     if listed:
         begun = table()
@@ -683,6 +698,44 @@ def stdin_sockets(pids):
     return None if text is None else procs.parse_lsof_unix(text)
 
 
+def open_fds(pids):
+    """parse_lsof_fds for `pids`, or None when lsof could not say."""
+    text = _lsof(["-nP", "-a", "-p", ",".join(str(p) for p in pids), "-F", "pfatn"])
+    return None if text is None else procs.parse_lsof_fds(text)
+
+
+CPU_WHILE_WAITING = 0.05      # seconds of CPU a process blocked in read may show in a sample
+
+
+def _cpu_seconds(pid):
+    """The CPU `pid` has used (ps -o time=), or None when ps could not say."""
+    return procs.parse_cpu_time(_ps(["-o", "time=", "-p", str(int(pid))]))
+
+
+def stack_sample(pid):
+    """Is `pid` waiting in read? A one-second `sample` of it (every 10 ms) with
+    every thread in the kernel's read (procs.stack_reads), and no CPU spent
+    meanwhile: a read that loops - on a file, /dev/null - uses CPU, a read that
+    waits does not (review 3). None when it could not be told: no such
+    process, not permitted, too slow. sample stops the process for each look,
+    about a millisecond. Apple's /usr/bin/sample, never the first `sample` on
+    PATH (review 3): its report is the one stack_reads reads."""
+    try:
+        before = _cpu_seconds(pid)
+        done = subprocess.run(["/usr/bin/sample", str(int(pid)), "1", "10", "-mayDie",
+                               "-file", "/dev/stdout"],
+                              capture_output=True, text=True, errors="replace", timeout=10,
+                              stdin=subprocess.DEVNULL)
+        after = _cpu_seconds(pid)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if before is not None and after is not None and after - before > CPU_WHILE_WAITING:
+        return False                    # working, whatever its stack looked like
+    # a sample that failed has no stack to read: stack_reads says unknown
+    said = procs.stack_reads(done.stdout)
+    return None if said and (before is None or after is None) else said
+
+
 def _started(start):
     """Seconds since the epoch of a `ps -o lstart` text (C locale, UTC), or None."""
     try:
@@ -691,20 +744,135 @@ def _started(start):
         return None
 
 
-_READER_KEEP = 256
+VERDICTS_KEEP = 512    # verdicts kept, in a scan's memory and in the file
+STACK_RESAMPLE = 300    # seconds before a process not seen reading is sampled again
+STACK_PER_SCAN = 2      # samples a scan may take, every session's together: each
+                        # takes about 1.5 s (the process stops about 1 ms a look)
 
 
-def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, cache=None):
+def verdicts_path():
+    """Where a stuck-reader verdict waits for the next ccwho process."""
+    return os.path.expanduser("~/.cache/ccwho/readers.json")
+
+
+def _verdict_key(claude, pid, start, cmd):
+    """One process, named without its command: a command can hold a secret."""
+    return hashlib.sha256(repr((claude, pid, start, cmd)).encode()).hexdigest()[:24]
+
+
+def _verdicts(raw):
+    """The well-formed entries of `raw`: key -> [verdict, when], a verdict
+    True, False or None (unknown). Only True is ever acted on."""
+    out = {}
+    for k, v in (raw.items() if isinstance(raw, dict) else ()):
+        if (isinstance(k, str) and isinstance(v, (list, tuple)) and len(v) == 2
+                and (v[0] is None or isinstance(v[0], bool)) and isinstance(v[1], (int, float))):
+            out[k] = [v[0], float(v[1])]
+    return out
+
+
+def _newest(entries):
+    """The newest VERDICTS_KEEP of key -> [verdict, when], in place."""
+    if len(entries) > VERDICTS_KEEP:
+        keep = sorted(entries, key=lambda k: entries[k][1], reverse=True)[:VERDICTS_KEEP]
+        kept = {k: entries[k] for k in keep}
+        entries.clear()
+        entries.update(kept)
+    return entries
+
+
+_VERDICT_PARTS = (("_fd0", "fd0"), ("_stacks", "stacks"))
+
+
+def load_verdicts(cache, path=None, now=None):
+    """Put the file's verdicts in `cache`: "_fd0" (fd 0 is the claude's socket)
+    and "_stacks" (every thread in read). Never raises: a file that cannot be
+    read holds no verdict, which only means a process is asked again. One
+    stamped in the future - a clock set back - is left out: it would come back
+    through this cache to the file (review 4)."""
+    later = (time.time() if now is None else now) + 60
+    try:
+        with open(path or verdicts_path()) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    for part, name in _VERDICT_PARTS:
+        cache[part] = {k: v for k, v in _verdicts(data.get(name)).items() if v[1] <= later}
+
+
+def adopt_verdicts(cache, learned):
+    """Put what `learned` knows - its definite verdicts, never an unknown - in
+    `cache`, and mark them to be kept. A kill learns in a dict of its own, and
+    the list's scan thread adopts it: the kill runs in a thread of its own,
+    beside a scan that may be walking the cache (review 3)."""
+    took = False
+    for part, _name in _VERDICT_PARTS:
+        mine = cache.setdefault(part, {})
+        for k, v in _verdicts(learned.get(part)).items():
+            # never over a newer look (a scan's, after the kill's: review 4)
+            if v[0] is not None and (k not in mine or v[1] >= mine[k][1]):
+                mine[k] = v
+                took = True
+    if took or learned.get("_verdicts_new"):
+        cache["_verdicts_new"] = True
+
+
+def save_verdicts(cache, path=None, now=None):
+    """Merge `cache`'s verdicts into the file and write it whole: a temp file,
+    then a rename. Another ccwho may have written it since it was read: the
+    newer verdict of each process wins, and the newest VERDICTS_KEEP stay. Two
+    writing at the same moment can lose one's new verdicts - not locked, as a
+    lost verdict is only asked again (review 1). A verdict stamped in the
+    future - a clock set back - is dropped, or it would win every merge after
+    (review 3). Never raises."""
+    path = path or verdicts_path()
+    later = (time.time() if now is None else now) + 60
+    disk = {}
+    load_verdicts(disk, path, now=later - 60)
+    out = {}
+    for part, name in _VERDICT_PARTS:
+        merged = disk[part]
+        for k, v in _verdicts(cache.get(part)).items():
+            if v[1] > later:
+                continue                # this process's own, stamped before a clock went back
+            if k not in merged or v[1] >= merged[k][1]:
+                merged[k] = v
+        out[name] = _newest(merged)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+            json.dump(out, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass                            # a verdict not kept is only asked again
+
+
+def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, cache=None,
+                      fds=None, stack=None, only=None, names=None):
     """A session's readers that cannot end: [{"pid", "tasks", "kind", "program",
     "root", "start"}] - `tasks` empty, there for a script reading dead_loops as
     loops; `start` so a kill knows it is still the reader that was listed.
 
-    A program reading its stdin (procs.stdin_reader) in the session's own tree,
-    whose fd 0 is a socket the session's claude holds. Claude Code never writes
-    to it: a command with a heredoc gets no `< /dev/null`, and a `cat` in one
-    moved to the background waited 20 hours (2026-09-26). `root` is the tool
-    shell under the claude: the task a person stops. Younger than `grace` or of
-    unknown age, it is not judged; lsof is asked only about candidates.
+    A program reading its stdin in the session's own tree, whose fd 0 is a
+    socket the session's claude holds. Claude Code never writes to it: a command
+    with a heredoc gets no `< /dev/null`, and a `cat` in one moved to the
+    background waited 20 hours (2026-09-26). `root` is the tool shell under the
+    claude: the task a person stops. Younger than `grace` or of unknown age, it
+    is not judged; lsof is asked only about candidates.
+
+    A program procs.stdin_reader names reads its stdin by its command line. Any
+    other one with no children of its own is proven the long way (2026-10-07: a
+    python3 read that socket for 5.5 hours): no other fd its read could be on
+    (`fds`, procs.only_stdin_can_block), and every thread in the kernel's read
+    (`stack`, a sample). Every verdict is asked again after STACK_RESAMPLE
+    seconds: some reads do return (`read -t`, an alarm). A scan samples at
+    most STACK_PER_SCAN - all its sessions together, when collect puts the
+    budget in `cache` ("_sample_budget"); the rest stay due for the next scan.
+    `only`: the pids a kill asked about - no other is sampled, and each of them
+    is. `names`: pid -> `ps -o comm`, the name a row prints. What `cache`
+    gains is marked "_verdicts_new", for collect to keep (save_verdicts).
     """
     kids = {}
     for cpid, (ppid, _start, _cmd) in (ptable or {}).items():
@@ -713,39 +881,96 @@ def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, c
     # only in a Bash tool's task: an MCP server's stdin is a claude socket too,
     # and Claude Code writes to that one
     found, seen = [], {pid}
-    stack = [(c, c) for c in sorted(kids.get(pid, [])) if procs.is_tool_shell(ptable[c][2])]
-    cands = {}
-    while stack:
-        cpid, root = stack.pop()
+    todo = [(c, c) for c in sorted(kids.get(pid, [])) if procs.is_tool_shell(ptable[c][2])]
+    cands, others = {}, {}
+    while todo:
+        cpid, root = todo.pop()
         if cpid in seen:
             continue
         seen.add(cpid)
         _ppid, start, cmd = ptable[cpid]
         if procs._is_an_agent(cmd):
             continue            # a claude the task started: its socket, its work
-        stack += [(k, root) for k in sorted(kids.get(cpid, []))]
+        todo += [(k, root) for k in sorted(kids.get(cpid, []))]
+        if procs._ZOMBIE.match(cmd or ""):
+            continue            # ended, not reaped: it holds no fd, it reads nothing
         began = _started(start)
-        if procs.stdin_reader(cmd) and (grace <= 0 or began is not None
-                                         and now - began >= grace):
+        if not (grace <= 0 or began is not None and now - began >= grace):
+            continue
+        if procs.stdin_reader(cmd):
             cands[cpid] = root
-    if not cands:
+        elif (not [k for k in kids.get(cpid, []) if not procs._ZOMBIE.match(ptable[k][2] or "")]
+              and (only is None or cpid in only)):
+            # a shell or wrapper waits on its child, not on its stdin - a child
+            # that ended and was never reaped is no child it waits on (review 4)
+            others[cpid] = root
+    if not cands and not others:
         return []
-    kept = {} if cache is None else cache.setdefault("_readers", {})
-    if len(kept) > _READER_KEEP:
-        kept.clear()
+    kept = {} if cache is None else cache.setdefault("_fd0", {})
+    stacks = {} if cache is None else cache.setdefault("_stacks", {})
+    key = {c: _verdict_key(pid, c, ptable[c][1], ptable[c][2]) for c in {**cands, **others}}
+    # a kill samples each process it asked about; a scan, what its budget allows
+    left = None if only is not None else (cache or {}).get("_sample_budget", STACK_PER_SCAN)
+    # with no sample left, a program not proven yet waits: its proof is a
+    # sample's first step - save, open and ps ask lsof nothing for it (review 5)
+    if left is not None and left <= 0:
+        others = {c: r for c, r in others.items() if key[c] in kept}
     # its fd 0 does not change while it runs, nor does the claude's end close
     # while the reader lives: asked once per (reader, claude)
-    key = {c: (pid, c, ptable[c][1], ptable[c][2]) for c in cands}
-    if any(key[c] not in kept for c in cands):
-        sockets = (unix or stdin_sockets)(sorted(set(cands) | {pid}))
+    every = {**cands, **others}
+    fresh = set()                   # proven by this call's own lsof
+    if any(key[c] not in kept for c in every):
+        sockets = (unix or stdin_sockets)(sorted(set(every) | {pid}))
         # lsof could not say: what was proven before still stands
-        for c in cands if sockets is not None else ():
-            kept[key[c]] = procs.stdin_from(sockets, c, pid)
-    for c in sorted(cands):
-        if kept.get(key[c]):
+        for c in every if sockets is not None else ():
+            kept[key[c]] = [procs.stdin_from(sockets, c, pid), now]
+            fresh.add(c)
+        if sockets is not None and cache is not None:
+            cache["_verdicts_new"] = True
+
+    def proven(c):
+        return (kept.get(key[c]) or [False])[0] is True
+    on_socket = [c for c in sorted(others) if proven(c)]
+
+    def due(c):
+        said = stacks.get(key[c])
+        # a stamp later than now: a clock set back (review 3)
+        return said is None or not 0 <= now - said[1] < STACK_RESAMPLE
+    asked = [c for c in on_socket if due(c)]
+    if asked and (left is None or left > 0):     # no sample left: not even lsof
+        # fd 0 proven again before a new sample: a dup2 may have put another
+        # socket there since (review 4); one this call just proved stands
+        stale = [c for c in asked if c not in fresh]
+        again = (unix or stdin_sockets)(sorted(set(stale) | {pid})) if stale else {}
+        listing = (fds or open_fds)(asked)
+        for c in asked:
+            if c in stale and again is not None and not procs.stdin_from(again, c, pid):
+                kept[key[c]] = [False, now]
+                said = False        # its stdin is no longer the claude's socket
+            elif (c in stale and again is None) or listing is None:
+                said = None         # lsof could not say: unknown, never no (review 3)
+            elif not procs.only_stdin_can_block(listing, c):
+                said = False        # a read that could be on another fd is not its stdin's
+            elif left is None or left > 0:
+                said = (stack or stack_sample)(c)
+                left = None if left is None else left - 1
+            else:
+                continue            # no sample left this scan: due on the next
+            if said is None and stacks.get(key[c]):
+                said = stacks[key[c]][0]        # unknown, never no: the last verdict stands
+            stacks[key[c]] = [said, now]
+            if cache is not None:
+                cache["_verdicts_new"] = True
+    if left is not None and cache is not None and "_sample_budget" in cache:
+        cache["_sample_budget"] = left
+    for c in sorted(every):
+        if proven(c) and (c in cands or (stacks.get(key[c]) or (None,))[0] is True):
             found.append({"pid": c, "tasks": [], "kind": "reader",
-                          "program": ptable[c][2].split()[0].rsplit("/", 1)[-1],
-                          "root": cands[c], "start": ptable[c][1]})
+                          "program": procs.reader_name(ptable[c][2], (names or {}).get(c)),
+                          "root": every[c], "start": ptable[c][1]})
+    # what this scan found stays: it is the newest
+    _newest(kept)
+    _newest(stacks)
     return found
 
 
@@ -3159,12 +3384,14 @@ def mark_reviewed(session_id, ts, path=None):
     return seen
 
 
-def collect(cache=None, status=None, session_apps=True):
+def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
     """`status` is a caller-owned dict, same idiom as `cache`. It carries out the
     one fact a caller cannot recover from the rows: whether the session source
     could be reached at all. An empty row list means nothing without it.
     `session_apps` False: no app asked for tab names only for its sessions
-    (Terminal.app, D7) is asked at all - the autosave job's scan."""
+    (Terminal.app, D7) is asked at all - the autosave job's scan. `samples`:
+    how many stack samples this scan may take (find_dead_readers) - 0 for a
+    scan whose rows show no stuck work."""
     raw = agents_json()
     parsed = parse_sessions(raw) if raw is not None else None
     source_ok = parsed is not None and read_is_complete(raw)
@@ -3184,6 +3411,11 @@ def collect(cache=None, status=None, session_apps=True):
     # sessions' transcripts are never found
     if cache is None:
         cache = {}
+    # what an earlier ccwho process proved about a stuck reader: ccwho ls starts
+    # with an empty cache every time, and a sample takes about 1.5 s
+    if "_fd0" not in cache:
+        load_verdicts(cache)
+    cache["_sample_budget"] = samples       # this scan's, every session's together
     extra = sorted({r["configDir"] for r in file_rows if r.get("configDir")})
     if extra != cache.get("_extra_roots", []):
         cache["_extra_roots"] = extra
@@ -3208,6 +3440,7 @@ def collect(cache=None, status=None, session_apps=True):
     # who started what: the env mark, which survives the process being orphaned;
     # built from the ps snapshot and start times this scan already has
     starts = {pid: start for pid, (start, _cmd) in table.items()}
+    comms = {pid: comm for pid, (_start, comm) in table.items()}
     ptable = {}
     for pid, ppid, cmd in procs.ps_rows(ps_out):
         if pid.isdigit():
@@ -3260,7 +3493,8 @@ def collect(cache=None, status=None, session_apps=True):
         mine = att["sessions"].get(sid, [])
         summary = procs.row_summary(mine)
         dead = (find_dead_loops(s.get("pid"), ptable, cache=cache)
-                + find_dead_readers(s.get("pid"), ptable, unix=stdin_sockets, cache=cache))
+                + find_dead_readers(s.get("pid"), ptable, unix=stdin_sockets, cache=cache,
+                                    names=comms))
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
@@ -3273,6 +3507,8 @@ def collect(cache=None, status=None, session_apps=True):
         # unknown is null, not [] - a script must not read "holds nothing"
         rows[-1]["ports"] = summary["ports"] if ports is not None else None
     rows.sort(key=sort_key)
+    if cache.pop("_verdicts_new", False):
+        save_verdicts(cache)
     if status is not None:
         # The same value the cheap check computes, so finishing a scan never
         # leaves the check thinking the world moved. Taken BEFORE the Codex
@@ -3591,7 +3827,7 @@ def ui_state_style(row):
 def dead_words(d):
     """What one thing that cannot end is waiting for, in a few words."""
     if d.get("kind") == "reader":
-        # the program is one of stdin_reader's few names, never free text
+        # the program is a short plain word (procs.reader_name), never free text
         return f"{d.get('program')} {d.get('pid')} waits for input Claude Code never sends"
     return f"loop {d.get('pid')} waits on {', '.join(d.get('tasks') or [])}, which has ended"
 

@@ -1,4 +1,5 @@
 """Tests for ccwho. Stdlib only: python3 -m unittest -v"""
+import calendar
 import errno
 import fcntl
 import json
@@ -37,7 +38,9 @@ def _where(name):
 
 
 REAL = {name: getattr(ccwho, name) for name in ("live_file_sessions", "ps_table",
-                                                "listen_ports", "read_codex_threads")}
+                                                "listen_ports", "read_codex_threads",
+                                                # a sample stops a real process
+                                                "stack_sample", "open_fds")}
 REAL_LIVE_FILE_SESSIONS = REAL["live_file_sessions"]
 REAL_TTY_SNAPSHOT = ccwho.tty_snapshot
 
@@ -72,10 +75,24 @@ def install_guards():
 
 
 _UNPIN = []
+REAL_VERDICTS_PATH = ccwho.verdicts_path
+
+
+def pin_verdicts():
+    """The stuck-reader verdicts file, in a temp dir for the module: collect()
+    writes it, and a test must never write the user's own (~/.cache/ccwho)."""
+    tmp = tempfile.mkdtemp(prefix="ccwho-test-verdicts-")
+    ccwho.verdicts_path = lambda: os.path.join(tmp, "readers.json")
+
+    def undo():
+        ccwho.verdicts_path = REAL_VERDICTS_PATH
+        shutil.rmtree(tmp, True)
+    return undo
 
 
 def setUpModule():
     install_guards()
+    _UNPIN.append(pin_verdicts())
     # a scan's digest stats the Codex lock folder: never the user's own
     _UNPIN.append(testkit.pin_codex_home())
 
@@ -112,6 +129,10 @@ class MachinelessCollect(unittest.TestCase):
         ccwho.listen_ports = lambda: {}
         ccwho.stdin_sockets = lambda pids: {}
         ccwho.read_codex_threads = lambda env=None, cache=None: []  # Codex's locks: machine
+        # what one scan proved reaches the next on disk: each test its own file
+        tmp = tempfile.mkdtemp(prefix="ccwho-test-verdicts-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        testkit.patch(self, ccwho, "verdicts_path", lambda: os.path.join(tmp, "readers.json"))
 
     def tearDown(self):
         (ccwho.ps_snapshot, ccwho.tty_snapshot,
@@ -1367,7 +1388,14 @@ class TestFindDeadReaders(unittest.TestCase):
         self.assertEqual([d["pid"] for d in self.find(self.ptable(start=""), grace=0)], [54329])
 
     def test_a_file_to_read_is_not_a_dead_reader(self):                     # control
-        self.assertEqual(self.find(self.ptable(reader="cat notes.md")), [])
+        # not by its name: since 2026-10-07 its stack says (TestFindAnyDeadReader)
+        notes = lambda pids: {p: {"0": ("u", "unix", "->0x4283419ab8f9493c"),  # noqa: E731
+                                  "3": ("r", "REG", "/Users/u/notes.md")} for p in pids}
+        # not by its name, nor by its fds since review 3 (a read of a file never
+        # waits for data): by its sample - reading notes.md uses CPU, and
+        # stack_sample says no (TestTheRealStackAndFdPathsRun's busy file)
+        self.assertEqual(self.find(self.ptable(reader="cat notes.md"), fds=notes,
+                                   stack=lambda pid: False), [])
 
     def test_another_sessions_reader_is_not_this_ones(self):               # control
         t = self.ptable()
@@ -1380,9 +1408,11 @@ class TestFindDeadReaders(unittest.TestCase):
         # tr and cut read stdin too - from the pipe, so they are not found
         self.assertEqual(seen, [[54329, 54330, 54331, 82755]])
         seen.clear()
+        # since 2026-10-07 any program with no children is a candidate too
+        # (TestFindAnyDeadReader) - once it has lived past the grace
         t = self.ptable(reader="sleep 100")
         t[54330] = t[54331] = (54328, self.START, "cargo test")
-        self.find(t, unix=self.unix(seen=seen))
+        self.find(t, unix=self.unix(seen=seen), now=1790435533.0 + 60)
         self.assertEqual(seen, [], "no candidate, no lsof")
 
     def test_the_real_lsof_path_runs(self):
@@ -1652,6 +1682,721 @@ class TestKillDeadReaders(unittest.TestCase):
         k.table[86083] = (82755, self.START, "npm exec some-mcp")
         got, k = self._kill(k)
         self.assertEqual((got, k.sent), ([], []))
+
+
+class AnyReaderWorld:
+    """The tree measured on 2026-10-07: a heredoc command ran `python3
+    /tmp/label_chunk.py`, which read its stdin - Claude Code's socket - for 5.5
+    hours. safe-chain, a wrapper, runs python3 as its child. Three fakes, each
+    noting who it was asked about: lsof -U (fd 0's socket), lsof (every fd), and
+    a sample of a stack (True: every thread in read; False: not; None: unknown)."""
+    START = "Wed Oct  7 11:17:44 2026"          # lstart, C locale, UTC
+    NOW = calendar.timegm(time.strptime(START, "%a %b %d %H:%M:%S %Y")) + 3600
+    CLAUDE, SHELL, WRAP, PY = 56728, 99591, 99622, 99740
+    TOOL = ("/bin/zsh -c source /Users/u/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null"
+            " || true && eval 'cat > /tmp/label_chunk.py << EOF'")
+    PYCMD = "/Users/u/.pyenv/versions/3.13.5/bin/python3 /tmp/label_chunk.py"
+    OUT = ("w", "REG", "/private/tmp/claude-501/x/tasks/bkdza8q8z.output")
+
+    def ptable(self, cmd=PYCMD, start=START):
+        return {self.CLAUDE: (1, self.START, "claude"),
+                self.SHELL: (self.CLAUDE, self.START, self.TOOL),
+                self.WRAP: (self.SHELL, self.START, "safe-chain python3 /tmp/label_chunk.py"),
+                self.PY: (self.WRAP, start, cmd)}
+
+    def unix(self, seen=None, peer="0x316f1225c8f0ee5a"):
+        def read(pids):
+            if seen is not None:
+                seen.append(sorted(pids))
+            out = {self.CLAUDE: {"25": ("0x316f1225c8f0ee5a", "->0xf32389e150b46276")}}
+            for p in pids:
+                if p != self.CLAUDE:
+                    out[p] = {"0": ("0xf32389e150b46276", "->" + peer)}
+            return out
+        return read
+
+    def fds(self, seen=None, extra=None):
+        def read(pids):
+            if seen is not None:
+                seen.append(sorted(pids))
+            return {p: dict({"cwd": (" ", "DIR", "/Users/u"),
+                             "0": ("u", "unix", "->0x316f1225c8f0ee5a"),
+                             "1": self.OUT, "2": self.OUT}, **(extra or {})) for p in pids}
+        return read
+
+    def stack(self, seen=None, says=True):
+        def read(pid):
+            if seen is not None:
+                seen.append(pid)
+            return says(pid) if callable(says) else says
+        return read
+
+
+class TestFindAnyDeadReader(AnyReaderWorld, unittest.TestCase):
+    """Any program, not only the few named ones: proven by its fd 0 (Claude
+    Code's socket), its other fds (none that a read could block on), and its
+    stack (every thread in the kernel's read)."""
+
+    def find(self, ptable=None, unix=None, fds=None, stack=None, now=None, **kw):
+        return ccwho.find_dead_readers(self.CLAUDE, ptable or self.ptable(),
+                                       unix=unix or self.unix(), fds=fds or self.fds(),
+                                       stack=stack or self.stack(),
+                                       now=self.NOW if now is None else now, **kw)
+
+    def test_the_5_hour_python3_is_found(self):
+        self.assertEqual(self.find(), [{"pid": self.PY, "tasks": [], "kind": "reader",
+                                        "program": "python3", "root": self.SHELL,
+                                        "start": self.START}])
+
+    def test_only_a_process_with_no_children_is_sampled(self):
+        # the tool shell and safe-chain hold the same socket, waiting on a child
+        seen = []
+        self.find(stack=self.stack(seen))
+        self.assertEqual(seen, [self.PY])
+
+    def test_asleep_is_not_stuck(self):                                     # control
+        self.assertEqual(self.find(stack=self.stack(says=False)), [])
+
+    def test_a_sample_that_failed_is_not_stuck(self):                       # control
+        self.assertEqual(self.find(stack=self.stack(says=None)), [])
+
+    def test_another_fd_that_could_block_is_not_sampled(self):              # control
+        seen = []
+        # a pipe as Apple's lsof prints it: no access mode (review 1)
+        got = self.find(fds=self.fds(extra={"3": (" ", "PIPE", "->0x1")}), stack=self.stack(seen))
+        self.assertEqual((got, seen), ([], []))
+
+    def test_an_lsof_that_failed_is_not_sampled(self):                      # control
+        seen = []
+        got = self.find(fds=lambda pids: None, stack=self.stack(seen))
+        self.assertEqual((got, seen), ([], []))
+
+    def test_stdin_from_anyone_else_asks_nothing_more(self):                # control
+        fds_seen, stack_seen = [], []
+        got = self.find(unix=self.unix(peer="0x1"), fds=self.fds(fds_seen),
+                        stack=self.stack(stack_seen))
+        self.assertEqual((got, fds_seen, stack_seen), ([], [], []))
+
+    def test_younger_than_the_grace_nothing_is_asked(self):                 # control
+        u, f, s = [], [], []
+        got = self.find(unix=self.unix(u), fds=self.fds(f), stack=self.stack(s),
+                        now=self.NOW - 3600 + 60)
+        self.assertEqual((got, u, f, s), ([], [], [], []))
+
+    def test_below_an_agent_it_is_not_this_sessions_reader(self):           # control
+        t = self.ptable()
+        t[99700] = (self.SHELL, self.START, "claude -p hi")
+        t[self.WRAP] = (99700, self.START, t[self.WRAP][2])
+        self.assertEqual(self.find(t), [])
+
+    def test_a_yes_is_not_asked_again_soon(self):
+        f, s, cache = [], [], {}
+        first = self.find(fds=self.fds(f), stack=self.stack(s), cache=cache)
+        again = self.find(fds=self.fds(f), stack=self.stack(s), cache=cache, now=self.NOW + 60)
+        self.assertEqual((first, again), (again, [dict(first[0])]))
+        self.assertEqual((len(f), len(s)), (1, 1))
+
+    def test_a_failed_sample_keeps_the_last_verdict(self):
+        # "unknown, never no" (review 2): a sample too slow under load
+        s, cache = [], {}
+        self.find(stack=self.stack(s), cache=cache)
+        later = self.find(stack=self.stack(s, says=None), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual(([d["pid"] for d in later], s), ([self.PY], [self.PY, self.PY]))
+
+    def test_a_failed_lsof_keeps_the_last_verdict(self):
+        # review 3: unknown, never no - in every place a verdict is written
+        s, cache = [], {}
+        self.find(stack=self.stack(s), cache=cache)
+        later = self.find(fds=lambda pids: None, stack=self.stack(s), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual(([d["pid"] for d in later], s), ([self.PY], [self.PY]))
+
+    def test_a_verdict_stamped_in_the_future_is_due(self):
+        # a clock set back: the stamp is later than now (review 3)
+        s, cache = [], {}
+        self.find(stack=self.stack(s), cache=cache, now=self.NOW + 3600)
+        self.find(stack=self.stack(s), cache=cache, now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual(s, [self.PY, self.PY])
+
+    def test_stdin_on_another_socket_after_its_proof_is_not_judged(self):
+        # dup2 of a socket to a live server: a unix socket still, not the
+        # claude's - fd 0 is proven again before each new sample (review 4)
+        s, cache = [], {}
+        self.find(cache=cache)
+        later = self.find(unix=self.unix(peer="0x1"), stack=self.stack(s), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual((later, s), ([], []))
+        again = self.find(stack=self.stack(s), cache={}, now=self.NOW)          # control
+        self.assertEqual(([d["pid"] for d in again], s), ([self.PY], [self.PY]))
+
+    def test_a_failed_proof_keeps_the_last_verdict(self):
+        # fd 0 asked again before a sample, and lsof could not say: unknown
+        s, cache = [], {}
+        self.find(stack=self.stack(s), cache=cache)
+        later = self.find(unix=lambda pids: None, stack=self.stack(s), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual(([d["pid"] for d in later], s), ([self.PY], [self.PY]))
+
+    def test_a_proof_made_in_this_scan_is_not_asked_again(self):
+        u = []
+        self.find(unix=self.unix(u))
+        self.assertEqual(len(u), 1)
+
+    def test_an_unreaped_child_does_not_hide_a_reader(self):
+        # a Popen never waited for, then sys.stdin.read() (review 4)
+        # macOS 27's ps prints a child left unreaped as "<defunct>" (review 5);
+        # one that has only just exited as "(sleep)" (measured 2026-09-29)
+        t = self.ptable()
+        for zombie in ("<defunct>", "(sleep)"):
+            with self.subTest(zombie=zombie):
+                t[99800] = (self.PY, self.START, zombie)
+                self.assertEqual([d["pid"] for d in self.find(t)], [self.PY])
+        t[99800] = (self.PY, self.START, "sleep 100")                         # control
+        s = []
+        found = [d["pid"] for d in self.find(t, stack=self.stack(s))]
+        # a live child: the python waits on it, so it is neither sampled nor found
+        self.assertEqual((self.PY in found, self.PY in s), (False, False))
+
+    def test_stdin_moved_after_its_proof_is_not_judged(self):
+        # fd 0 proven the claude's socket once; then dup2 or `exec 0<fifo`
+        cache = {}
+        self.find(cache=cache)
+        moved = self.fds(extra={"0": ("r", "FIFO", "/tmp/fifo")})
+        self.assertEqual(self.find(fds=moved, cache=cache, now=self.NOW + ccwho.STACK_RESAMPLE + 1),
+                         [])
+
+    def test_no_sample_left_is_no_proof_asked_either(self):
+        # the first proof of fd 0 is a sample's first step: a scan with nothing
+        # left to sample (save, open, ps: samples=0) asks lsof nothing for a
+        # program it cannot judge, and has nothing new to keep (review 5)
+        u, cache = [], {"_sample_budget": 0}
+        self.assertEqual((self.find(unix=self.unix(u), cache=cache), u), ([], []))
+        self.assertNotIn("_verdicts_new", cache)
+        named = {"_sample_budget": 0}                                          # control
+        got = self.find(self.ptable(cmd="cat"), unix=self.unix(u), cache=named)
+        self.assertEqual(([d["program"] for d in got], len(u)), (["cat"], 1))
+        # and one proven before is still listed: from what the cache knows
+        proven = {}
+        self.find(cache=proven)
+        proven["_sample_budget"] = 0
+        self.assertEqual([d["pid"] for d in self.find(unix=lambda pids: self.fail("lsof"),
+                                                      stack=lambda pid: self.fail("sampled"),
+                                                      cache=proven, now=self.NOW + 60)], [self.PY])
+
+    def test_an_empty_budget_asks_nothing(self):
+        # one proven before and due again: no sample left, so no lsof either
+        cache = {}
+        self.find(cache=cache)
+        u, f, s = [], [], []
+        later = self.NOW + ccwho.STACK_RESAMPLE + 1
+        cache["_sample_budget"] = 0
+        self.find(unix=self.unix(u), fds=self.fds(f), stack=self.stack(s), cache=cache, now=later)
+        self.assertEqual((u, f, s), ([], [], []))
+        cache["_sample_budget"] = 1                                            # control
+        self.find(unix=self.unix(u), fds=self.fds(f), stack=self.stack(s), cache=cache, now=later)
+        self.assertEqual((len(u), len(f), len(s)), (1, 1, 1))
+
+    def test_a_reader_that_stops_reading_leaves_within_a_while(self):
+        # some reads do return - `read -t`, an alarm before input() (review 1)
+        s, cache = [], {}
+        self.find(stack=self.stack(s), cache=cache)
+        later = self.find(stack=self.stack(s, says=False), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual((later, s), ([], [self.PY, self.PY]))
+
+    def test_a_no_is_asked_again_only_after_a_while(self):
+        s, cache = [], {}
+        self.find(stack=self.stack(s, says=False), cache=cache)
+        soon = self.find(stack=self.stack(s), cache=cache, now=self.NOW + 60)
+        later = self.find(stack=self.stack(s), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual((soon, [d["pid"] for d in later], s), ([], [self.PY], [self.PY, self.PY]))
+
+    def test_an_unknown_is_asked_again_only_after_a_while(self):
+        # a sample that failed is not retried on every refresh either
+        s, cache = [], {}
+        self.find(stack=self.stack(s, says=None), cache=cache)
+        self.find(stack=self.stack(s), cache=cache, now=self.NOW + 60)
+        self.assertEqual(s, [self.PY])
+
+    def test_at_most_a_few_samples_a_scan(self):
+        t = self.ptable()
+        more = [99801, 99802, 99803]
+        for p in more:
+            t[p] = (self.SHELL, self.START, f"python3 job{p}.py")
+        s, cache, found = [], {}, set()
+        for _ in range(3):
+            n = len(s)
+            found |= {d["pid"] for d in self.find(t, stack=self.stack(s), cache=cache)}
+            self.assertLessEqual(len(s) - n, ccwho.STACK_PER_SCAN)
+        self.assertEqual(found, {self.PY, *more})
+
+    def test_a_named_reader_needs_no_sample(self):
+        f, s = [], []
+        got = self.find(self.ptable(cmd="cat"), fds=self.fds(f), stack=self.stack(s))
+        self.assertEqual(([d["program"] for d in got], f, s), (["cat"], [], []))
+
+    def test_only_the_asked_pids_are_sampled(self):
+        t = self.ptable()
+        t[99801] = (self.SHELL, self.START, "python3 other.py")
+        s = []
+        got = self.find(t, stack=self.stack(s), only={self.PY})
+        self.assertEqual(([d["pid"] for d in got], s), ([self.PY], [self.PY]))
+
+    def test_a_program_name_is_never_free_text(self):
+        # it goes to a terminal, and to agents reading --json
+        for cmd, said in (("/opt/x/node-20 job.js", "node-20"),
+                          ("/tmp/\x1b]0;evil\x07 job", "a program"),
+                          ("/tmp/" + "n" * 40, "a program")):
+            with self.subTest(cmd=cmd):
+                got = self.find(self.ptable(cmd=cmd))
+                self.assertEqual([d["program"] for d in got], [said])
+
+    def test_the_name_comes_from_the_executable(self):
+        # ps -o comm, spaces and all: the command's first word would be "Application"
+        app = "/Users/u/Library/Application Support/x/bin/python3"
+        got = self.find(self.ptable(cmd=app + " job.py"), names={self.PY: app})
+        self.assertEqual([d["program"] for d in got], ["python3"])
+
+
+class TestReaderVerdictsAreShared(AnyReaderWorld, unittest.TestCase):
+    """ccwho ls starts with an empty cache every time, and a sample takes about
+    1.5 s: what one ccwho process proved, the next one reads from a file. Kept
+    by a hash of (claude, pid, start, command): no command text on disk."""
+
+    def setUp(self):
+        folder = tempfile.mkdtemp(prefix="ccwho-test-v-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        self.path = os.path.join(folder, "readers.json")
+
+    def find(self, cache, ptable=None, now=None, **kw):
+        for name, fake in (("unix", self.unix()), ("fds", self.fds()), ("stack", self.stack())):
+            kw.setdefault(name, fake)
+        return ccwho.find_dead_readers(self.CLAUDE, ptable or self.ptable(), cache=cache,
+                                       now=self.NOW if now is None else now, **kw)
+
+    def handed_on(self, cache):
+        """What the next ccwho process starts from: the file this one wrote."""
+        ccwho.save_verdicts(cache, path=self.path)
+        later = {}
+        ccwho.load_verdicts(later, path=self.path)
+        return later
+
+    def nothing(self, *a):
+        self.fail("asked again")
+
+    def test_a_yes_is_not_sampled_again_by_the_next_ccwho(self):
+        first = {}
+        self.find(first)
+        got = self.find(self.handed_on(first), unix=self.nothing, fds=self.nothing,
+                        stack=self.nothing)
+        self.assertEqual([d["pid"] for d in got], [self.PY])
+
+    def test_a_no_is_asked_again_after_a_while_by_the_next_ccwho(self):
+        first, s = {}, []
+        self.find(first, stack=self.stack(says=False))
+        later = self.handed_on(first)
+        self.find(later, stack=self.stack(s), now=self.NOW + 60)
+        got = self.find(later, stack=self.stack(s), now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual((s, [d["pid"] for d in got]), ([self.PY], [self.PY]))
+
+    def test_no_command_text_reaches_the_file(self):
+        first = {}
+        self.find(first)
+        ccwho.save_verdicts(first, path=self.path)
+        with open(self.path) as fh:
+            text = fh.read()
+        for word in ("label_chunk", "python3", str(self.PY), "safe-chain"):
+            self.assertNotIn(word, text)
+
+    def test_the_file_is_the_users_alone(self):
+        ccwho.save_verdicts({"_fd0": {"k": [True, 1.0]}, "_stacks": {}}, path=self.path)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_an_unreadable_file_holds_no_verdict(self):
+        for junk in ("not json", "[]", '{"fd0": [], "stacks": 3}',
+                     '{"fd0": {"k": true}, "stacks": {"k": [true]}}',
+                     '{"fd0": {"k": [true, "x"]}, "stacks": {"k": ["yes", 1]}}'):
+            with self.subTest(junk=junk):
+                with open(self.path, "w") as fh:
+                    fh.write(junk)
+                cache = {}
+                ccwho.load_verdicts(cache, path=self.path)
+                self.assertEqual((cache.get("_fd0"), cache.get("_stacks")), ({}, {}))
+
+    def test_no_file_holds_no_verdict(self):
+        cache = {}
+        ccwho.load_verdicts(cache, path=self.path)
+        self.assertEqual((cache.get("_fd0"), cache.get("_stacks")), ({}, {}))
+
+    def test_a_file_that_cannot_be_written_is_no_error(self):
+        blocked = os.path.join(self.path, "under-a-file", "readers.json")
+        with open(self.path, "w") as fh:
+            fh.write("{}")
+        ccwho.save_verdicts({"_fd0": {"k": [True, 1.0]}, "_stacks": {}}, path=blocked)
+
+    def test_two_ccwho_processes_keep_both_verdicts(self):
+        t = self.ptable()
+        t[99801] = (self.SHELL, self.START, "python3 other.py")
+        a, b = {}, {}
+        self.find(a)
+        self.find(b, ptable=t, only={99801})
+        ccwho.save_verdicts(a, path=self.path)
+        ccwho.save_verdicts(b, path=self.path)
+        later = {}
+        ccwho.load_verdicts(later, path=self.path)
+        got = self.find(later, ptable=t, unix=self.nothing, fds=self.nothing, stack=self.nothing)
+        self.assertEqual([d["pid"] for d in got], [self.PY, 99801])
+
+    def test_the_newer_verdict_of_a_process_wins(self):
+        # another ccwho wrote since this one read: each process's newer verdict
+        ccwho.save_verdicts({"_fd0": {}, "_stacks": {"a": [False, 100.0], "b": [True, 300.0]}},
+                            path=self.path)
+        ccwho.save_verdicts({"_fd0": {}, "_stacks": {"a": [True, 200.0], "b": [False, 200.0]}},
+                            path=self.path)
+        later = {}
+        ccwho.load_verdicts(later, path=self.path)
+        self.assertEqual(later["_stacks"], {"a": [True, 200.0], "b": [True, 300.0]})
+
+    def test_a_new_process_on_that_pid_is_asked_again(self):
+        # a pid is reused: its verdict belongs to the process that had it
+        first, s = {}, []
+        self.find(first, stack=self.stack(s))
+        later = self.handed_on(first)
+        self.find(later, ptable=self.ptable(start="Wed Oct  7 12:00:00 2026"), stack=self.stack(s))
+        self.assertEqual(s, [self.PY, self.PY])
+
+    def test_what_a_scan_learns_is_marked_for_the_file(self):
+        # a socket proof alone, and later a sample alone: each is new to keep
+        named = {}
+        self.find(named, ptable=self.ptable(cmd="cat"))
+        self.assertTrue(named.pop("_verdicts_new", False), "a socket proof")
+        cache = {}
+        self.find(cache, stack=self.stack(says=False))
+        cache.pop("_verdicts_new")
+        self.find(cache, now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertTrue(cache.get("_verdicts_new"), "a sample, its socket known")
+
+    def test_nothing_learned_is_nothing_to_keep(self):                      # control
+        cache = {}
+        self.find(cache)
+        cache.pop("_verdicts_new")
+        self.find(cache)
+        self.assertNotIn("_verdicts_new", cache)
+
+    def test_a_stamp_from_the_future_is_not_loaded(self):
+        # it would come back through the cache that loaded it (review 4)
+        with open(self.path, "w") as fh:
+            json.dump({"fd0": {}, "stacks": {"k": [True, self.NOW + 3600], "j": [True, self.NOW]}}, fh)
+        cache = {}
+        ccwho.load_verdicts(cache, path=self.path, now=self.NOW)
+        self.assertEqual(cache["_stacks"], {"j": [True, self.NOW]})
+
+    def test_a_stamp_from_the_future_in_a_cache_is_not_written(self):
+        ccwho.save_verdicts({"_fd0": {}, "_stacks": {"k": [True, self.NOW + 3600]}}, path=self.path,
+                            now=self.NOW)
+        later = {}
+        ccwho.load_verdicts(later, path=self.path, now=self.NOW + 7200)
+        self.assertEqual(later["_stacks"], {})
+
+    def test_a_stamp_from_the_future_does_not_hold_the_file(self):
+        # written while the clock ran ahead: it must not win every merge after
+        ccwho.save_verdicts({"_fd0": {}, "_stacks": {"k": [True, self.NOW + 3600]}}, path=self.path,
+                            now=self.NOW + 3600)
+        ccwho.save_verdicts({"_fd0": {}, "_stacks": {"k": [False, self.NOW]}}, path=self.path,
+                            now=self.NOW)
+        later = {}
+        ccwho.load_verdicts(later, path=self.path)
+        self.assertEqual(later["_stacks"], {"k": [False, self.NOW]})
+
+    def test_the_newest_verdicts_are_kept(self):
+        many = {f"k{i}": [True, float(i)] for i in range(ccwho.VERDICTS_KEEP + 50)}
+        ccwho.save_verdicts({"_fd0": many, "_stacks": {}}, path=self.path)
+        later = {}
+        ccwho.load_verdicts(later, path=self.path)
+        self.assertEqual(len(later["_fd0"]), ccwho.VERDICTS_KEEP)
+        self.assertIn(f"k{ccwho.VERDICTS_KEEP + 49}", later["_fd0"])
+        self.assertNotIn("k0", later["_fd0"])
+
+    def test_a_scan_keeps_its_memory_bounded(self):
+        old = {f"k{i}": [False, 0.0] for i in range(ccwho.VERDICTS_KEEP + 10)}
+        cache = {"_fd0": dict(old), "_stacks": dict(old)}
+        got = self.find(cache)
+        self.assertEqual([d["pid"] for d in got], [self.PY])
+        self.assertLessEqual(max(len(cache["_fd0"]), len(cache["_stacks"])), ccwho.VERDICTS_KEEP)
+
+    def test_the_file_lives_in_ccwhos_cache_folder(self):
+        self.assertEqual(REAL_VERDICTS_PATH(),
+                         os.path.expanduser("~/.cache/ccwho/readers.json"))
+
+
+class RealChildren:
+    """This test's own children, for the tests that run the real lsof and sample."""
+
+    def children(self, codes, pass_fds=None):
+        """This test's own children, each with a socket for its stdin that no
+        one writes to - as Claude Code's is in a heredoc command. `pass_fds`:
+        name -> the fds that child alone keeps."""
+        import socket
+        kids = {}
+        for name, argv in codes.items():
+            mine, theirs = socket.socketpair()
+            kids[name] = subprocess.Popen(argv, stdin=theirs,
+                                          pass_fds=(pass_fds or {}).get(name, ()))
+            theirs.close()
+            self.addCleanup(mine.close)
+            self.addCleanup(kids[name].wait)
+            self.addCleanup(kids[name].kill)
+        time.sleep(0.5)                     # each at its read, its loop or its sleep
+        return kids
+
+    def py(self, code):
+        return [sys.executable, "-c", code]
+
+
+class TestTheRealStackAndFdPathsRun(RealChildren, unittest.TestCase):
+    """Every test above injects lsof and sample: these take the defaults, on a
+    pid no process has, so nothing real is sampled or listed."""
+
+    def test_sampling_a_pid_that_does_not_run_is_unknown(self):
+        self.assertIsNone(REAL["stack_sample"](99999991))
+
+    def test_listing_a_pid_that_does_not_run_finds_nothing(self):
+        self.assertEqual(REAL["open_fds"]([99999991]), {})
+
+    def test_a_real_unreaped_child_is_a_zombie(self):
+        # what ps prints for one is what procs._ZOMBIE must match (review 5: the
+        # test of round 4 used a form this Mac does not print)
+        zombie = subprocess.Popen(["/usr/bin/true"])          # exits; not waited for
+        live = subprocess.Popen(["/bin/sleep", "20"])
+        self.addCleanup(zombie.wait)
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        time.sleep(0.5)
+        cmds = {int(p): c for p, _pp, c in ccwho.procs.ps_rows(ccwho.ps_snapshot()) if p.isdigit()}
+        self.assertTrue(ccwho.procs._ZOMBIE.match(cmds[zombie.pid]), cmds.get(zombie.pid))
+        self.assertFalse(ccwho.procs._ZOMBIE.match(cmds[live.pid]), cmds.get(live.pid))  # control
+
+    def test_a_real_reader_is_seen_reading(self):
+        # this test's own children, each with a socket for its stdin: one reads
+        # it, one sleeps. The real sample and lsof, their flags and their text
+        import socket
+        kids = []
+        for code in ("import sys; sys.stdin.read()", "import time; time.sleep(20)"):
+            mine, theirs = socket.socketpair()
+            kids.append(subprocess.Popen([sys.executable, "-c", code], stdin=theirs))
+            theirs.close()
+            self.addCleanup(mine.close)
+        for k in kids:
+            self.addCleanup(k.wait)
+            self.addCleanup(k.kill)
+        time.sleep(0.5)                     # each at its read or its sleep
+        reader, sleeper = (k.pid for k in kids)
+        fds = REAL["open_fds"]([reader, sleeper])
+        self.assertTrue(ccwho.procs.only_stdin_can_block(fds, reader), fds)
+        self.assertEqual((REAL["stack_sample"](reader), REAL["stack_sample"](sleeper)),
+                         (True, False))
+
+    def test_the_report_comes_on_stdout(self):
+        # without -file, sample also leaves its report in /tmp, every time
+        asked = []
+
+        def run(argv, **kw):
+            asked.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        testkit.patch(self, ccwho.subprocess, "run", run)
+        testkit.patch(self, ccwho, "_cpu_seconds", lambda pid: 1.0)
+        folder = tempfile.mkdtemp(prefix="ccwho-test-path-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        fake = os.path.join(folder, "sample")
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake, 0o755)
+        testkit.patch(self, os, "environ", dict(os.environ, PATH=folder + os.pathsep +
+                                                os.environ.get("PATH", "")))
+        REAL["stack_sample"](12345)
+        # Apple's own, never the first `sample` on PATH (review 3): its report is
+        # the one stack_reads reads
+        self.assertEqual(asked[0], ["/usr/bin/sample", "12345", "1", "10", "-mayDie",
+                                    "-file", "/dev/stdout"])
+
+    def test_a_process_using_cpu_while_sampled_is_not_stuck(self):
+        # every thread in read at each look, and CPU spent between: a busy loop
+        reads = ("Analysis of sampling x (pid 4242) every 10 milliseconds\nCall graph:\n"
+                 "    90 Thread_1   DispatchQueue_1: com.apple.main-thread  (serial)\n\n"
+                 "Sort by top of stack, same collapsed (when >= 5):\n"
+                 "        read  (in libsystem_kernel.dylib)        90\n\n")
+        testkit.patch(self, ccwho.subprocess, "run", lambda argv, **kw:
+                      subprocess.CompletedProcess(argv, 0, stdout=reads, stderr=""))
+        for cpu, said in (((1.0, 1.0), True), ((1.0, 1.8), False), ((None, 1.0), None),
+                          ((1.0, None), None)):
+            with self.subTest(cpu=cpu):
+                times = list(cpu)
+                testkit.patch(self, ccwho, "_cpu_seconds", lambda pid: times.pop(0))
+                self.assertEqual(REAL["stack_sample"](4242), said)
+
+    def test_a_real_shell_waiting_in_read_is_stuck(self):
+        # the tool shell's own `read` (zsh holds /dev/null on fd 10), and a bash
+        # script's (bash holds the script on fd 255): review 3
+        folder = tempfile.mkdtemp(prefix="ccwho-test-readers-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        script = os.path.join(folder, "ask.sh")
+        with open(script, "w") as fh:
+            fh.write("read -r answer\n")
+        kids = self.children({"zsh": ["/bin/zsh", "-c", "read -r line"],
+                              "bash": ["/bin/bash", script]})
+        fds = REAL["open_fds"](sorted(k.pid for k in kids.values()))
+        self.assertEqual({n: ccwho.procs.only_stdin_can_block(fds, k.pid) for n, k in kids.items()},
+                         {"zsh": True, "bash": True}, fds)
+        self.assertEqual({n: REAL["stack_sample"](k.pid) for n, k in kids.items()},
+                         {"zsh": True, "bash": True})
+
+
+class TestTheRealBusyReadersAreNotStuck(RealChildren, unittest.TestCase):
+    """A read that can return - of a pipe, or one that loops on a file or a
+    device - on this test's own children, with the real lsof and sample. A
+    class of its own: each sample takes about 1.5 s, and a class runs under
+    a 30 s kill."""
+
+    def test_a_real_read_of_a_pipe_is_not_judged(self):
+        # in the kernel's read on every sample, as a stdin reader is (review 1):
+        # only its fds tell them apart
+        r, w = os.pipe()
+        self.addCleanup(os.close, w)
+        kids = self.children({"pipe": self.py(f"import os; os.read({r}, 1)"),
+                              "stdin": self.py("import sys; sys.stdin.read()")},
+                             pass_fds={"pipe": (r,)})
+        os.close(r)
+        fds = REAL["open_fds"](sorted(k.pid for k in kids.values()))
+        said = {n: ccwho.procs.only_stdin_can_block(fds, k.pid) for n, k in kids.items()}
+        self.assertEqual(said, {"pipe": False, "stdin": True}, fds)
+
+    def test_a_real_busy_read_of_a_device_is_not_stuck(self):
+        # /dev/zero, and /dev/null read in a loop: their fds cannot wait for
+        # data, and the CPU each uses through the sample says it is working
+        # 16 MB a read: nearly every look finds the kernel's read, as a C
+        # program copying /dev/urandom does - only the CPU tells it from a wait
+        kids = self.children({
+            "zero": self.py("import os\nfd = os.open('/dev/zero', os.O_RDONLY)\n"
+                            "while True: os.read(fd, 1 << 24)"),
+            "null": self.py("f = open('/dev/null', 'rb')\nwhile True: f.read(1)")})
+        fds = REAL["open_fds"](sorted(k.pid for k in kids.values()))
+        self.assertTrue(all(ccwho.procs.only_stdin_can_block(fds, k.pid) for k in kids.values()), fds)
+        self.assertEqual({n: REAL["stack_sample"](k.pid) for n, k in kids.items()},
+                         {"zero": False, "null": False})
+
+    def test_a_real_busy_read_of_a_file_is_not_stuck(self):
+        folder = tempfile.mkdtemp(prefix="ccwho-test-readers-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        data = os.path.join(folder, "data")
+        with open(data, "wb") as fh:
+            fh.write(b"x" * (1 << 25))
+        # 32 MB a read, from the page cache: nearly every look finds the read
+        kids = self.children({"file": self.py(
+            f"import os\nfd = os.open({data!r}, os.O_RDONLY)\n"
+            "while True:\n os.lseek(fd, 0, 0); os.read(fd, 1 << 25)")})
+        fds = REAL["open_fds"]([kids["file"].pid])
+        self.assertTrue(ccwho.procs.only_stdin_can_block(fds, kids["file"].pid), fds)
+        self.assertIs(REAL["stack_sample"](kids["file"].pid), False)
+
+
+class TestKillAnyDeadReader(AnyReaderWorld, unittest.TestCase):
+    """`x` on any stuck reader stops its task, as for a cat - looked for again
+    first, with a new sample of only the pids asked for."""
+
+    def _kill(self, says=True, pids=None, extra=(), report=None, seen=None):
+        t = self.ptable()
+        t.update(dict(extra))
+        k = FakeKernel(t, shells={self.SHELL})
+        got = ccwho.kill_dead_loops(self.CLAUDE, list(pids or [self.PY]), ps=k.ps, kill=k.kill,
+                                    starts=k.starts, unix=self.unix(), fds=self.fds(),
+                                    stack=self.stack(seen, says=says),
+                                    started={self.PY: self.START}, report=report,
+                                    read=lambda path: None, matches=lambda a, f: False)
+        return got, k
+
+    def test_its_whole_task_is_stopped_parents_first(self):
+        got, k = self._kill()
+        self.assertEqual(got, [self.PY])
+        self.assertEqual([p for p, _ in k.sent], [self.SHELL, self.WRAP, self.PY])
+
+    def test_no_longer_reading_it_is_left_alone_and_said_so(self):          # control
+        report = {}
+        got, k = self._kill(says=False, report=report)
+        self.assertEqual((got, k.sent, report.get("unconfirmed")), ([], [], [self.PY]))
+
+    def test_only_the_asked_pid_is_sampled(self):
+        seen = []
+        self._kill(extra={99801: (self.SHELL, self.START, "python3 other.py")}, seen=seen)
+        self.assertEqual(seen, [self.PY])
+
+    def listed_then_killed(self, says=True, fds=None, seen=None):
+        """The list's cache after a scan found PY; what a kill then learned."""
+        listed, learned, report = {}, {}, {}
+        ccwho.find_dead_readers(self.CLAUDE, self.ptable(), unix=self.unix(), fds=self.fds(),
+                                stack=self.stack(), now=self.NOW, cache=listed)
+        k = FakeKernel(self.ptable(), shells={self.SHELL})
+        ccwho.kill_dead_loops(self.CLAUDE, [self.PY], ps=k.ps, kill=k.kill, starts=k.starts,
+                              unix=self.unix(), fds=fds or self.fds(),
+                              stack=self.stack(seen, says=says), started={self.PY: self.START},
+                              report=report, cache=learned, now=self.NOW + 30,
+                              read=lambda path: None, matches=lambda a, f: False)
+        return listed, learned, report
+
+    def later(self, listed):
+        return ccwho.find_dead_readers(self.CLAUDE, self.ptable(), unix=self.unix(),
+                                       fds=self.fds(), stack=lambda pid: self.fail("sampled"),
+                                       now=self.NOW + 60, cache=listed)
+
+    def test_what_the_kill_saw_reaches_the_lists_cache(self):
+        # the kill sampled again and saw no read: the list must not go on
+        # offering the kill for five minutes on its older yes (review 2). It is
+        # handed over, not written into the cache a scan may be walking (review 3)
+        seen = []
+        listed, learned, report = self.listed_then_killed(says=False, seen=seen)
+        self.assertEqual((seen, report.get("unconfirmed")), ([self.PY], [self.PY]),
+                         "the kill looks again, whatever the list's cache says")
+        self.assertTrue(learned.get("_verdicts_new"), "and it is to be kept")
+        ccwho.adopt_verdicts(listed, learned)
+        self.assertTrue(listed.get("_verdicts_new"))
+        self.assertEqual(self.later(listed), [])
+
+    def test_an_older_verdict_never_overwrites_a_newer_one(self):
+        # a scan sampled again after the kill did (review 4)
+        cache = {"_stacks": {"k": [True, 200.0]}}
+        ccwho.adopt_verdicts(cache, {"_stacks": {"k": [False, 100.0]}})
+        self.assertEqual(cache["_stacks"]["k"], [True, 200.0])
+        ccwho.adopt_verdicts(cache, {"_stacks": {"k": [False, 300.0]}})        # control
+        self.assertEqual(cache["_stacks"]["k"], [False, 300.0])
+
+    def test_an_unknown_from_the_kill_leaves_the_lists_yes(self):
+        # a sample or an lsof that fails at the kill is no "not reading" (review 3)
+        for case in ({"says": None}, {"fds": lambda pids: None}):
+            with self.subTest(case=list(case)):
+                listed, learned, _ = self.listed_then_killed(**case)
+                ccwho.adopt_verdicts(listed, learned)
+                self.assertEqual([d["pid"] for d in self.later(listed)], [self.PY])
+
+    def test_the_kills_no_reaches_the_file(self):
+        folder = tempfile.mkdtemp(prefix="ccwho-test-v-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "readers.json")
+        listed, learned, _ = self.listed_then_killed(says=False)
+        ccwho.adopt_verdicts(listed, learned)
+        ccwho.save_verdicts(listed, path=path)
+        on_disk = {}
+        ccwho.load_verdicts(on_disk, path=path)
+        key = ccwho._verdict_key(self.CLAUDE, self.PY, self.START, self.PYCMD)
+        self.assertIs(on_disk["_stacks"][key][0], False)
+
+    def test_every_reader_asked_about_is_sampled(self):
+        # a scan takes a few; a kill looks at each one it was asked about
+        more = {p: (self.SHELL, self.START, f"python3 job{p}.py") for p in (99801, 99802)}
+        seen = []
+        self._kill(pids=[self.PY, *more], extra=more, seen=seen)
+        self.assertEqual(sorted(seen), [self.PY, *more])
+
 
 class TestTaskFile(unittest.TestCase):
     """The two facts the dead-loop rule needs about a task output: how it ends,
@@ -6111,7 +6856,8 @@ class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
         ccwho.ps_snapshot = lambda: self.PS + (
             "  50    10 /bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'x'\n"
             "  51    50 cat\n")
-        ccwho.ps_table = lambda: {pid: (START, "claude" if pid == 10 else "node")
+        # ps -o comm is the executable: the row's name since review 1 of 2026-10-07
+        ccwho.ps_table = lambda: {pid: (START, {10: "claude", 51: "/bin/cat"}.get(pid, "node"))
                                   for pid in (10, 11, 12, 13, 20, 30, 40, 41, 50, 51)}
         ccwho.stdin_sockets = lambda pids: {10: {"16": ("0xa", "->0xb")},
                                            51: {"0": ("0xb", "->0xa")}}
@@ -6120,6 +6866,44 @@ class TestCollectKnowsWhatEachSessionStarted(MachinelessCollect):
                                                   "program": "cat", "root": 50,
                                                   "start": START}])
         self.assertEqual(rows[0]["attention"], "stuck")
+
+    def test_a_stack_proven_once_is_not_sampled_by_the_next_scan(self):
+        # ccwho ls is a new process each time: what one proved reaches the next
+        ccwho.ps_snapshot = lambda: self.PS + (
+            "  50    10 /bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'x'\n"
+            "  51    50 python3 job.py\n")
+        ccwho.ps_table = lambda: {pid: (START, "claude" if pid == 10 else "node")
+                                  for pid in (10, 11, 12, 13, 20, 30, 40, 41, 50, 51)}
+        ccwho.stdin_sockets = lambda pids: {10: {"16": ("0xa", "->0xb")},
+                                           51: {"0": ("0xb", "->0xa")}}
+        testkit.patch(self, ccwho, "open_fds", lambda pids: {51: {"0": ("u", "unix", "->0xa")}})
+        samples = []
+        testkit.patch(self, ccwho, "stack_sample", lambda pid: samples.append(pid) or True)
+        first, _ = ccwho.collect(cache={})
+        again, _ = ccwho.collect(cache={})
+        self.assertEqual([[d["pid"] for d in rows[0]["dead_loops"]] for rows in (first, again)],
+                         [[51], [51]])
+        self.assertEqual(samples, [51])
+
+    def test_the_file_is_read_once_for_a_cache(self):
+        # the list's cache knows more than the file: a "no" a kill handed to it
+        # is the newest word, and reading the file again would undo it (review 4)
+        ccwho.ps_snapshot = lambda: self.PS + (
+            "  50    10 /bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'x'\n"
+            "  51    50 python3 job.py\n")
+        ccwho.ps_table = lambda: {pid: (START, "claude" if pid == 10 else "node")
+                                  for pid in (10, 11, 12, 13, 20, 30, 40, 41, 50, 51)}
+        ccwho.stdin_sockets = lambda pids: {10: {"16": ("0xa", "->0xb")},
+                                           51: {"0": ("0xb", "->0xa")}}
+        testkit.patch(self, ccwho, "open_fds", lambda pids: {51: {"0": ("u", "unix", "->0xa")}})
+        testkit.patch(self, ccwho, "stack_sample", lambda pid: True)
+        cache = {}
+        ccwho.collect(cache=cache)                     # found, and kept in the file as a yes
+        key = ccwho._verdict_key(10, 51, START, "python3 job.py")
+        cache["_stacks"][key] = [False, time.time()]   # what a kill then saw
+        testkit.patch(self, ccwho, "stack_sample", lambda pid: self.fail("sampled"))
+        rows, _ = ccwho.collect(cache=cache)
+        self.assertEqual((rows[0]["dead_loops"], cache["_stacks"][key][0]), ([], False))
 
     def test_a_reader_on_a_pipe_leaves_the_row_alone(self):                # control
         ccwho.ps_snapshot = lambda: self.PS + "  50    10 /bin/zsh -c x\n  51    50 cat\n"
@@ -8604,6 +9388,71 @@ class TestATableFromAPsThatFailedIsNone(unittest.TestCase):
 
     def test_a_clean_exit(self):                                                # control
         self.assertEqual(self.run_ps(0, "  PID UID UCOMM\n1 0 launchd\n"), "  PID UID UCOMM\n1 0 launchd\n")
+
+
+class TestCollectSamplesAFewAScan(MachinelessCollect):
+    """STACK_PER_SCAN is one scan's - every session's together - not each
+    session's: a sample takes about 1.5 s, and a fleet has many sessions
+    (review 1). No session waits for ever: what was sampled is not due."""
+    OTHER = "bbbb2222-0000-4000-8000-000000000002"
+    PS = ("  10     1 claude\n  60     1 claude\n"
+          "  50    10 /bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'x'\n"
+          "  51    50 python3 a.py\n  52    50 python3 b.py\n  53    50 python3 e.py\n"
+          "  80    60 /bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'y'\n"
+          "  81    80 python3 c.py\n  82    80 python3 d.py\n")
+    LEAVES = [51, 52, 53, 81, 82]       # one session with more than a scan's samples
+
+    def setUp(self):
+        super().setUp()
+        sessions = [{"pid": 10, "sessionId": LIVE, "cwd": "/Users/x/p/app", "status": "idle"},
+                    {"pid": 60, "sessionId": self.OTHER, "cwd": "/Users/x/p/lib", "status": "idle"}]
+        testkit.patch(self, ccwho, "agents_json", lambda: json.dumps(sessions))
+        testkit.patch(self, ccwho, "read_procargs", lambda pid: {})
+        ccwho.ps_snapshot = lambda: self.PS
+        ccwho.ps_table = lambda: {pid: (START, "claude" if pid in (10, 60) else "python3")
+                                  for pid in (10, 60, 50, 80, *self.LEAVES)}
+        ccwho.stdin_sockets = lambda pids: {
+            10: {"16": ("0xa", "->0xb")}, 60: {"16": ("0xc", "->0xd")},
+            51: {"0": ("0xb", "->0xa")}, 52: {"0": ("0xb", "->0xa")}, 53: {"0": ("0xb", "->0xa")},
+            81: {"0": ("0xd", "->0xc")}, 82: {"0": ("0xd", "->0xc")}}
+        out = ("w", "REG", "/x/task.output")
+        testkit.patch(self, ccwho, "open_fds", lambda pids: {
+            p: {"0": ("u", "unix", "->x"), "1": out, "2": out} for p in pids})
+        self.samples = []
+        testkit.patch(self, ccwho, "stack_sample", lambda pid: self.samples.append(pid) or True)
+
+    def scans(self, cache):
+        found = []
+        for _ in range(3):
+            n = len(self.samples)
+            rows, _ = ccwho.collect(cache=cache() if callable(cache) else cache)
+            self.assertLessEqual(len(self.samples) - n, ccwho.STACK_PER_SCAN)
+            found = sorted(d["pid"] for r in rows for d in r["dead_loops"])
+        self.assertEqual((sorted(self.samples), found), (self.LEAVES, self.LEAVES))
+
+    def test_the_list_samples_a_few_a_scan(self):
+        self.scans({})                  # one cache for every scan, as the list keeps
+
+    def test_ccwho_ls_samples_a_few_a_run(self):
+        self.scans(dict)                # a new cache each run: the file carries on
+
+    def test_a_scan_that_shows_no_stuck_work_takes_no_sample(self):
+        # ccwho save, open, restore: no row of theirs shows a stuck item (review 2)
+        listed = []
+        ccwho.open_fds = lambda pids: listed.append(pids) or {}
+        ccwho.collect(cache={}, samples=0)
+        self.assertEqual((self.samples, listed), ([], []))
+
+    def test_the_row_names_the_executable(self):
+        # ps -o comm (argv[0], spaces and all): the command's first word is
+        # "/Users/x/Application"
+        app = "/Users/x/Application Support/bin/python3"
+        ccwho.ps_snapshot = lambda: self.PS.replace("51    50 python3 a.py", f"51    50 {app} a.py")
+        table = ccwho.ps_table()
+        ccwho.ps_table = lambda: {**table, 51: (START, app)}
+        rows, _ = ccwho.collect(cache={})
+        named = {d["pid"]: d["program"] for r in rows for d in r["dead_loops"]}
+        self.assertEqual(named.get(51), "python3", named)
 
 
 class TestNoPsReaderTrustsAPsThatFailed(unittest.TestCase):

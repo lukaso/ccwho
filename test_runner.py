@@ -404,7 +404,7 @@ class TestSaveAndRestore(unittest.TestCase):
         d = runner.restore_dir()
         path = os.path.join(d, os.listdir(d)[0])
 
-        def no_rows(cache=None, status=None):
+        def no_rows(cache=None, status=None, samples=None):
             if status is not None:
                 status["source_ok"] = True
             return ([], 0)
@@ -3437,7 +3437,7 @@ class TestTheSaveAsksNoSessionApp(unittest.TestCase):
     def test_its_scan_asks_no_session_app(self):
         seen = []
 
-        def scan(cache=None, status=None, eng=None, session_apps=True):
+        def scan(cache=None, status=None, eng=None, session_apps=True, **kw):
             seen.append(session_apps)
             return [], {}
         testkit.patch(self, runner, "scan", scan)
@@ -3445,6 +3445,62 @@ class TestTheSaveAsksNoSessionApp(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             runner.save([])
         self.assertEqual(seen, [False])
+
+class TestOnlyScansThatShowStuckWorkSample(unittest.TestCase):
+    """A sample of a possible stuck reader takes about 1.5 s and stops the
+    process at each look. Only a scan whose rows show stuck work may take one:
+    ls and show. save (the launchd job, every 15 minutes), open, restore,
+    stop's check (review 2) and ps - which prints no row's state (review 3) -
+    take none."""
+    SAMPLING = {"ls", "show"}
+
+    def test_the_save_takes_no_sample(self):
+        seen = []
+
+        def scan(cache=None, status=None, eng=None, session_apps=True, samples=None):
+            seen.append(samples)
+            return [], {}
+        testkit.patch(self, runner, "scan", scan)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            runner.save([])
+        self.assertEqual(seen, [0])
+
+    def test_every_scan_but_ls_and_show_takes_none(self):
+        import ast
+        here = os.path.dirname(os.path.abspath(__file__))
+        tree = ast.parse(open(os.path.join(here, "ccwho.py")).read())
+        calls = {}
+        for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "scan"):
+                    kw = {k.arg: k.value for k in node.keywords}
+                    calls.setdefault(fn.name, []).append(
+                        getattr(kw.get("samples"), "value", "default") if "samples" in kw
+                        else "default")
+        self.assertTrue(self.SAMPLING <= set(calls), calls)                       # control
+        self.assertTrue({"save", "open_session", "restore", "_live_rows", "ps"} <= set(calls), calls)
+        for fn, said in sorted(calls.items()):
+            with self.subTest(fn=fn):
+                self.assertEqual(set(said), {"default"} if fn in self.SAMPLING else {0})
+
+    def test_the_scan_hands_the_budget_on(self):
+        got = []
+
+        class Eng:
+            @staticmethod
+            def collect(cache=None, status=None, **kw):
+                got.append(kw)
+                return [], {}
+
+            @staticmethod
+            def live_ids(rows):
+                return set()
+        runner.scan(cache={}, eng=Eng, samples=0)
+        runner.scan(cache={}, eng=Eng)
+        # an engine of before (or a stand-in) is not handed a word it does not know
+        self.assertEqual(got, [{"samples": 0}, {}])
+
 
 class TestADamagedIdLeavesOpenToTheRest(unittest.TestCase):
     """`ccwho open <id>` - the command restore prints - reads every save: one
@@ -5416,7 +5472,7 @@ class TestOpenGivesABackgroundSessionAWindow(unittest.TestCase):
         self.real_collect = runner.engine.collect
         runner.subprocess.run = lambda cmd, *a, **k: self.ran.append(cmd) or type(
             "D", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             status.update({"source_ok": True}) or
             ([{"sessionId": self.SID, "tty": "", "pid": 42,
                "kind": "background"}], 0))
@@ -5599,7 +5655,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
                  "codex": [{"pid": 30, "ports": [60805], "helper": False,
                             "command": "workerd serve", "orphan": True,
                             "harness": "codex", "session": "01a0abc8"}]}
-        runner.engine.collect = lambda cache=None, status=None: ([row], fleet)
+        runner.engine.collect = lambda cache=None, status=None, samples=None: ([row], fleet)
         self.addCleanup(setattr, runner.engine, "collect", self.real)
 
     def run_ps(self, *args):
@@ -5621,7 +5677,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
                      codex_threads=[{"thread": thread, "cwd": "/Users/x/projects/liveapp",
                                      "name": "Refactor the session index parser for speed",
                                      "source": "vscode"}])
-        runner.engine.collect = lambda cache=None, status=None: (_rows, fleet)
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (_rows, fleet)
         rc, out, _ = self.run_ps()
         self.assertEqual(rc, 0)
         line = next(l for l in out.splitlines() if l.startswith("30 "))
@@ -5686,7 +5742,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
     def test_unknown_processes_are_not_no_processes(self):
         fleet = dict(runner.engine.collect()[1], procs_ok=False, by_session={},
                      left_behind=[], codex=[])
-        runner.engine.collect = lambda cache=None, status=None: ([], fleet)
+        runner.engine.collect = lambda cache=None, status=None, samples=None: ([], fleet)
         rc, out, err = self.run_ps()
         self.assertEqual(rc, 4)
         self.assertIn("unknown", err)
@@ -5695,7 +5751,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
     def test_a_port_question_with_ports_unknown_has_its_own_answer(self):
         # adversarial #4: exit 1 means "nobody holds it"; unknown is not that
         row, fleet = runner.engine.collect()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, ports_ok=False))
         rc, out, err = self.run_ps("--port", "3000")
         self.assertEqual(rc, 4)
@@ -5703,12 +5759,12 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
 
     def test_ports_unknown_shows_a_question_mark(self):
         row, fleet = runner.engine.collect()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, ports_ok=False))
         _, out, _ = self.run_ps()
         line = [l for l in out.splitlines() if l.startswith("11 ")][0]
         self.assertEqual(line.split()[1], "?")
-        runner.engine.collect = lambda cache=None, status=None: (row, fleet)
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (row, fleet)
         _, out, _ = self.run_ps()
         self.assertEqual([l for l in out.splitlines() if l.startswith("11 ")][0]
                          .split()[1], ":5173")
@@ -5718,7 +5774,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         unsure = [{"pid": 50, "ports": [], "helper": False, "command": "vite",
                    "orphan": True, "harness": "claude", "session": "dddd",
                    "why": "the session list is incomplete"}]
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, unsure=unsure))
         _, out, _ = self.run_ps("--json")
         got = {p["pid"]: p["group"] for p in json.loads(out)}
@@ -5731,7 +5787,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
     def test_processes_unknown_has_the_unknown_exit(self):
         # cycle 3 #7: 1 means "no agent holds it"; a script starts a server on 1
         row, fleet = runner.engine.collect()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, procs_ok=False))
         for args in ((), ("--port", "3000")):
             with self.subTest(args=args):
@@ -5739,7 +5795,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
 
     def test_a_port_held_by_an_unreadable_process_is_unknown(self):
         row, fleet = runner.engine.collect()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, unknown_ports=[8080]))
         rc, _, err = self.run_ps("--port", "8080")
         self.assertEqual(rc, 4)
@@ -5750,7 +5806,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         # macOS hides ControlCenter's environment: who started it is not known,
         # but a person reads "AirPlay" in the name at once
         row, fleet = runner.engine.collect()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, unknown_ports=[5000],
                       unknown_holders={5000: [{"pid": 1190, "name": "ControlCenter"}]}))
         rc, _, err = self.run_ps("--port", "5000")
@@ -5759,7 +5815,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
 
     def test_an_unreadable_holders_name_cannot_repaint_the_terminal(self):
         row, fleet = runner.engine.collect()
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, unknown_ports=[5000],
                       unknown_holders={5000: [{"pid": 7, "name": "x\x1b[2Jy"}]}))
         _, _, err = self.run_ps("--port", "5000")
@@ -5779,7 +5835,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         lb = fleet["left_behind"] + [{"pid": 21, "ports": [], "helper": True,
                                       "command": "npx some-mcp", "orphan": True,
                                       "harness": "claude", "session": "dddd"}]
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (
             row, dict(fleet, left_behind=lb))
         _, out, _ = self.run_ps()
         self.assertIn("some-mcp", out)
@@ -5795,7 +5851,7 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
     def test_json_says_when_ports_are_unknown(self):
         row, fleet = runner.engine.collect()
         fleet = dict(fleet, ports_ok=False)
-        runner.engine.collect = lambda cache=None, status=None: (row, fleet)
+        runner.engine.collect = lambda cache=None, status=None, samples=None: (row, fleet)
         _, out, _ = self.run_ps("--json")
         self.assertTrue(all(p["ports"] is None for p in json.loads(out)))
 
@@ -7132,7 +7188,7 @@ class TestAJumpGoesToTheAppThatShowsIt(unittest.TestCase):
         real_scan, real_run = runner.scan, runner.subprocess.run
         self.addCleanup(setattr, runner, "scan", real_scan)
         self.addCleanup(setattr, runner.subprocess, "run", real_run)
-        runner.scan = lambda cache=None, status=None, eng=None: ([row], {})
+        runner.scan = lambda cache=None, status=None, eng=None, samples=None: ([row], {})
         self.calls = []
         runner.subprocess.run = lambda argv, **k: self.calls.append(argv) or subprocess.CompletedProcess(
             argv, 0, stdout=answer or f"focused {argv[-1]}\n", stderr="")
@@ -8400,7 +8456,7 @@ class TestASightingIsTakenBeforeTheScan(unittest.TestCase):
         self.addCleanup(setattr, runner.engine.terms, "app_snapshot", GUARDS["app_snapshot"])
         calls = []
 
-        def slow_collect(cache=None, status=None):
+        def slow_collect(cache=None, status=None, samples=None):
             # seen by the first scan only: a later one (jump's) starts after
             # the claim, and lets go of it rightly if it sees the session
             rows = [] if calls else [{"sessionId": self.SID, "tty": "ttys032", "pid": 90266,
@@ -9747,7 +9803,7 @@ class TestDecidedAtIsTheScanStart(unittest.TestCase):
     def setUp(self):
         self._F.setUp(self)
 
-        def slow_read(cache=None, status=None):
+        def slow_read(cache=None, status=None, samples=None):
             # our read said not running; meanwhile another ccwho launched it
             # and a scan that started after ours saw it
             time.sleep(0.01)
@@ -10121,7 +10177,7 @@ class TestADecisionTooOldIsSaidAsOne(unittest.TestCase):
     setUp, tearDown, write_manifest, _restore_open = _F.setUp, _F.tearDown, _F.write_manifest, _F._restore_open
 
     def test_restore(self):
-        def slept(cache=None, status=None):
+        def slept(cache=None, status=None, samples=None):
             status["source_ok"] = True
             status["seen_at"] = time.time() - runner.SIGHTING_SECONDS - 60
             status["seen_mono"] = runner._mono() - runner.SIGHTING_SECONDS - 60
@@ -10299,7 +10355,7 @@ class TestARestoreThatTurnsStaleLetsGoOfWhatItClaimed(unittest.TestCase):
     def test_the_first_one_claimed_is_let_go(self):
         seen = {}
 
-        def collect(cache=None, status=None):
+        def collect(cache=None, status=None, samples=None):
             seen["status"] = status
             status["source_ok"] = True
             return [], 0
@@ -10478,7 +10534,7 @@ class TestOpenSaysItsListIsTooOld(unittest.TestCase):
     setUp, tearDown, write_manifest = _F.setUp, _F.tearDown, _F.write_manifest
 
     def test_open(self):
-        def slept(cache=None, status=None):
+        def slept(cache=None, status=None, samples=None):
             status["source_ok"] = True
             status["seen_at"] = time.time() - runner.SIGHTING_SECONDS - 60
             status["seen_mono"] = runner._mono() - runner.SIGHTING_SECONDS - 60
@@ -10699,7 +10755,7 @@ class TestAnOldCutOffLaunchAgainstAnOlderListIsNotStarting(unittest.TestCase):
             runner._write_claim(sid, {"pid": DEAD, "owner": "x", "since": time.time() - 100,
                                       "sessionId": sid, "launched": True, "cut_off": True})
 
-        def older_list(cache=None, status=None):
+        def older_list(cache=None, status=None, samples=None):
             status["source_ok"] = True
             status["seen_at"] = time.time() - 120
             status["seen_mono"] = runner._mono() - 120
@@ -10822,7 +10878,7 @@ class TestASessionLaunchedSinceTheListLeavesTheRestAlone(unittest.TestCase):
     _script = _F._script
 
     def test_one_launched_during_the_scan(self):
-        def scan(cache=None, status=None):
+        def scan(cache=None, status=None, samples=None):
             status["source_ok"] = True
             runner._write_claim(self.DEAD_SID, {"pid": DEAD, "owner": "x", "since": time.time() + 1,
                                                 "sessionId": self.DEAD_SID, "launched": True})
@@ -11033,7 +11089,7 @@ class TestTheListCountsASessionThatChanged(unittest.TestCase):
     setUp, tearDown, write_manifest = _F.setUp, _F.tearDown, _F.write_manifest
 
     def test_one_launched_during_the_scan(self):
-        def scan(cache=None, status=None):
+        def scan(cache=None, status=None, samples=None):
             status["source_ok"] = True
             runner._write_claim(self.DEAD_SID, {"pid": DEAD, "owner": "x", "since": time.time() + 1,
                                                 "sessionId": self.DEAD_SID, "launched": True})
@@ -11399,7 +11455,7 @@ class TestMoreHeldSessionsSaidRight(unittest.TestCase):
     setUp, tearDown, write_manifest, _restore_open = _F.setUp, _F.tearDown, _F.write_manifest, _F._restore_open
 
     def test_open_after_a_newer_sighting(self):
-        def scan(cache=None, status=None):
+        def scan(cache=None, status=None, samples=None):
             status["source_ok"] = True
             t = time.time() + 1
             runner._write_claim(self.DEAD_SID, {"sessionId": self.DEAD_SID, "seen": True, "since": t, "until": t})
@@ -11414,7 +11470,7 @@ class TestMoreHeldSessionsSaidRight(unittest.TestCase):
         self.assertIn("run it again", text)
 
     def changed_during_the_scan(self, rows):
-        def scan(cache=None, status=None):
+        def scan(cache=None, status=None, samples=None):
             status["source_ok"] = True
             runner._write_claim(self.DEAD_SID, {"pid": DEAD, "owner": "x", "since": time.time() + 1,
                                                 "sessionId": self.DEAD_SID, "launched": True})
@@ -13087,7 +13143,7 @@ class TestTheScansClocksReachTheJudgement(TheClocks, unittest.TestCase):
     def setUp(self):
         self._F.setUp(self)
 
-        def stepped_scan(cache=None, status=None):
+        def stepped_scan(cache=None, status=None, samples=None):
             status["seen_at"] += 20                      # stamped by a clock 20 s fast
             time.sleep(0.01)
             runner.release_claims([self.SID], time.time(), runner._mono())   # another scan sees it
@@ -13125,7 +13181,7 @@ class TestTheRestoresScanReachesTheJudgement(TheClocks, unittest.TestCase):
         self._F.setUp(self)
         self.write_manifest([{"sessionId": self.DEAD_SID, "cwd": self.cwd("b"), "project": "b"}])
 
-        def stepped_scan(cache=None, status=None):
+        def stepped_scan(cache=None, status=None, samples=None):
             status["seen_at"] += 20
             time.sleep(0.01)
             runner.release_claims([self.DEAD_SID], time.time(), runner._mono())

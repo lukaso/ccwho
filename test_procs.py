@@ -3,6 +3,7 @@
 Every input is built here, byte for byte where it matters, so nothing depends on
 what this machine is running. The fake token below must never come back out.
 """
+import re
 import struct
 import unittest
 
@@ -1225,6 +1226,227 @@ class TestStdinFromClaude(unittest.TestCase):
     def test_another_fd_on_that_socket_is_not_stdin(self):               # control
         unix = procs.parse_lsof_unix(self.LSOF.replace("p43074\nf0\n", "p43074\nf3\n"))
         self.assertFalse(procs.stdin_from(unix, 43074, 83454))
+
+
+def sample_report(*tops, threads=None,
+                  header="Analysis of sampling python3.13 (pid 99740) every 10 milliseconds"):
+    """`sample PID 1 10 -mayDie -file /dev/stdout`, cut to what is read: each
+    thread's samples in the call graph (`    N Thread_..`), and the "Sort by top
+    of stack" section, one `name  (in library)  count` per line. One thread
+    with every sample, unless `threads` says otherwise."""
+    if threads is None:
+        threads = [sum(n for _name, _lib, n in tops)] if tops else []
+    lines = [header, "Call graph:"]
+    for i, n in enumerate(threads):
+        lines += [f"    {n} Thread_{175588389 + i}" + ("   DispatchQueue_1: com.apple.main-thread"
+                                                      "  (serial)" if i == 0 else ""),
+                  f"      {n} start  (in dyld) + 6688  [0x18940be80]"]
+    lines += ["", "Total number in stack (recursive counted multiple, when >=5):", "",
+              "Sort by top of stack, same collapsed (when >= 5):"]
+    lines += [f"        {name}  (in {lib})        {n}" for name, lib, n in tops]
+    return "\n".join(lines + ["", "Binary Images:", "   0x1 - 0x2 +python3.13 (0) <X> /p", ""])
+
+
+class TestStackReads(unittest.TestCase):
+    """Is every thread of a process blocked in read()? From a `sample` of it.
+    On 2026-10-07 a python3 in a heredoc command read its stdin - Claude Code's
+    socket - for 5.5 hours; ccwho knew only cat, tr, cut, head, tail, wc, sort
+    and uniq as readers. The tops below are the ones measured that day."""
+
+    KERNEL = "libsystem_kernel.dylib"
+
+    def test_a_process_blocked_in_read_reads(self):
+        # the stuck python3, and /bin/cat with no input
+        self.assertTrue(procs.stack_reads(sample_report(("read", self.KERNEL, 893))))
+        self.assertTrue(procs.stack_reads(sample_report(("__read_nocancel", self.KERNEL, 90))))
+
+    def test_a_sleeping_process_does_not(self):                          # control
+        self.assertFalse(procs.stack_reads(sample_report(("__semwait_signal", self.KERNEL, 885))))
+
+    def test_one_thread_doing_anything_else_is_not_blocked(self):        # control
+        # safe-chain, waiting on its python3 child: 7 threads of 879 samples
+        self.assertFalse(procs.stack_reads(sample_report(
+            ("__psynch_cvwait", self.KERNEL, 3516), ("kevent", self.KERNEL, 1758),
+            ("read", self.KERNEL, 879), threads=[879] * 7)))
+
+    def test_a_thread_the_section_leaves_out_is_unknown(self):
+        # the section lists only tops seen 5 times or more: a second thread busy
+        # in many small functions shows none of them (review 2, a C program).
+        # Every sample of every thread must be in it
+        self.assertIsNone(procs.stack_reads(sample_report(("read", self.KERNEL, 88),
+                                                          threads=[88, 88])))
+        self.assertTrue(procs.stack_reads(sample_report(("read", self.KERNEL, 176),
+                                                        threads=[88, 88])))       # control
+
+    def test_no_threads_in_the_call_graph_is_unknown(self):
+        text = sample_report(("read", self.KERNEL, 893)).replace(
+            "    893 Thread_175588389", "    893 Fiber_175588389")
+        self.assertIsNone(procs.stack_reads(text))
+
+    def test_only_the_kernels_read_counts(self):                         # control
+        # a program's own function named read, or a name that ends in "read"
+        self.assertFalse(procs.stack_reads(sample_report(("read", "libpython3.13.dylib", 90))))
+        self.assertFalse(procs.stack_reads(sample_report(
+            ("start_wqthread", "libsystem_pthread.dylib", 90))))
+        self.assertFalse(procs.stack_reads(sample_report(("pread", self.KERNEL, 90))))
+
+    def test_a_line_out_of_place_is_unknown(self):
+        # a sample whose report reads otherwise is not judged by half of it
+        text = sample_report(("read", self.KERNEL, 893)).replace(
+            "        read  (in", "        ???\n        read  (in")
+        self.assertIsNone(procs.stack_reads(text))
+
+    def test_no_report_is_unknown(self):
+        # sample failed (no such process, not permitted, timed out): never "no"
+        for text in (None, "", "sample[1]: sample cannot examine process 99999991",
+                     sample_report().replace("Sort by top of stack", "Sorted otherwise"),
+                     sample_report()):
+            with self.subTest(text=(text or "")[:40]):
+                self.assertIsNone(procs.stack_reads(text))
+
+
+class TestOnlyStdinCanBlock(unittest.TestCase):
+    """A read is on fd 0 when fd 0 is the only fd it could be on: fds 1 and 2
+    are output, and every other fd is open for writing only. Not "a file
+    cannot block": a busy read of a file or /dev/zero sits in the same kernel
+    read, and Apple's lsof gives a pipe no access mode at all (review 1)."""
+
+    # `lsof -nP -a -p PID -F pfatn` of a python3 reading a socket, as measured
+    # on 2026-10-07 (paths shortened)
+    LSOF = ("p99206\nfcwd\na \ntDIR\nn/Users/u/projects/x\n"
+            "ftxt\na \ntREG\nn/Users/u/.pyenv/versions/3.13.5/bin/python3.13\n"
+            "ftxt\na \ntREG\nn/usr/lib/dyld\n"
+            "f0\nau\ntunix\nn->0x6d81ea688f3fab28\n"
+            "f1\naw\ntREG\nn/Users/u/reader.pid\n"
+            "f2\naw\ntREG\nn/private/tmp/claude-501/x/tasks/bfutp3vwh.output\n")
+
+    def fds(self, extra=""):
+        return procs.parse_lsof_fds(self.LSOF + extra)
+
+    def test_the_measured_reader_can_block_only_on_stdin(self):
+        self.assertTrue(procs.only_stdin_can_block(self.fds(), 99206))
+
+    def test_a_write_only_fd_is_not_read(self):
+        # a log the program appends to; a tty it only writes to
+        for extra in ("f3\naw\ntREG\nn/Users/u/job.log\n", "f3\naw\ntCHR\nn/dev/ttys003\n"):
+            with self.subTest(extra=extra):
+                self.assertTrue(procs.only_stdin_can_block(self.fds(extra), 99206))
+
+    def test_fds_1_and_2_are_output_whatever_they_are(self):
+        # `python3 x.py | tee`: fd 1 a pipe, which Apple's lsof gives no access
+        # mode. Taken as written, never read - a program reading its own fd 1 or
+        # 2 is not judged by this rule (an assumption, stated here)
+        for one, two in (("f1\na \ntPIPE\nn->0x5\n", "f2\na \ntPIPE\nn->0x5\n"),
+                         ("f1\nau\ntREG\nn/x.out\n", "f2\nau\ntCHR\nn/dev/ttys003\n")):
+            with self.subTest(one=one, two=two):
+                lsof = re.sub(r"f1\naw\ntREG\nn[^\n]*\nf2\naw\ntREG\nn[^\n]*\n", lambda m: one + two,
+                              self.LSOF)
+                self.assertNotEqual(lsof, self.LSOF)
+                self.assertTrue(procs.only_stdin_can_block(procs.parse_lsof_fds(lsof), 99206))
+
+    def test_a_file_a_folder_or_an_answering_device_waits_for_no_data(self):
+        # zsh always holds /dev/null on fd 10, bash its script on fd 255 (review
+        # 3): a read of such an fd returns or loops - never waits. A loop uses
+        # CPU, and the sample's CPU check (stack_sample) tells it from a wait
+        for extra in ("f10\nar\ntCHR\nn/dev/null\n", "f255\nar\ntREG\nn/Users/u/ask.sh\n",
+                      "f3\nar\ntCHR\nn/dev/zero\n", "f3\nau\ntCHR\nn/dev/urandom\n",
+                      "f3\nar\ntDIR\nn/Users/u\n", "f12\nar\ntREG\nn/x\n"):
+            with self.subTest(extra=extra):
+                self.assertTrue(procs.only_stdin_can_block(self.fds(extra), 99206))
+
+    def test_anything_that_waits_for_data_could_be_the_read(self):       # control
+        # as Apple's lsof 4.91 prints them: a pipe has no access mode (the
+        # `diff <(..) <(..)` of review 1)
+        for extra in ("f3\na \ntPIPE\nn->0x1\n", "f3\nau\ntunix\nn->0x2\n",
+                      "f3\nau\ntIPv4\nn127.0.0.1:5432\n", "f3\nau\ntCHR\nn/dev/ttys003\n",
+                      "f3\nau\ntKQUEUE\nncount=0\n", "f3\nar\ntFIFO\nn/tmp/fifo\n",
+                      "f3\na \ntsystm\nn\n", "f3\nar\ntCHR\nn/dev/null-but-not\n"):
+            with self.subTest(extra=extra):
+                self.assertFalse(procs.only_stdin_can_block(self.fds(extra), 99206))
+
+    def test_stdin_must_still_be_a_socket(self):
+        # moved after its proof (dup2, exec 0<fifo): a read that can return
+        for fd0 in ("f0\nar\ntFIFO\nn/tmp/fifo\n", "f0\nau\ntCHR\nn/dev/ttys003\n",
+                    "f0\nar\ntREG\nn/x\n"):
+            with self.subTest(fd0=fd0):
+                fds = procs.parse_lsof_fds(self.LSOF.replace(
+                    "f0\nau\ntunix\nn->0x6d81ea688f3fab28\n", fd0))
+                self.assertFalse(procs.only_stdin_can_block(fds, 99206))
+
+    def test_stdin_not_open_for_reading_is_not_read(self):               # control
+        fds = procs.parse_lsof_fds(self.LSOF.replace("f0\nau\n", "f0\naw\n"))
+        self.assertFalse(procs.only_stdin_can_block(fds, 99206))
+
+    def test_unknown_is_no(self):                                        # control
+        self.assertFalse(procs.only_stdin_can_block(self.fds(), 4242))
+        self.assertFalse(procs.only_stdin_can_block(None, 99206))
+        self.assertFalse(procs.only_stdin_can_block(
+            procs.parse_lsof_fds(self.LSOF.replace("f0\nau\ntunix\nn->0x6d81ea688f3fab28\n", "")),
+            99206))
+
+    def test_the_lsof_fields_are_read(self):
+        got = procs.parse_lsof_fds(self.LSOF)
+        self.assertEqual(got[99206]["0"], ("u", "unix", "->0x6d81ea688f3fab28"))
+        self.assertEqual(got[99206]["1"], ("w", "REG", "/Users/u/reader.pid"))
+        self.assertEqual(procs.parse_lsof_fds(""), {})
+
+    def test_a_line_out_of_place_is_unknown(self):
+        for bad in ("f0\nau\n", "p12\nau\n", "px\nf0\n", "p12\nf0\nzjunk\n"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(procs.parse_lsof_fds(bad))
+
+
+class TestCpuTime(unittest.TestCase):
+    """`ps -o time=`, the CPU a process has used: [[dd-]hh:]mm:ss.ss."""
+
+    def test_the_shapes_ps_prints(self):
+        for text, secs in (("0:00.00", 0.0), ("7:18.05", 438.05), ("1:02:03", 3723.0),
+                           ("2-01:00:00", 176400.0), ("  0:00.02\n", 0.02)):
+            with self.subTest(text=text):
+                self.assertAlmostEqual(procs.parse_cpu_time(text), secs)
+
+    def test_anything_else_is_unknown(self):                            # control
+        for text in ("", None, "-", "x:00.00", "0:00.00 0:01.00", "1:2:3:4"):
+            with self.subTest(text=text):
+                self.assertIsNone(procs.parse_cpu_time(text))
+
+
+class TestZombie(unittest.TestCase):
+    """An exited child nobody reaped: macOS 27's ps prints `<defunct>` for one
+    left that way (review 5), `(name)` for one that has only just exited."""
+
+    def test_both_forms(self):
+        for cmd in ("<defunct>", "(sleep)", "(grep)"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(procs._ZOMBIE.match(cmd))
+
+    def test_a_live_process_is_none(self):                              # control
+        for cmd in ("sleep 100", "python3 <defunct>", "<defunct> x", "(a) b", ""):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(procs._ZOMBIE.match(cmd))
+
+
+class TestReaderName(unittest.TestCase):
+    """The name a stuck reader's row prints: the executable's base name, from
+    `ps -o comm` (spaces and all) when there is one, else the command's first
+    word - ps prints no quotes. A short plain word, else "a program"."""
+
+    def test_from_the_executable(self):
+        app = "/Users/u/Library/Application Support/x/bin/python3"
+        self.assertEqual(procs.reader_name(app + " job.py", app), "python3")
+
+    def test_from_the_command(self):
+        for cmd, said in (("grep -r it's .", "grep"), ("/opt/x/node-20 job.js", "node-20"),
+                          ("python3", "python3"), ("cat", "cat")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(procs.reader_name(cmd), said)
+
+    def test_never_free_text(self):                                     # control
+        for cmd, comm in (("/tmp/\x1b]0;evil\x07 job", None), ("/tmp/" + "n" * 40, None),
+                          ("", None), (None, None), ("x", "/Applications/Two Words"),
+                          ("x", "/tmp/caf\u00e9")):
+            with self.subTest(cmd=cmd, comm=comm):
+                self.assertEqual(procs.reader_name(cmd, comm), "a program")
 
 
 class TestHelpers(unittest.TestCase):

@@ -755,7 +755,7 @@ class TestASession(unittest.TestCase):
 
     def test_a_feed_not_read_is_not_no_match(self):
         real = engine.collect
-        def collect(cache=None, status=None):
+        def collect(cache=None, status=None, **kw):
             status["source_ok"] = False
             return [], []
         engine.collect = collect
@@ -764,7 +764,9 @@ class TestASession(unittest.TestCase):
         c.read_rows = runner._live_rows
         rc, out = c.run("liveapp")
         self.assertEqual(rc, 4, "could not tell")
-        self.assertIn("could not be read", out)
+        # the feed's own answer, not a fake that could not take the scan's words
+        # (review 3: a TypeError said "could not be read" too)
+        self.assertIn("could not be read (LookupError)", out)
         self.assertNotIn("no live session matches", out)
 
     def test_a_pid_is_never_a_session(self):                           # control

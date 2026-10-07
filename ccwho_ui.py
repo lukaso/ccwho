@@ -28,6 +28,7 @@ problem this tool exists to solve.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -2433,6 +2434,8 @@ class Collector:
 
     def __init__(self):
         self.cache = {}
+        # what a kill learned, for the scan thread to adopt (engine.adopt_verdicts)
+        self.learned, self.learned_lock = [], threading.Lock()
         self.last = 0.0
         self.reload_error = ""
         self.digest = None      # what the files said at the last look
@@ -2494,6 +2497,13 @@ class Collector:
         except Exception:                            # never the reason it goes down
             seen_mono = None
         status, seen_at = {}, time.time()
+        with self.learned_lock:
+            learned, self.learned = self.learned, []
+        for each in learned:
+            try:
+                engine.adopt_verdicts(self.cache, each)
+            except Exception:            # an engine of before: what it learned is lost
+                pass
         try:
             rows, procs = engine.collect(cache=self.cache, status=status)
         except Exception as ex:                      # never kill the screen
@@ -2651,9 +2661,20 @@ class Collector:
         report = {}
         try:
             # a reader is killed only while it has the start it was listed with
+            # what its new look sees, the list's next scan adopts (fleet) - if
+            # the engine takes it: one of before does not (a hot reload onto an
+            # older checkout, review 4), and a kill must not be run twice
+            learned = {}
+            try:
+                takes = "cache" in inspect.signature(engine.kill_dead_loops).parameters
+            except (TypeError, ValueError):
+                takes = False
             killed = engine.kill_dead_loops(
                 row.get("pid"), pids, started={p: d.get("start") for p, d in readers.items()},
-                report=report)
+                report=report, **({"cache": learned} if takes else {}))
+            if takes:
+                with self.learned_lock:
+                    self.learned.append(learned)
         except Exception as ex:         # its text may hold a path: the type only
             return [f"could not kill ({type(ex).__name__}) - run ccwho ps"]
         said = []

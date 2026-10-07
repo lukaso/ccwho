@@ -626,10 +626,12 @@ _HELPER = re.compile(r"(?:^|[\s/])(?:[\w.-]*-mcp(?:-server)?|mcp-server[\w.-]*|m
 # what every claude runs as its own child to keep the Mac awake (measured
 # 2026-09-27): a helper there, and work anywhere else (`caffeinate -i make`)
 _KEEP_AWAKE = re.compile(r"^(?:/usr/bin/)?caffeinate -i -t \d+\Z")
-# an exited child nobody reaped yet: ps shows its name in brackets. By text,
-# not state (the table has none): a live process that named itself `(x)` is
-# left out of its session's list - none did on the Mac measured 2026-09-27
-_ZOMBIE = re.compile(r"^\(.*\)\Z")
+# an exited child nobody reaped yet: ps shows its name in brackets when it has
+# only just exited, and `<defunct>` when it is left that way (macOS 27, review
+# 5 of the stuck-reader slice). By text, not state (the table has none): a live
+# process that named itself `(x)` is left out of its session's list - none did
+# on the Mac measured 2026-09-27
+_ZOMBIE = re.compile(r"^(?:\(.*\)|<defunct>)\Z")
 
 
 # macOS runs python3 - Apple's, Homebrew's, python.org's - as .../Python.framework/
@@ -1127,6 +1129,120 @@ def stdin_from(unix, pid, claude):
     peer = ((unix or {}).get(pid) or {}).get("0", ("", ""))[1]
     return peer.startswith("->") and any(
         dev == peer[2:] for dev, _name in ((unix or {}).get(claude) or {}).values())
+
+
+# Any program can read its stdin: on 2026-10-07 a python3 read Claude Code's
+# socket for 5.5 hours, and no command line says it would. What the kernel is
+# doing says it: every thread blocked in read(), seen by `sample`, with fd 0
+# the only fd such a read could be on.
+
+_STACK_TOPS = "Sort by top of stack"
+_STACK_TOP = re.compile(r"^\s+(\S+)\s+\(in ([^)]+)\)\s+(\d+)\s*$")
+_THREAD = re.compile(r"^ {4}(\d+) Thread_")
+_READ_TOPS = {("read", "libsystem_kernel.dylib"), ("__read_nocancel", "libsystem_kernel.dylib")}
+
+
+def stack_reads(text):
+    """Is every thread of a sampled process blocked in the kernel's read()?
+    From `sample PID 1 10 -mayDie -file /dev/stdout`: its "Sort by top of
+    stack" section, every entry of which must be that read - and must hold
+    every sample of every thread (`    N Thread_..` in the call graph): the
+    section leaves out a top seen fewer than 5 times, so a thread busy in many
+    small functions shows nothing there (review 2). None when the report does
+    not hold all that (sample failed, a thread left out): unknown, never "no"."""
+    lines = (text or "").splitlines()
+    at = next((i for i, line in enumerate(lines) if line.startswith(_STACK_TOPS)), None)
+    if at is None:
+        return None
+    threads = sum(int(m.group(1)) for m in map(_THREAD.match, lines[:at]) if m)
+    tops, counted = [], 0
+    for line in lines[at + 1:]:
+        if not line.strip():
+            break
+        m = _STACK_TOP.match(line)
+        if not m:
+            return None
+        tops.append((m.group(1), m.group(2)))
+        counted += int(m.group(3))
+    if not tops or not threads or counted != threads:
+        return None
+    return all(t in _READ_TOPS for t in tops)
+
+
+def parse_lsof_fds(text):
+    """`lsof -nP -a -p PIDS -F pfatn`: pid -> {fd: (access, type, name)}.
+    Nothing listed is {}; a line out of place is None - unknown, not "none"."""
+    out, pid, fd = {}, None, None
+    for line in (text or "").splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p" and value.isdigit():
+            pid, fd = int(value), None
+            out.setdefault(pid, {})
+        elif tag == "f" and pid is not None:
+            fd = value
+            out[pid][fd] = ("", "", "")
+        elif tag in ("a", "t", "n") and fd is not None:
+            access, kind, name = out[pid][fd]
+            out[pid][fd] = {"a": (value, kind, name), "t": (access, value, name),
+                            "n": (access, kind, value)}[tag]
+        else:
+            return None
+    return out
+
+
+# what a read never waits on for data: it returns, or it loops - and a loop
+# uses CPU, which the sample's CPU check sees (stack_sample)
+_NO_WAIT_KINDS = {"REG", "DIR"}
+_ANSWERING_DEVICES = {"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"}
+
+
+def only_stdin_can_block(fds, pid):
+    """Is fd 0 the only fd of `pid` a read could wait on? fd 0 a socket open
+    for reading (still the one proven: not moved to a FIFO or a tty); fds 1
+    and 2 taken as output, written and not read; every other fd open for
+    writing only, or a file, a folder or a device that always answers - zsh
+    holds /dev/null on fd 10, bash its script on fd 255 (review 3). A pipe,
+    a socket, a tty, a FIFO or anything else could be the read: Apple's lsof
+    gives a pipe no access mode at all (review 1). cwd, txt and mem are a
+    folder and files. From parse_lsof_fds's answer; unknown is no."""
+    mine = (fds or {}).get(pid)
+    access0, kind0, _name0 = mine.get("0", ("", "", "")) if mine else ("", "", "")
+    if access0 not in ("r", "u") or kind0 != "unix":
+        return False
+    return all(fd in ("0", "1", "2") or access == "w"
+               or kind in _NO_WAIT_KINDS or (kind == "CHR" and name in _ANSWERING_DEVICES)
+               for fd, (access, kind, name) in mine.items())
+
+
+def parse_cpu_time(text):
+    """Seconds of CPU from `ps -o time=` ([[dd-]hh:]mm:ss.ss), or None."""
+    words = (text or "").split()
+    if len(words) != 1:
+        return None
+    days, _, clock = words[0].rpartition("-")
+    parts = clock.split(":")
+    try:
+        if not 2 <= len(parts) <= 3 or (days and not days.isdigit()):
+            return None
+        secs = float(parts[-1]) + 60 * int(parts[-2]) + (3600 * int(parts[0]) if len(parts) == 3 else 0)
+    except ValueError:
+        return None
+    return secs + 86400 * int(days or 0)
+
+
+# a program's name as a row may print it: it comes from the process table,
+# and goes to a terminal and to agents reading --json
+_PROGRAM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,31}")
+
+
+def reader_name(cmd, comm=None):
+    """The base name of a process's program - `ps -o comm` (on macOS its
+    argv[0], spaces and all) when there is one, else the command's first word
+    (ps prints no quotes) - or "a program" when that name is anything but a
+    short plain word."""
+    words = (cmd or "").split()
+    name = (comm or (words[0] if words else "")).rsplit("/", 1)[-1]
+    return name if _PROGRAM_NAME.fullmatch(name) else "a program"
 
 
 def row_summary(mine):

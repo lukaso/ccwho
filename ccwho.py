@@ -316,22 +316,24 @@ def _sent(sids, app):
             claim_unresolved(sid, shown, app=app.key)
 
 
-def scan(cache=None, status=None, eng=None, session_apps=True):
+def scan(cache=None, status=None, eng=None, session_apps=True, samples=None):
     """engine.collect(), and every session it sees running - a parked terminal
     too - lets go of its launch claim (release_claims). From the moment the
     scan STARTED: a claim made while `claude agents` was being read may be a
     new launch of a session that has ended since. That moment is
     status["seen_at"]: what a caller decides from these rows, it decided then.
     `eng` is the engine to scan with (a test's stand-in; ccwho's own by default).
-    `session_apps`: engine.collect's."""
+    `session_apps`, `samples`: engine.collect's (0 for a scan that shows no
+    stuck work: a sample takes about 1.5 s)."""
     eng = engine if eng is None else eng
     seen_at, seen_mono = time.time(), _mono()
     if status is not None:
         status["seen_at"], status["seen_mono"] = seen_at, seen_mono
     # given only when off: a caller of collect that does not know it is not
     # made to (an older engine, a test's stand-in)
-    rows, fleet = eng.collect(cache=cache, status=status,
-                              **({} if session_apps else {"session_apps": False}))
+    given = dict({} if session_apps else {"session_apps": False},
+                 **({} if samples is None else {"samples": samples}))
+    rows, fleet = eng.collect(cache=cache, status=status, **given)
     release_claims(eng.live_ids(rows), seen_at, seen_mono)
     return rows, fleet
 
@@ -2364,7 +2366,7 @@ def open_session(argv, from_index=False, live_only=False):
         print(OPEN_USAGE, file=sys.stderr)
         return 2
     status = {}
-    rows, _ = scan(cache={}, status=status)
+    rows, _ = scan(cache={}, status=status, samples=0)
     source_ok = status.get("source_ok", False)
     row = None
     me = engine.agent_id(os.environ)         # an agent's own session, or None
@@ -2526,7 +2528,7 @@ def ps(argv):
         port = int(raw)
     # --full: the whole command line, redacted - best effort, so never the default
     full = "--full" in argv
-    rows, fleet = scan(cache={})
+    rows, fleet = scan(cache={}, samples=0)      # its lines show no stuck work
     fleet = fleet if isinstance(fleet, dict) else {}
     if not fleet.get("procs_ok", True):
         # 4, could not tell: 1 is "no agent holds it", and a script acts on 1
@@ -2680,7 +2682,7 @@ def _one_session(cmd, word, rows, exact, nothing):
 def _live_rows():
     """The live sessions, or an error: an unread feed is no "no match"."""
     status = {}
-    rows, _ = scan(cache={}, status=status)
+    rows, _ = scan(cache={}, status=status, samples=0)
     if not status.get("source_ok", True):
         raise LookupError("claude agents could not be read")
     return rows
@@ -3555,7 +3557,7 @@ def save(argv):
     status = {}
     # no tab names from Terminal.app: a restore has no use for them (#30), and
     # the launchd job's ask would bring a prompt naming its python
-    rows, _ = scan(cache={}, status=status, session_apps=False)
+    rows, _ = scan(cache={}, status=status, session_apps=False, samples=0)
     if not status.get("source_ok", True):
         print("ccwho save: cannot reach `claude agents` - nothing written.", file=sys.stderr)
         print("  A save that cannot ask must not answer: an empty manifest would be",
@@ -3988,7 +3990,7 @@ def restore(argv):
         # click does, and an unreadable fleet opens nothing at all.
         entries = engine.manifest_entries(man)
         status = {}
-        live, _ = scan(cache={}, status=status)
+        live, _ = scan(cache={}, status=status, samples=0)
         source_ok = status.get("source_ok", False)
         if not source_ok:
             print("ccwho restore: cannot read the live session list - not reopening"

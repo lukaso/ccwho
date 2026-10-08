@@ -917,6 +917,64 @@ class TestSearchKeys(UiTest):
             self.assertTrue(isinstance(app.focused, ui.Row))
 
 
+class TestTheSearchBoxStandsOut(UiTest):
+    """Reported: "when searching, give the search box a highlight ... Otherwise
+    it's too easy to miss we are in search mode." Drawn like any input, the box
+    was a grey frame at the bottom - blue while you typed - and after Enter,
+    with the keys back on the list, nothing down there said the list was cut.
+    Open, it is framed in the accent, the colour of NEEDS YOU and of the
+    selected row's bar: not the kill box's red, which on an input reads as an
+    error."""
+
+    def assert_lit(self, app):
+        """What the screen draws, not what the stylesheet says: a frame of
+        spaces, one a tint dims, or one an amber widget covers has the accent in
+        the box's styles too."""
+        from textual.color import Color
+        from textual.geometry import Region
+        box = app.query_one("#search")
+        # the theme says #ffa62b; Textual's $accent is #fea62b
+        accent = Color.parse(app.get_css_variables()["accent"]).rgb
+        r = box.region
+        lines = box.render_lines(Region(0, 0, r.width, r.height))
+        for side, (x, y) in {"corner": (0, 0), "top": (r.width // 2, 0),
+                             "bottom": (r.width // 2, r.height - 1),
+                             "left": (0, r.height // 2),
+                             "right": (r.width - 1, r.height // 2)}.items():
+            self.assertIs(app.screen.get_widget_at(r.x + x, r.y + y)[0], box,
+                          f"the {side} frame is covered")
+            # by cell, not by character: a wide character takes two
+            self.assertNotIn(lines[y].crop(x, x + 1).text, " ", f"no {side} frame is drawn")
+            drawn = app.screen.get_style_at(r.x + x, r.y + y).color
+            self.assertEqual(tuple(drawn.triplet), accent, f"the {side} frame is not lit")
+
+    async def search(self, pilot, text):
+        await pilot.press("slash")
+        for ch in text:
+            await pilot.press(ch)
+        await pilot.pause()
+
+    async def test_the_box_you_type_in_is_lit(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self.search(pilot, "release")
+            self.assertIs(app.focused, app.query_one("#search"))
+            self.assert_lit(app)
+
+    async def test_it_stays_lit_when_enter_gives_the_keys_to_the_list(self):
+        # where it was missed: the list is cut, and the keys are on a row
+        app = self.app()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await self.search(pilot, "release")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.focused, ui.Row)
+            self.assertNotIn("Issue 362", self.screen_text(app), "the list is cut")
+            self.assert_lit(app)
+
+
 class TestTheEngineIsHotReloaded(unittest.TestCase):
     """This window stays open for days. A fix on disk it cannot see is a fix that
     did not happen - so every collection re-reads the engine first."""

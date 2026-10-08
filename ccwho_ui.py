@@ -757,7 +757,10 @@ class CcwhoUi(App):
     #list { width: 1fr; }
     #detail { width: 38%; border-left: solid $panel; padding: 0 1; }
     #detail.full { width: 1fr; border-left: none; }
-    #search { height: 3; }
+    /* While it is open, the search box has an accent frame, whether or not
+       you type in it: an input's own frame - grey, blue while you type - was
+       missed, and a list the search cuts looked like the whole fleet. */
+    #search { height: 3; border: round $accent; }
     .row { height: 2; padding: 0 1; border-left: blank; }
     /* The selected row is a block of colour with a bar down its left edge, not
        a shade of the background: on a dark terminal $boost was invisible. */

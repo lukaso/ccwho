@@ -154,6 +154,74 @@ class TestTheCodexRows(UiTest):
             self.assertEqual(seen, [(T, 42)])
             self.assertEqual(row["attention"], "stopped")
 
+    async def test_enter_on_a_finished_thread_leaves_the_highlight_in_needs_you(self):
+        # as for a Claude row you go to (owner, 2026-10-08): the next one
+        from test_ui import reviewable
+        done = dict(PROCS, codex_threads=[dict(PROCS["codex_threads"][0], turn="done", ask="",
+                                               ts=42, mtime=1.0)])
+        real = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: None
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", real)
+        app = self.app(collector=CodexCollector(procs=done, rows=(LIVE, reviewable())))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            needs = [r.get("sessionId") for g in app.groups() if g["heading"] == "NEEDS YOU"
+                     for r in g["rows"]]
+            self.assertEqual(needs, [LIVE["sessionId"], T, reviewable()["sessionId"]])  # control
+            app.selected = T
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            row = next(r for r in app.fleet.rows if r.get("kind") == "codex")
+            self.assertEqual(row["attention"], "stopped")
+            self.assertEqual(app.selected_row()["sessionId"], reviewable()["sessionId"])
+
+    async def test_a_failed_jump_ends_only_its_own_sessions_go(self):
+        # Enter on a Claude row, then - while its window opens - Enter on a
+        # Codex thread that asks: that is going there. The Claude jump that
+        # fails later ends its own go, not the thread's (review s3b)
+        import time
+        from test_ui import ASKING, OTHER, GatedAdapter
+
+        class Fails(GatedAdapter):
+            def focus(self, row, deadline=5.0):
+                super().focus(row, deadline)
+                return "iTerm2 did not answer in 5s"
+
+        thread = dict(PROCS["codex_threads"][0], turn="done", ask="Shall I land it?", ts=42,
+                      mtime=1.0)
+        asks = dict(PROCS, codex_threads=[thread])
+        adapter = Fails()
+        c = CodexCollector(procs=asks, rows=(ASKING, OTHER))
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            try:
+                await pilot.pause()
+                needs = [r.get("sessionId") for g in app.groups() if g["heading"] == "NEEDS YOU"
+                         for r in g["rows"]]
+                self.assertEqual(needs, [T, ASKING["sessionId"], OTHER["sessionId"]])  # control
+                await pilot.press("down", "enter")      # the Claude row: its window opens
+                await pilot.pause(0.1)
+                await pilot.press("up", "enter")        # the thread
+                await pilot.pause()
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [ASKING["sessionId"]])
+            self.assertEqual(app.selected_row()["sessionId"], T)
+            busy = dict(PROCS, codex_threads=[dict(thread, turn="open", ask="",
+                                                   mtime=time.time())])
+            c.fleet_value = fleet((ASKING, OTHER), busy)
+            app.show(fleet((ASKING, OTHER), busy))
+            await pilot.pause()
+            await pilot.pause()
+            row = next(r for r in app.fleet.rows if r.get("kind") == "codex")
+            self.assertEqual(row["attention"], "busy")
+            self.assertEqual(app.selected_row()["sessionId"], ASKING["sessionId"])
+
     async def test_its_detail_says_what_it_is_and_lists_its_processes(self):
         app = self.app(collector=CodexCollector())
         async with app.run_test(size=(160, 40)) as pilot:

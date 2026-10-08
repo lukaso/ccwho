@@ -162,7 +162,7 @@ ccwho                         # on a terminal
 | key | does |
 |---|---|
 | ↑ ↓ / `j` `k` | move |
-| Enter | go to the session's window - or give it one (see below). On a Codex row it says where the thread runs |
+| Enter | go to the session's window - or give it one (see below). On a Codex row it says where the thread runs. When the session you went to in NEEDS YOU (with Enter or a click) stops needing you - a finished turn (△) you looked at drops to STOPPED, a question (▲) you answered turns busy, or you ended it - the highlight stays in NEEDS YOU, on the session that was under it (the one above when it was the last; in a search, the next one the search shows), so the next Enter goes on to the next session that needs you; with no other session there to see, it goes with the session. Once, and only while the highlight stays on it: after an arrow key (also while its window opens) or a jump that failed, and for a session you go to under PARKED, STOPPED or a search's SAID, the highlight goes with the row as with any row, so Enter goes where you look |
 | click | a click on a row goes to the session; a click on the `\ /` at the row's right edge opens its brief |
 | → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |

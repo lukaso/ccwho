@@ -869,6 +869,8 @@ class CcwhoUi(App):
         self.painted_shape = None
         self.hint_widget = None         # the Codex-only list's hint (place_hint)
         self.selected = ""      # by session id: widgets come and go, this does not
+        self.went_to = ""       # the session you went to in NEEDS YOU: going_to
+        self.needs_order = []   # NEEDS YOU around it, the rows a search hides too
         self.acting = ""        # the session a window is being opened for
         self.kill_busy = False  # a kill is being read, asked or carried out
         self.clock = time.monotonic
@@ -1321,6 +1323,7 @@ class CcwhoUi(App):
             return
         width = self.list_width()
         groups = self.groups()
+        self.stay_in_needs_you(groups)
         hint = self.codex_only_hint(groups)
         # an empty search is its words: what you typed, and whether the ended
         # sessions are still being read - a new word is a new list. Not an
@@ -1363,6 +1366,53 @@ class CcwhoUi(App):
         self.call_after_refresh(self.restore_selection, keep)
         if self.detail_open:
             self.call_after_refresh(self.paint_detail)
+
+    def going_to(self, row):
+        """Enter or a click on a session in NEEDS YOU on screen: when it stops
+        needing you, the highlight stays in NEEDS YOU (stay_in_needs_you). One
+        you go to under PARKED, STOPPED or a search's SAID is a row like any
+        other."""
+        sid = row.get("sessionId", "")
+        heading = engine.UI_GROUPS[0][0]
+        shown = any(r.get("sessionId") == sid for g in self.groups()
+                    if g["heading"] == heading for r in g["rows"])
+        self.went_to, self.needs_order = (sid, self.needs_ids()) if shown else ("", [])
+
+    def needs_ids(self):
+        """NEEDS YOU in its order, the rows a search hides too."""
+        heading = engine.UI_GROUPS[0][0]
+        return [r.get("sessionId") for g in self.fleet.groups("") if g["heading"] == heading
+                for r in g["rows"]]
+
+    def stay_in_needs_you(self, groups):
+        """The session you went to has stopped needing you - it had finished
+        and you looked, you answered it, or it ended: the highlight stays in
+        NEEDS YOU, on the session that was under it (above it, when it was the
+        last), so Enter goes on to the next one (owner, 2026-10-08) - one you
+        can see: a search hides some. Once, and only while the highlight is on
+        it (mark_selected): a row you moved to takes the highlight along, so
+        Enter goes where you look."""
+        sid = self.went_to
+        if not sid:
+            return
+        now = self.needs_ids()
+        if sid in now:
+            self.needs_order = now      # the rows around it now
+            return
+        self.went_to = ""
+        heading = engine.UI_GROUPS[0][0]
+        seen = {r.get("sessionId") for g in groups if g["heading"] == heading for r in g["rows"]}
+        at = self.needs_order.index(sid)
+        below = (next((n for n in self.needs_order[at + 1:] if n in seen), "")
+                 or next((n for n in reversed(self.needs_order[:at]) if n in seen), ""))
+        if below:
+            self.selected = below
+            detail = self.part("#detail")
+            if detail is not None:
+                detail.scroll_home(animate=False)   # another session's brief starts at its top
+            # rows that only move keep their focus: the one left on this row
+            # would take the highlight back with it
+            self.call_after_refresh(self.restore_selection)
 
     def reordered(self, listing, groups, width):
         """Move the rows that are already there, when that is all it takes.
@@ -1741,6 +1791,8 @@ class CcwhoUi(App):
         """One row carries the class the stylesheet paints. Focus alone is not
         enough: the list can be hidden behind a narrow detail, and focus then
         belongs to something else entirely."""
+        if self.went_to != self.selected:
+            self.went_to = ""           # the highlight left it: where you look now
         for widget in self.rows_on_screen():
             widget.set_class(widget.row.get("sessionId") == self.selected,
                              "selected")
@@ -2331,6 +2383,7 @@ class CcwhoUi(App):
             self.said(f"{row.get('short')}"
                       f"  {engine.cut_codex_title(row.get('tab_title'), 40)}:"
                       f" {engine.codex_there(row, 'open')}")
+            self.going_to(row)
             self.looked_at(row, row.get("ts"))
             return
         if row.get("attention") == "ended" and self.reopening_sid:
@@ -2367,6 +2420,7 @@ class CcwhoUi(App):
             self.status = "opening a window for it..."
             self.mark_acting(row.get("sessionId", ""))
             self.paint_header(self.groups())
+            self.going_to(row)
             self.jumps += 1         # only where a jump starts: a number with no
             self.attaching(value, row, self.jumps)      # answer would never end
             return
@@ -2379,6 +2433,7 @@ class CcwhoUi(App):
             return
         self.mark_acting(row.get("sessionId", ""))
         self.paint_header(self.groups())
+        self.going_to(row)
         self.jumps += 1
         self.go_to(row, self.jumps)
         # The session you just opened is about to stop needing you. Look again
@@ -2467,6 +2522,8 @@ class CcwhoUi(App):
         if worked and row.get("sessionId"):
             self.reviewing[row["sessionId"]] = row
         latest = jump == self.jumps
+        if latest and not worked and self.went_to == row.get("sessionId"):
+            self.went_to = ""           # a jump that failed is not going there
         if latest or not worked:
             # an older jump that worked is not the window in front: say nothing
             self.said(text, row)

@@ -7920,6 +7920,641 @@ class TestAParkInASearch(ParkTest):
                 self.assertEqual(self.z_says(app), "unpark")
 
 
+DONE = dict(ASKING, attention="review")         # △: it finished its turn
+LATER = "2026-09-22T11:30:00.000Z"
+
+
+class TestTheHighlightStaysInNeedsYou(ParkTest):
+    """You go to a session that needs you, and it stops needing you - it had
+    finished and you looked (△), or you answered it (▲): the highlight stays in
+    NEEDS YOU, on the next row, so Enter goes on to the next one (owner,
+    2026-10-08). A row you only moved to takes the highlight along: Enter goes
+    where you look."""
+
+    _S = TestTheSearchFindsWhatWasSaid
+    long_brief = TestTheHighlightStaysInItsGroup.long_brief
+
+    def on(self, app):
+        return (app.selected_row() or {}).get("sessionId")
+
+    def focused_on(self, app):
+        return (getattr(app.focused, "row", None) or {}).get("sessionId")
+
+    async def go(self, pilot):
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+    def scan(self, app, collector, *rows):
+        """A scan that brings `rows`: what the collector answers from now on,
+        and on the screen now."""
+        collector.fleet_value = ui.Fleet([dict(r) for r in rows] + [dict(BUSY)],
+                                         True, "12:00:05")
+        app.show(ui.Fleet([dict(r) for r in rows] + [dict(BUSY)], True, "12:00:05"))
+
+    async def test_a_finished_one_you_go_to_leaves_it_on_the_next(self):
+        app = self.app(collector=self.fleet(DONE, dict(OTHER, attention="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            await self.go(pilot)
+            self.assertEqual(self.state(app), ["stopped"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.assertEqual(self.focused_on(app), OTHER["sessionId"])
+
+    async def test_a_click_on_it_does_the_same(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter,
+                       collector=self.fleet(DONE, dict(OTHER, attention="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            w = next(w for w in app.query(ui.Row) if w.row["sessionId"] == ASKING["sessionId"])
+            await pilot.click(w, offset=(4, 0))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [ASKING["sessionId"]])
+            self.assertEqual(self.state(app), ["stopped"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def test_one_you_answered_leaves_it_when_it_turns_busy(self):
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.assertEqual(self.on(app), ASKING["sessionId"], "a question you have not answered")
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["busy"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.assertEqual(self.focused_on(app), OTHER["sessionId"])
+
+    async def test_answered_while_its_window_opens(self):
+        # the scan that saw it busy waited for the jump: shown when it lands
+        adapter = GatedAdapter()
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                c.fleet_value = ui.Fleet([dict(ASKING, attention="busy", ts=LATER),
+                                          dict(OTHER), dict(BUSY)], True, "12:00:05")
+                app.collect()
+                await pilot.pause(0.1)
+                self.assertEqual(self.state(app), ["asks"], "held while it opens")
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["busy"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def test_one_you_ended_leaves_it_on_the_next(self):
+        # gone from the list is no longer needing you: the next one, not the top
+        c = self.fleet(OTHER, ASKING, THIRD)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.go(pilot)
+            self.scan(app, c, OTHER, THIRD)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.on(app), THIRD["sessionId"])
+
+    async def test_a_row_that_arrives_meanwhile_does_not_take_its_place(self):
+        # the session that was under it: a new one sorted above is no "next"
+        new = row("ffff7777-0000-4000-8000-000000000007", "blocked", ts=LATER,
+                  title="New prompt", tab_title="✳ New prompt (claude)", name="liveapp-f6")
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER, new)
+            await pilot.pause()
+            await pilot.pause()
+            needs = [r.get("sessionId") for g in app.groups() if g["heading"] == "NEEDS YOU"
+                     for r in g["rows"]]
+            self.assertEqual(needs, [new["sessionId"], OTHER["sessionId"]])        # control
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def test_an_older_jump_landing_late_is_not_where_you_went(self):
+        import threading
+
+        class TheOlderFails(GatedAdapter):
+            def focus(self, row, deadline=5.0):
+                said = super().focus(row, deadline)
+                return ("iTerm2 did not answer in 5s"
+                        if row.get("sessionId") == ASKING["sessionId"] else said)
+
+        adapter = TheOlderFails()
+        adapter.gates = {ASKING["sessionId"]: threading.Event(),
+                         OTHER["sessionId"]: threading.Event()}
+        c = self.fleet(ASKING, OTHER, THIRD)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("j", "enter")
+                await pilot.pause(0.1)
+                adapter.gates[OTHER["sessionId"]].set()     # the latest lands first
+                await pilot.pause(0.1)
+                await pilot.pause()
+                adapter.gates[ASKING["sessionId"]].set()    # and the older one late
+                await pilot.pause(0.1)
+                await pilot.pause()
+            finally:
+                for gate in adapter.gates.values():
+                    gate.set()
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.scan(app, c, ASKING, dict(OTHER, attention="busy", ts=LATER), THIRD)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.on(app), THIRD["sessionId"])
+
+    async def test_a_parked_one_you_go_to_keeps_it(self):
+        # you went to it in PARKED: it unparks and drops to STOPPED, and the
+        # highlight goes with it - it was never in NEEDS YOU (review s3)
+        app = self.app(collector=self.fleet(dict(OTHER, attention="review"), parked(was="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.go(pilot)
+            self.assertEqual(self.state(app), ["stopped"])
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            self.assertEqual(self.focused_on(app), ASKING["sessionId"])
+
+    async def test_a_parked_question_you_go_to_takes_it_along(self):
+        # unparked, it asks you again - but you went to it in PARKED
+        c = self.fleet(OTHER, parked(was="asks"))
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.go(pilot)
+            self.assertEqual(self.state(app), ["asks"])
+            self.scan(app, c, OTHER, dict(ASKING, attention="busy", ts=LATER))
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_a_failed_jump_after_one_that_worked(self):
+        adapter = FakeAdapter()
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), OTHER["sessionId"])                    # control
+            self.scan(app, c, dict(ASKING, ts="2026-09-22T12:30:00.000Z"), OTHER)
+            await pilot.pause()
+            adapter.answer = "iTerm2 did not answer in 5s"
+            w = next(w for w in app.query(ui.Row) if w.row["sessionId"] == ASKING["sessionId"])
+            await pilot.click(w, offset=(4, 0))
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked[-1], ASKING["sessionId"])
+            self.scan(app, c, dict(ASKING, attention="busy", ts="2026-09-22T13:30:00.000Z"), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_arrows_while_its_window_opens_end_it(self):
+        adapter = GatedAdapter()
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("down", "up")
+                await pilot.pause()
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])                   # control
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_answered_while_a_search_hides_it(self):
+        # it left NEEDS YOU while you typed: Esc shows the next one, not it in BUSY
+        fleet = ui.Fleet([dict(ASKING), dict(OTHER, title="kiwi one"), dict(BUSY)],
+                         True, "12:00:00")
+        c = self._S.collector(self, fleet=fleet, found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.go(pilot)
+                await self._S.search(self, pilot, "kiwi", app=app)
+                ids = [w.row.get("sessionId") for w in app.rows_on_screen()]
+                self.assertNotIn(ASKING["sessionId"], ids)                        # control
+                self.scan(app, c, dict(ASKING, attention="busy", ts=LATER),
+                          dict(OTHER, title="kiwi one"))
+                await pilot.pause()
+                await pilot.press("escape")
+                await pilot.pause()
+                await pilot.pause()
+                self.assertIn(ASKING["sessionId"],
+                              [w.row.get("sessionId") for w in app.rows_on_screen()])
+                self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def test_a_row_that_came_after_you_went_can_be_the_next(self):
+        # the rows around it when it leaves, not when you went
+        new = row("ffff8888-0000-4000-8000-000000000008", "asks", ts=TS,
+                  title="New question", tab_title="✳ New question (claude)", name="liveapp-g7")
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.scan(app, c, ASKING, new, OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])                   # control
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), new, OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), new["sessionId"])
+
+    async def test_a_session_given_a_window_counts(self):
+        # running with no window: Enter attaches it - that is going there too
+        bg = row("51fddd61-822b-49e0-9aeb-2145e91e1244", "asks", ts=TS, tab_title="",
+                 tty="", windowed=False, kind="background", title="Background question")
+        adapter = FakeAdapter()
+        c = self.fleet(bg, OTHER)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.assertEqual(adapter.attached, ["claude attach 51fddd61"])        # control
+            self.scan(app, c, dict(bg, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def test_once_it_stopped_needing_you_it_is_a_row_like_any(self):
+        c = self.fleet(ASKING)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER))
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"], "alone: it goes with it")
+            self.scan(app, c, dict(ASKING, ts="2026-09-22T12:30:00.000Z"), OTHER)
+            await pilot.pause()
+            self.scan(app, c, dict(ASKING, attention="busy", ts="2026-09-22T13:30:00.000Z"), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    def kiwi(self):
+        """NEEDS YOU is X, A, B, C; the search "kiwi" shows X, A and C."""
+        c4 = row("ffff9999-0000-4000-8000-000000000009", "asks", ts=TS, title="kiwi c",
+                 tab_title="✳ kiwi c (claude)", name="liveapp-h8")
+        return [dict(OTHER, title="kiwi x"), dict(ASKING, title="kiwi a"),
+                dict(THIRD, title="hidden b"), c4]
+
+    async def kiwi_go(self, app, pilot):
+        """Search "kiwi", the keys to the list, down to A, and go there."""
+        await self._S.search(self, pilot, "kiwi", app=app)
+        await pilot.press("enter")                  # the keys to the list: X
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        self.assertEqual(self.on(app), ASKING["sessionId"])
+        await self.go(pilot)
+
+    async def test_in_a_search_the_next_is_one_you_can_see(self):
+        x, a, b, c4 = self.kiwi()
+        c = self._S.collector(self, fleet=ui.Fleet([dict(r) for r in (x, a, b, c4, BUSY)],
+                                                   True, "12:00:00"), found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.kiwi_go(app, pilot)
+                self.scan(app, c, x, dict(a, attention="busy", ts=LATER), b, c4)
+                await pilot.pause()
+                await pilot.pause()
+                self.assertEqual(self.on(app), c4["sessionId"])
+                self.assertEqual(self.focused_on(app), c4["sessionId"])
+
+    async def test_in_a_search_with_none_left_to_see_it_goes_with_it(self):
+        # B still needs you, but the search hides it: the highlight goes with
+        # A, not to the top row of another group
+        x, a, b, c4 = self.kiwi()
+        kept = dict(x, attention="stopped")
+        c = self._S.collector(self, fleet=ui.Fleet([dict(r) for r in (kept, a, b, BUSY)],
+                                                   True, "12:00:00"), found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self._S.search(self, pilot, "kiwi", app=app)
+                await pilot.press("enter")              # the keys to the list: A
+                await pilot.pause()
+                self.assertEqual(self.on(app), ASKING["sessionId"])               # control
+                await self.go(pilot)
+                self.scan(app, c, kept, dict(a, attention="busy", ts=LATER), b)
+                await pilot.pause()
+                await pilot.pause()
+                self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_a_park_in_a_search_after_the_go_keeps_its_own_next(self):
+        x, a, b, c4 = self.kiwi()
+        c = self._S.collector(self, fleet=ui.Fleet([dict(r) for r in (x, a, b, c4, BUSY)],
+                                                   True, "12:00:00"), found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.kiwi_go(app, pilot)
+                await self.park_it(app, pilot, "later")
+                self.assertEqual(self.state(app), ["parked"])
+                self.assertEqual(self.on(app), c4["sessionId"])
+
+    async def test_a_park_under_said_after_the_go_keeps_it(self):
+        # the park keeps the highlight on a row that stays under SAID: the go
+        # before it does not take it to the next one that needs you
+        said = {"text": "the flamingo is pink", "who": "you",
+                "ts": "2026-09-22T10:00:00.000Z", "key": (9, True, 9)}
+        c = self._S.collector(self, fleet=ui.Fleet(
+            [dict(ASKING), dict(OTHER, title="flamingo pond"), dict(BUSY)], True, "12:00:00"),
+            found={"flamingo": {ASKING["sessionId"]: said}})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self._S.search(self, pilot, "flamingo", app=app)
+                self.assertTrue(await self._S.until(self, pilot,
+                                                    lambda: "SAID" in self.screen_text(app)))
+                await pilot.press("enter")              # the keys to the list
+                await pilot.pause()
+                await self.select(app, pilot)
+                self.assertEqual(self.heading_of(app), "SAID")                    # control
+                await self.go(pilot)
+                await self.park_it(app, pilot, "later")
+                self.assertEqual(self.heading_of(app), "SAID")
+                self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def said_go(self, app, pilot, attention):
+        """Search "flamingo": ASKING under SAID, OTHER in NEEDS YOU; go to ASKING."""
+        await self._S.search(self, pilot, "flamingo", app=app)
+        self.assertTrue(await self._S.until(self, pilot, lambda: "SAID" in self.screen_text(app)))
+        await pilot.press("enter")                  # the keys to the list
+        await pilot.pause()
+        await self.select(app, pilot)
+        self.assertEqual(self.heading_of(app), "SAID")                            # control
+        await self.go(pilot)
+
+    def said_collector(self, attention):
+        said = {"text": "the flamingo is pink", "who": "you",
+                "ts": "2026-09-22T10:00:00.000Z", "key": (9, True, 9)}
+        return self._S.collector(self, fleet=ui.Fleet(
+            [dict(ASKING, attention=attention), dict(OTHER, title="flamingo pond"), dict(BUSY)],
+            True, "12:00:00"), found={"flamingo": {ASKING["sessionId"]: said}})
+
+    async def test_a_question_you_go_to_under_said_takes_it_along(self):
+        # SAID is what was said, not what needs you: a row like any other
+        c = self.said_collector("asks")
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.said_go(app, pilot, "asks")
+                self.scan(app, c, dict(ASKING, attention="busy", ts=LATER),
+                          dict(OTHER, title="flamingo pond"))
+                await pilot.pause()
+                await pilot.pause()
+                self.assertEqual(self.state(app), ["busy"])
+                self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_a_finished_one_you_go_to_under_said_takes_it_along(self):
+        c = self.said_collector("review")
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.said_go(app, pilot, "review")
+                self.assertEqual(self.state(app), ["stopped"])
+                self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_a_second_enter_whose_first_jump_fails_late(self):
+        # the window was slow, so Enter again: the second jump works, the first
+        # fails after it - that failure is not the latest jump's
+        import threading
+
+        class FirstFailsLate(FakeAdapter):
+            def __init__(self):
+                super().__init__()
+                self.first = threading.Event()
+
+            def focus(self, row, deadline=5.0):
+                self.asked.append(row.get("sessionId"))
+                if len(self.asked) == 1:
+                    self.first.wait(10)
+                    return "iTerm2 did not answer in 5s"
+                return "focused s022"
+
+        adapter = FirstFailsLate()
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.pause()
+            finally:
+                adapter.first.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [ASKING["sessionId"]] * 2)               # control
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def test_an_unpark_of_another_session_keeps_the_go(self):
+        # Enter on a parked row, its window slow; up to a finished one, Enter:
+        # both land, and the parked one's unpark is not about this one
+        import threading
+        adapter = GatedAdapter()
+        adapter.gates = {THIRD["sessionId"]: threading.Event(),
+                         ASKING["sessionId"]: threading.Event()}
+        app = self.app(adapter=adapter, collector=self.fleet(
+            DONE, dict(OTHER, attention="review"),
+            dict(THIRD, attention="parked", park_was="asks", park_note="x")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await self.select(app, pilot, THIRD["sessionId"])
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await self.select_up(app, pilot, ASKING["sessionId"])
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                adapter.gates[THIRD["sessionId"]].set()     # the parked one lands first
+                await pilot.pause(0.1)
+                adapter.gates[ASKING["sessionId"]].set()
+                await pilot.pause(0.1)
+                await pilot.pause()
+            finally:
+                for gate in adapter.gates.values():
+                    gate.set()
+            await pilot.pause()
+            self.assertEqual(self.state(app, THIRD["sessionId"]), ["asks"])       # control
+            self.assertEqual(self.state(app), ["stopped"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+
+    async def select_up(self, app, pilot, sid):
+        for _ in range(5):
+            if (app.selected_row() or {}).get("sessionId") == sid:
+                return
+            await pilot.press("up")
+            await pilot.pause()
+        self.fail(f"{sid} is not on the screen")
+
+    async def test_a_row_you_only_moved_to_takes_it_along(self):      # control
+        c = self.fleet(OTHER, ASKING)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            self.scan(app, c, OTHER, dict(ASKING, attention="busy", ts=LATER))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["busy"])
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_moved_away_and_back_it_takes_it_along(self):
+        # the arrows are yours: after them it is a row you moved to
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            await pilot.press("down", "up")
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_a_jump_that_failed_is_not_going_there(self):       # control
+        c = self.fleet(ASKING, OTHER)
+        app = self.app(adapter=FakeAdapter(answer="iTerm2 did not answer in 5s"), collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER), OTHER)
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_moved_during_the_jump_it_stays_where_you_moved(self):
+        adapter = GatedAdapter()
+        app = self.app(adapter=adapter,
+                       collector=self.fleet(DONE, dict(OTHER, attention="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                await pilot.press("down", "down")       # past the next one, to BUSY
+                await pilot.pause()
+                self.assertEqual(self.on(app), BUSY["sessionId"])
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["stopped"])
+            self.assertEqual(self.on(app), BUSY["sessionId"])
+
+    async def test_alone_in_needs_you_it_goes_with_the_row(self):
+        # into STOPPED, under a row above it there: not the top row
+        app = self.app(collector=self.fleet(
+            DONE, dict(OTHER, attention="stopped", ts=1790000000.0)))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.go(pilot)
+            self.assertEqual(self.state(app), ["stopped"])
+            stopped = [r.get("sessionId") for g in app.groups() if g["heading"] == "STOPPED"
+                       for r in g["rows"]]
+            self.assertEqual(stopped, [OTHER["sessionId"], ASKING["sessionId"]])  # control
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_the_last_one_leaves_it_on_the_row_above(self):
+        app = self.app(collector=self.fleet(dict(OTHER, attention="review"),
+                                            dict(THIRD, attention="review"), DONE))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.go(pilot)
+            self.assertEqual(self.state(app), ["stopped"])
+            self.assertEqual(self.on(app), THIRD["sessionId"])
+
+    async def test_in_the_middle_it_takes_the_one_below(self):
+        app = self.app(collector=self.fleet(dict(OTHER, attention="review"), DONE,
+                                            dict(THIRD, attention="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.go(pilot)
+            self.assertEqual(self.on(app), THIRD["sessionId"])
+
+    async def test_a_stopped_one_you_go_to_takes_it_along(self):
+        # NEEDS YOU only: you went to it in STOPPED - a row that needs you is
+        # there, and the highlight still goes with the one you went to
+        c = self.fleet(dict(ASKING, attention="stopped"), dict(OTHER, attention="stopped"), THIRD)
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.go(pilot)
+            self.scan(app, c, dict(ASKING, attention="busy", ts=LATER),
+                      dict(OTHER, attention="stopped"), THIRD)
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["busy"])
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_the_next_sessions_brief_starts_at_its_top(self):
+        app = self.app(collector=self.long_brief(DONE, dict(OTHER, attention="review")))
+        async with app.run_test(size=(160, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            app.query_one("#detail").scroll_to(y=10, animate=False)
+            await pilot.pause()
+            self.assertGreater(app.query_one("#detail").scroll_y, 0)              # control
+            await self.go(pilot)
+            await pilot.pause()
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.assertEqual(app.query_one("#detail").scroll_y, 0)
+
+    async def test_a_search_that_hides_it_is_not_it_leaving(self):
+        # it still needs you: the search hid it, it did not answer you
+        fleet = ui.Fleet([dict(OTHER, title="kiwi one"), dict(ASKING),
+                          dict(THIRD, title="kiwi two"), dict(BUSY)], True, "12:00:00")
+        app = self.app(collector=self._S.collector(self, fleet=fleet, found={}))
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.select(app, pilot)
+                await self.go(pilot)
+                await self._S.search(self, pilot, "kiwi", app=app)
+                ids = [w.row.get("sessionId") for w in app.rows_on_screen()]
+                self.assertNotIn(ASKING["sessionId"], ids)                        # control
+                # in the box still: Enter there gives the keys to the top row
+                self.assertEqual(self.on(app), OTHER["sessionId"], "the top row, as for any search")
+
+
 class TestTheParkTargetLightsUp(ParkTest):
     async def test_park_lights_up_under_the_mouse(self):
         app = self.app(collector=self.fleet(ASKING))

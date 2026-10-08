@@ -52,7 +52,8 @@ RELOAD_FIRST = ("ccwho_text", "ccwho_procs", "ccwho_terms", "ccwho_brief", "ccwh
 # waiting on a machine, not on you, so it sorts last. `stuck` needs you too - to
 # kill a loop that cannot end - but less than anything that finished or asked.
 _RANK = {"blocked": 0, "waiting": 0, "asks": 1, "review": 2, "stuck": 2.5, "stopped": 3,
-         "busy": 4, "ready": 5, "shell": 6, "idle": 7, "running": 8, "program": 9}
+         "busy": 4, "ready": 5, "shell": 6, "idle": 7, "running": 8, "parked": 8.5,
+         "program": 9}
 
 # Descendants that are session infrastructure rather than work. An idle session
 # keeps its MCP servers alive; counting them would make every session look busy.
@@ -3204,7 +3205,8 @@ def no_window_note(row):
 
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
-              tab_title="", reviewed=None, windowed=None, dead_loops=(), terminal=""):
+              tab_title="", reviewed=None, windowed=None, dead_loops=(), terminal="",
+              parks=None):
     """One display row from one session's data. Pure: no disk, no subprocess.
 
     collect() used to inline this, which hid the wiring - notably which clock
@@ -3257,6 +3259,12 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     ep = entrypoint_of(session, head, tail)
     if ep in ccwho_index.AGENT_ENTRYPOINTS and attention != "stuck":
         attention = "program"
+    # You parked it at this turn: it waits for you to want it (load_parks). A
+    # program's session is never yours to park - nothing in it waits on you.
+    park = (parks or {}).get(session.get("sessionId", ""))
+    park_note = park_was = ""
+    if ts and park and park.get("ts") == ts and attention != "program":
+        park_note, park_was, attention = park["note"], attention, "parked"
     # The recap comes off the windows this function was already given: the list's
     # second line is "what is this about", and the harness already answered it.
     recs = as_records(head) + as_records(tail)
@@ -3287,6 +3295,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # the app whose tab shows it (terms.App.key), "" when no app ccwho knows does
         "terminal": terminal,
         "parked": [],           # collect fills it: terminals that parked this job
+        # parked in ccwho (attention "parked"): your note, and its state unparked
+        "park_note": park_note,
+        "park_was": park_was,
         "recap": r["text"],
         "recap_ts": r["ts"],
         "recap_age": brief.age_between(r["ts"], now_iso(now)) if r["ts"] else "",
@@ -3315,7 +3326,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
 # every row field but the prose ones (recap, topic, first, ask)
 _ONE_LINE = ("kind", "entrypoint", "project", "status", "attention", "waitingFor", "name", "title",
              "doing", "since", "age", "tty", "tab_title", "recap_age", "sessionId", "cwd",
-             "configDir")
+             "configDir", "park_note", "park_was")
 
 
 def project_dirs(roots=None):
@@ -3427,6 +3438,74 @@ def mark_reviewed(session_id, ts, path=None):
     return seen
 
 
+# What you parked: sessions you keep but will not work on now (owner,
+# 2026-10-08). Keyed by session, valued by the turn you parked it at and your
+# note - so the session writing a new turn ends the park by itself, as a new
+# turn ends a dismissal. Going to it ends it too (the list calls unpark).
+PARKS_CAP = 500             # sessions end; this file must not grow for ever
+PARK_NOTE_MAX = 200         # a note is a line on a row, not a document
+
+
+def parks_path():
+    """Beside ccwho's other files: CCWHO_DIR, or ~/.ccwho."""
+    return os.path.join(os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho"),
+                        "parked.json")
+
+
+def load_parks(path=None):
+    """{session id: {"ts", "note"}}. Never raises: an unreadable file is no
+    parks - every row is shown where it would be - and an entry of another
+    shape is left out."""
+    try:
+        with open(path or parks_path()) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {sid: {"ts": e["ts"], "note": e.get("note", "")} for sid, e in data.items()
+            if isinstance(e, dict) and isinstance(e.get("ts"), (str, int, float))
+            and not isinstance(e.get("ts"), bool) and isinstance(e.get("note", ""), str)}
+
+
+def _save_parks(parks, path):
+    """True when the parks are on disk: temp + replace, so no reader sees half."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(parks, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)              # a half-written temp file is litter
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def park(session_id, ts, note="", path=None):
+    """Park a session at turn `ts`, with a note of one printable line. True when
+    it is saved: a park that is not saved comes back on the next scan."""
+    path = path or parks_path()
+    parks = load_parks(path)
+    parks.pop(session_id, None)         # re-inserted last: newest at the end
+    note = " ".join(procs.printable(note).split())[:PARK_NOTE_MAX]
+    parks[session_id] = {"ts": ts, "note": note}
+    for gone in list(parks)[:max(0, len(parks) - PARKS_CAP)]:
+        parks.pop(gone)
+    return _save_parks(parks, path)
+
+
+def unpark(session_id, path=None):
+    """As if it was never parked. True when that is on disk."""
+    path = path or parks_path()
+    parks = load_parks(path)
+    parks.pop(session_id, None)
+    return _save_parks(parks, path)
+
+
 def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
     """`status` is a caller-owned dict, same idiom as `cache`. It carries out the
     one fact a caller cannot recover from the rows: whether the session source
@@ -3513,6 +3592,7 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
     att = procs.attribute(ptable, marks, ports or {}, sessions,
                           sessions_known=sessions_ok, own=os.getpid(), named=named)
     reviewed = load_reviewed()
+    parks = load_parks()
     rows = []
     parents, commands = parent_map(ps_out), command_map(ps_out)
     # the spare and the parked terminal still count above - as live claude
@@ -3541,7 +3621,7 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
-                              reviewed=reviewed,
+                              reviewed=reviewed, parks=parks,
                               windowed=windowed(tty, shown, blind=blind),
                               terminal=app_of_tty.get(terms.short_tty_full(tty), "") if tty else "",
                               dead_loops=dead))
@@ -3639,7 +3719,7 @@ _C = {"blocked": "\033[33;1m", "asks": "\033[35;1m", "stopped": "\033[32m",
       "review": "\033[33m", "stuck": "\033[31;1m",
       "running": "\033[2m", "ready": "\033[32m", "waiting": "\033[33;1m",
       "busy": "\033[32m", "idle": "\033[2m",
-      "shell": "\033[32m", "program": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
+      "shell": "\033[32m", "program": "\033[2m", "parked": "\033[2m", "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m"}
 
 
 def _paint(text, key, color):
@@ -3656,7 +3736,8 @@ def now_iso(now=None):
 _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
           "review": "FINISHED", "ready": "stopped", "stuck": "STUCK",
           "stopped": "STOPPED", "busy": "busy", "running": "running",
-          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program"}
+          "ready": "ready", "shell": "shell", "idle": "idle", "program": "program",
+          "parked": "PARKED"}
 
 
 
@@ -3785,6 +3866,8 @@ UI_GROUPS = (("NEEDS YOU", ("blocked", "waiting", "asks", "review")),
              ("STUCK", ("stuck",)),
              ("STOPPED", ("stopped", "ready", "shell", "idle")),
              ("BUSY", ("busy", "running")),
+             # you said not now: kept, and quiet until it writes again or you go to it
+             ("PARKED", ("parked",)),
              # started by a program, which answers it: last, and never a question
              ("PROGRAMS", ("program",)))
 
@@ -3843,18 +3926,21 @@ def ui_groups(rows):
 # carries the state; the words stay plain.
 UI_STATE_MARK = {"blocked": "▲", "waiting": "▲", "asks": "▲", "review": "△", "stuck": "◆",
                  "stopped": "·", "ready": "·", "shell": "·", "idle": "·",
-                 "busy": "●", "running": "●", "program": "·"}
+                 "busy": "●", "running": "●", "program": "·", "parked": "·"}
 UI_STATE_STYLE = {"blocked": "needs", "waiting": "needs", "asks": "needs",
                   "review": "review", "stuck": "needs",
                   "stopped": "quiet", "ready": "quiet", "shell": "quiet",
-                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet"}
+                  "idle": "quiet", "busy": "busy", "running": "busy", "program": "quiet",
+                  "parked": "quiet"}
 UI_UNKNOWN_MARK = "·"
 
 # What a part of a row IS, so the screen can decide how to draw it. The engine
 # never names a colour: a terminal's palette is not its business.
 UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action",
-            "detail")
+            "detail", "park")
 UI_KILL = "[kill stuck process…]"
+# On a row that needs you: park it - kept, out of NEEDS YOU, with a note of why
+UI_PARK = "[park]"
 # A click on a row goes to the session; this opens its detail instead: \ at the
 # right edge of line one over / on line two, one > the height of the row. ASCII:
 # a symbol of "ambiguous" width is two cells in some terminals, and pushes the
@@ -3880,6 +3966,21 @@ def loop_kill_offered(row):
     may be about to deal with it - said, not offered. A program's session is
     never known to be past its turn (a loop it cannot end makes it stuck)."""
     return bool(row.get("dead_loops")) and row.get("attention") not in ("busy", "program")
+
+
+def parkable(row):
+    """Can `z` park this row? A Claude session whose turn has ended: a busy
+    one's next turn would end the park at once, a program answers its own,
+    an ended one has no turn to come, and a Codex thread lives in its app."""
+    return (row.get("attention") not in ("busy", "program", "ended", "parked")
+            and row.get("kind") != "codex" and bool(row.get("ts"))
+            and bool(row.get("sessionId")))
+
+
+def park_offered(row):
+    """Does the row itself offer [park]? Only where it needs you: elsewhere it
+    is already quiet, and `z` parks it."""
+    return parkable(row) and row.get("attention") in dict(UI_GROUPS)["NEEDS YOU"]
 
 
 def ui_row_cells(row, width=100, tag=""):
@@ -3996,6 +4097,10 @@ def ui_row_cells(row, width=100, tag=""):
         who = {"you": "you", "claude": "Claude"}.get(said.get("who"), said.get("who") or "?")
         mark = f"{said.get('age') or '?'} · {who}: "
         body = said.get("text") or ""
+    elif row.get("attention") == "parked" and row.get("park_note"):
+        # why you kept it, in your words: the reason it is here
+        mark = "parked · "
+        body = row["park_note"]
     elif row.get("recap"):
         age = row.get("recap_age") or "?"
         turns = row.get("turns_since_recap") or 0
@@ -4007,26 +4112,33 @@ def ui_row_cells(row, width=100, tag=""):
     pad = "        "
     loops = row.get("dead_loops") or []
     # mid-turn the agent may be about to deal with it: said, not offered
-    act = [("  ", "pad"), (UI_KILL, "action")] if loop_kill_offered(row) else []
+    kill = [("  ", "pad"), (UI_KILL, "action")] if loop_kill_offered(row) else []
+    park = [("  ", "pad"), (UI_PARK, "park")] if park_offered(row) else []
     if loops:
         more = f" (+{len(loops) - 1} more)" if len(loops) > 1 else ""
         words, tail = dead_words(loops[0]), f"{more} · "
         mark = words + tail
-    # in screen cells, as _fit cuts the line: a CJK recap counted in characters
-    # ran twice as wide, and the cut dropped the kill at the end of the line
-    room = (width - _cells(pad) - sum(_cells(t) for t, _ in act)
-            - _cells(UI_DETAIL[1]) - 1)
-    if loops:
-        # what to do about it comes first; the recap only where it can be read,
-        # and the words about the loop give way - to nothing - before the kill
-        # the count stays: cut, it hid a second stuck item behind the first
-        mark = (_cut(words, room - _cells(tail)) + tail if more and room - _cells(tail) >= 8
-                else _cut(mark, max(0, room)))
-        body = body if room - _cells(mark) >= 20 else ""
-    second = [(pad, "pad"), (mark, "age")] + (
-        [(_cut(body, max(8, room - _cells(mark))), "recap")] if body else []) + act
-    return _to_the_edge(first, UI_DETAIL[0], width), \
-        _to_the_edge(second, UI_DETAIL[1], width)
+    # [park] gives way first where the line cannot hold it and the kill whole:
+    # `z` still parks, and a cut button is no button
+    for act in ([park + kill, kill] if park else [kill]):
+        # in screen cells, as _fit cuts the line: a CJK recap counted in
+        # characters ran twice as wide, and the cut dropped the kill at the end
+        room = (width - _cells(pad) - sum(_cells(t) for t, _ in act)
+                - _cells(UI_DETAIL[1]) - 1)
+        said, text = mark, body
+        if loops:
+            # what to do about it comes first; the recap only where it can be
+            # read, and the words about the loop give way - to nothing - before
+            # the kill. The count stays: cut, it hid a second stuck item
+            said = (_cut(words, room - _cells(tail)) + tail if more and room - _cells(tail) >= 8
+                    else _cut(mark, max(0, room)))
+            text = body if room - _cells(said) >= 20 else ""
+        second = _to_the_edge([(pad, "pad"), (said, "age")] + (
+            [(_cut(text, max(8, room - _cells(said))), "recap")] if text else []) + act,
+            UI_DETAIL[1], width)
+        if all(part in second for part in act):
+            break
+    return _to_the_edge(first, UI_DETAIL[0], width), second
 
 
 def _to_the_edge(line, half, width):
@@ -4054,8 +4166,8 @@ def ui_action_at(row, width, line, col, tag=""):
     at = 0
     for text, role in ui_row_cells(row, width, tag=tag)[line] if line in (0, 1) else ():
         # a click lands in screen cells, where a CJK character takes two
-        if role in ("action", "detail") and at <= col < at + _cells(text):
-            return "kill" if role == "action" else "detail"
+        if role in ("action", "detail", "park") and at <= col < at + _cells(text):
+            return {"action": "kill", "detail": "detail", "park": "park"}[role]
         at += _cells(text)
     return None
 
@@ -4284,7 +4396,9 @@ def render(rows, fleet=None, color=True, width=None, links=False):
         over = max(0, len(handle) - w_name)
         w_t = max(0, w_title - over)
         w_d = w_doing - max(0, over - w_title)
-        doing = (r.get("ask") if att == "asks" else r["doing"]) or "-"
+        doing = (r.get("ask") if att == "asks" else
+                 r.get("park_note") if att == "parked" and r.get("park_note") else
+                 r["doing"]) or "-"
         if att == "running" and r.get("work"):
             doing = f"[{r['work']} bg] {doing}"
         where = short_tty(r.get("tty", "")) or "-"

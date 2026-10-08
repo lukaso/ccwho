@@ -62,6 +62,7 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "name": "",              # plain: this is the thing you are reading
               "meta": "dim",
               "action": "bold",        # the one part of a row you click on its own: no underline
+              "park": "bold",          # [park]: a part you click on its own too
               "detail": "bold",        # the › that opens the detail, not the jump
               "age": "bold",           # inside a dim line, the age stands out
               "recap": "dim",
@@ -428,7 +429,7 @@ class Row(Static):
         # read again for this text: a row rewritten under a still mouse has moved
         # its parts, and the light follows what is under the mouse now
         self.lit = self.action_at(*self.mouse_at) if self.mouse_at else None
-        lit = {"detail": "detail", "kill": "action"}.get(self.lit)
+        lit = {"detail": "detail", "kill": "action", "park": "park"}.get(self.lit)
         for part, role in self.spans():
             style = state if role == "mark" else ROLE_STYLE.get(role, "")
             # under the mouse, the part a click on it acts on lights up
@@ -662,6 +663,55 @@ class ChoiceBox(ModalScreen):
         self.dismiss(None)
 
 
+class ParkBox(ModalScreen):
+    """Park one session: a line for why you keep it, which may stay empty.
+    Enter parks, Esc or ✕ parks nothing. The answer is the note ("" for none),
+    or None. Used now and then, so it says what it does (and when the park
+    ends) where you type."""
+
+    DEFAULT_CSS = """
+    ParkBox { align: center middle; }
+    #parkbox { width: 72; max-width: 100%; height: auto;
+               border: round $accent; background: $surface; padding: 0 1; }
+    #parktop { height: auto; }
+    #parkhead { width: 1fr; text-style: bold; }
+    #parkclose { width: 3; color: $text-muted; }
+    #parkclose:hover { background: $accent; color: $text; }
+    .parknote { color: $text-muted; height: auto; }
+    """
+
+    BINDINGS = [Binding("escape", "close", "close")]
+
+    def __init__(self, title):
+        super().__init__()
+        self.title_text = title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="parkbox"):
+            with Horizontal(id="parktop"):
+                yield Static(f"park {self.title_text}", id="parkhead", markup=False)
+                yield Static(" ✕ ", id="parkclose", markup=False)
+            yield Static("why do you keep it? (optional) - it moves to PARKED until it"
+                         " writes a new turn or you go to it; z on it there unparks it",
+                         classes="parknote", markup=False)
+            yield Input(placeholder="a note for yourself", id="parknote")
+            yield Static("Enter parks · Esc closes", classes="parknote", markup=False)
+
+    def on_mount(self):
+        self.query_one("#parknote", Input).focus()
+
+    @on(Input.Submitted, "#parknote")
+    def submitted(self, event):
+        self.dismiss(event.value)
+
+    def on_click(self, event):
+        if getattr(getattr(event, "widget", None), "id", None) == "parkclose":
+            self.dismiss(None)
+
+    def action_close(self):
+        self.dismiss(None)
+
+
 class SavesMenu(ModalScreen):
     """Which save to reopen: every one, newest first and highlighted.
 
@@ -794,6 +844,10 @@ class CcwhoUi(App):
         Binding("x", "row_x", "kill or stop"),
         # no choice on this row: `x` says why, and the footer shows no `x`
         Binding("x", "row_nothing", "", show=False),
+        # park a session you keep but will not work on now; on a parked row,
+        # unpark it - check_action picks which of the two the footer shows
+        Binding("z", "park", "park"),
+        Binding("z", "unpark", "unpark"),
         Binding("r", "restart", "restart", show=False),
         Binding("q", "quit", "quit"),
     ]
@@ -826,6 +880,9 @@ class CcwhoUi(App):
         self.reviewing = {}     # session id -> row, looked at by a jump that landed
         self.jumps = 0          # which jump is the latest: only its answer ends it
         self.seen = {}          # session id -> the turn (ts) you looked at
+        # session id -> (ts, note) parked here, or (ts, None) unparked here:
+        # until a scan agrees, one that read the parks before is not shown
+        self.parks_here = {}
         self.loading = False    # the saves are being read for the o menu
         self.note = ""          # an `o` that missed iTerm2's panes: shown until a key
         self.note_at = 0.0      # when it came: time.monotonic, the clock of a key's .time
@@ -990,10 +1047,33 @@ class CcwhoUi(App):
         turn you saw stays seen. Every fleet that reaches the screen comes
         through here - the held one included."""
         for row in fleet.rows:
+            self.keep_park(row)
             if row.get("attention") == "review" and row.get("ts") \
                     and self.seen.get(row.get("sessionId")) == row.get("ts"):
                 row["attention"] = "stopped"
         return fleet
+
+    def keep_park(self, row):
+        """A park or unpark made here, on a row a scan read before it: shown as
+        made. A new turn ends it, and a scan that shows it the same way is the
+        parks on disk saying so: from then on they are the truth."""
+        sid = row.get("sessionId")
+        if sid in self.parks_here and not self.apply_park(row, *self.parks_here[sid]):
+            del self.parks_here[sid]
+
+    @staticmethod
+    def apply_park(row, ts, note):
+        """The row parked with `note`, or unparked (None) - when it is still on
+        turn `ts` and shown the other way. True when it changed the row."""
+        if row.get("ts") != ts or (row.get("attention") == "parked") == (note is not None):
+            return False
+        if note is None:
+            row["attention"] = row.get("park_was")
+            row["park_note"] = row["park_was"] = ""
+        else:
+            row["park_was"], row["park_note"] = row.get("attention", ""), note
+            row["attention"] = "parked"
+        return True
 
     # ---------------------------------------------------------------- painting
 
@@ -1665,11 +1745,13 @@ class CcwhoUi(App):
             widget.set_class(widget.row.get("sessionId") == self.selected,
                              "selected")
         self.paint_usage()          # the selected row's account is the bright one
-        # what Enter does follows the row: the footer is rebuilt when that
-        # changes - a reopened session keeps its widget as it moves out of ENDED
-        ended = self.on_ended()
-        if ended != getattr(self, "_enter_for", False):
-            self._enter_for = ended
+        # what Enter and z do follow the row: the footer is rebuilt when that
+        # changes - a reopened session keeps its widget as it moves out of
+        # ENDED, a parked one as it moves in or out of PARKED
+        row = self.selected_row() or {}
+        keys = (self.on_ended(), row.get("attention") == "parked", engine.parkable(row))
+        if keys != getattr(self, "_keys_for", None):
+            self._keys_for = keys
             self.refresh_bindings()
 
     # ----------------------------------------------------------------- actions
@@ -1722,6 +1804,9 @@ class CcwhoUi(App):
         if action == "detail":
             self.open_detail("brief")
             return
+        if action == "park":
+            self.action_park()          # the box: a click on [park] is not a jump
+            return
         self._go()          # a click names its row, whatever the pane shows
 
     def row_choices(self, row):
@@ -1758,7 +1843,93 @@ class CcwhoUi(App):
                     and bool(self.row_choices(self.selected_row())[0]))
         if action in ("go", "reopen_ended"):
             return self.on_ended() == (action == "reopen_ended")
+        if action in ("park", "unpark"):
+            # not on the process screen: it is not about the selected row
+            row = self.selected_row() or {}
+            if self.detail_open and self.detail_mode == "procs":
+                return False
+            return (row.get("attention") == "parked" if action == "unpark"
+                    else engine.parkable(row))
         return True
+
+    def action_park(self):
+        """`z`: the box that parks the selected row, with a note of why."""
+        row = self.selected_row()
+        if not row:
+            return
+        title = "  ".join(t for t in (engine.brief.short_id(row.get("sessionId", "")),
+                                       engine.session_handle(row)) if t)
+        self.push_screen(ParkBox(title),
+                         callback=lambda note, row=row: self.parked_with(row, note))
+
+    def parked_with(self, row, note):
+        """The box's answer: park at the turn the box was opened on - a turn
+        that came since is news, and is not parked."""
+        if note is None:
+            return
+        sid, ts = row.get("sessionId", ""), row.get("ts")
+        now = next((r for r in self.fleet.rows if r.get("sessionId") == sid), {})
+        if now.get("ts") != ts:
+            # a park of the old turn would end at once: say so, park nothing
+            self.said("it changed while the box was open - nothing parked; z again")
+            return
+        if not engine.park(sid, ts, note):
+            self.said("could not save the park - nothing parked")
+            return
+        note = " ".join(engine.procs.printable(note).split())[:engine.PARK_NOTE_MAX]
+        self.park_here(sid, ts, note)
+
+    def action_unpark(self):
+        """`z` on a parked row: as if it was never parked."""
+        row = self.selected_row()
+        if row and row.get("attention") == "parked":
+            self.unpark_row(row)
+
+    def unpark_row(self, row):
+        sid = row.get("sessionId", "")
+        if not engine.unpark(sid):
+            # on the warning line until a key, not the status line a scan
+            # clears: going to it brings another window to the front
+            self.note, self.note_at = (f"{engine.brief.short_id(sid)} stays parked"
+                                       " - could not save the unpark", time.monotonic())
+            self.status = ""
+            self.paint_header(self.groups())
+            return
+        self.park_here(sid, row.get("ts"), None)
+
+    def park_here(self, sid, ts, note):
+        """A park (`note` a text) or an unpark (None) made here: on the screen
+        now, rather than on the next scan, and kept over a scan that read the
+        parks before it (keep_park)."""
+        self.parks_here[sid] = (ts, note)
+        heading, below = self.place(sid)
+        for row in self.fleet.rows:
+            if row.get("sessionId") == sid:
+                self.apply_park(row, ts, note)
+        if note is not None and below and self.place(sid)[0] != heading:
+            # the highlight stays where you were working, so Enter goes on to
+            # the next session that needs you - not to this one, which a go
+            # would unpark. An unpark brings back the one you want: it follows;
+            # and a row that stays in its group - a search's SAID - keeps it
+            self.selected = below
+            detail = self.part("#detail")
+            if detail is not None:
+                detail.scroll_home(animate=False)   # another session's brief starts at its top
+        self.painted_shape = None       # it moves group, so the list is rebuilt
+        self.rebuild()
+        # the rows only moved, so nothing gave focus to the new one: the focus
+        # left on the parked row would take the highlight back with it
+        self.call_after_refresh(self.restore_selection)
+
+    def place(self, sid):
+        """(the heading over `sid`, the row under it in that group - or the one
+        above when it is the last, "" when it is alone there)."""
+        for group in self.groups():
+            ids = [r.get("sessionId") for r in group["rows"]]
+            if sid in ids:
+                at = ids.index(sid)
+                return group["heading"], (ids[at + 1:] or ids[at - 1:at] or [""])[0]
+        return None, ""
 
     def on_ended(self):
         """Is the selected row an ended session - one Enter reopens?"""
@@ -2084,6 +2255,7 @@ class CcwhoUi(App):
         self.detail_open = True
         self.detail_mode = mode
         self.paint_detail()
+        self.refresh_bindings()         # what x and z do there is not what they do on a row
 
     def action_back(self):
         # The detail goes first. Coming back from a brief you opened FROM a
@@ -2092,6 +2264,7 @@ class CcwhoUi(App):
             self.detail_open = False
             self.query_one("#detail").display = False
             self.query_one("#list").display = True
+            self.refresh_bindings()
             self.call_after_refresh(self.restore_selection)
             return
         box = self.query_one("#search")
@@ -2225,10 +2398,14 @@ class CcwhoUi(App):
         `ts` is the turn you were shown. A newer turn - one that came while the
         window was opening - is one you have not seen.
         """
-        if row.get("attention") != "review":
-            return
         sid = row.get("sessionId", "")
         if not (sid and ts) or row.get("ts", "") != ts:
+            return
+        if row.get("attention") == "parked":
+            # going to it ends the park: as if it was never parked (owner,
+            # 2026-10-08) - and then the look counts as for any row
+            self.unpark_row(row)
+        if row.get("attention") != "review":
             return
         engine.mark_reviewed(sid, ts)
         self.seen[sid] = ts
@@ -2265,6 +2442,12 @@ class CcwhoUi(App):
         if not text.startswith(("reopened", "focused", "attached")):
             self.note, self.note_at, self.status = self.status, time.monotonic(), ""
             self.paint_header(self.groups())
+            return
+        park = engine.load_parks().get(row.get("sessionId", ""))
+        if park:
+            # going to it ends a park, and a reopen is going to it - at the
+            # park's own turn: the ENDED row has the index's, never a live row's
+            self.unpark_row(dict(row, attention="parked", ts=park["ts"]))
 
     @work(thread=True)
     def go_to(self, row, jump):

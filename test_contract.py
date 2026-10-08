@@ -37,6 +37,8 @@ ROW_KEYS = {
                           # (ctrl+b) - they show it, and have no row of their own
     "terminal",           # added 2026-09-30: the app whose tab shows it (iterm2,
                           # terminal), "" when no app ccwho knows does
+    "park_note", "park_was",  # added 2026-10-08: parked in ccwho (attention
+                          # "parked"): your note, and its state when not parked
 }
 
 # Every key a manifest session entry has ever carried. Append only.

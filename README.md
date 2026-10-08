@@ -171,6 +171,7 @@ ccwho                         # on a terminal
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. In the box: `l` the stuck items, `p` its processes, `s` stop. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
+| `z` | park the session: you keep it, but not now. A box asks why (Enter parks, Esc parks nothing; the note may stay empty), and the row moves to a quiet PARKED group with your note as its second line. A click on `[park]` on a row that needs you opens the same box. The highlight stays in the group the row left, on the next row (the one above when it was the last), so Enter goes on to the next session that needs you; with no other row there, or when the row stays where it is (under SAID in a search), it stays on the parked row. The park ends when the session writes a new turn, when you go to it (Enter or a click, or Enter on an ended one, which reopens it), or with `z` on the parked row - then the row is as if it was never parked. Notes are kept in `parked.json` in `~/.ccwho` (or `$CCWHO_DIR`), so they outlive a restart, which text left unsent in a prompt box does not. Not on a busy row (its next turn would end the park), a program's, an ended one or a Codex thread |
 | `o` | a menu of every save, newest first, with how many of its sessions run now and how many it would reopen; the last save before the restart is marked. Running sessions, and those Claude Desktop or a program ran, are left alone |
 | `r` | restart the list |
 | `q` | quit |
@@ -777,6 +778,7 @@ So `ccwho` derives the state instead:
 | busy | harness says busy, mid-turn | busy |
 | running | background work is in flight: not busy, or busy with the turn over | running |
 | program | a program started it (see [Started by a program](#started-by-a-program)), and it is not stuck | program |
+| parked | you parked it at its last turn (`z` in the live list), and it has written nothing since. `--json` gives your note as `park_note`, and the state it has when not parked as `park_was` | PARKED |
 
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.

@@ -14,8 +14,23 @@ _UNPIN = []
 
 def setUpModule():
     import ccwho
+    import os
+    import shutil
+    import tempfile
     import testkit
     _UNPIN.append(testkit.pin_ccwho_dir(ccwho))
+    # a park is written to disk: never the user's own file (test_ui does the same)
+    parks = tempfile.mkdtemp(prefix="ccwho-test-parks-")
+    os.environ["CCWHO_DIR"] = parks
+    _UNPIN.append(lambda: (os.environ.pop("CCWHO_DIR", None), shutil.rmtree(parks, True)))
+
+
+class TestNoTestHereWritesTheRealParks(unittest.TestCase):
+    def test_the_parks_are_in_a_temp_dir(self):
+        import os
+        import ccwho_ui
+        here = os.environ.get("CCWHO_DIR", "")
+        self.assertTrue(here and ccwho_ui.engine.parks_path().startswith(here))
 
 
 def tearDownModule():

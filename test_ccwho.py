@@ -5380,6 +5380,348 @@ class TestWhatYouHaveLookedAtSurvives(unittest.TestCase):
         self.assertEqual(status.get("reviewed"), {"a": "t1"})
 
 
+class TestParksAreKept(unittest.TestCase):
+    """A session you keep but will not work on now is parked: out of NEEDS YOU,
+    with a note that says why (owner, 2026-10-08). The note was text left unsent
+    in the session's prompt box - in no file, and lost with the process."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "parked.json")
+
+    def test_nothing_parked_yet_is_an_empty_answer(self):
+        self.assertEqual(ccwho.load_parks(self.path), {})
+
+    def test_a_park_comes_back_with_its_turn_and_note(self):
+        self.assertTrue(ccwho.park("a", 1788177600.5, "temp folders checked later",
+                                   path=self.path))
+        self.assertEqual(ccwho.load_parks(self.path),
+                         {"a": {"ts": 1788177600.5, "note": "temp folders checked later"}})
+
+    def test_no_note_is_a_park_too(self):
+        ccwho.park("a", "t1", path=self.path)
+        self.assertEqual(ccwho.load_parks(self.path), {"a": {"ts": "t1", "note": ""}})
+
+    def test_unpark_takes_it_all_away(self):
+        ccwho.park("a", "t1", "why", path=self.path)
+        ccwho.park("b", "t2", path=self.path)
+        self.assertTrue(ccwho.unpark("a", path=self.path))
+        self.assertEqual(ccwho.load_parks(self.path), {"b": {"ts": "t2", "note": ""}})
+
+    def test_unparking_what_is_not_parked_is_no_error(self):
+        self.assertTrue(ccwho.unpark("nobody", path=self.path))
+        self.assertEqual(ccwho.load_parks(self.path), {})
+
+    def test_the_note_is_one_printable_line(self):
+        # it goes to a terminal and to agents (--json)
+        ccwho.park("a", "t1", "two\nlines \x1b[31mred\x07", path=self.path)
+        self.assertEqual(ccwho.load_parks(self.path)["a"]["note"], "two lines ?[31mred?")
+
+    def test_a_long_note_is_cut(self):
+        ccwho.park("a", "t1", "x" * 1000, path=self.path)
+        self.assertEqual(len(ccwho.load_parks(self.path)["a"]["note"]), ccwho.PARK_NOTE_MAX)
+
+    def test_a_file_full_of_nonsense_is_not_a_crash(self):
+        with open(self.path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(ccwho.load_parks(self.path), {})
+
+    def test_an_entry_of_the_wrong_shape_is_left_out(self):
+        with open(self.path, "w") as fh:
+            json.dump({"a": "t1", "b": {"note": "no turn"}, "c": {"ts": True},
+                       "d": {"ts": "t4", "note": 7}, "e": {"ts": "t5", "note": "kept"},
+                       "f": {"ts": None, "note": ""}, "g": {"ts": ["t7"], "note": ""}}, fh)
+        self.assertEqual(ccwho.load_parks(self.path), {"e": {"ts": "t5", "note": "kept"}})
+
+    def test_a_park_after_a_bad_file_starts_again(self):
+        with open(self.path, "w") as fh:
+            fh.write("[1, 2]")
+        self.assertTrue(ccwho.park("a", "t1", path=self.path))
+        self.assertEqual(ccwho.load_parks(self.path), {"a": {"ts": "t1", "note": ""}})
+
+    def test_a_half_written_file_never_reaches_a_reader(self):
+        ccwho.park("a", "t1", path=self.path)
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["parked.json"])
+
+    def test_it_does_not_grow_for_ever(self):
+        for i in range(ccwho.PARKS_CAP + 5):
+            ccwho.park(f"s{i}", f"t{i}", path=self.path)
+        kept = ccwho.load_parks(self.path)
+        self.assertEqual(len(kept), ccwho.PARKS_CAP)
+        self.assertIn(f"s{ccwho.PARKS_CAP + 4}", kept, "the newest are kept")
+        self.assertNotIn("s0", kept)
+
+    def test_parking_again_makes_it_the_newest(self):
+        for i in range(ccwho.PARKS_CAP):
+            ccwho.park(f"s{i}", f"t{i}", path=self.path)
+        ccwho.park("s0", "t0b", path=self.path)
+        ccwho.park("new", "t", path=self.path)
+        kept = ccwho.load_parks(self.path)
+        self.assertIn("s0", kept)
+        self.assertNotIn("s1", kept, "the oldest went")
+
+    def test_a_write_that_fails_half_way_leaves_the_parks_whole(self):
+        ccwho.park("a", "t1", "kept", path=self.path)
+        real = ccwho.json.dump
+
+        def half(obj, fh, **kw):
+            fh.write('{"b": {"ts"')
+            raise OSError("disk full")
+        testkit.patch(self, ccwho.json, "dump", half)
+        self.assertFalse(ccwho.park("b", "t2", path=self.path))
+        testkit.patch(self, ccwho.json, "dump", real)
+        self.assertEqual(ccwho.load_parks(self.path), {"a": {"ts": "t1", "note": "kept"}})
+        self.assertEqual(os.listdir(self.tmp), ["parked.json"], "no temp file left")
+
+    def test_its_folder_is_made_when_there_is_none(self):
+        path = os.path.join(self.tmp, "missing", "parked.json")
+        self.assertTrue(ccwho.park("a", 1.0, path=path))
+        self.assertEqual(ccwho.load_parks(path), {"a": {"ts": 1.0, "note": ""}})
+
+    def test_a_park_that_cannot_be_saved_says_so(self):
+        # the folder it goes in is a file: the write cannot happen
+        blocker = os.path.join(self.tmp, "blocker")
+        with open(blocker, "w"):
+            pass
+        path = os.path.join(blocker, "parked.json")
+        self.assertFalse(ccwho.park("a", "t1", path=path))
+        self.assertFalse(ccwho.unpark("a", path=path))
+
+    def test_it_lives_with_the_rest_of_ccwhos_files(self):
+        had = os.environ.pop("CCWHO_DIR", None)
+        self.addCleanup(lambda: os.environ.__setitem__("CCWHO_DIR", had) if had is not None
+                        else os.environ.pop("CCWHO_DIR", None))
+        os.environ["CCWHO_DIR"] = self.tmp
+        self.assertEqual(ccwho.parks_path(), self.path)
+        os.environ.pop("CCWHO_DIR")
+        self.assertEqual(ccwho.parks_path(),
+                         os.path.join(os.path.expanduser("~"), ".ccwho", "parked.json"))
+
+
+class TestAParkedRow(unittest.TestCase):
+    """Parked until the session writes a new turn, or you go to it (owner,
+    2026-10-08): then it is as if it was never parked."""
+
+    SESSION = TestBuildRow.SESSION
+
+    def tail(self, ts="2026-08-31T12:00:00.000Z", text="Want me to build S2a?"):
+        return [json.dumps({"type": "assistant", "timestamp": ts,
+                            "message": {"content": [{"type": "text", "text": text}]}})]
+
+    def build(self, parks=None, session=None, tail=None):
+        return ccwho.build_row(session or self.SESSION, [], tail or self.tail(), mtime=0,
+                               now=1788177600.0, parks=parks)
+
+    def test_parked_at_its_last_turn_it_is_parked(self):
+        ts = self.build()["ts"]
+        row = self.build(parks={"s1": {"ts": ts, "note": "checked later"}})
+        self.assertEqual(row["attention"], "parked")
+        self.assertEqual(row["park_note"], "checked later")
+        self.assertEqual(row["park_was"], "asks", "what it is when not parked")
+
+    def test_a_new_turn_ends_the_park(self):
+        old = self.build(tail=self.tail("2026-08-30T12:00:00.000Z"))["ts"]
+        row = self.build(parks={"s1": {"ts": old, "note": "checked later"}})
+        self.assertEqual(row["attention"], "asks")
+        self.assertEqual(row["park_note"], "")
+        self.assertEqual(row["park_was"], "")
+
+    def test_a_finished_turn_can_be_parked(self):
+        tail = self.tail(text="234 tests green.")
+        ts = self.build(tail=tail)["ts"]
+        row = self.build(parks={"s1": {"ts": ts, "note": ""}}, tail=tail)
+        self.assertEqual((row["attention"], row["park_was"]), ("parked", "review"))
+
+    def test_a_turn_with_no_time_is_never_parked(self):
+        tail = [json.dumps({"type": "assistant",
+                            "message": {"content": [{"type": "text", "text": "Shall I?"}]}})]
+        row = self.build(parks={"s1": {"ts": None, "note": ""}}, tail=tail)
+        self.assertEqual(row["attention"], "asks")
+
+    def test_another_sessions_park_is_not_this_ones(self):           # control
+        ts = self.build()["ts"]
+        self.assertEqual(self.build(parks={"s2": {"ts": ts, "note": ""}})["attention"], "asks")
+
+    def test_a_programs_session_stays_a_programs(self):
+        session = dict(self.SESSION, entrypoint="sdk-py")
+        ts = self.build(session=session)["ts"]
+        row = self.build(parks={"s1": {"ts": ts, "note": ""}}, session=session)
+        self.assertEqual(row["attention"], "program")
+
+    def test_the_note_is_one_line_on_the_row(self):
+        ts = self.build()["ts"]
+        row = self.build(parks={"s1": {"ts": ts, "note": "two\nlines"}})
+        self.assertEqual(row["park_note"], "two lines")
+
+    def test_a_scan_reads_the_parks(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "parked.json")
+        testkit.patch(self, ccwho, "parks_path", lambda: path)
+        testkit.patch(self, ccwho, "agents_json", lambda: json.dumps([dict(
+            self.SESSION, pid=11, kind="interactive")]))
+        testkit.patch(self, ccwho, "read_windows",
+                      lambda sid, cache=None: ([], self.tail(), 0))
+        for name, fake in (("ps_snapshot", lambda: ""), ("tty_snapshot", lambda: ""),
+                           ("live_file_sessions", lambda *a, **k: ([], 0)),
+                           ("ps_table", lambda: {}), ("listen_ports", lambda: {}),
+                           ("stdin_sockets", lambda pids: {}),
+                           ("read_codex_threads", lambda env=None, cache=None: []),
+                           ("verdicts_path", lambda: os.path.join(tmp, "readers.json"))):
+            testkit.patch(self, ccwho, name, fake)
+        for app in ccwho.terms.APPS:
+            testkit.patch(self, app, "titles", lambda timeout=5.0, **k: {})
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["attention"], "asks")                # control
+        ccwho.park("s1", rows[0]["ts"], "later", path=path)
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual((rows[0]["attention"], rows[0]["park_note"]), ("parked", "later"))
+
+
+class TestParkedInTheList(unittest.TestCase):
+    """PARKED is its own quiet group, after BUSY: nothing in it needs you."""
+
+    def rows(self):
+        return [{"sessionId": s, "attention": s, "ts": "t"} for s in
+                ("asks", "stopped", "busy", "parked", "program")]
+
+    def test_parked_rows_have_their_own_group_after_busy(self):
+        groups = ccwho.ui_groups(self.rows())
+        self.assertEqual([g["heading"] for g in groups],
+                         ["NEEDS YOU", "STOPPED", "BUSY", "PARKED", "PROGRAMS"])
+        self.assertFalse(groups[3]["needs_you"])
+
+    def test_needs_you_leaves_parked_rows_out(self):
+        self.assertEqual([r["attention"] for r in ccwho.needs_you(self.rows())], ["asks"])
+
+    def test_it_is_called_parked(self):
+        self.assertEqual(ccwho._LABEL["parked"], "PARKED")
+
+    def test_it_sorts_after_running_and_before_programs(self):
+        rank = ccwho._RANK
+        self.assertLess(rank["running"], rank["parked"])
+        self.assertLess(rank["parked"], rank["program"])
+
+    def test_the_table_shows_the_note(self):
+        row = {"sessionId": "a", "attention": "parked", "status": "idle",
+               "project": "liveapp", "title": "x", "tab_title": "", "name": "n",
+               "doing": "Bash: run it", "ask": "Shall I land it?", "since": "1m", "ts": "",
+               "topic": "", "first": "", "age": "", "orphans": 0, "work": 0, "tty": "",
+               "pid": 1, "cwd": "/x", "recap": "", "recap_ts": "", "recap_age": "",
+               "turns_since_recap": 0, "park_note": "temp folders checked later",
+               "park_was": "asks"}
+        out = ccwho.render([row], 0, color=False, width=160)
+        self.assertIn("PARKED", out)
+        self.assertIn("temp folders checked later", out)
+        self.assertNotIn("Shall I land it?", out)
+        out = ccwho.render([dict(row, park_note="")], 0, color=False, width=160)
+        self.assertIn("Bash: run it", out)                            # control
+
+
+class TestTheParkTarget(unittest.TestCase):
+    """[park] on a row that needs you: a left click is the only click that
+    reaches ccwho in iTerm2, so the action needs something visible to click."""
+
+    def row(self, att="asks", **kw):
+        return dict({"sessionId": "aaaa1111-0000-4000-8000-000000000001", "attention": att,
+                     "ts": "2026-08-31T12:00:00.000Z", "name": "liveapp-de",
+                     "project": "liveapp", "since": "17h", "tty": "ttys009",
+                     "recap": "the temp folder cleanup", "recap_age": "17h",
+                     "dead_loops": []}, **kw)
+
+    def zone(self, row, width=100):
+        _, second = ccwho.ui_row_cells(row, width=width)
+        col = 0
+        for text, role in second:
+            if role == "park":
+                return col
+            col += ccwho._cells(text)
+        return None
+
+    def test_a_row_that_needs_you_offers_it(self):
+        for att in ("asks", "review", "blocked", "waiting"):
+            with self.subTest(att=att):
+                _, second = ccwho.ui_row_cells(self.row(att), width=100)
+                self.assertEqual([t for t, r in second if r == "park"], [ccwho.UI_PARK])
+
+    def test_no_other_row_offers_it(self):                           # control
+        for att in ("stopped", "busy", "running", "stuck", "parked", "program", "ended"):
+            with self.subTest(att=att):
+                _, second = ccwho.ui_row_cells(self.row(att), width=100)
+                self.assertNotIn("park", [r for _, r in second])
+
+    def test_a_codex_thread_is_not_parked(self):
+        _, second = ccwho.ui_row_cells(self.row(kind="codex"), width=100)
+        self.assertNotIn("park", [r for _, r in second])
+
+    def test_a_row_with_no_turn_is_not_parked(self):
+        _, second = ccwho.ui_row_cells(self.row(ts=None), width=100)
+        self.assertNotIn("park", [r for _, r in second])
+
+    def test_the_click_lands_on_it(self):
+        row = self.row()
+        col = self.zone(row)
+        self.assertEqual(ccwho.ui_action_at(row, 100, 1, col), "park")
+        self.assertEqual(ccwho.ui_action_at(row, 100, 1, col + len(ccwho.UI_PARK) - 1), "park")
+        self.assertIsNone(ccwho.ui_action_at(row, 100, 1, col - 1))
+
+    def test_it_survives_a_narrow_window(self):
+        _, second = ccwho.ui_row_cells(self.row(), width=40)
+        self.assertEqual([t for t, r in second if r == "park"], [ccwho.UI_PARK])
+
+    def test_park_gives_way_before_the_kill_is_cut(self):
+        # z still parks; a cut kill is no button (review 1 of slice 2)
+        row = self.row(dead_loops=[{"pid": 86246, "tasks": ["bscl8fc6k"]}])
+        for width in range(36, 61):
+            with self.subTest(width=width):
+                _, second = ccwho.ui_row_cells(row, width=width)
+                self.assertIn((ccwho.UI_KILL, "action"), second)
+
+    def test_park_is_whole_or_not_there(self):
+        for row in (self.row(), self.row(dead_loops=[{"pid": 86246, "tasks": ["b"]}])):
+            for width in range(24, 61):
+                with self.subTest(width=width, loops=bool(row["dead_loops"])):
+                    _, second = ccwho.ui_row_cells(row, width=width)
+                    self.assertIn([t for t, r in second if r == "park"], ([], [ccwho.UI_PARK]))
+        _, second = ccwho.ui_row_cells(self.row(), width=100)                # control
+        self.assertEqual([t for t, r in second if r == "park"], [ccwho.UI_PARK])
+
+    def test_with_a_stuck_loop_both_are_there(self):
+        row = self.row(dead_loops=[{"pid": 86246, "tasks": ["bscl8fc6k"]}])
+        _, second = ccwho.ui_row_cells(row, width=100)
+        self.assertEqual([t for t, r in second if r in ("park", "action")],
+                         [ccwho.UI_PARK, ccwho.UI_KILL])
+        col = self.zone(row)
+        self.assertEqual(ccwho.ui_action_at(row, 100, 1, col), "park")
+        self.assertEqual(ccwho.ui_action_at(row, 100, 1, col + len(ccwho.UI_PARK) + 2), "kill")
+
+    def test_the_key_parks_any_row_whose_turn_has_ended(self):
+        for att in ("asks", "review", "blocked", "waiting", "stopped", "running", "stuck"):
+            with self.subTest(att=att):
+                self.assertTrue(ccwho.parkable(self.row(att)))
+
+    def test_the_key_does_not_park_what_cannot_wait(self):           # control
+        # busy: its next turn ends the park at once; a program's is not yours;
+        # an ended one has no turn to come; a Codex thread is its app's
+        for row in (self.row("busy"), self.row("program"), self.row("ended"),
+                    self.row("parked"), self.row(kind="codex"), self.row(ts=None),
+                    self.row(ts=""), self.row(sessionId="")):
+            with self.subTest(row=(row["attention"], row.get("kind"), row["ts"])):
+                self.assertFalse(ccwho.parkable(row))
+
+    def test_a_parked_row_shows_its_note_in_place_of_the_recap(self):
+        row = self.row("parked", park_note="checked later")
+        _, second = ccwho.ui_row_cells(row, width=100)
+        text = "".join(t for t, _ in second)
+        self.assertIn("checked later", text)
+        self.assertNotIn("the temp folder cleanup", text)
+
+    def test_a_parked_row_with_no_note_shows_its_recap(self):          # control
+        _, second = ccwho.ui_row_cells(self.row("parked", park_note=""), width=100)
+        self.assertIn("the temp folder cleanup", "".join(t for t, _ in second))
+
+
 class TestOneTableSaysWhatAStateIsCalled(unittest.TestCase):
     """The table had its own copy of the label map, so a state added to the
     engine printed as its internal name - "review" instead of FINISHED. One

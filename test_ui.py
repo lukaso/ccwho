@@ -32,6 +32,14 @@ def setUpModule():
     ui.Collector.doctor = lambda self: ""
     _UNPIN.append(lambda: setattr(ui.Collector, "doctor", REAL_DOCTOR)
                   if REAL_DOCTOR is not None else delattr(ui.Collector, "doctor"))
+    # a park is written to disk: never the user's own file. Through CCWHO_DIR,
+    # which a hot reload keeps - a patched parks_path would be made anew
+    import os
+    import shutil
+    import tempfile
+    parks = tempfile.mkdtemp(prefix="ccwho-test-parks-")
+    os.environ["CCWHO_DIR"] = parks
+    _UNPIN.append(lambda: (os.environ.pop("CCWHO_DIR", None), shutil.rmtree(parks, True)))
 
 
 def tearDownModule():
@@ -528,8 +536,11 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         import ccwho as runner
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        os.environ["CCWHO_DIR"] = tmp
-        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+        # put back as it was: setUpModule's CCWHO_DIR keeps every park away
+        # from the user's own file
+        env = mock.patch.dict(os.environ, {"CCWHO_DIR": tmp})
+        env.start()
+        self.addCleanup(env.stop)
         runner._write_claim(self.SID, {"pid": 4_000_000, "since": time.time() - 5,
                                        "sessionId": self.SID, "unresolved": True,
                                        "iterm_pid": 4_000_000})
@@ -578,8 +589,11 @@ class TestTheListLetsGoOfLaunchesItSeesRunning(unittest.TestCase):
         import ccwho as runner
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        os.environ["CCWHO_DIR"] = tmp
-        self.addCleanup(os.environ.pop, "CCWHO_DIR", None)
+        # put back as it was: setUpModule's CCWHO_DIR keeps every park away
+        # from the user's own file
+        env = mock.patch.dict(os.environ, {"CCWHO_DIR": tmp})
+        env.start()
+        self.addCleanup(env.stop)
 
         def collect(cache=None, status=None):
             time.sleep(0.02)
@@ -7468,3 +7482,852 @@ class TestTheCollectorGreps(unittest.TestCase):
             fh.write(line + "\n")
         c.grep(entries, "flamingo")
         self.assertEqual(c.said_store.parsed, parsed + 1, "only the new line")
+
+
+class TestNoTestWritesTheRealParks(unittest.TestCase):
+    """setUpModule points the parks at a temp dir through CCWHO_DIR - not a
+    patch of engine.parks_path, which a hot reload makes anew (review 1 of
+    slice 2)."""
+
+    def test_a_reload_keeps_them_in_the_temp_dir(self):
+        import os
+        here = os.environ.get("CCWHO_DIR", "")
+        self.assertTrue(here and ui.engine.parks_path().startswith(here))
+        ui.Collector().reload()
+        self.assertTrue(ui.engine.parks_path().startswith(here))
+
+    def test_a_test_that_points_it_elsewhere_puts_it_back(self):
+        # a later test that set CCWHO_DIR and popped it left every test after
+        # it writing to $HOME/.ccwho (review 2 of slice 2)
+        import os
+        here = os.environ.get("CCWHO_DIR")
+        for name in ("test_a_session_on_the_list_lets_go_of_its_claim",
+                     "test_a_claim_made_during_the_lists_scan_survives_it"):
+            with self.subTest(name=name):
+                result = unittest.TestResult()
+                TestTheListLetsGoOfLaunchesItSeesRunning(name).run(result)
+                self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+                self.assertEqual(os.environ.get("CCWHO_DIR"), here)
+
+
+TS = "2026-09-22T10:00:00.000Z"
+ASKING = row("cccc3333-0000-4000-8000-000000000003", "asks", ts=TS,
+             title="Temp folder cleanup", tab_title="✳ Temp folder cleanup (claude)",
+             recap="the temp folders", recap_age="17h", name="liveapp-de")
+
+
+def parked(was="asks", note="checked later"):
+    return dict(ASKING, attention="parked", park_was=was, park_note=note)
+
+
+class ParkTest(UiTest):
+    """Park a session you keep but will not work on now (owner, 2026-10-08): out
+    of NEEDS YOU, with a note of why, until it writes a new turn or you go to it -
+    then as if it was never parked."""
+
+    def setUp(self):
+        self.parks, self.unparks, self.marks = [], [], []
+        self.saves = True
+        for name, fake in (
+                ("park", lambda sid, ts, note="", path=None:
+                    self.parks.append((sid, ts, note)) or self.saves),
+                ("unpark", lambda sid, path=None: self.unparks.append(sid) or self.saves),
+                ("mark_reviewed", lambda sid, ts, path=None: self.marks.append((sid, ts)))):
+            real = getattr(ui.engine, name)
+            setattr(ui.engine, name, fake)
+            self.addCleanup(setattr, ui.engine, name, real)
+
+    def fleet(self, *rows):
+        # copies: the list rewrites a row in place, and these are shared
+        return FakeCollector(fleet=ui.Fleet([dict(r) for r in rows] + [dict(BUSY)],
+                                            True, "12:00:00"))
+
+    async def select(self, app, pilot, sid=ASKING["sessionId"]):
+        """Down to the row: a parked one is under BUSY, and the top row is
+        the one selected at the start."""
+        for _ in range(5):
+            if (app.selected_row() or {}).get("sessionId") == sid:
+                return
+            await pilot.press("down")
+            await pilot.pause()
+        self.fail(f"{sid} is not on the screen")
+
+    def state(self, app, sid=ASKING["sessionId"]):
+        return [w.row["attention"] for w in app.query(ui.Row) if w.row["sessionId"] == sid]
+
+    def heading_of(self, app, sid=ASKING["sessionId"]):
+        for g in app.groups():
+            if any(r.get("sessionId") == sid for r in g["rows"]):
+                return g["heading"]
+        return None
+
+    def z_says(self, app):
+        active = app.active_bindings.get("z")
+        return active.binding.description if active and active.binding.show else None
+
+    def box(self, app):
+        return app.screen if isinstance(app.screen, ui.ParkBox) else None
+
+    async def park_it(self, app, pilot, note):
+        await pilot.press("z")
+        await pilot.pause()
+        if note:
+            await pilot.press(*note)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+
+class TestZParksARow(ParkTest):
+    async def test_z_opens_a_box_that_says_what_it_does(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertIsNotNone(self.box(app))
+            text = "\n".join(str(w.content) for w in self.box(app).query(ui.Static))
+            self.assertIn("park", text)
+            self.assertIn("why", text)
+            self.assertIn("Enter parks", text)
+            self.assertIn("Esc", text)
+            self.assertIs(app.focused, app.screen.query_one(ui.Input), "type at once")
+
+    async def test_enter_parks_it_with_your_note(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "checked later")
+            self.assertEqual(self.parks, [(ASKING["sessionId"], TS, "checked later")])
+            self.assertIsNone(self.box(app))
+            self.assertEqual(self.state(app), ["parked"], "now, not on the next scan")
+            self.assertEqual(self.heading_of(app), "PARKED")
+            self.assertIn("checked later", self.screen_text(app))
+
+    async def test_the_note_is_shown_as_it_is_kept(self):
+        # one line, its spaces closed up: as the engine keeps it (park)
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "checked   later")
+            row = next(w.row for w in app.query(ui.Row)
+                       if w.row["sessionId"] == ASKING["sessionId"])
+            self.assertEqual(row["park_note"], "checked later")
+
+    async def test_no_note_parks_it_too(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "")
+            self.assertEqual(self.parks, [(ASKING["sessionId"], TS, "")])
+            self.assertEqual(self.state(app), ["parked"])
+
+    async def test_esc_parks_nothing(self):                           # control
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.press("c", "escape")
+            await pilot.pause()
+            self.assertIsNone(self.box(app))
+            self.assertEqual(self.parks, [])
+            self.assertEqual(self.state(app), ["asks"])
+
+    async def test_the_cross_closes_it_and_parks_nothing(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.click("#parkclose")
+            await pilot.pause()
+            self.assertIsNone(self.box(app))
+            self.assertEqual(self.parks, [])
+
+    async def test_not_on_the_process_screen(self):
+        # its keys are about the process lines, not the session (rare screens
+        # say what their keys do there)
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertEqual(app.detail_mode, "procs")
+            self.assertIsNone(self.z_says(app))
+
+    async def test_a_new_turn_while_the_box_is_open_parks_nothing_and_says_so(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            app.show(ui.Fleet([dict(ASKING, ts="2026-09-23T10:00:00.000Z"), dict(BUSY)],
+                              True, "12:00:05"))
+            await pilot.pause()
+            await pilot.press("l", "a", "t", "e", "r", "enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.parks, [], "a park of the old turn would do nothing")
+            self.assertEqual(self.state(app), ["asks"])
+            self.assertIn("changed while the box was open", self.screen_text(app))
+
+    async def test_a_park_that_is_not_saved_says_so_and_parks_nothing(self):
+        self.saves = False
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["asks"])
+            self.assertIn("could not save the park", self.screen_text(app))
+
+    async def test_the_footer_names_it_where_it_works(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.z_says(app), "park")
+            await pilot.press("down")                   # BUSY: its next turn would end it
+            await pilot.pause()
+            self.assertIsNone(self.z_says(app))
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertIsNone(self.box(app), "z on a busy row opens nothing")
+
+    async def test_a_click_on_park_opens_the_box_and_goes_nowhere(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            w = next(w for w in app.query(ui.Row) if w.row["sessionId"] == ASKING["sessionId"])
+            line = "".join(t for t, _ in w.spans_lines()[1])
+            self.assertIn(ui.engine.UI_PARK, line)
+            await pilot.click(w, offset=(line.index(ui.engine.UI_PARK) + 2, 1))
+            await pilot.pause()
+            self.assertIsNotNone(self.box(app))
+            self.assertEqual(adapter.asked, [], "a click on [park] is not a jump")
+
+
+OTHER = row("dddd4444-0000-4000-8000-000000000004", "asks", ts="2026-09-22T11:00:00.000Z",
+            title="Second question", tab_title="✳ Second question (claude)",
+            name="liveapp-c3")
+THIRD = row("eeee5555-0000-4000-8000-000000000005", "asks", ts="2026-09-22T12:00:00.000Z",
+            title="Third question", tab_title="✳ Third question (claude)",
+            name="liveapp-d4")
+
+
+class TestTheHighlightStaysInItsGroup(ParkTest):
+    """After a park the highlight stays where you were working: on the next row
+    of the group the parked one left, so Enter goes to the next session that
+    needs you - not to the parked one, which a go would unpark (owner,
+    2026-10-08: decision 4, "B")."""
+
+    def on(self, app):
+        return (app.selected_row() or {}).get("sessionId")
+
+    def focused_on(self, app):
+        return (getattr(app.focused, "row", None) or {}).get("sessionId")
+
+    async def test_it_stays_on_the_next_row(self):
+        app = self.app(collector=self.fleet(ASKING, OTHER))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["parked"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.assertEqual(self.focused_on(app), OTHER["sessionId"])
+            self.assertEqual(self.heading_of(app, OTHER["sessionId"]), "NEEDS YOU")
+
+    async def test_enter_then_goes_to_the_next_one(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.fleet(ASKING, OTHER))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(adapter.asked, [OTHER["sessionId"]])
+            self.assertEqual(self.unparks, [], "the parked one stays parked")
+
+    async def test_in_the_middle_it_takes_the_one_below(self):
+        app = self.app(collector=self.fleet(OTHER, ASKING, THIRD))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["parked"])
+            self.assertEqual(self.on(app), THIRD["sessionId"])
+
+    async def test_the_last_one_leaves_it_on_the_row_above(self):
+        # three: the one above it, not a wrap to the top of the group (review s2-b)
+        app = self.app(collector=self.fleet(OTHER, THIRD, ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["parked"])
+            self.assertEqual(self.on(app), THIRD["sessionId"])
+
+    async def test_alone_in_its_group_it_goes_with_the_row(self):
+        # no other row needs you: it stays on the parked one, where z undoes it
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            self.assertEqual(self.focused_on(app), ASKING["sessionId"])
+            self.assertEqual(self.z_says(app), "unpark")
+
+    async def test_a_stopped_row_leaves_it_in_stopped(self):
+        app = self.app(collector=self.fleet(dict(ASKING, attention="stopped"),
+                                            dict(OTHER, attention="stopped")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["parked"])
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.assertEqual(self.heading_of(app, OTHER["sessionId"]), "STOPPED")
+
+    async def test_an_unpark_keeps_it_on_the_row(self):
+        # z on a parked row: you want that one back - the highlight goes with it
+        app = self.app(collector=self.fleet(
+            parked(), dict(OTHER, attention="parked", park_was="asks", park_note="x")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["asks"])
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    def long_brief(self, *rows):
+        long = dict(FakeCollector().brief_value,
+                    progress=[f"Bash: step {i}" for i in range(80)])
+        return FakeCollector(fleet=ui.Fleet([dict(r) for r in rows] + [dict(BUSY)],
+                                            True, "12:00:00"), brief=long)
+
+    async def test_the_next_sessions_brief_starts_at_its_top(self):
+        # as an arrow to another session does (review s2-b)
+        app = self.app(collector=self.long_brief(ASKING, OTHER))
+        async with app.run_test(size=(160, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            app.query_one("#detail").scroll_to(y=10, animate=False)
+            await pilot.pause()
+            self.assertGreater(app.query_one("#detail").scroll_y, 0)              # control
+            await self.park_it(app, pilot, "later")
+            await pilot.pause()
+            self.assertEqual(self.on(app), OTHER["sessionId"])
+            self.assertEqual(app.query_one("#detail").scroll_y, 0)
+
+    async def test_its_own_brief_stays_where_it_was(self):            # control
+        app = self.app(collector=self.long_brief(ASKING))
+        async with app.run_test(size=(160, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+            app.query_one("#detail").scroll_to(y=10, animate=False)
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+            self.assertGreater(app.query_one("#detail").scroll_y, 0)
+
+    async def test_esc_leaves_it_where_it_was(self):                  # control
+        app = self.app(collector=self.fleet(ASKING, OTHER))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+    async def test_a_park_not_saved_leaves_it_where_it_was(self):     # control
+        self.saves = False
+        app = self.app(collector=self.fleet(ASKING, OTHER))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["asks"])
+            self.assertEqual(self.on(app), ASKING["sessionId"])
+
+
+class TestAParkInASearch(ParkTest):
+    """While you search, the highlight stays among the rows you see - and where
+    the row stays in its group, on it (review s2-b)."""
+
+    _S = TestTheSearchFindsWhatWasSaid
+    collector, until = _S.collector, _S.until
+
+    async def search(self, app, pilot, text):
+        await self._S.search(self, pilot, text, app=app)
+
+    async def to_the_list(self, pilot):
+        await pilot.press("enter")              # out of the box, to the list
+        await pilot.pause()
+
+    def on(self, app):
+        return (app.selected_row() or {}).get("sessionId")
+
+    async def test_a_row_the_search_hides_is_not_the_next(self):
+        # the next one you can see: one you cannot is no row Enter can go to
+        kiwi = row("ffff6666-0000-4000-8000-000000000006", "asks",
+                   ts="2026-09-22T13:00:00.000Z", title="kiwi next",
+                   tab_title="✳ kiwi next (claude)", name="liveapp-e5")
+        fleet = ui.Fleet([dict(OTHER, title="kiwi first"), dict(ASKING, title="kiwi park"),
+                          dict(THIRD), kiwi, dict(BUSY)], True, "12:00:00")
+        app = self.app(collector=self.collector(fleet=fleet, found={}))
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.search(app, pilot, "kiwi")
+                await self.to_the_list(pilot)
+                ids = [w.row.get("sessionId") for w in app.rows_on_screen()]
+                self.assertNotIn(THIRD["sessionId"], ids)                         # control
+                await self.select(app, pilot)
+                await self.park_it(app, pilot, "later")
+                self.assertEqual(self.state(app), ["parked"])
+                self.assertEqual(self.on(app), kiwi["sessionId"])
+
+    async def test_a_row_that_stays_in_said_keeps_it(self):
+        # SAID is what was said, not what it needs: the parked row stays there,
+        # and the row after it can be an ended one, which Enter would reopen
+        said = {"text": "the flamingo is pink", "who": "you",
+                "ts": "2026-09-22T10:00:00.000Z", "key": (9, True, 9)}
+        ended = {"text": "a flamingo", "who": "claude",
+                 "ts": "2026-09-22T10:00:00.000Z", "key": (1, False, 1)}
+        app = self.app(collector=self.collector(
+            fleet=ui.Fleet([dict(ASKING), dict(BUSY)], True, "12:00:00"),
+            found={"flamingo": {ASKING["sessionId"]: said, ENDED_SID: ended}}))
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await self.search(app, pilot, "flamingo")
+                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                await self.to_the_list(pilot)
+                ids = [w.row.get("sessionId") for w in app.rows_on_screen()]
+                self.assertEqual(ids, [ASKING["sessionId"], ENDED_SID])           # control
+                self.assertEqual(self.on(app), ASKING["sessionId"])
+                await self.park_it(app, pilot, "later")
+                self.assertEqual(self.parks, [(ASKING["sessionId"], TS, "later")])
+                self.assertEqual(self.heading_of(app), "SAID")
+                self.assertEqual(self.on(app), ASKING["sessionId"])
+                self.assertEqual(self.z_says(app), "unpark")
+
+
+class TestTheParkTargetLightsUp(ParkTest):
+    async def test_park_lights_up_under_the_mouse(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            w = next(w for w in app.query(ui.Row) if w.row["sessionId"] == ASKING["sessionId"])
+            line = "".join(t for t, _ in w.spans_lines()[1])
+            await pilot.hover(w, offset=(line.index(ui.engine.UI_PARK) + 2, 1))
+            await pilot.pause()
+            self.assertEqual(TestClickableThingsLightUp.roles_lit(None, w), {ui.engine.UI_PARK})
+
+
+class TestTheFooterFollowsThePark(ParkTest):
+    """The footer's widgets, not app.active_bindings: those are asked afresh on
+    every read, while the footer on the screen is drawn once - and was left
+    saying `z unpark` on a row that was unparked (review 1 of slice 2)."""
+
+    def drawn(self, app):
+        from textual.widgets._footer import FooterKey
+        return sorted(k.description for k in app.query(FooterKey) if k.key == "z")
+
+    async def settle(self, pilot):
+        for _ in range(4):
+            await pilot.pause()
+
+    async def test_after_a_park_it_says_unpark(self):              # control
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["park"])
+            await self.park_it(app, pilot, "later")
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["unpark"])
+
+    async def test_after_z_unparks_it_says_park(self):
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await self.settle(pilot)
+            await self.select(app, pilot)
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["unpark"])
+            await pilot.press("z")
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["park"])
+
+    async def test_after_a_go_unparks_it_says_park(self):
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await self.settle(pilot)
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["park"])
+
+    async def test_a_scan_that_parks_the_row_says_unpark(self):
+        # parked from another list: the scan moves the selected row
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await self.settle(pilot)
+            app.show(ui.Fleet([parked(), dict(BUSY)], True, "12:00:05"))
+            await self.settle(pilot)
+            self.assertEqual((app.selected_row() or {}).get("sessionId"), ASKING["sessionId"])
+            self.assertEqual(self.drawn(app), ["unpark"])
+
+    async def test_a_row_that_turns_busy_takes_park_away(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["park"])
+            app.show(ui.Fleet([dict(ASKING, attention="busy", ts="2026-09-23T10:00:00.000Z"),
+                               dict(BUSY)], True, "12:00:05"))
+            await self.settle(pilot)
+            self.assertEqual((app.selected_row() or {}).get("sessionId"), ASKING["sessionId"])
+            self.assertEqual(self.drawn(app), [])
+
+    async def test_the_process_screen_takes_it_away_and_gives_it_back(self):
+        # with no processes to show, nothing else redraws the footer
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.settle(pilot)
+            await pilot.press("p")
+            await self.settle(pilot)
+            self.assertEqual(app.detail_mode, "procs")
+            self.assertEqual(self.drawn(app), [])
+            await pilot.press("escape")
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["park"])
+
+    async def test_a_new_busy_turn_takes_unpark_away(self):
+        # it can be parked neither before nor after: only the park changed
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await self.settle(pilot)
+            await self.select(app, pilot)
+            await self.settle(pilot)
+            self.assertEqual(self.drawn(app), ["unpark"])
+            app.show(ui.Fleet([dict(ASKING, attention="busy", ts="2026-09-23T10:00:00.000Z"),
+                               dict(BUSY)], True, "12:00:05"))
+            await self.settle(pilot)
+            self.assertEqual((app.selected_row() or {}).get("sessionId"), ASKING["sessionId"])
+            self.assertEqual(self.drawn(app), [])
+
+
+class TestAReopenEndsAPark(ParkTest):
+    """Enter on an ended session reopens it: going to it, as for a running
+    one - a park of it ends (review 2 of slice 2)."""
+
+    _E = TestEndedRowsAfterTheSecondReview
+    until, search, read = _E.until, _E.search, _E.read
+    collector, ended_row_selected = _E.collector, _E.ended_row_selected
+
+    # the engine keeps a live row's turn as epoch seconds (last_turn_ts); the
+    # ENDED row carries the index's ISO text - the two never compare equal
+    PARK_TS = 1790000000.25
+
+    def parked_on_disk(self):
+        import json
+        import os
+        path = ui.engine.parks_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump({ENDED_SID: {"ts": self.PARK_TS, "note": "later"}}, fh)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+
+    async def reopen_with_a_scan_held(self, pilot, app, c):
+        """Enter on the ENDED row, and while the reopen runs, a scan that read
+        the park before the unpark and sees the session running again."""
+        gate, real = threading.Event(), c.reopen_ended
+        c.reopen_ended = lambda r: (gate.wait(5), real(r))[1]
+        try:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            live = row(ENDED_SID, "parked", ts=self.PARK_TS, park_was="review",
+                       park_note="later", title="liveapp pull request 526 CI tests")
+            held = ui.Fleet([live, dict(BUSY)], True, "12:00:09")
+            app.show(held)
+            self.assertIs(app.held, held, "the scan waits for the reopen to land")
+        finally:
+            gate.set()
+        self.assertTrue(await self.until(pilot, lambda: not app.acting))
+        await pilot.pause()
+        return [r.get("attention") for r in app.fleet.rows if r.get("sessionId") == ENDED_SID]
+
+    async def test_a_scan_held_during_the_reopen_shows_it_unparked(self):
+        self.parked_on_disk()
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            got = await self.reopen_with_a_scan_held(pilot, app, c)
+            self.assertEqual(self.unparks, [ENDED_SID])
+            self.assertEqual(got, ["review"], "as if it was never parked")
+
+    async def test_a_held_scan_after_a_failed_reopen_stays_parked(self):  # control
+        self.parked_on_disk()
+        c = self.collector()
+        c.reopen_answer = f"not reopening {ENDED_SID} - cwd is gone: /x"
+        app = self.app(collector=c)
+        async with app.run_test(size=(140, 40)) as pilot:
+            got = await self.reopen_with_a_scan_held(pilot, app, c)
+            self.assertEqual(got, ["parked"])
+
+    async def test_a_reopen_that_found_it_running_unparks_it_too(self):
+        for answer in ("focused s022", "attached in a new window"):
+            with self.subTest(answer=answer):
+                self.unparks.clear()
+                self.parked_on_disk()
+                c = self.collector()
+                c.reopen_answer = answer
+                app = self.app(collector=c)
+                async with app.run_test(size=(120, 40)) as pilot:
+                    await self.ended_row_selected(pilot, app)
+                    await pilot.press("enter")
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    self.assertEqual(self.unparks, [ENDED_SID])
+
+    async def test_an_unpark_not_saved_is_said_after_the_reopen(self):
+        self.parked_on_disk()
+        self.saves = False
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIn("could not save", app.status + app.note)
+
+    async def test_an_unpark_not_saved_stays_said_until_a_key(self):
+        # a scan clears the status line, and the reopen brought another window
+        # to the front: the warning line keeps it (review 4 of slice 2)
+        self.parked_on_disk()
+        self.saves = False
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            app.show(ui.Fleet([dict(BUSY)], True, "12:00:09"))
+            await pilot.pause()
+            self.assertIn("10fe stays parked - could not save the unpark", app.note)
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.note, "")
+
+    async def test_an_unpark_saved_says_nothing_of_it(self):          # control
+        self.parked_on_disk()
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [ENDED_SID])
+            self.assertTrue(app.status.startswith("reopened 10fe"), app.status)
+            self.assertEqual(app.note, "")
+
+    async def test_a_reopen_unparks_it(self):
+        self.parked_on_disk()
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertEqual(c.reopened, [ENDED_SID])
+            self.assertEqual(self.unparks, [ENDED_SID])
+
+    async def test_a_reopen_of_one_not_parked_unparks_nothing(self):  # control
+        c = self.collector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertEqual(c.reopened, [ENDED_SID])
+            self.assertEqual(self.unparks, [])
+
+    async def test_a_reopen_that_failed_keeps_it(self):              # control
+        self.parked_on_disk()
+        c = self.collector()
+        c.reopen_answer = f"not reopening {ENDED_SID} - cwd is gone: /x"
+        app = self.app(collector=c)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self.ended_row_selected(pilot, app)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [])
+
+
+class TestAParkEnds(ParkTest):
+    async def test_z_on_a_parked_row_unparks_it(self):
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            self.assertEqual(self.z_says(app), "unpark")
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIsNone(self.box(app), "no box: nothing to ask")
+            self.assertEqual(self.unparks, [ASKING["sessionId"]])
+            self.assertEqual(self.state(app), ["asks"])
+            self.assertEqual(self.heading_of(app), "NEEDS YOU")
+            self.assertNotIn("checked later", self.screen_text(app))
+            row = next(w.row for w in app.query(ui.Row)
+                       if w.row["sessionId"] == ASKING["sessionId"])
+            self.assertEqual((row["park_note"], row["park_was"]), ("", ""),
+                             "as an unparked row comes from a scan")
+
+    async def test_an_unpark_that_is_not_saved_says_so_and_stays_parked(self):
+        self.saves = False
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["parked"])
+            app.show(ui.Fleet([parked(), dict(BUSY)], True, "12:00:05"))
+            await pilot.pause()
+            banner = str(app.query_one("#banner").content)
+            self.assertIn("cccc stays parked - could not save the unpark", app.note)
+            self.assertIn("cccc stays parked - could not save the unpark", banner)
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.note, "")
+
+    async def test_a_go_whose_unpark_is_not_saved_keeps_it_said(self):
+        # the jump brought another window to the front: on the warning line
+        # until a key, not on the status line a scan clears
+        self.saves = False
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            app.show(ui.Fleet([parked(), dict(BUSY)], True, "12:00:05"))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["parked"])
+            self.assertIn("cccc stays parked - could not save the unpark", app.note)
+
+    async def test_going_to_it_unparks_it(self):
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [ASKING["sessionId"]])
+            self.assertEqual(self.state(app), ["asks"], "a question you have not answered")
+
+    async def test_going_to_a_parked_finished_turn_leaves_it_stopped(self):
+        # as if it was never parked: going to a finished turn is looking at it
+        app = self.app(collector=self.fleet(parked(was="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [ASKING["sessionId"]])
+            self.assertEqual(self.marks, [(ASKING["sessionId"], TS)])
+            self.assertEqual(self.state(app), ["stopped"])
+
+    async def test_a_scan_from_before_the_go_keeps_it_stopped(self):
+        # the unpark is applied before the look: a FINISHED row you went to
+        # stays STOPPED, not FINISHED again (review 1 of slice 2)
+        app = self.app(collector=self.fleet(parked(was="review")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            app.show(ui.Fleet([parked(was="review"), dict(BUSY)], True, "12:00:05"))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["stopped"])
+
+    async def test_a_jump_that_failed_keeps_the_park(self):          # control
+        app = self.app(adapter=FakeAdapter(answer="iTerm2 did not answer in 5s"),
+                       collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [])
+            self.assertEqual(self.state(app), ["parked"])
+
+    async def test_a_new_turn_ends_it(self):
+        # the engine ends it (TestAParkedRow); a park made here must not hold it
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.state(app), ["parked"])
+            app.show(ui.Fleet([dict(ASKING, ts="2026-09-23T10:00:00.000Z"), BUSY],
+                              True, "12:00:05"))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["asks"])
+
+
+class TestAScanThatStartedEarlierDoesNotUndoIt(ParkTest):
+    """A scan that read the parks before you parked, arriving after, must not
+    move the row back - as a scan does not undo a look (keep_seen)."""
+
+    async def test_a_park_stays(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            app.show(ui.Fleet([dict(ASKING), BUSY], True, "12:00:05"))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["parked"])
+            self.assertIn("later", self.screen_text(app))
+
+    async def test_an_unpark_stays(self):
+        app = self.app(collector=self.fleet(parked()))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("z")
+            await pilot.pause()
+            app.show(ui.Fleet([parked(), BUSY], True, "12:00:05"))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["asks"])
+
+    async def test_the_next_scan_that_agrees_lets_go(self):
+        # once the parks on disk say it, they are the truth: parked elsewhere
+        # (another list) after that is shown
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.park_it(app, pilot, "later")
+            app.show(ui.Fleet([parked(note="later"), BUSY], True, "12:00:05"))
+            await pilot.pause()
+            app.show(ui.Fleet([dict(ASKING), BUSY], True, "12:00:10"))
+            await pilot.pause()
+            self.assertEqual(self.state(app), ["asks"])

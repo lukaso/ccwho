@@ -38,7 +38,7 @@ import ccwho_usage as usage
 DIM, RESET = "\033[2m", "\033[0m"
 
 
-# Things you asked for (jump, open, restore) go straight to the terminal app -
+# Things you asked for (open, a ccwho:// link, restore) go straight to the terminal app -
 # they are one at a time by nature, unlike the background asks behind
 # engine.terms.ask - but never without a deadline: an osascript with none waits
 # as long as a stuck app does, which is forever (2026-09-29).
@@ -2363,6 +2363,8 @@ def open_session(argv, from_index=False, live_only=False):
     """
     query = " ".join(a for a in argv if not a.startswith("-")).strip()
     if not query:
+        print("ccwho open: give it a session: its id, name, tty, pid or words of its title",
+              file=sys.stderr)
         print(OPEN_USAGE, file=sys.stderr)
         return 2
     status = {}
@@ -2495,8 +2497,10 @@ def url(argv):
         return open_session([target])
     if verb == "jump":
         return open_session([target], live_only=True)
-    print("ccwho url: not a ccwho:// link I understand", file=sys.stderr)
-    return 1
+    print("ccwho url: " + ("not a ccwho:// link I understand" if argv
+                           else "give it one ccwho:// link"), file=sys.stderr)
+    print(COMMAND_TAKES["url"][3], file=sys.stderr)
+    return 2
 
 
 PS_FLAGS = ("--port", "--helpers", "--json", "--full")
@@ -2574,8 +2578,7 @@ def ps(argv):
     return 0
 
 
-KILL_USAGE = ("usage: ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]\n"
-              "       ccwho clean [--mine] [--dry-run] [--yes] [--force]")
+KILL_USAGE = "usage: ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]"
 KILL_FLAGS = ("--dry-run", "--yes", "--force")
 
 
@@ -2689,7 +2692,7 @@ def _live_rows():
 
 
 def kill_cli(argv, clean=False, seams=None):
-    """`ccwho kill <pid>|:<port>` and `ccwho clean [--mine]`.
+    """`ccwho kill <pid>|:<port>|<session>` and `ccwho clean [--mine]`.
 
     A person sees every process the kill takes, each with what ccwho doubts
     about it, and answers on a terminal; --yes skips the question; with no
@@ -2697,7 +2700,8 @@ def kill_cli(argv, clean=False, seams=None):
     session id in ccwho's own environment - is never asked, and kill_plan takes
     only its own session's work. Right before each signal the signaller checks
     again (engine.carry_out). Exit 0 all killed, 1 not all (or nothing), 2
-    usage, 3 needs --yes. `seams` replaces the machine (tests)."""
+    usage or several matches, 3 needs --yes, 4 could not tell (nothing killed),
+    130 interrupted before any signal. `seams` replaces the machine (tests)."""
     cmd = "clean" if clean else "kill"
     s = {"build": lambda mine=None, status=None: engine.build_world(mine, status=status),
          "ask": lambda prompt: _ask(prompt), "tty": lambda: _can_ask(sys.stdin, sys.stdout),
@@ -2706,7 +2710,16 @@ def kill_cli(argv, clean=False, seams=None):
     s.update(seams or {})
     parsed = _kill_target(argv, clean)
     if parsed is None:
-        print(KILL_USAGE, file=sys.stderr)
+        words = [a for a in argv if not a.startswith("-")]
+        w = words[0] if words else ""
+        why = ("give it one pid" if not w and "--pid" in argv
+               else "give it one pid, :port or session" if not w
+               else f"{w!r} is no pid" if "--pid" in argv
+               else f"{w!r} is no port (1-65535, no leading zero)"
+               if w.startswith(":") and w[1:].isdigit()
+               else f"{w!r} is no pid, :port or session")
+        print(f"ccwho {cmd}: {why}", file=sys.stderr)
+        print(COMMAND_TAKES[cmd][3], file=sys.stderr)     # its own usage
         return 2
     mode, target = parsed
     asked_digits = mode == "digits"          # a pid, unless it starts a session id
@@ -2864,6 +2877,14 @@ def stop_cli(argv, seams=None):
     words = [a for a in argv if not a.startswith("-")]
     parsed = _kill_target(words, False) if len(words) == 1 else None
     if any(f not in STOP_FLAGS for f in flags) or parsed is None or parsed[0] != "query":
+        print("ccwho stop: " + (f"{words[0]!r} is a number - stop takes no pid; give its name"
+                                " or tty (`ccwho ls` shows them), or its full id"
+                                " (`ccwho ls --json`)"
+                                if words and words[0].isdigit() else
+                                f"cannot take {words[0]!r} - give its id, name or tty as"
+                                " `ccwho ls` shows them"
+                                if words else "give it one session: its id, name or tty"),
+              file=sys.stderr)
         print(STOP_USAGE, file=sys.stderr)
         return 2
     word = words[0]
@@ -3920,10 +3941,26 @@ def _named(entry):
 
 
 def restore(argv):
-    """Read the manifest back: what was open, what it was about, how to reopen it."""
+    """Read the manifest back: what was open, what it was about, how to reopen it.
+    One mode at a time - --open, --check or --list - with no order among them
+    to know; --list lists every save, so it names none (--from) and prints no
+    colour or link."""
+    path = _arg(argv, "--from", None)
+    if "--from" in argv:                    # its path is no mode: --from=--open
+        at = argv.index("--from")
+        argv = argv[:at] + argv[at + 2:]
+    modes = [m for m in ("--open", "--check", "--list") if m in argv]
+    extra = [a for a in argv if a != "--list"]
+    if len(modes) > 1 or ("--list" in argv and (path is not None or extra)):
+        print("ccwho restore: " + (f"{' and '.join(modes)} - one at a time" if len(modes) > 1
+                                   else "--list lists every save; --from names one - not both"
+                                   if path is not None else
+                                   f"--list lists every save - it takes no {extra[0]}"),
+              file=sys.stderr)
+        print(COMMAND_TAKES["restore"][3], file=sys.stderr)
+        return 2
     if "--list" in argv:
         return list_manifests()
-    path = _arg(argv, "--from", None)
     if not path:
         d = restore_dir()
         try:
@@ -3948,9 +3985,9 @@ def restore(argv):
         return 4                            # could not tell
 
     if "--check" in argv:
-        # Deliberately BEFORE --open: a check must never launch anything, even if
-        # both flags are given. Answering "would this work?" cannot be the thing
-        # that opens seventeen windows.
+        # A check must never launch anything: --check with --open is refused
+        # above (one mode at a time). Answering "would this work?" cannot be the
+        # thing that opens seventeen windows.
         # what --open does with each saved session (engine.sort_saved, by
         # engine.check_manifest): one it leaves where it ran is named as --open
         # names it, and not checked (the owner, 2026-10-06)
@@ -4205,9 +4242,10 @@ COMMAND_TAKES = {
              "usage: ccwho show <session> [--all] [--json] [--no-color]   what that session was working on"),
     "open": ((), (), None, OPEN_USAGE),
     "restore": (("--open", "--check", "--list", "--no-color", "--no-links"), ("--from",), 0,
-                "usage: ccwho restore [--open | --check | --list] [--from PATH] [--no-color] [--no-links]"),
+                "usage: ccwho restore [--open | --check] [--from PATH] [--no-color] [--no-links]\n"
+                "       ccwho restore --list"),
     "ps": (("--helpers", "--json", "--full"), ("--port",), 0, PS_USAGE),
-    "kill": (("--pid",) + KILL_FLAGS, (), 1, KILL_USAGE.splitlines()[0]),
+    "kill": (("--pid",) + KILL_FLAGS, (), 1, KILL_USAGE),
     "clean": (("--mine",) + KILL_FLAGS, (), 0, CLEAN_USAGE),
     "stop": (STOP_FLAGS, (), 1, STOP_USAGE),
     "usage": (("--json",), (), None,
@@ -4239,7 +4277,7 @@ def command_args(cmd, argv):
     if "--help" in argv or "-h" in argv:
         print(usage_)
         return 0
-    out, words, i = [], [], 0
+    out, words, i, given = [], [], 0, set()
     while i < len(argv):
         a = argv[i]
         if a == "-y" and "--yes" in flags:
@@ -4252,6 +4290,9 @@ def command_args(cmd, argv):
                 i, value = i + 1, argv[i + 1]
             if not value:
                 return refuse(f"{name} needs a value")          # --from= is no file
+            if name in given:
+                return refuse(f"{name} given twice")            # one value: no hidden winner
+            given.add(name)
             out += [name, value]
         elif a.startswith("-"):
             if a not in flags:
@@ -4350,15 +4391,15 @@ def main(argv=None):
         print(__doc__.strip())
         print("\nusage: ccwho                                      the live list (on a terminal)")
         print("       ccwho save                                 record the live fleet (BEFORE a reboot)")
-        print("       ccwho restore [--open] [--from PATH]       list it back / reopen them, in their old panes")
+        print("       ccwho restore [--open] [--from PATH] [--no-color] [--no-links]  list it back / reopen them")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
-        print("       ccwho ls [words] [--all] [--needs-you] [--json]  the table, or every session matching;")
+        print("       ccwho ls [words] [--all] [--needs-you] [--json] [--no-color] [--no-links]  the table, or every session matching;")
         print("                                                  `ccwho` with options, or piped, is this")
         print("                                                  (--all: sessions a program started too;")
         print("                                                  --needs-you: the sessions the list puts on top;")
         print("                                                  Claude Code sessions only, no Codex thread)")
-        print("       ccwho show <anything> [--all] [--json]     what that session was working on")
+        print("       ccwho show <session> [--all] [--json] [--no-color]  what that session was working on")
         print("       ccwho ps [--port N] [--helpers] [--json] [--full]  what agents started, and their ports")
         print("       ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
         print("       ccwho stop <session> [--and-procs] [--dry-run] [--yes]  stop a background session (its conversation is kept) - asks")
@@ -4366,7 +4407,7 @@ def main(argv=None):
         print("       ccwho usage [--json]                       subscription usage, per account")
         print("       ccwho usage name <id> <label>              a display name for an account")
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
-        print("       ccwho doctor [--json]                      is everything ccwho needs in place?")
+        print("       ccwho doctor [--json] [--no-color]         is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]  install what ccwho needs, once")
         print("       ccwho setup --no-usage | --usage           turn usage info off / back on")
         print("       ccwho open <session>                       go to it: its window (iTerm2, Terminal.app),")
@@ -4375,8 +4416,9 @@ def main(argv=None):
         print("                                                  pid, or words of its title")
         print("       ccwho url  <ccwho://...>                   what the clickable links call")
         print("\nEvery command: --help (or -h) prints its usage and runs nothing; an")
-        print("unknown option or word is refused (exit 2); --flag=value is --flag value;")
-        print("-y is --yes; --no-color, NO_COLOR or no terminal: no colour.")
+        print("unknown option or word is refused (exit 2), and so is an option given two")
+        print("values; --flag=value is --flag value; -y is --yes. restore takes one mode at")
+        print("a time. ls, show, restore and doctor: --no-color, NO_COLOR or no terminal: no colour.")
         print("Exit codes: 0 done; 1 not done or not found; 2 a usage error or several matches;")
         print("3 needs --yes; 4 could not tell (a source could not be read); 130 interrupted.")
         print("\nusage: 5h 42%↓/60% = 42% of the 5-hour budget used, 60% of the 5 hours gone;")
@@ -4384,7 +4426,7 @@ def main(argv=None):
         print("\nThe tty column is a clickable link when stdout is a terminal, and so is")
         print("each project name in `ccwho restore` - that one reopens the session if")
         print("its window is gone, and focuses it if it is still up.")
-        print("`ccwho setup` registers the ccwho:// scheme; --no-links opts out.")
+        print("`ccwho setup` registers the ccwho:// scheme. ls and restore: --no-links prints no links.")
         return 0
     args = command_args("ls", argv)          # `ccwho` with options, or piped, is `ccwho ls`
     return args if isinstance(args, int) else ls(args)

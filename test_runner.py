@@ -984,9 +984,10 @@ class TestRestoreCheck(unittest.TestCase):
         real = runner.subprocess.run
         runner.subprocess.run = lambda *a, **k: calls.append(a)
         try:
-            self.run_check(["--check", "--open"])
+            rc, out = self.run_check(["--check", "--open"])
         finally:
             runner.subprocess.run = real
+        self.assertEqual(rc, 2, "one mode at a time (the CLI revamp)")
         self.assertEqual(calls, [], "--check must never launch anything, even with --open")
 
 
@@ -1102,12 +1103,21 @@ class TestUrlDispatch(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.calls, [("open", ["s032"], {"live_only": True})])
 
+    def test_no_link_is_a_usage_error(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = runner.main(["url"])
+        self.assertEqual((rc, self.calls), (2, []), err.getvalue())
+        self.assertEqual(err.getvalue().splitlines()[0], "ccwho url: give it one ccwho:// link")
+        self.assertIn("usage: ccwho url", err.getvalue())
+
     def test_an_unrecognised_url_runs_nothing(self):
         for bad in ("https://evil.example/x", "ccwho://delete/all",
                     "ccwho://open/$(whoami)", "ccwho://jump/; rm -rf /", "nonsense"):
             self.calls = []
             rc, err = self._url(bad)
-            self.assertEqual(rc, 1, bad)
+            self.assertEqual(rc, 2, bad)                    # a usage error, as everywhere
+            self.assertTrue(err.startswith("ccwho url: "), err)
             self.assertEqual(self.calls, [], "unrecognised URL must reach no verb: " + bad)
 
 
@@ -6924,11 +6934,35 @@ class TestUsageWords(unittest.TestCase):
                       " ".join(out.split()))
         self.assertNotIn("This file is the RUNNER", out)
 
+    def test_help_names_the_commands_that_take_no_color_and_no_links(self):
+        # "ls, show, restore and doctor: --no-color" - the commands that take it
+        out = " ".join(self.help_text().split())
+        for flag in ("--no-color", "--no-links"):
+            with self.subTest(flag=flag):
+                m = re.search(rf"((?:\w+, )*\w+(?: and \w+)?): {flag}", out)
+                self.assertIsNotNone(m, out)
+                named = set(re.split(r", | and ", m.group(1)))
+                self.assertEqual(named, {cmd for cmd, (flags, *_rest) in runner.COMMAND_TAKES.items()
+                                         if flag in flags})
+
+    def test_help_says_what_every_command_refuses(self):
+        out = " ".join(self.help_text().split())
+        self.assertIn("an option given two values", out)
+        self.assertIn("restore takes one mode at a time", out)
+
     def test_help_names_every_flag_a_command_takes(self):
+        # every option of each command's own usage (COMMAND_TAKES), on its lines
+        # in the general help - the two cannot drift apart (the docs pass of
+        # the CLI revamp)
         out = self.help_text()
         self.assertRegex(out, r"ccwho kill <pid>\|:<port>\|<session> \[--pid\]")
-        self.assertIn("ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]", out)
-        self.assertIn("ccwho show <anything> [--all] [--json]", out)
+        for cmd, (_f, _v, _c, usage_) in runner.COMMAND_TAKES.items():
+            if cmd == "hotkey":                      # only the hotkey window runs it
+                continue
+            lines = " ".join(l for l in out.splitlines() if re.search(rf"\bccwho {cmd}\b", l))
+            for flag in re.findall(r"--[a-z][a-z-]*", usage_):
+                with self.subTest(cmd=cmd, flag=flag):
+                    self.assertIn(flag, lines)
 
     def test_the_usage_legend_follows_the_commands(self):
         out = self.help_text()
@@ -8863,6 +8897,104 @@ class TestEveryCommandKeepsTheSameRules(unittest.TestCase):
                 self.assertEqual(rc, 2, err)
                 self.assertIn("ccwho usage name <id> <label>", err)
                 self.assertNotIn("unexpected word", err)
+
+    def test_a_target_it_cannot_take_says_why_first(self):
+        # `ccwho <command>: why`, then its own usage - not a usage line alone
+        # (the docs audit of the CLI revamp)
+        for argv in (["kill"], ["kill", ":70000"], ["kill", "--pid", "name"],
+                     ["stop"], ["stop", "4412"], ["open"]):
+            with self.subTest(argv=argv):
+                self.reached = []
+                rc, out, err = self.main(*argv)
+                self.assertEqual((rc, self.reached), (2, []), err)
+                first = err.splitlines()[0]
+                self.assertTrue(first.startswith(f"ccwho {argv[0]}: "), err)
+                self.assertNotIn("usage", first)
+                self.assertIn(f"usage: ccwho {argv[0]}", err)
+        rc, out, err = self.main("kill")
+        self.assertNotIn("ccwho clean", err, "kill's own usage, not clean's too")
+        # each says what it takes (review of the docs pass)
+        rc, out, err = self.main("kill", "--pid")
+        self.assertTrue(err.startswith("ccwho kill: give it one pid\n"), err)
+        rc, out, err = self.main("kill", "01")                 # no pid: no leading zero
+        self.assertEqual(err.splitlines()[0], "ccwho kill: '01' is no pid, :port or session")
+        for w in (":70000", ":0", ":080"):           # each reason true for its word
+            rc, out, err = self.main("kill", w)
+            self.assertTrue(err.startswith(f"ccwho kill: '{w}' is no port (1-65535,"
+                                           " no leading zero)\n"), err)
+        rc, out, err = self.main("kill", "--pid", ":80")              # --pid takes a pid
+        self.assertTrue(err.startswith("ccwho kill: ':80' is no pid\n"), err)
+        rc, out, err = self.main("stop", "4412")        # a short id may be all digits
+        self.assertTrue(err.startswith("ccwho stop: '4412' is a number - stop takes no pid"), err)
+        self.assertIn("its full id (`ccwho ls --json`)", err.splitlines()[0])
+        rc, out, err = self.main("stop")
+        self.assertTrue(err.startswith("ccwho stop: give it one session: its id, name or tty"), err)
+        rc, out, err = self.main("stop", "/dev/ttys032")
+        self.assertTrue(err.startswith("ccwho stop: cannot take '/dev/ttys032' - give its id,"
+                                       " name or tty as `ccwho ls` shows them"), err)
+        rc, out, err = self.main("stop", ":80")
+        self.assertTrue(err.startswith("ccwho stop: cannot take ':80' - "), err)
+
+    def test_restore_takes_one_mode_at_a_time(self):
+        # no hidden order among --open, --check and --list; --list names no save
+        for argv in (["--open", "--check"], ["--list", "--check"], ["--list", "--open"],
+                     ["--list", "--from", "/x/m.json"], ["--list", "--no-color"],
+                     ["--list", "--no-links"]):
+            with self.subTest(argv=argv):
+                self.reached = []
+                rc, out, err = self.main("restore", *argv)
+                self.assertEqual((rc, self.reached), (2, []), err)
+                self.assertTrue(err.startswith("ccwho restore: "), err)
+        rc, out, err = self.main("restore", "--list")                       # control
+        self.assertNotEqual(rc, 2, err)
+        rc, out, err = self.main("restore", "--list", "--no-color")    # it prints no colour
+        self.assertTrue(err.startswith("ccwho restore: --list lists every save - it takes"
+                                       " no --no-color\n"), err)
+        rc, out, err = self.main("restore", "--list", "--from", "/x/m.json")
+        self.assertEqual(err.splitlines()[0],
+                         "ccwho restore: --list lists every save; --from names one - not both")
+        rc, out, err = self.main("restore", "--check", "--open")
+        self.assertEqual(err.splitlines()[0], "ccwho restore: --open and --check - one at a time")
+        self.reached = []
+        rc, out, err = self.main("restore", "--from=--open", "--check")  # a path is no mode
+        self.assertEqual(rc, 4, err)                     # it went to read that path
+        self.assertIn("cannot read --open", err)
+        self.assertEqual(self.reached, [], err)                  # it checks; it opens nothing
+        # and its usage says so: --list on a line of its own, without --from
+        usage_ = runner.COMMAND_TAKES["restore"][3]
+        self.assertFalse([l for l in usage_.splitlines() if "--list" in l and "--from" in l], usage_)
+        self.assertIn("       ccwho restore --list", usage_.splitlines())
+
+    def test_a_value_given_twice_is_refused(self):
+        # the second --from was ignored: one spelling, one value
+        for cmd, argv in (("restore", ["--from", "/x/a.json", "--from", "/x/b.json"]),
+                          ("restore", ["--from=/x/a.json", "--from", "/x/b.json"]),
+                          ("ps", ["--port", "80", "--port=81"])):
+            with self.subTest(cmd=cmd, argv=argv):
+                self.reached = []
+                rc, out, err = self.main(cmd, *argv)
+                self.assertEqual((rc, self.reached), (2, []), err)
+                name = argv[0].partition("=")[0]
+                self.assertEqual(err.splitlines()[0], f"ccwho {cmd}: {name} given twice")
+        self.assertEqual(runner.command_args("restore", ["--from", "/x/a.json", "--check"]),
+                         ["--from", "/x/a.json", "--check"])            # control: once
+        rc, out, err = self.main("restore", "--from", "/x/a.json", "--from=")
+        self.assertEqual(err.splitlines()[0], "ccwho restore: --from needs a value")
+        # a flag with no value says the same thing twice: it is taken
+        self.assertEqual(runner.command_args("ls", ["--json", "--json"]), ["--json", "--json"])
+        self.assertIsInstance(runner.command_args("kill", ["1234", "-y", "--yes"]), list)
+
+    def test_every_usage_names_what_its_command_takes(self):
+        # the other way round from TestUsageWords: a flag the code takes is in its usage,
+        # but for the two no person types (test_the_options_no_usage_names_are_taken)
+        internal = {("setup", "--proof"), ("save", "--out")}
+        for cmd, (flags, values, count, usage_) in runner.COMMAND_TAKES.items():
+            for f in flags + values:
+                with self.subTest(cmd=cmd, flag=f):
+                    if (cmd, f) in internal:
+                        self.assertNotIn(f, usage_)
+                    else:
+                        self.assertIn(f, usage_)
 
     def test_y_is_yes_where_yes_is(self):
         for cmd, argv in (("kill", ["-y", "1234"]), ("clean", ["-y"]), ("stop", ["x", "-y"]),

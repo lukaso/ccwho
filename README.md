@@ -46,6 +46,9 @@ claude (it shows the change and asks first), the iTerm2 hotkey window, and the A
 permission the hotkey needs to reach you from another app (asked for when setup runs
 directly in an iTerm2 window, not in tmux: macOS gives it to the app setup runs in). It writes nothing on a
 machine that cannot work, and a second run changes nothing that is already right.
+At the end it opens the live list: add `--no-list` to stop that. Add
+`--no-hotkey` to add no hotkey window (it does not remove one), and `--yes` to skip
+its questions.
 `ccwho doctor` checks the same things later, read-only. The iTerm2 steps apply only
 while you use iTerm2 - it runs, or ccwho's hotkey is installed; otherwise setup and
 doctor say "not used" and what to do to add it ([Adding iTerm2 later](#adding-iterm2-later)).
@@ -75,9 +78,10 @@ terminal ccwho runs in, or ccwho-jump.app for a click on a link.
   names (the title Claude Code gives a tab, never the text on its screen), and only
   while a Claude Code session runs in one of its tabs. The autosave job never asks
   it.
-- A jump, a new window and a restore ask it because you asked for them.
+- To bring a window to the front, to open a new one and to restore, ccwho asks it
+  because you asked for that.
 
-If you did not allow it, the rows show no tab names and a jump to a tab fails:
+If you did not allow it, the rows show no tab names and ccwho cannot bring a tab to the front:
 System Settings > Privacy & Security > Automation, then the app that asked, then
 Terminal. `ccwho doctor` says so, and how long ago, from what the list's last ask
 found - doctor asks Terminal.app nothing itself, so after you allow it, it reads
@@ -335,11 +339,11 @@ out two checks that `ccwho doctor` makes: Accessibility (that check is also
 macOS's request for it, and the list does not ask for a permission unasked) and
 iTerm2's own status hook (ccwho does not need it).
 
-Right after the Mac wakes, it gives the autosave job one 15-minute window to run
-before it says the job is not running: launchd does not run a job for the time
-the Mac slept.
+After the Mac wakes or starts, doctor gives the autosave job 17 minutes to run -
+one 15-minute timer window, and 2 minutes more - before it says that the job is
+not running. launchd does not run a job for the time that the Mac slept.
 
-It has a Terminal.app line once the list has asked that app. After an ask of iTerm2
+Doctor has a Terminal.app line once the list has asked that app. After an ask of iTerm2
 or Terminal.app timed out, its line says when ccwho asks again (`asks it again in 7m`).
 
 ## Sources
@@ -465,16 +469,17 @@ names a running session only, and an id is matched by its start, as a short id i
 
 The tty column is emitted as an **OSC 8 hyperlink** when stdout is a terminal, so in
 iTerm2 (3.x) it is genuinely clickable. Clicking hands `ccwho://jump/s032` to
-LaunchServices, where a small applet turns it back into `ccwho open s032` - for a
-running session only: this link never reopens one.
+LaunchServices. A small applet gives the whole URL to `ccwho url`, which finds the
+running session on that tty or pid and goes to it as `ccwho open` does. This link
+never reopens a session.
 
 ```sh
 ccwho setup                  # once; builds ~/Applications/ccwho-jump.app
 ```
 
-The applet is ~10 lines of AppleScript, has no Dock icon (`LSUIElement`), and runs
-no daemon. `--no-links` opts out; a terminal that cannot render OSC 8 shows the
-plain label, so there is no downside to leaving it on.
+The applet is a short AppleScript. It has no Dock icon (`LSUIElement`) and runs no
+daemon. To print no links, add `--no-links` to `ccwho ls` or `ccwho restore`. A
+terminal that cannot render OSC 8 shows the plain label, so links do no harm.
 
 **On trusting the URL.** A `ccwho://` URL can be handed to the applet by anything on
 the machine, so the target is validated against `^[A-Za-z]?[0-9]{1,8}$` before use -
@@ -515,19 +520,35 @@ came free.
 ccwho never asks and takes only what that agent's own session started, and
 nothing that carries a doubt: `ccwho clean --mine` cleans up after itself.
 
-Exit codes: 0 all killed, 1 not all (or nothing to kill), 2 usage, 3 needs `--yes`,
-4 the machine or the session list could not be read (nothing killed), 130
-interrupted before any signal (nothing killed). A `--dry-run` exits as the kill
-would: 1 when part of the target would be refused.
+Exit codes:
+
+- 0: all killed.
+- 1: not all killed, or nothing to kill.
+- 2: a usage error; several matches; a number that is a pid and also the start of
+  a session id; or (with `--yes`, or from an agent) a word that is not its id,
+  name or tty.
+- 3: needs `--yes`.
+- 4: the machine or the session list could not be read. Nothing was killed.
+- 130: interrupted before any signal. Nothing was killed.
+
+A `--dry-run` exits as the kill would: 1 when part of the target would be refused.
 
 `ccwho stop` stops only a background session, with `claude stop`; `claude attach`
 brings it back. A session started in a window is never stopped: end it there
 (`/exit`). A background session attached in a window is stopped, and the question
-says it is open there. An agent stops no session. Exit codes: 0 stopped, 1 not (or
-not all), 2 usage, several matches, or (with `--yes`) a word that is not its id, name
-or tty, 3 needs `--yes`, 4 the session list (or, with `--and-procs`, the machine)
-could not be read, 130 interrupted - after `claude stop` began, the session may
-be stopped (run `ccwho ls`). A `--dry-run` exits as the stop would.
+says it is open there. An agent stops no session. Exit codes:
+
+- 0: stopped.
+- 1: not stopped, or not all.
+- 2: a usage error; several matches; or (with `--yes`) a word that is not its id,
+  name or tty.
+- 3: needs `--yes`.
+- 4: the session list (or, with `--and-procs`, the machine) could not be read; or
+  ccwho could not confirm that the stopped session ended.
+- 130: interrupted. If `claude stop` began, the session may be stopped: run
+  `ccwho ls`.
+
+A `--dry-run` exits as the stop would.
 
 ## ccwho save / restore - a reboot stops being a one-way door
 
@@ -655,7 +676,7 @@ is gone, which is exactly when the restore list is what you are reading.
 
 The registered handler forwards the **whole** URL to `ccwho url`, so adding a verb
 never means rebuilding the applet. Both targets are pattern validated on the far
-side - a session id must be a UUID, a jump target a tty or pid - because the URL
+side - a session id must be a UUID, a `ccwho://jump` target a tty or pid - because the URL
 arrives from LaunchServices and anything on the machine can hand you one. Nothing
 unrecognised reaches a verb.
 
@@ -685,7 +706,7 @@ ccwho                   # the live list (on a terminal)
 ccwho ls [words] [--all]  # the table, or every session matching (with options, or piped, `ccwho` is this)
 ccwho ls --needs-you    # only the Claude Code sessions the live list puts on top: NEEDS YOU and STUCK
 ccwho ls --json         # the rows, for a script, a status line or an agent
-ccwho show <anything>   # what that session was working on
+ccwho show <session>    # what that session was working on
 ccwho ps [--port N] [--helpers] [--full]  # what agents started, and their ports
 ccwho open <session>    # go to it: its window, a window for a background one, or reopen an ended one
 ccwho save              # record the live fleet (before a reboot)
@@ -701,9 +722,14 @@ ccwho setup             # install what it needs, once
 
 Every command takes `--help` (or `-h`): it prints that command's usage and runs
 nothing. An option or word a command does not take is refused (exit 2), never
-ignored. `--flag=value` is `--flag value`, and `-y` is `--yes`. Every error line
-starts with `ccwho <command>:`. Colour is off with `--no-color`, with `NO_COLOR`
-set, or with no terminal. Every `--json` names a session `sessionId`.
+ignored. So are an option given twice with two values, two modes of `restore` at
+once, and any other option with `restore --list`. `--flag=value` is `--flag value`,
+and `-y` is `--yes`. Every error line starts with `ccwho <command>:` (`ccwho url`
+hands a link it understands to `open`; the lines that follow start `ccwho open:`). Four commands print
+colour - `ls`, `show`, `restore` and `doctor` - and each takes `--no-color`; colour
+is also off when `NO_COLOR` is set, or when the output is not a terminal.
+`ccwho statusline` always prints colour: Claude Code shows its line in its status
+bar. Every `--json` names a session `sessionId`.
 
 | Exit | Means |
 |---|---|
@@ -719,7 +745,7 @@ set, or with no terminal. Every `--json` names a session `sessionId`.
 | Column | Where it comes from |
 |---|---|
 | name | the address you message the session by; its project when it has none |
-| tty | where it runs; a link that jumps there |
+| tty | where it runs; a link that brings its window to the front |
 | status | derived, see below - NEEDS YOU sorts to the top |
 | title | the tab's name (iTerm2 or Terminal.app); `~` + Claude Code's own `ai-title` when no tab gives one. A renamed session's project comes first |
 | doing | the last tool call, using Bash's human `description` when present |
@@ -945,7 +971,7 @@ Implication, as with the Ruby version: keep the engine free of long-lived object
 Pure functions and plain dicts only.
 
 The runner itself is not reloaded: after an update that changes `ccwho.py`, restart
-every open `ccwho` (list or watch). One left running reads what the new code writes,
+every open live list. One left running reads what the new code writes,
 such as a launch claim naming Terminal.app, by its old rules.
 
 ## Design notes

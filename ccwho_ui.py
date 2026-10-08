@@ -2430,6 +2430,13 @@ class CcwhoUi(App):
             # anyway answers "not found: /dev/ttys042", which is not an
             # answer anyone can act on.
             self.said(engine.no_window_note(row))
+            # but you have seen its finished turn, as on a Codex row: a △ left
+            # in NEEDS YOU, with no [park], only `z` moved (owner: a bug). Else
+            # you went nowhere, as after a failed jump: a question still needs
+            # you, a parked one stays parked
+            if row.get("attention") == "review":
+                self.going_to(row)
+                self.looked_at(row, row.get("ts"))
             return
         self.mark_acting(row.get("sessionId", ""))
         self.paint_header(self.groups())

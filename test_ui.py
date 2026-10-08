@@ -3220,6 +3220,88 @@ class TestItNeverOffersAJumpItCannotMake(UiTest):
             self.assertEqual(adapter.asked, [LIVE["sessionId"]])
 
 
+class TestAFinishedTurnWithNoWindowLeavesNeedsYou(UiTest):
+    """A finished turn (△) leaves NEEDS YOU when you go to it, so it has no
+    [park]. One with no window stayed: the click said "has no window" and
+    nothing else, and only `z` moved it (owner: a bug). You have seen its
+    finished turn all the same, as on a Codex row."""
+
+    TS = "2026-09-22T10:00:00.000Z"
+
+    def setUp(self):
+        self.marks = []
+        real = ui.engine.mark_reviewed
+        ui.engine.mark_reviewed = lambda sid, ts, path=None: self.marks.append((sid, ts))
+        self.addCleanup(setattr, ui.engine, "mark_reviewed", real)
+
+    def homeless(self, att):
+        return row("9999aaaa-0000-4000-8000-000000009999", att, ts=self.TS,
+                   tab_title="", tty="ttys042", windowed=False)
+
+    async def attention_after_enter(self, att):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            fleet=ui.Fleet([self.homeless(att), BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("no window", str(app.query_one("#header").content).lower())
+            self.assertEqual(adapter.asked, [])
+            return [w.row["attention"] for w in app.query(ui.Row)
+                    if w.row["sessionId"] == self.homeless(att)["sessionId"]]
+
+    async def test_it_moves_to_stopped(self):
+        self.assertEqual(await self.attention_after_enter("review"), ["stopped"])
+        self.assertEqual(self.marks, [(self.homeless("review")["sessionId"], self.TS)])
+
+    async def test_a_question_with_no_window_still_needs_you(self):  # control
+        # a look does not answer it: there [park] is how it leaves
+        self.assertEqual(await self.attention_after_enter("asks"), ["asks"])
+        self.assertEqual(self.marks, [])
+
+    async def test_the_highlight_stays_in_needs_you(self):
+        # as for any session you go to there (owner, 2026-10-08): the next one
+        homeless = self.homeless("review")
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([LIVE, homeless, reviewable()], True, "12:00:00")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            needs = [r.get("sessionId") for g in app.groups() if g["heading"] == "NEEDS YOU"
+                     for r in g["rows"]]
+            self.assertIn(homeless["sessionId"], needs[:-1])               # control
+            under = needs[needs.index(homeless["sessionId"]) + 1]
+            app.selected = homeless["sessionId"]
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            row = next(r for r in app.fleet.rows if r["sessionId"] == homeless["sessionId"])
+            self.assertEqual(row["attention"], "stopped")
+            self.assertEqual(app.selected_row()["sessionId"], under)
+
+    async def test_enter_on_a_question_with_no_window_is_not_going_there(self):
+        # nothing came forward, as after a failed jump: answered later from
+        # elsewhere, it is a row like any other, and the highlight goes with it
+        homeless = self.homeless("asks")
+        app = self.app(collector=FakeCollector(
+            fleet=ui.Fleet([LIVE, homeless, reviewable()], True, "12:00:00")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.selected = homeless["sessionId"]
+            app.restore_selection()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            app.show(ui.Fleet([LIVE, dict(homeless, attention="busy"), reviewable()],
+                              True, "12:00:05"))
+            await pilot.pause()
+            self.assertEqual(app.selected_row()["sessionId"], homeless["sessionId"])
+
+
 class TestEnterOnABackgroundSessionGivesItAWindow(UiTest):
     """The third kind: running, no window, and you want one. Enter opens a
     terminal and attaches - it never resumes, which would fork a conversation
@@ -8889,6 +8971,24 @@ class TestAParkEnds(ParkTest):
             self.assertEqual(self.unparks, [ASKING["sessionId"]])
             self.assertEqual(self.marks, [(ASKING["sessionId"], TS)])
             self.assertEqual(self.state(app), ["stopped"])
+
+    async def test_enter_on_one_with_no_window_keeps_it(self):
+        # there is nothing to go to, as after a jump that failed: it stays
+        # parked, a question and a finished turn alike
+        for was in ("asks", "review"):
+            with self.subTest(was=was):
+                self.unparks.clear(), self.marks.clear()
+                app = self.app(collector=self.fleet(
+                    dict(parked(was=was), tty="ttys042", windowed=False)))
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    await self.select(app, pilot)
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.pause()
+                    self.assertIn("no window", str(app.query_one("#header").content))
+                    self.assertEqual((self.unparks, self.marks), ([], []))
+                    self.assertEqual(self.state(app), ["parked"])
 
     async def test_a_scan_from_before_the_go_keeps_it_stopped(self):
         # the unpark is applied before the look: a FINISHED row you went to

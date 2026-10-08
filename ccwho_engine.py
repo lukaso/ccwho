@@ -3939,7 +3939,7 @@ UI_UNKNOWN_MARK = "·"
 UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action",
             "detail", "park")
 UI_KILL = "[kill stuck process…]"
-# On a row that needs you: park it - kept, out of NEEDS YOU, with a note of why
+# On a question for you (▲): park it - kept, out of NEEDS YOU, with a note of why
 UI_PARK = "[park]"
 # A click on a row goes to the session; this opens its detail instead: \ at the
 # right edge of line one over / on line two, one > the height of the row. ASCII:
@@ -3978,9 +3978,10 @@ def parkable(row):
 
 
 def park_offered(row):
-    """Does the row itself offer [park]? Only where it needs you: elsewhere it
-    is already quiet, and `z` parks it."""
-    return parkable(row) and row.get("attention") in dict(UI_GROUPS)["NEEDS YOU"]
+    """Does the row itself offer [park]? Only on a question for you (▲): a look
+    does not answer it, so it stays in NEEDS YOU. A finished turn (△) moves to
+    STOPPED when you go to it, and the rest are already quiet: there `z` parks."""
+    return parkable(row) and UI_STATE_MARK.get(row.get("attention")) == "▲"
 
 
 def ui_row_cells(row, width=100, tag=""):

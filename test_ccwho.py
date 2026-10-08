@@ -5620,7 +5620,7 @@ class TestParkedInTheList(unittest.TestCase):
 
 
 class TestTheParkTarget(unittest.TestCase):
-    """[park] on a row that needs you: a left click is the only click that
+    """[park] on a question for you (▲): a left click is the only click that
     reaches ccwho in iTerm2, so the action needs something visible to click."""
 
     def row(self, att="asks", **kw):
@@ -5639,11 +5639,20 @@ class TestTheParkTarget(unittest.TestCase):
             col += ccwho._cells(text)
         return None
 
-    def test_a_row_that_needs_you_offers_it(self):
-        for att in ("asks", "review", "blocked", "waiting"):
+    def test_a_question_for_you_offers_it(self):
+        # ▲: a look does not answer it, so it stays in NEEDS YOU until parked
+        for att in ("asks", "blocked", "waiting"):
             with self.subTest(att=att):
                 _, second = ccwho.ui_row_cells(self.row(att), width=100)
                 self.assertEqual([t for t, r in second if r == "park"], [ccwho.UI_PARK])
+
+    def test_a_finished_turn_does_not_offer_it(self):
+        # △: a click on it moves it to STOPPED, which is as quiet as PARKED
+        # (owner); `z` still parks it
+        row = self.row("review")
+        _, second = ccwho.ui_row_cells(row, width=100)
+        self.assertNotIn("park", [r for _, r in second])
+        self.assertTrue(ccwho.parkable(row))
 
     def test_no_other_row_offers_it(self):                           # control
         for att in ("stopped", "busy", "running", "stuck", "parked", "program", "ended"):

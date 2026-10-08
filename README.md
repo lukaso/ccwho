@@ -939,6 +939,26 @@ usually one the message goes on to answer. The phrase list ("tell me", "your cal
 "say the word", ...) is deliberately short and every entry was validated against a
 live fleet: 6 flagged, 6 genuine, 9 correctly quiet.
 
+A phrase counts only as whole words: "should I" is not in "should ignore", "your
+call" is not in "your calls". And "tell me", "let me know" and "want me to" ask you
+only when you are the one to act: "you" is in their clause ("if you can tell me",
+"you'll need to tell me"), or nothing but a few small words stands between them and
+the start of the clause ("tell me which", "please also tell me", "feel free to let
+me know", "otherwise just tell me"), or a word that joins them to the clause before
+("press ⌥/ and tell me"). A quoted text counts as one word, and ends its sentence
+when it ends in . ! ? or … and a capital letter follows. Any other word before
+them is taken as their subject, so some requests are not found - among them a
+request with no comma before it ("If the build fails let me know", "Restart ccwho
+then tell me"), and one after a word that is not one of those small words ("Kindly
+let me know", "Be sure to tell me which"). With another subject the line reports:
+a session whose closing line was "The marker files tell me which leftovers come
+from old code..." sat 17 hours in ASKED YOU (2026-10-08). Measured that day over
+7380 ended turns, the two rules took 6 lines out of ASKED YOU and put none in. One
+of the 6 did wait for you - "272 still waits for your answer on whether usernames
+should ignore upper and lower case" - and was found only because "should i" was in
+"should ignore". A line that says it waits for your answer or your go is the
+announced-then-stopped shape above, and is not found.
+
 ### The older NEEDS YOU vs ready split
 
 `claude agents --json` reports one status, `waiting`, with `waitingFor: "input

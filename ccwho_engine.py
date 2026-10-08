@@ -64,6 +64,24 @@ _INFRA = re.compile(r"(npm exec\s+\S*mcp|\S*-mcp\b|mcp-server|mcp_server)|_npx/"
 _ASK_PHRASES = ("tell me", "let me know", "your call", "say the word",
                 "which do you want", "shall i", "want me to", "should i",
                 "do you want", "confirm whether", "decision is yours")
+# Whole words only: "should i" is not "should ignore", "your call" not "your calls".
+_ASK_RE = re.compile(r"(?<!\w)(?:%s)(?!\w)" % "|".join(map(re.escape, _ASK_PHRASES)))
+# A phrase with "me" in it asks you only when you are the one to act: "you" in
+# its clause, or no subject at all ("tell me which", "and tell me"). With
+# another subject it reports - "the marker files tell me which leftovers..." sat
+# 17 hours in ASKED YOU. Measured 2026-10-08 over 7380 ended turns: 3 of 146
+# "tell me" closings had another subject, and none of the 3 asked.
+_ASK_ME = ("tell me", "let me know", "want me to")
+# what ends a clause: a mark, or a dash after a space
+_CLAUSE_END = re.compile(r"[.,;:!…—–→]|\s-")
+# words that may stand before the phrase in a clause with no subject. Any other
+# word is taken as its subject, so the line is not an ask: a lead clause with no
+# comma ("If the build fails let me know") is not found.
+_ASK_FILLER = {"please", "just", "also", "then", "now", "do", "feel", "free", "to",
+               "either", "otherwise", "next", "instead", "maybe", "perhaps", "first"}
+# words that join it to a clause before it, whose subject it shares: "press ⌥/
+# and tell me"
+_ASK_LEAD = {"and", "or", "but", "so"}
 _UNKNOWN_RANK = 4
 
 
@@ -314,10 +332,35 @@ def asks_user(text):
     so status alone loses them. Only the closing line is considered: a question
     earlier in a long report is usually one the message goes on to answer.
     """
-    closing = _QUOTED.sub("", _closing_line(text).lower())
+    closing = _QUOTED.sub(_quoted_word, _closing_line(text)).lower()
     if not closing.strip():
         return False
-    return "?" in closing or any(p in closing for p in _ASK_PHRASES)
+    return "?" in closing or any(
+        m.group() not in _ASK_ME or _you_are_asked(closing[:m.start()])
+        for m in _ASK_RE.finditer(closing))
+
+
+def _quoted_word(m):
+    """A quote stands as one word - a thing said, never a "?" to you - and keeps
+    the end of the sentence it ends: one that ends in a mark, with a capital
+    letter after it."""
+    after = m.string[m.end():].lstrip()[:1]
+    ends = m.group()[:-1].endswith((".", "!", "?", "…")) and after.isupper()
+    return " quote. " if ends else " quote "
+
+
+def _you_are_asked(before):
+    """Is a "me" phrase that follows `before` put to you? Yes when "you" is in
+    its clause, or when only filler stands between it and the start of its
+    clause, or a word that joins it to the clause before."""
+    clause = _CLAUSE_END.split(before)[-1]
+    if re.search(r"\byou\b", clause):
+        return True
+    for word in reversed(clause.split()):
+        word = word.lstrip("(")
+        if any(c.isalpha() for c in word) and word not in _ASK_FILLER:
+            return word in _ASK_LEAD         # a symbol or a number is no subject
+    return True                         # its clause starts with it
 
 
 def last_assistant_text(lines):

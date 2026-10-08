@@ -564,6 +564,117 @@ class TestAsksUser(unittest.TestCase):
         self.assertFalse(ccwho.asks_user(""))
 
 
+class TestAnAskPhraseAsksYou(unittest.TestCase):
+    """A phrase is an ask only as whole words, and a phrase with "me" in it only
+    when you are the one asked. Real closing lines (2026-10-08): a session that
+    reported what its marker files would tell it sat in ASKED YOU for 17 hours."""
+
+    def test_another_subject_reports_and_does_not_ask(self):
+        for line in (
+                "- The marker files tell me which leftovers come from old code, from kept "
+                "RED gates, or from killed runs. With that I can say whether the "
+                "follow-up step (S4) is needed: collecting finished leftovers after a day.",
+                "That run will tell me which. Once it's green I'll dispatch the third review.",
+                "If they edit agent-env.ts we'd collide - better they tell me before landing.",
+                "The reviewers want me to split it, so it is split.",
+                "The logs let me know when the gate ends.",
+                "Your logs tell me which.",                         # "your" is not "you"
+                "The Bayou logs tell me which.",
+                "The tests then tell me whether it holds.",
+                "When you are back, the logs tell me which.",
+                "The two gates (ruff and mypy) tell me nothing new.",
+                "The step-by-step and the how-to tell me nothing new.",
+                # a quote is a thing said, not a clause of its own
+                'Both "git status" and "git log" tell me the tree is clean.',
+                "Rows 1-3 tell me nothing."):
+            with self.subTest(line=line):
+                self.assertFalse(ccwho.asks_user(line))
+
+    def test_a_phrase_inside_a_longer_word_is_not_one(self):
+        self.assertFalse(ccwho.asks_user(
+            "This old CI event keeps starting new cycles, so the engine should ignore "
+            "events it already handled."))
+        self.assertFalse(ccwho.asks_user(
+            "Nothing outstanding from you at this point; both your calls are applied."))
+        self.assertFalse(ccwho.asks_user("That came from Marshall I think."))
+
+    def test_you_in_its_clause_asks(self):                       # control
+        # whatever stands between: you are the one asked
+        for line in (
+                "I do nothing further until you tell me to.",
+                "You’ll tell me when it is done.",
+                "You'll need to tell me which branch to keep.",
+                "If you don't want me to land it, say so.",
+                "You can rm it (or explicitly tell me to).",
+                # a quote that does not end the sentence leaves "you" in it
+                'If you see "Saved." in the footer please tell me.'):
+            with self.subTest(line=line):
+                self.assertTrue(ccwho.asks_user(line))
+
+    def test_no_subject_still_asks(self):                        # control
+        # one line for each way the clause can start: each would ask on its own
+        for line in (
+                "Tell me if it can go.",                            # the line starts
+                "So **tell me** which.",
+                # a word that joins it to what you were asked first
+                "One thing for you: press ⌥/ and tell me what happens.",
+                "I can leave the branch as it is, or want me to delete it.",
+                "I can leave the branch (or want me to delete it).",
+                "The framing is yours, but tell me where it drifts.",
+                "So tell me which one.",
+                # filler before it
+                "Do steps 1-4, then tell me what it says.",
+                "So please also tell me whether it appeared by itself.",
+                "Just tell me which one.",
+                "Now tell me what the screen shows.",
+                "Do let me know if anything breaks.",
+                "Feel free to let me know if it should change.",
+                "If it's a different account: either tell me the handle or paste the URL.",
+                "Otherwise just tell me.",
+                "Next tell me which.",
+                "Instead tell me which.",
+                "Maybe tell me which.",
+                "Perhaps tell me which.",
+                "First tell me which.",
+                # a symbol is no subject
+                "3) Tell me whether to push.",
+                "👉 Tell me which.",
+                # a clause starts after these
+                "The branch is merged. Tell me if it can go.",
+                "Untick it anyway (the point is the toggle.) Tell me when you have.",
+                "When it is done, tell me.",
+                "The branch is merged; tell me if it can go.",
+                "One thing: tell me which.",
+                "It works! Tell me if it breaks.",
+                "The branch is merged – tell me if it can go.",
+                "The branch is merged - tell me if it can go.",
+                "Your hotkey is still ⌥w — tell me and I will set it back.",
+                "Happy to adjust—just let me know.",
+                "Happy to adjust -- just let me know.",
+                "Restart it → tell me what the row shows.",
+                "It waits, and waits… tell me when to stop it.",
+                "Ruff says 'ok.' Tell me which.",
+                "- tell me whether to file the token-guidance issue.",
+                "• tell me which one to keep.",
+                "+ tell me which one to keep.",
+                # and after a quote that ends a sentence
+                'Ruff reports "All checks passed." Tell me if it can be pushed.',
+                "The doctor now says “all good.” Let me know if the row clears.",
+                'It printed "done!" Tell me if that is right.',
+                'It said "wait…" Tell me when to go on.',
+                'The reviewer asked "is it pending?" Tell me what to answer.',
+                # the other phrases have no subject rule
+                "Whether to land it is your call.",
+                "Your call on whether to run it or stop here.",
+                "Should I land it now"):
+            with self.subTest(line=line):
+                self.assertTrue(ccwho.asks_user(line))
+
+    def test_any_phrase_that_asks_you_is_enough(self):           # control
+        self.assertTrue(ccwho.asks_user("The logs tell me nothing, so tell me what you saw."))
+        self.assertTrue(ccwho.asks_user("Tell me which; the logs tell me nothing."))
+
+
 class TestExtractAsk(unittest.TestCase):
     def _msg(self, text):
         return json.dumps({"type": "assistant", "message": {"content": [

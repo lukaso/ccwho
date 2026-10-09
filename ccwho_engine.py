@@ -4004,7 +4004,7 @@ def ui_row_cells(row, width=100, tag=""):
     Line two is the recap - the harness's own summary, which is the only line
     written to answer "what was this about" - never without its age. No recap
     yet, and it says so and shows the last thing the session did instead. A row
-    found under SAID shows what was said that matched instead, its age and who
+    found under MORE RESULTS shows what was said that matched instead, its age and who
     said it first: that is why the row is there.
     """
     sid = row.get("short") or brief.short_id(row.get("sessionId", ""))
@@ -4106,7 +4106,7 @@ def ui_row_cells(row, width=100, tag=""):
         body = ("waiting? (maybe an approval)" if row.get("attention") == "waiting"
                 else ask or row.get("folder") or "(no folder yet)")
     elif row.get("said"):
-        # found under SAID: the message that matched is why it is there
+        # found under MORE RESULTS: the message that matched is why it is there
         said = row["said"]
         who = {"you": "you", "claude": "Claude"}.get(said.get("who"), said.get("who") or "?")
         mark = f"{said.get('age') or '?'} · {who}: "
@@ -4286,8 +4286,13 @@ def ui_ended_groups(idx, query, live_rows, now_iso, limit=UI_ENDED_SHOWN):
              "needs_you": False, "ended": True, "total": len(hits)}]
 
 
+# its heading: the sessions only what was said in them finds. It was "SAID",
+# which did not say what the group is (2026-10-08)
+UI_MORE = "MORE RESULTS"
+
+
 def ui_said_group(idx, query, live_rows, found, now_iso, limit=UI_ENDED_SHOWN):
-    """The SAID group, last: the sessions the grep of what was said found
+    """The MORE RESULTS group, last: the sessions the grep of what was said found
     (`found`, ccwho_index.grep: {id: Said}) and nothing else did. A session that
     matches by a name, or by what the index says it was about, shows where that
     puts it and never here as well: a common word was said in most sessions, and
@@ -4338,7 +4343,8 @@ def ui_said_group(idx, query, live_rows, found, now_iso, limit=UI_ENDED_SHOWN):
         return []
     rows.sort(key=lambda r: (tuple((r[0] or {}).get("key") or ()), r[1], r[2]), reverse=True)
     total = len(rows)
-    heading = "SAID" if total <= limit else f"SAID  {limit} of {total} - type more to narrow"
+    heading = (UI_MORE if total <= limit
+               else f"{UI_MORE}  {limit} of {total} - type more to narrow")
     return [{"heading": heading, "rows": [r[3] for r in rows[:limit]], "needs_you": False,
              "said": True, "total": total}]
 

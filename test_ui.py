@@ -1630,27 +1630,241 @@ class TestTheStatusSaysWhichSessionItWent(UiTest):
                           "say which session, in the words you picked it by")
 
 
-class TestYouCanSeeWhenItLastLooked(UiTest):
-    """"The list is not updating" should be answerable by looking at it. The
-    time of the snapshot was shown only when something had gone wrong, so a
-    frozen list and a quiet fleet looked exactly the same."""
+class StuckCollector(FakeCollector):
+    """A first scan that does not come back until the test lets it go."""
 
-    async def test_the_header_says_when_the_snapshot_was_taken(self):
+    def __init__(self):
+        super().__init__()
+        self.go = threading.Event()
+
+    def fleet(self):
+        self.go.wait(10)        # the test lets it go; never past its 30 s kill
+        return super().fleet()
+
+
+class TestItSaysWhenTheListStopsUpdating(UiTest):
+    """"The list is not updating" should be answerable by looking at it: a list
+    that has stopped and a fleet where nothing happens look the same. The time
+    of each scan in the header said so all day, for the one moment it mattered
+    ("why do we have a clock in the title?"). Fresh, the list shows no time;
+    once no scan has landed for a minute and a half, the amber line says since
+    when. Not sooner: a full scan is due every 20 s, but a tick can skip one
+    (Collector.due) and a slow `claude agents` adds 30 s or more."""
+
+    def app_at(self, now, collector=None, adapter=None):
+        app = self.app(collector=collector, adapter=adapter)
+        app.clock = lambda: now[0]
+        return app
+
+    def header(self, app):
+        return str(app.query_one("#header").content)
+
+    def banner(self, app):
+        banner = app.query_one("#banner")
+        return str(banner.content) if banner.display else ""
+
+    async def started(self, pilot, app):
+        """Past the first scan and the first paints: a clock moved before the
+        scan lands dates the scan, and one moved before the width poll paints
+        the list (0.2 s in) is painted by it, not by the one-second timer."""
+        self.assertTrue(await self.until(pilot, lambda: app.fresh is not None, wait=10))
+        await pilot.pause(0.5)
+
+    async def ticked(self, pilot, app):
+        """The one-second timer has looked at the list's age since now: a line
+        found missing before it looked proves nothing."""
+        looked, real = [], app.check_stale
+        app.check_stale = lambda: (looked.append(1), real())
+        try:
+            self.assertTrue(await self.until(pilot, lambda: looked, wait=10))
+        finally:
+            app.check_stale = real
+
+    async def until(self, pilot, done, wait=2.5):
+        """The list looks at its age on its one-second timer."""
+        for _ in range(int(wait / 0.05)):
+            if done():
+                return True
+            await pilot.pause(0.05)
+        return done()
+
+    async def test_a_fresh_list_shows_no_time(self):
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.started(pilot, app)
+            await self.ticked(pilot, app)
+            self.assertIn("1 needs", self.header(app))
+            self.assertNotIn("12:00", self.header(app))
+            self.assertNotIn("not updated", self.banner(app))
+
+    async def test_no_scan_for_a_minute_and_a_half_says_since_when(self):
+        now = [1000.0]
+        app = self.app_at(now)
+        async with app.run_test() as pilot:
+            await self.started(pilot, app)
+            now[0] += 91
+            self.assertTrue(await self.until(
+                pilot, lambda: "not updated since 12:00 (1 min)" in self.banner(app)),
+                self.banner(app))
+            self.assertNotIn("12:00", self.header(app))
+
+    async def test_a_skipped_tick_and_a_slow_scan_say_nothing(self):    # control
+        # the longest wait between scans that are on time: two periods, and a
+        # scan as slow as `claude agents` gets
+        now = [1000.0]
+        app = self.app_at(now)
+        async with app.run_test() as pilot:
+            await self.started(pilot, app)
+            now[0] += 2 * ui.REFRESH_EVERY + 30
+            await self.ticked(pilot, app)
+            self.assertNotIn("not updated", self.banner(app))
+
+    async def test_the_minutes_go_up(self):
+        now = [1000.0]
+        app = self.app_at(now)
+        async with app.run_test() as pilot:
+            await self.started(pilot, app)
+            now[0] += 91
+            self.assertTrue(await self.until(pilot, lambda: "(1 min)" in self.banner(app)))
+            now[0] += 94
+            self.assertTrue(await self.until(pilot, lambda: "(3 min)" in self.banner(app)),
+                            self.banner(app))
+
+    async def test_a_new_scan_takes_it_away(self):
+        now = [1000.0]
+        collector = FakeCollector()
+        app = self.app_at(now, collector)
+        async with app.run_test() as pilot:
+            await self.started(pilot, app)
+            now[0] += 91
+            self.assertTrue(await self.until(pilot, lambda: "not updated" in self.banner(app)))
+            collector.fleet_value = ui.Fleet([LIVE, BUSY], True, "12:01:31")
+            app.collect()
+            self.assertTrue(await self.until(pilot, lambda: "not updated" not in self.banner(app)),
+                            self.banner(app))
+            self.assertNotIn("12:01", self.header(app))
+
+    async def test_a_scan_that_could_not_read_the_fleet_is_no_update(self):
+        # it lands with no time and says why: the last scan that read the
+        # fleet is still the one of 12:00
+        now = [1000.0]
+        collector = FakeCollector()
+        app = self.app_at(now, collector)
+        async with app.run_test() as pilot:
+            await self.started(pilot, app)
+            collector.fleet_value = ui.Fleet([], False, "", "could not read the fleet (OSError)")
+            app.collect()
+            self.assertTrue(await self.until(pilot, lambda: "could not read" in self.banner(app)))
+            now[0] += 91
+            self.assertTrue(await self.until(
+                pilot, lambda: "not updated since 12:00 (1 min)" in self.banner(app)),
+                self.banner(app))
+            self.assertIn("could not read the fleet", self.banner(app))
+
+    async def test_a_scan_held_while_a_window_opens_is_an_update(self):
+        # while a window is being opened the list holds each scan, and shows it
+        # when the jump lands: the scan still looked
+        now = [1000.0]
+        adapter, collector = GatedAdapter(), FakeCollector()
+        app = self.app_at(now, collector, adapter)
+        async with app.run_test() as pilot:
+            try:
+                await self.started(pilot, app)
+                now[0] += 50
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                collector.fleet_value = ui.Fleet([LIVE, dict(BUSY, tab_title="rescanned")],
+                                                 True, "12:00:50")
+                app.collect()
+                self.assertTrue(await self.until(
+                    pilot, lambda: app.held is not None and app.held.at == "12:00:50"))
+                self.assertNotIn("rescanned", self.screen_text(app))   # held
+                # the scans after it read nothing: only the held one can date the list
+                collector.fleet_value = ui.Fleet([LIVE, dict(BUSY, tab_title="rescanned")],
+                                                 False, "", "could not read the fleet (test)")
+                now[0] += 41        # 91 s after the first scan, 41 after the held one
+            finally:
+                adapter.gate.set()
+            self.assertTrue(await self.until(pilot, lambda: "rescanned" in self.screen_text(app)))
+            await self.ticked(pilot, app)
+            self.assertNotIn("not updated", self.banner(app))
+
+    async def test_its_clock_goes_on_while_the_mac_sleeps_and_never_back(self):
+        # time.monotonic stops while a Mac sleeps: woken two hours on, the list
+        # said nothing until its next scan landed. The wall clock can be set
+        # back: an hour back, it said nothing for an hour. CLOCK_MONOTONIC
+        # does neither (man 3 clock_gettime)
+        mono, wall, real = [1000.0], [5000.0], ui.time.clock_gettime
+        fake = lambda which: mono[0] if which == ui.time.CLOCK_MONOTONIC else real(which)
+        with mock.patch.object(ui.time, "clock_gettime", fake), \
+                mock.patch.object(ui.time, "time", lambda: wall[0]):
+            app = self.app()
+            async with app.run_test() as pilot:
+                await self.started(pilot, app)
+                wall[0] -= 3600         # the clock set back an hour
+                mono[0] += 2 * 3600     # and two hours asleep
+                self.assertTrue(await self.until(
+                    pilot, lambda: "not updated since 12:00 (120 min)" in self.banner(app)),
+                    self.banner(app))
+
+    async def test_the_line_waits_while_a_row_blinks(self):
+        # nothing on the list moves while a window opens (TestTheRowMovesWhenTheBlinkEnds):
+        # a scan held then took the line away, and every row moved up one
+        now = [1000.0]
+        adapter, collector = GatedAdapter(), FakeCollector()
+        app = self.app_at(now, collector, adapter)
+        async with app.run_test() as pilot:
+            try:
+                await self.started(pilot, app)
+                now[0] += 91
+                self.assertTrue(await self.until(pilot, lambda: "not updated" in self.banner(app)))
+                await pilot.pause(0.2)
+                top = app.query_one("#list").region.y
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                collector.fleet_value = ui.Fleet([LIVE, BUSY], True, "12:01:31")
+                app.collect()
+                self.assertTrue(await self.until(
+                    pilot, lambda: app.held is not None and app.held.at == "12:01:31"))
+                await self.ticked(pilot, app)
+                await pilot.press("x")      # says why not: the header is painted again
+                await pilot.pause(0.1)
+                self.assertIn("nothing to kill", self.header(app))
+                self.assertEqual(app.query_one("#list").region.y, top, "the list moved")
+                self.assertIn("not updated", self.banner(app))
+            finally:
+                adapter.gate.set()
+            self.assertTrue(await self.until(pilot, lambda: "not updated" not in self.banner(app)),
+                            self.banner(app))
+
+    async def test_a_first_scan_that_never_lands_says_so_too(self):
+        now = [1000.0]
+        collector = StuckCollector()
+        app = self.app_at(now, collector)
+        async with app.run_test() as pilot:
+            try:
+                await pilot.pause(0.5)
+                self.assertIn("collecting", self.header(app))
+                now[0] += 91
+                self.assertTrue(await self.until(
+                    pilot, lambda: "no scan has read the fleet yet (1 min)" in self.banner(app)),
+                    self.banner(app))
+            finally:
+                collector.go.set()
+
+
+class TestTheHeaderCountsByState(UiTest):
+    """"the 14 sessions + 1 codex seems a little superfluous" - "do keep the 6
+    needs - 3 stopped - 6 busy though". The groups are counted; the total is
+    not."""
+
+    async def test_it_counts_each_group_and_not_the_whole(self):
         app = self.app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            self.assertIn("12:00:00", str(app.query_one("#header").content))
-
-    async def test_a_newer_snapshot_shows_its_own_time(self):
-        collector = FakeCollector()
-        app = self.app(collector=collector)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            collector.fleet_value = ui.Fleet([LIVE, BUSY], True, "12:00:30")
-            app.collect()
-            await pilot.pause()
-            await pilot.pause()
-            self.assertIn("12:00:30", str(app.query_one("#header").content))
+            header = str(app.query_one("#header").content)
+            self.assertIn("1 needs · 1 busy", header)
+            self.assertNotIn("sessions", header)
 
 
 class TestItChecksAgainRightAfterYouAnswerOne(UiTest):
@@ -2042,17 +2256,19 @@ class TestTheRowMovesWhenTheBlinkEnds(UiTest):
                 await pilot.pause(0.1)
                 # the other stopped session starts asking: it would jump to the top
                 collector.fleet_value = ui.Fleet(
-                    [reviewable(), dict(other, attention="asks"), BUSY], True, "12:00:05")
+                    [reviewable(), dict(other, attention="asks", tab_title="Other asks"), BUSY],
+                    True, "12:00:05")
                 app.collect()
                 await pilot.pause(0.1)
                 self.assertEqual(order(), before, "nothing moves under the blink")
+                self.assertNotIn("Other asks", self.screen_text(app))
                 self.assertIn("going to", app.status)
             finally:
                 adapter.gate.set()
             await pilot.pause(0.1)
             await pilot.pause()
             self.assertEqual(order()[0], other["sessionId"], "and then it does")
-            self.assertIn("12:00:05", self.screen_text(app))
+            self.assertIn("Other asks", self.screen_text(app))     # the scan it held
             self.assertIn("went to", app.status)
 
 
@@ -2254,16 +2470,18 @@ class TestAJumpEndsOnlyWithItsOwnAnswer(UiTest):
                 await pilot.pause(0.1)
                 await pilot.press("j", "enter")         # nothing to go to: no jump
                 await pilot.pause(0.1)
-                collector.fleet_value = ui.Fleet([self.A, nowhere], True, "12:00:07")
+                collector.fleet_value = ui.Fleet([self.A, dict(nowhere, tab_title="rescanned")],
+                                                 True, "12:00:07")
                 app.collect()
                 await pilot.pause(0.1)
+                self.assertNotIn("rescanned", self.screen_text(app))   # held
             finally:
                 adapter.gate.set()
             await pilot.pause(0.1)
             await pilot.pause()
             self.assertEqual(app.acting, "")
             self.assertIsNone(app.held)
-            self.assertIn("12:00:07", self.screen_text(app))
+            self.assertIn("rescanned", self.screen_text(app))      # the scan it held
             self.assertEqual(self.marks, [self.A["sessionId"]])
 
     async def test_an_older_jump_landing_last_is_applied_at_once(self):
@@ -5822,8 +6040,8 @@ class TestTheSearchFindsASessionThatEnded(UiTest):
             self.assertTrue(await self.until(pilot, lambda: "ENDED" in self.screen_text(app)))
             header = str(app.query_one("#header").content)
             self.assertIn("0 of 2 + 1 ended", header)
-            # the counts before the time are of the sessions that run
-            self.assertNotIn("ended", header.split("12:00:00")[0])
+            # the counts before the search are of the sessions that run
+            self.assertNotIn("ended", header.split("search ")[0])
 
     async def test_a_scan_that_finds_it_running_again_takes_it_out_of_ended(self):
         c = self.collector()
@@ -6915,7 +7133,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
     """The owner, 2026-10-05: "a keyword search on the session contents (a
     basic case independent grep)". Half a second after the last key, the list
     greps what was said in every session - your prompts and Claude's replies -
-    in the background; the sessions only that finds show last, under SAID."""
+    in the background; the sessions only that finds show last, under MORE RESULTS."""
 
     _T = TestTheSearchFindsASessionThatEnded
     until, read = _T.until, _T.read
@@ -6951,7 +7169,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
             async with app.run_test(size=(140, 40)) as pilot:
                 await pilot.pause()
                 await self.search(pilot, "flamingo")
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 self.assertIn("liveapp pull request 526", self.screen_text(app))
                 self.assertEqual(self.calls(c), ["flamingo"])
 
@@ -6981,9 +7199,9 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()],
                                  [BUSY["sessionId"]])
                 text = self.screen_text(app)
-                self.assertIn("SAID", text)
+                self.assertIn("MORE RESULTS", text)
                 self.assertNotIn("BUSY", text, "not in its group: no name of it matched")
-                self.assertIn("0 of 2 + 1 said", self.header(app))
+                self.assertIn("0 of 2 + 1 more", self.header(app))
 
     async def test_a_said_row_shows_what_was_said_that_matched(self):
         # the owner, 2026-10-07: the session was in the list, its row about
@@ -6996,7 +7214,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
             async with app.run_test(size=(140, 40)) as pilot:
                 await pilot.pause()
                 await self.search(pilot, "flamingo")
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 text = self.screen_text(app)
                 self.assertIn("Claude: the flamingo build is green", text)
                 self.assertNotIn(ENDED_ENTRY["recap"], text, "not its recap")
@@ -7016,10 +7234,10 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 text = self.screen_text(app)
                 self.assertIn("ENDED", text)
                 self.assertIn("liveapp pull request 526", text)
-                self.assertNotIn("SAID", text)
+                self.assertNotIn("MORE RESULTS", text)
 
     async def test_a_said_row_changes_with_its_session_at_once(self):
-        # review-plan1 F13: a row copied for SAID would say "review" until the
+        # review-plan1 F13: a row copied for MORE RESULTS would say "review" until the
         # next scan, after you went to it
         marks = []
         real = ui.engine.mark_reviewed
@@ -7036,7 +7254,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
             async with app.run_test(size=(140, 40)) as pilot:
                 await pilot.pause()
                 await self.search(pilot, "flamingo")
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 where = lambda: [w.row["attention"] for w in app.query(ui.Row)   # noqa: E731
                                  if w.row["sessionId"] == sid]
                 self.assertEqual(where(), ["review"])
@@ -7057,7 +7275,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
             async with app.run_test(size=(140, 40)) as pilot:
                 await pilot.pause()
                 await self.search(pilot, "release")
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 self.assertEqual([w.row.get("sessionId") for w in app.rows_on_screen()],
                                  [BUSY["sessionId"], LIVE["sessionId"]],
                                  "the name match first, what was said last")
@@ -7083,10 +7301,10 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 try:
                     await pilot.pause()
                     await self.search(pilot, "flamingo")
-                    self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                    self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                     app.query_one("#search").value = "flamingo zebra"
                     await pilot.pause(0.3)
-                    self.assertNotIn("SAID", self.screen_text(app),
+                    self.assertNotIn("MORE RESULTS", self.screen_text(app),
                                      "the finds for 'flamingo' are not those for 'flamingo zebra'")
                 finally:
                     gate.set()
@@ -7116,7 +7334,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                                      "nothing has searched the conversations for abc yet")
                 finally:
                     gate.set()
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 self.assertEqual(self.calls(c)[-1], "abc")
 
     async def test_with_no_answer_yet_the_list_does_not_search_again_on_every_paint(self):
@@ -7251,9 +7469,9 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 await pilot.pause()
                 self.assertTrue(await self.until(pilot, lambda: len(calls) == 2
                                                  and app.index_out == 0))
-                await self.until(pilot, lambda: "SAID" in self.screen_text(app), wait=1.5)
+                await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app), wait=1.5)
                 self.assertEqual(self.calls(c), ["release"], "the grep for the words ran")
-                self.assertIn("SAID", self.screen_text(app))
+                self.assertIn("MORE RESULTS", self.screen_text(app))
 
     async def test_a_new_text_while_the_index_is_read_greps_it_once(self):
         # review 5: the index lands inside the pause after a new text - the
@@ -7347,7 +7565,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                     app.query_one("#search").value = "flamingo"
                     self.assertTrue(await self.until(pilot, lambda: app.content_out == 2))
                     gates["flamingo"].set()                 # the newer one first
-                    self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                    self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                     gates["flam"].set()                     # then the older one, late
                     self.assertTrue(await self.until(pilot, lambda: app.content_out == 0))
                     await pilot.pause()
@@ -7358,7 +7576,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 self.assertEqual((first, second), ("flam", "flamingo"))
                 self.assertTrue(stop1(), "the older one is told to stop")
                 self.assertFalse(stop2())
-                self.assertIn("SAID", self.screen_text(app))
+                self.assertIn("MORE RESULTS", self.screen_text(app))
                 self.assertNotIn("Release queue", self.screen_text(app),
                                  "the older answer, back last, is not shown")
 
@@ -7379,7 +7597,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                 self.assertTrue(await self.until(pilot, lambda: app.content_out == 0))
                 await pilot.pause()
                 self.assertTrue(c.grep_calls[0][1](), "told to stop")
-                self.assertNotIn("SAID", self.screen_text(app))
+                self.assertNotIn("MORE RESULTS", self.screen_text(app))
                 self.assertEqual(app.filter_text, "")
 
     async def test_no_grep_until_the_index_is_read(self):
@@ -7400,7 +7618,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                     self.assertEqual(self.calls(c), [], "it greps the index's transcripts")
                 finally:
                     gate.set()
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 self.assertEqual(self.calls(c), ["flamingo"])
 
     async def test_a_grep_that_fails_leaves_the_search_working(self):
@@ -7983,7 +8201,7 @@ class TestAParkInASearch(ParkTest):
                 self.assertEqual(self.on(app), kiwi["sessionId"])
 
     async def test_a_row_that_stays_in_said_keeps_it(self):
-        # SAID is what was said, not what it needs: the parked row stays there,
+        # MORE RESULTS is what was said, not what it needs: the parked row stays there,
         # and the row after it can be an ended one, which Enter would reopen
         said = {"text": "the flamingo is pink", "who": "you",
                 "ts": "2026-09-22T10:00:00.000Z", "key": (9, True, 9)}
@@ -7996,14 +8214,14 @@ class TestAParkInASearch(ParkTest):
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause()
                 await self.search(app, pilot, "flamingo")
-                self.assertTrue(await self.until(pilot, lambda: "SAID" in self.screen_text(app)))
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
                 await self.to_the_list(pilot)
                 ids = [w.row.get("sessionId") for w in app.rows_on_screen()]
                 self.assertEqual(ids, [ASKING["sessionId"], ENDED_SID])           # control
                 self.assertEqual(self.on(app), ASKING["sessionId"])
                 await self.park_it(app, pilot, "later")
                 self.assertEqual(self.parks, [(ASKING["sessionId"], TS, "later")])
-                self.assertEqual(self.heading_of(app), "SAID")
+                self.assertEqual(self.heading_of(app), "MORE RESULTS")
                 self.assertEqual(self.on(app), ASKING["sessionId"])
                 self.assertEqual(self.z_says(app), "unpark")
 
@@ -8369,7 +8587,7 @@ class TestTheHighlightStaysInNeedsYou(ParkTest):
                 self.assertEqual(self.on(app), c4["sessionId"])
 
     async def test_a_park_under_said_after_the_go_keeps_it(self):
-        # the park keeps the highlight on a row that stays under SAID: the go
+        # the park keeps the highlight on a row that stays under MORE RESULTS: the go
         # before it does not take it to the next one that needs you
         said = {"text": "the flamingo is pink", "who": "you",
                 "ts": "2026-09-22T10:00:00.000Z", "key": (9, True, 9)}
@@ -8382,24 +8600,24 @@ class TestTheHighlightStaysInNeedsYou(ParkTest):
                 await pilot.pause()
                 await self._S.search(self, pilot, "flamingo", app=app)
                 self.assertTrue(await self._S.until(self, pilot,
-                                                    lambda: "SAID" in self.screen_text(app)))
+                                                    lambda: "MORE RESULTS" in self.screen_text(app)))
                 await pilot.press("enter")              # the keys to the list
                 await pilot.pause()
                 await self.select(app, pilot)
-                self.assertEqual(self.heading_of(app), "SAID")                    # control
+                self.assertEqual(self.heading_of(app), "MORE RESULTS")                    # control
                 await self.go(pilot)
                 await self.park_it(app, pilot, "later")
-                self.assertEqual(self.heading_of(app), "SAID")
+                self.assertEqual(self.heading_of(app), "MORE RESULTS")
                 self.assertEqual(self.on(app), ASKING["sessionId"])
 
     async def said_go(self, app, pilot, attention):
-        """Search "flamingo": ASKING under SAID, OTHER in NEEDS YOU; go to ASKING."""
+        """Search "flamingo": ASKING under MORE RESULTS, OTHER in NEEDS YOU; go to ASKING."""
         await self._S.search(self, pilot, "flamingo", app=app)
-        self.assertTrue(await self._S.until(self, pilot, lambda: "SAID" in self.screen_text(app)))
+        self.assertTrue(await self._S.until(self, pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
         await pilot.press("enter")                  # the keys to the list
         await pilot.pause()
         await self.select(app, pilot)
-        self.assertEqual(self.heading_of(app), "SAID")                            # control
+        self.assertEqual(self.heading_of(app), "MORE RESULTS")                            # control
         await self.go(pilot)
 
     def said_collector(self, attention):
@@ -8410,7 +8628,7 @@ class TestTheHighlightStaysInNeedsYou(ParkTest):
             True, "12:00:00"), found={"flamingo": {ASKING["sessionId"]: said}})
 
     async def test_a_question_you_go_to_under_said_takes_it_along(self):
-        # SAID is what was said, not what needs you: a row like any other
+        # MORE RESULTS is what was said, not what needs you: a row like any other
         c = self.said_collector("asks")
         app = self.app(collector=c)
         with mock.patch.object(ui, "CONTENT_PAUSE", 0.1):

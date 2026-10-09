@@ -1144,7 +1144,7 @@ class TestStuckOnScreen(unittest.TestCase):
         self.assertIsNone(ccwho.ui_action_at(self._row("asks", loops=[]), 100, 1, 90))
 
     def test_what_was_said_does_not_cost_the_kill(self):
-        # a stuck session found under SAID: what it said in place of the recap,
+        # a stuck session found under MORE RESULTS: what it said in place of the recap,
         # the loop and the kill where they are (review-plan1 F14)
         row = dict(self._row(), said={"text": "it hasn't woken the loop", "who": "you",
                                       "age": "2h"})
@@ -10190,7 +10190,7 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
         self.assertEqual(ccwho.ui_found_running(None, "flamingo", [live]), [])
 
     # the grep of what was said (ccwho_index.grep): the ids it found go to a
-    # SAID group of their own, last - never among the name matches (review 1)
+    # MORE RESULTS group of their own, last - never among the name matches (review 1)
     def said(self, idx, query, live=(), found=(), limit=10):
         # found: the grep's {id: Said}; a set of ids (no Said) is taken too
         return ccwho.ui_said_group(idx, query, list(live), found, self.NOW, limit=limit)
@@ -10198,7 +10198,7 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
     def test_an_ended_session_found_only_by_what_was_said(self):
         idx = self.index(self.entry())                 # no "flamingo" in its names
         groups = self.said(idx, "flamingo", found={self.SID})
-        self.assertEqual([g["heading"] for g in groups], ["SAID"])
+        self.assertEqual([g["heading"] for g in groups], ["MORE RESULTS"])
         self.assertEqual(self.ids(groups), [self.SID])
         self.assertEqual(groups[0]["rows"][0]["attention"], "ended")
         self.assertFalse(groups[0]["needs_you"])
@@ -10240,7 +10240,7 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
         self.assertEqual(groups[0]["total"], 12)
         self.assertIn("10 of 12", groups[0]["heading"])
         self.assertEqual(self.said(self.sessions(10), "flamingo",
-                                   found=set(self.sessions(10)))[0]["heading"], "SAID")  # control
+                                   found=set(self.sessions(10)))[0]["heading"], "MORE RESULTS")  # control
 
     def test_nothing_said_without_a_search(self):
         idx = self.index(self.entry())

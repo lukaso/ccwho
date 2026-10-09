@@ -75,19 +75,21 @@ class TestTheCodexRows(UiTest):
             self.assertIn("· VS Code", text)
             self.assertIn("STOPPED", text)                    # no turn read: stopped
 
-    async def test_the_header_counts_sessions_and_codex_apart(self):
+    async def test_the_header_counts_a_thread_in_its_group(self):
+        # the header counts the groups, not sessions and Codex threads apart
         app = self.app(collector=CodexCollector())
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
             header = str(app.query_one("#header").content)
-            self.assertIn("1 sessions + 1 codex", header)
+            self.assertIn("1 needs · 1 stopped", header)
+            self.assertNotIn("codex", header)
 
     async def test_no_threads_no_group(self):                            # control
         app = self.app(collector=CodexCollector(procs=dict(PROCS, codex_threads=None)))
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
             self.assertNotIn("fix the navbar", self.screen_text(app))
-            self.assertNotIn("codex", str(app.query_one("#header").content))
+            self.assertNotIn("stopped", str(app.query_one("#header").content))
 
     async def test_enter_says_where_it_runs_and_opens_nothing(self):
         adapter = FakeAdapter()

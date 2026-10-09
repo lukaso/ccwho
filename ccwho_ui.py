@@ -19,7 +19,7 @@ What it does that the one-shot table cannot:
     ended sessions too, from the index `ccwho ls` searches; Enter reopens one.
     Half a second after the last key it also greps what was said in each -
     your prompts and Claude's replies, any case, a word's forms too (woke,
-    woken for wake) - and lists what only that finds under SAID, last: the
+    woken for wake) - and lists what only that finds under MORE RESULTS, last: the
     closest first, each row showing the message that matched
 
 Collection runs in a worker thread. `claude agents --json` can take 30 seconds
@@ -99,6 +99,10 @@ WINDOW_NAME = "ccwho"
 # at all, or it would cost more than the scans it saves.
 WATCH_EVERY = 1.0              # "has anything changed?" - 0.5ms to answer
 REFRESH_EVERY = 20.0           # a full scan even when nothing moved
+# no scan has landed for this long: the list says since when (stale_line). Scans
+# on time can be 70 s apart: a tick a little early is skipped (Collector.due),
+# so two periods pass, and `claude agents` may take all of its 30 s timeout
+STALE_AFTER = 90.0
 AFTER_A_JUMP = 2.0             # long enough for the session to notice you
 PULSE_EVERY = 0.45             # the blink on a row that is being opened
 
@@ -122,6 +126,15 @@ CONTENT_PAUSE = 0.5
 # (a root on a volume that is gone) said so for good (review 2).
 CONTENT_PATIENCE = 60.0
 NOTHING_SAID = types.MappingProxyType({})   # one object: the cache compares by identity
+
+
+def awake_clock():
+    """Seconds that go on while the Mac sleeps and never go back - what a list's
+    age is read on. time.monotonic stops while it sleeps: woken two hours on, the
+    list said nothing until its next scan. The wall clock can be set back: an
+    hour back, it said nothing for an hour (man 3 clock_gettime). ccwho._mono
+    reads the same clock; this module imports ccwho only inside a scan."""
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
 
 
 class Fleet:
@@ -873,7 +886,12 @@ class CcwhoUi(App):
         self.needs_order = []   # NEEDS YOU around it, the rows a search hides too
         self.acting = ""        # the session a window is being opened for
         self.kill_busy = False  # a kill is being read, asked or carried out
-        self.clock = time.monotonic
+        self.clock = awake_clock
+        # (the time of the last scan that landed, when on self.clock) - or None
+        # before the first: what stale_line reads; stale_shown is its line on screen
+        self.fresh = None
+        self.opened = None      # when the list opened, on self.clock: on_mount
+        self.stale_shown = ""
         self.pulsing = False
         # While a window is being opened nothing on the list moves - you are
         # watching one row blink - so a scan waits here, and so does the row you
@@ -942,6 +960,7 @@ class CcwhoUi(App):
         self.set_interval(WATCH_EVERY, self.watch_tick)
         self.set_interval(PULSE_EVERY, self.pulse)
         self.set_interval(0.2, self.check_width)      # no subprocess, just a number
+        self.opened = self.clock()
         self.collect()
 
     def name_the_window(self, write=None):
@@ -1015,6 +1034,7 @@ class CcwhoUi(App):
         costs about 4% of a core.
         """
         self.sniff()
+        self.check_stale()
 
     @work(exclusive=True, thread=True, group="sniff")
     def sniff(self):
@@ -1037,6 +1057,8 @@ class CcwhoUi(App):
         if seq and seq < self.shown:
             return                      # a slower collection, finishing late
         self.shown = max(self.shown, seq)
+        if fleet.at:
+            self.fresh = (fleet.at, self.clock())     # held or shown: it is a look
         if self.acting:
             self.held = fleet           # shown when the jump is done: landed()
             return
@@ -1147,12 +1169,12 @@ class CcwhoUi(App):
         """What the list shows: the running sessions the search finds - by
         their rows, and by what the index says they were about, as `ccwho ls`
         finds them - and, while you search, the ended ones under ENDED, then
-        under SAID those only the grep of what was said found."""
+        under MORE RESULTS those only the grep of what was said found."""
         running, ended, said = self.index_found()
         return self.fleet.groups(self.filter_text, also=running) + ended + said
 
     def index_found(self):
-        """(the running rows the index finds, the ENDED group, the SAID group),
+        """(the running rows the index finds, the ENDED group, the MORE RESULTS group),
         from the index as read when the search opened and the grep's answer for
         this text. Asked for on every paint and every move: made once per search
         text, index, scan and answer - a scan brings new ages, and which
@@ -1189,7 +1211,7 @@ class CcwhoUi(App):
         return found[:2] + (self.as_running_now(found[2]),)
 
     def as_running_now(self, groups):
-        """The SAID group with each running row as it is NOW: a SAID row is a
+        """The MORE RESULTS group with each running row as it is NOW: its row is a
         copy of the live row, and a row changed in place - you went to it, and it
         left review - must not wait for the next scan to say so (review-plan1 F13)."""
         live = {r.get("sessionId"): r for r in self.fleet.rows}
@@ -1370,7 +1392,7 @@ class CcwhoUi(App):
     def going_to(self, row):
         """Enter or a click on a session in NEEDS YOU on screen: when it stops
         needing you, the highlight stays in NEEDS YOU (stay_in_needs_you). One
-        you go to under PARKED, STOPPED or a search's SAID is a row like any
+        you go to under PARKED, STOPPED or a search's MORE RESULTS is a row like any
         other."""
         sid = row.get("sessionId", "")
         heading = engine.UI_GROUPS[0][0]
@@ -1526,44 +1548,74 @@ class CcwhoUi(App):
         return "  No Claude Code sessions running, and nothing saved to reopen."
 
     def paint_header(self, groups):
-        header, banner = self.part("#header"), self.part("#banner")
-        if header is None or banner is None:
+        header = self.part("#header")
+        if header is None:
             return
         # the ended sessions are not counted with the ones that run: "1 ended"
         # among them reads as a running session that ended. The search says them
         ended = sum(g.get("total", len(g["rows"])) for g in groups if g.get("ended"))
         said = sum(g.get("total", len(g["rows"])) for g in groups if g.get("said"))
         groups = [g for g in groups if not (g.get("ended") or g.get("said"))]
+        # each group counted, a Codex thread in its state's: not the whole too
+        # ("14 sessions + 1 codex" was one more number to read), nor the time
+        # of the scan - the list says that only once it is old (stale_line)
         counts = " · ".join(f"{len(g['rows'])} {g['heading'].split()[0].lower()}"
                             for g in groups)
-        # Always say when this was true. Without it, a list that has stopped
-        # refreshing and a fleet where nothing is happening look identical -
-        # and the first thing anyone asks is "is this thing updating?".
-        when = f"  {self.fleet.at}" + ("  (stale)" if self.fleet.error else "")
         # A list hiding most of itself has to SAY so, where you are already
         # looking. The box at the bottom is easy to forget, and a filtered list
         # you have forgotten about looks like a broken one.
         shown = sum(len(g["rows"]) for g in groups)
-        searching = (f"   search {self.filter_text!r}: {shown} of {len(self.fleet.rows)}"
+        searching = (f"search {self.filter_text!r}: {shown} of {len(self.fleet.rows)}"
                      + (f" + {ended} ended" if ended else "")
-                     + (f" + {said} said" if said else "")
+                     + (f" + {said} more" if said else "")
                      + (" · searching the conversations..." if self.grepping() else "")
                      + " · esc to clear"
                      if self.filter_text else "")
-        # sessions are Claude's; the Codex threads are counted by their group
-        sessions = sum(1 for r in self.fleet.rows if r.get("kind") != "codex")
-        codex = len(self.fleet.rows) - sessions
-        header.update(
-            f"{sessions} sessions" + (f" + {codex} codex" if codex else "")
-            + (f": {counts}" if counts else "")
-            + when + searching + ("  " + self.status if self.status else ""))
-        doctor = f"⚠ {self.fleet.doctor}" if self.fleet.doctor else ""
-        trouble = "\n".join(line for line in (self.fleet.error, self.fleet.secure, doctor,
-                                              self.note) if line)
-        banner.update(trouble)
-        banner.display = bool(trouble)
+        header.update("   ".join(part for part in (counts, searching, self.status) if part))
+        self.paint_banner()
         self.paint_procs_lines()
         self.paint_usage()
+
+    def stale_line(self):
+        """"not updated since 14:02 (3 min)" once no scan has landed for
+        STALE_AFTER - "no scan has read the fleet yet (2 min)" when none has since
+        the list opened - else "". A list that has stopped and a fleet where nothing
+        happens look the same: the header showed the time of every scan for
+        that (2026-09-21), a clock read all day for the one moment it mattered.
+        A scan that could not read the fleet lands with no time: no update."""
+        since = self.fresh[1] if self.fresh else self.opened
+        if since is None:
+            return ""
+        old = self.clock() - since
+        if old < STALE_AFTER:
+            return ""
+        if self.fresh is None:
+            return f"no scan has read the fleet yet ({int(old // 60)} min)"
+        return f"not updated since {self.fresh[0][:5]} ({int(old // 60)} min)"
+
+    def paint_banner(self):
+        """The amber lines under the header: what went wrong, how old the list
+        is, and what stops a hotkey or a check. Hidden when there are none."""
+        banner = self.part("#banner")
+        if banner is None:
+            return
+        # while a row blinks the line stays as it is: it coming or going moved
+        # every row under it, and nothing on the list moves until the jump lands
+        if not self.acting:
+            self.stale_shown = self.stale_line()
+        doctor = f"⚠ {self.fleet.doctor}" if self.fleet.doctor else ""
+        trouble = "\n".join(line for line in (self.fleet.error, self.stale_shown,
+                                              self.fleet.secure, doctor, self.note) if line)
+        banner.update(trouble)
+        banner.display = bool(trouble)
+
+    def check_stale(self):
+        """On the one-second timer: no scan is what the line is about, so no
+        scan can be what paints it. Painted only when its text changes."""
+        # not while a row blinks: paint_banner keeps the line as it is then,
+        # and this would only write it again every second
+        if not self.acting and self.stale_line() != self.stale_shown:
+            self.paint_banner()
 
     def paint_usage(self):
         """From the snapshot in hand: moving the cursor reads no file."""
@@ -1962,7 +2014,7 @@ class CcwhoUi(App):
             # the highlight stays where you were working, so Enter goes on to
             # the next session that needs you - not to this one, which a go
             # would unpark. An unpark brings back the one you want: it follows;
-            # and a row that stays in its group - a search's SAID - keeps it
+            # and a row that stays in its group - a search's MORE RESULTS - keeps it
             self.selected = below
             detail = self.part("#detail")
             if detail is not None:

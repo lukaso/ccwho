@@ -232,10 +232,15 @@ class TestSaveAndRestore(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         os.environ["CCWHO_DIR"] = self.tmp
         self.real_collect = runner.engine.collect
+        # what runs now (None: ROWS, read when a scan asks - other classes run
+        # this setUp with no ROWS of their own), and whether the live list
+        # could be read: a test that restores "after the reboot" empties it
+        self.rows_now, self.source_ok, self.scans = None, True, []
         def fake_collect(cache=None, status=None, **k):
+            self.scans.append(k)
             if status is not None:
-                status["source_ok"] = True      # this class tests a REACHABLE source
-            return (list(self.ROWS), 0)
+                status["source_ok"] = self.source_ok  # REACHABLE, unless a test says not
+            return (list(self.ROWS if self.rows_now is None else self.rows_now), 0)
 
         runner.engine.collect = fake_collect
 
@@ -260,9 +265,82 @@ class TestSaveAndRestore(unittest.TestCase):
     def test_save_writes_a_manifest_that_restore_reads_back(self):
         rc, _ = self._save()
         self.assertEqual(rc, 0)
+        self.rows_now = []                      # the reboot: nothing runs now
         rc, out = self._restore()
         self.assertEqual(rc, 0)
         self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+
+    def test_restore_says_which_still_run_and_gives_them_no_resume_line(self):
+        # run before a reboot, the list said to resume sessions that run: a
+        # second process on one transcript. The links resolve at click time;
+        # the printed lines are read now, so they say it now
+        self._save()
+        rc, out = self._restore()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("claude --resume 4f2b91ac", out)
+        self.assertIn("running now - ccwho open 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+        # one scan, the one a save takes: no samples (1.5 s each, for stuck
+        # work) and no Terminal.app asked for tab names (#30)
+        self.assertEqual(self.scans[1:], [{"session_apps": False, "samples": 0}])
+
+    def _restore_apart(self, argv=()):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.restore(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    WARNING = "ccwho restore: could not read which sessions run now"
+
+    def test_restore_that_cannot_read_what_runs_says_so(self):
+        # the lines stay - after a reboot they are what you need - and it says
+        # that it cannot tell which of them still run: after the list, in it
+        self._save()
+        self.rows_now, self.source_ok = [], False
+        rc, out, _err = self._restore_apart()
+        self.assertEqual(rc, 0)
+        self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+        self.assertIn(self.WARNING, out)
+        self.assertGreater(out.index(self.WARNING), out.index("claude --resume 4f2b91ac"))
+
+    def test_one_seen_running_is_marked_though_the_read_was_not_whole(self):
+        # a session seen running runs, whatever else could not be read
+        self._save()
+        self.source_ok = False
+        rc, out = self._restore()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("claude --resume 4f2b91ac", out)
+        self.assertIn("running now - ccwho open 4f2b91ac", out)
+        self.assertIn(self.WARNING, out)
+
+    def test_a_terminal_parked_under_a_job_runs(self):
+        # ctrl+b: the terminal saved has no row of its own now - the job it
+        # parked under stands for it (answers_for), as `ccwho open` has it
+        self._save()
+        job = "99999999-9999-4999-8999-999999999999"
+        self.rows_now = [dict(self.ROWS[0], sessionId=job, parked=[self.ROWS[0]["sessionId"]])]
+        rc, out = self._restore()
+        self.assertNotIn("claude --resume 4f2b91ac", out)
+        self.assertIn("running now - ccwho open 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+        self.rows_now = [dict(self.ROWS[0], sessionId=job)]                  # control
+        rc, out = self._restore()
+        self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+
+    def test_a_scan_that_fails_still_lists_everything(self):
+        # after a reboot this list is what you need: the scan only marks it
+        self._save()
+        def dies(cache=None, status=None, **k):
+            raise RuntimeError("claude agents broke")
+        runner.engine.collect = dies
+        rc, out = self._restore()
+        self.assertEqual(rc, 0)
+        self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
+        self.assertIn(self.WARNING, out)
+
+    def test_a_restore_that_could_read_it_says_nothing_of_it(self):      # control
+        self._save()
+        self.rows_now = []
+        rc, out = self._restore()
+        self.assertNotIn("could not read", out)
 
     def test_save_records_the_pane_each_session_is_in(self):
         iterm = runner.engine.terms.ITERM2

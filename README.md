@@ -580,6 +580,12 @@ ccwho open <session>       # focus that session, or reopen it if its window is g
       claude --resume a1acd3cd-848b-...
 ```
 
+A session that still runs - you ran `ccwho restore` before the reboot - shows
+`running now - ccwho open <id>` in place of its resume line: `claude --resume` on a
+running session starts a second process on one transcript. One a program runs, with
+no window to go to, says `running now - a program runs it`. When ccwho cannot read
+all of what runs, it marks the ones it saw, keeps the other lines and says so.
+
 **Both halves, because neither identifies a session alone.** Measured on the real
 fleet: `latest` read `/compact`, `go ahead` and `let's fix 1-3` for three of the
 seventeen, while `opened` read `restart from disk` for another. Rows are in

@@ -3334,6 +3334,53 @@ class RenderRestore(unittest.TestCase):
         self.assertIn("claude --resume 4f2b91ac-1111-4222-8333-abcdefabcdef", out)
         self.assertIn("claude --resume a1b2c3d4-1111-4222-8333-abcdefabcdef", out)
 
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+
+    def test_one_that_runs_now_gets_no_resume_line(self):
+        # `claude --resume` on a running session starts a second process on
+        # one transcript: run before a reboot, the list said to do just that
+        live = {self.SID: {"sessionId": self.SID, "entrypoint": "cli"}}
+        out = ccwho.render_restore(self.man(), color=False, live=live)
+        self.assertNotIn("claude --resume 4f2b91ac", out)
+        self.assertIn("      running now - ccwho open 4f2b91ac-1111-4222-8333-abcdefabcdef\n", out)
+        self.assertIn("claude --resume a1b2c3d4-1111-4222-8333-abcdefabcdef", out)  # control
+        self.assertIn("liveapp", out)
+        self.assertIn("the worktree reaper", out, "what it was about stays")
+
+    def test_one_that_runs_with_no_resume_line_says_it_runs(self):
+        # no cwd: no resume line to build - but it runs, and that is what to say
+        m = self.man()
+        m["sessions"][0]["cwd"] = ""
+        out = ccwho.render_restore(m, color=False, live={self.SID: {"sessionId": self.SID}})
+        self.assertIn("running now - ccwho open 4f2b91ac", out)
+        self.assertNotIn("find it with: claude --resume", out)
+
+    def test_one_a_program_runs_is_not_sent_to_ccwho_open(self):
+        # `ccwho open` on it only says a program runs it: say that here
+        live = {self.SID: {"sessionId": self.SID, "entrypoint": "sdk-cli"}}
+        out = ccwho.render_restore(self.man(), color=False, live=live)
+        self.assertIn("      running now - a program runs it\n", out)
+        self.assertNotIn("ccwho open 4f2b91ac", out)
+        self.assertNotIn("claude --resume 4f2b91ac", out)
+
+    def test_one_a_program_runs_in_a_window_is_sent_to_it(self):
+        # `ccwho open` focuses a window it has (resolve_open): that is the way back
+        live = {self.SID: {"sessionId": self.SID, "entrypoint": "sdk-cli", "tty": "ttys032"}}
+        out = ccwho.render_restore(self.man(), color=False, live=live)
+        self.assertIn("      running now - ccwho open 4f2b91ac-1111-4222-8333-abcdefabcdef\n", out)
+        self.assertNotIn("a program runs it", out)
+
+    def test_a_damaged_id_renders_while_sessions_run(self):
+        # an id that is not text cannot be looked up in what runs: it raised
+        live = {self.SID: {"sessionId": self.SID}}
+        for bad in ([1], {"a": 1}, 5, None):
+            m = self.man()
+            m["sessions"][1]["sessionId"] = bad
+            with self.subTest(bad=bad):
+                out = ccwho.render_restore(m, color=False, live=live)
+                self.assertIn("2 sessions to restore", out)
+                self.assertIn("running now - ccwho open 4f2b91ac", out)
+
     def test_surfaces_what_was_waiting_on_you(self):
         out = ccwho.render_restore(self.man(), color=False)
         self.assertIn("Want me to land it?", out)

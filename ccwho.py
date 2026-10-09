@@ -4225,8 +4225,22 @@ def restore(argv):
 
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
     links = sys.stdout.isatty() and "--no-links" not in argv
-    sys.stdout.write(engine.render_restore(man, color=color, links=links))
+    # one that still runs gets no resume line: `claude --resume` on it starts
+    # a second process on one transcript. The links resolve at click time
+    # (resolve_open); these lines are read now, so they say it now. The scan a
+    # save takes: the ids are all it needs
+    status, rows = {}, []
+    try:
+        rows, _ = scan(cache={}, status=status, session_apps=False, samples=0)
+    except Exception:       # after a reboot this list is what you need: the scan only marks it
+        status["source_ok"] = False
+    # one seen running runs, whatever else could not be read (as `ccwho open`)
+    live = {sid: r for r in rows for sid in engine.answers_for(r) if sid}
+    sys.stdout.write(engine.render_restore(man, color=color, links=links, live=live))
     sys.stdout.write("\nadd --open to reopen these, each in the terminal app it was in.\n")
+    if not status.get("source_ok", False):
+        print("\nccwho restore: could not read which sessions run now - do not resume one"
+              " that still runs: that starts a second process on it.")
     return 0
 
 

@@ -2906,9 +2906,12 @@ def entry_problem(entry, cwd_exists, transcript_for):
     return ""
 
 
-def render_restore(manifest, color=True, width=None, links=False):
-    """The post-reboot view: what was open, what it was about, how to get it back."""
+def render_restore(manifest, color=True, width=None, links=False, live=None):
+    """The post-reboot view: what was open, what it was about, how to get it back.
+    `live`: session id -> its row, for each that runs now - those get no
+    resume line."""
     c = _C if color else {k: "" for k in _C}
+    live = live or {}
     entries = manifest_entries(manifest)
     m = manifest if isinstance(manifest, dict) else {}
     when = m.get("savedAt")
@@ -2944,7 +2947,15 @@ def render_restore(manifest, color=True, width=None, links=False):
         if ask:
             out.append("      %sASKED YOU: %s%s\n" % (
                 c["asks"], truncate(ask, (width or 100) - 17), c["reset"]))
-        if cmd:
+        sid = _text(s_.get("sessionId"))
+        if sid and sid in live:
+            # it runs: `claude --resume` on it starts a second process on one
+            # transcript - `ccwho open` goes to it instead, as resolve_open
+            # decides, or says a program runs it: then that is all there is
+            program = resolve_open(sid, [live[sid]], [])[0] == "program"
+            how = "a program runs it" if program else f"ccwho open {sid}"
+            out.append("      %srunning now - %s%s\n" % (c["dim"], how, c["reset"]))
+        elif cmd:
             out.append("      %s%s%s\n" % (c["dim"], cmd, c["reset"]))
         else:
             # kept visible rather than dropped: a session you cannot reopen from here

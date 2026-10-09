@@ -3226,9 +3226,11 @@ def accounts(argv):
     now = time.time()
     labels = read_labels()
     rows = usage.accounts(usage.load_readings(usage_dir(), now), now, labels)
-    # Codex's limits too, a thread open or not: this is the whole listing (D20)
+    # Codex's limits too, a thread open or not: this is the whole listing (D20).
+    # No `threads`: one-shot, it knows no thread open, and [] would say none spends it
     try:
-        rows += [dict(r, label=labels.get(r["id"]) or r["label"])
+        rows += [dict({k: v for k, v in r.items() if k != "threads"},
+                      label=labels.get(r["id"]) or r["label"])
                  for r in usage.codex_rows(engine.codex_home(), now, every=True)]
     except Exception:             # noqa: BLE001 - an odd rollout costs Codex's line only
         pass

@@ -1293,6 +1293,53 @@ class TestCodexUsage(unittest.TestCase):
         self.home.rollout([token_count(NOW - 60)], when=NOW - 60, thread=T2)
         self.assertEqual(self.rows()[0]["sessions"], 2)
 
+    def test_a_row_names_the_open_threads_that_spend_it(self):
+        # the list brightens the entry a highlighted Codex row spends: an open
+        # thread spends the limit its rollout's last reading names
+        self.home.rollout([token_count(NOW - 120, limit="premium"), token_count(NOW - 60)],
+                          when=NOW - 60, thread=T1)
+        self.home.rollout([token_count(NOW - 120), token_count(NOW - 60, limit="premium")],
+                          when=NOW - 60, thread=T2)
+        threads = lambda rows: {r["id"]: r["threads"] for r in rows}
+        self.assertEqual(threads(self.rows(threads=[T1, T2])),
+                         {"codex:codex": [T1], "codex:premium": [T2]})
+        # a thread not open spends nothing on the list (control: read all the same)
+        self.assertEqual(threads(self.rows(threads=[T1])),
+                         {"codex:codex": [T1], "codex:premium": []})
+
+    def test_the_limit_written_last_is_the_one_spent(self):
+        # a later line is a later reading - also at one time: a rollout that
+        # starts with a copied history has all of it in one second (measured:
+        # rollouts of 2026-09-03)
+        threads = lambda: {r["id"]: r["threads"] for r in self.rows(threads=[T1])}
+        self.home.rollout([token_count(NOW - 300), token_count(NOW - 200, limit="premium"),
+                           token_count(NOW - 100)], when=NOW - 60, thread=T1)
+        self.assertEqual(threads(), {"codex:codex": [T1], "codex:premium": []})
+        for order in (["codex", "premium"], ["premium", "codex"],
+                      ["codex", "premium", "codex"]):
+            self.home.rollout([token_count(NOW - 60, limit=limit) for limit in order],
+                              when=NOW - 60, thread=T1)
+            last, other = order[-1], ({"codex", "premium"} - {order[-1]}).pop()
+            self.assertEqual((threads()[f"codex:{last}"], threads()[f"codex:{other}"]),
+                             ([T1], []), order)
+
+    def test_a_limit_with_no_window_is_never_the_one_spent(self):
+        # it has no entry to brighten: Codex writes "premium" with no window
+        # after its own limit, in the same second (measured: rollouts of 2026-09-03)
+        premium = lambda when: token_count(when, used=None, limit="premium")
+        for events in ([token_count(NOW - 60), premium(NOW - 60)],
+                       [premium(NOW - 60), token_count(NOW - 60)],
+                       [token_count(NOW - 120), premium(NOW - 60)]):
+            self.home.rollout(events, when=NOW - 60, thread=T1)
+            self.assertEqual({r["id"]: r["threads"] for r in self.rows(threads=[T1])},
+                             {"codex:codex": [T1]}, events)
+
+    def test_the_open_threads_may_come_as_any_iterable(self):
+        # read twice: to find an old folder's rollout, and to name who spends it
+        self.home.rollout([token_count(NOW - 60)], when=NOW - 60, day=NOW - 20 * 86400)
+        self.assertEqual([(r["id"], r["threads"]) for r in self.rows(threads=iter([T1]))],
+                         [("codex:codex", [T1])])
+
     def test_the_last_reading_in_a_file_wins(self):
         self.home.rollout([token_count(NOW - 120, used=40.0), token_count(NOW - 60, used=65.0)],
                           when=NOW - 60)
@@ -1588,6 +1635,21 @@ class TestCodexOnTheUsageLine(unittest.TestCase):
         s = usage.snapshot([], NOW, set(), {"usage_roots": []}, codex=[self.CODEX])
         self.assertEqual(s["state"], "ok")
         self.assertTrue(text(usage.usage_lines(s, 200))[0].startswith("usage  oai:codex 7d 65%"))
+
+    def test_an_open_thread_spends_its_entry(self):
+        # a highlighted Codex row brightens its entry, as a Claude row its account
+        r = reading("login:a", five=(5, FIVE_RESET), sid="s1", email="lukaso@gmail.com")
+        s = usage.snapshot([r], NOW, {"s1"}, self.FACTS,
+                           codex=[dict(self.CODEX, threads=[T1])])
+        self.assertEqual(s["sessions"], {"s1": "login:a", T1: "codex:codex"})
+        bright = lambda sel: "".join(t for line in usage.usage_lines(s, 200, selected=sel)
+                                     for t, st in line if st == "plain")
+        self.assertIn("oai:codex", bright(s["sessions"][T1]))
+        self.assertNotIn("lukaso", bright(s["sessions"][T1]))
+        self.assertNotIn("oai:codex", bright(s["sessions"]["s1"]))      # control
+        # a row with no threads (CODEX has none): nothing spends it
+        s = usage.snapshot([r], NOW, {"s1"}, self.FACTS, codex=[self.CODEX])
+        self.assertEqual(s["sessions"], {"s1": "login:a"})
 
     def test_no_codex_no_entry(self):                                     # control
         r = reading("login:a", five=(5, FIVE_RESET), sid="s1")

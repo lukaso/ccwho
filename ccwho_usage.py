@@ -287,7 +287,10 @@ def _codex_readings(path, st, cache):
                 windows[CODEX_WINDOWS[minutes]] = {"used_percentage": w["used_percent"],
                                                    "resets_at": reset if _number(reset) else None}
         if not odd:
-            out[limit] = (when, windows)    # a later line is a later reading
+            # a later line is a later reading, and it goes last: the limit
+            # written last is the one a thread spends now (codex_rows)
+            out.pop(limit, None)
+            out[limit] = (when, windows)
     if cache is not None:
         cache[key] = (ident, out)
     return out
@@ -350,8 +353,11 @@ def codex_rows(home, now, cache=None, threads=(), every=False):
     """Codex usage (the owner's D20): one row per limit, from the newest reading
     in the rollouts of the last two weeks - none for a limit whose newest reading
     has no window ccwho can name. `sessions` is the rollouts that carried it.
-    `threads`: the open threads' ids, whose rollouts are read wherever they are."""
-    newest, carried, seen = {}, {}, set()
+    `threads`: the open threads' ids, whose rollouts are read wherever they are;
+    a row's `threads` are those of them that spend it."""
+    threads = list(threads or ())       # read twice: it may come as an iterator
+    newest, carried, seen, spends = {}, {}, set(), {}
+    open_threads = {t for t in threads if isinstance(t, str)}
     for path in sorted(_codex_paths(home, now, threads, cache, every)):
         try:
             st = os.stat(path)
@@ -360,10 +366,20 @@ def codex_rows(home, now, cache=None, threads=(), every=False):
         if now - st.st_mtime > KEEP_SECONDS:
             continue
         seen.add(f"_codex_usage:{path}")
-        for limit, (when, windows) in _codex_readings(path, st, cache).items():
+        readings = _codex_readings(path, st, cache)
+        for limit, (when, windows) in readings.items():
             carried[limit] = carried.get(limit, 0) + 1
             if limit not in newest or when > newest[limit][0]:
                 newest[limit] = (when, windows)
+        # an open thread spends the limit its last reading names: the list
+        # brightens that entry while the thread's row is highlighted. Not a
+        # limit with no window - it has no entry - and Codex writes one after
+        # its own, in the same second (measured: rollouts of 2026-09-03).
+        # "rollout-<when>-<thread>.jsonl" - a thread id is 36 characters
+        thread = os.path.basename(path)[:-len(".jsonl")][-36:]
+        named = [limit for limit, (_, windows) in readings.items() if windows]
+        if named and thread in open_threads:
+            spends[thread] = named[-1]      # the readings are in the file's order
     if cache is not None:               # a rollout gone or too old is no key kept
         for key in [k for k in cache if k.startswith("_codex_usage:") and k not in seen]:
             del cache[key]
@@ -374,6 +390,7 @@ def codex_rows(home, now, cache=None, threads=(), every=False):
         age = now - when
         row = {"id": f"codex:{limit}", "kind": "codex", "brand": "oai", "email": "",
                "label": limit, "sessions": carried[limit], "age": age,
+               "threads": sorted(t for t, spent in spends.items() if spent == limit),
                "five_hour": None, "seven_day": None}
         for name, w in windows.items():
             reset = w["resets_at"]
@@ -671,12 +688,14 @@ def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
     """What the list needs about usage, built once per collect: every account
     with a reading kept (KEEP_SECONDS), a live session spending it or not
     (owner, 2026-10-03: "I switch between them" - it was the live ones only,
-    E-D6). `codex`: the Codex rows, kept as long. `sessions`: the live ones."""
+    E-D6). `codex`: the Codex rows, kept as long. `sessions`: the live ones,
+    and the open Codex threads - each spends the limit whose row names it."""
     labels = labels or {}
     rows = accounts(readings, now, labels)
     spent = session_accounts(readings)
     live_ids = set(live_ids or ())
     sessions = {sid: aid for sid, aid in spent.items() if sid in live_ids}
+    sessions.update((t, r["id"]) for r in codex or [] for t in r.get("threads") or ())
     shown = rows + list(codex or [])
     if set(sessions.values()) & {r["id"] for r in rows}:
         state = "ok"

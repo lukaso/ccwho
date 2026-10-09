@@ -290,8 +290,9 @@ Codex has an entry too, after the Claude accounts, named by its limit:
 `oai:codex 7d 69%↑/60% ↻Sun (42m ago)`. It is kept two weeks after its last reading, the same
 as an account, a Codex thread open or not. ccwho reads it from Codex's own transcripts - the
 `rate_limits` of their `token_count` events - with no app-server and no credential, and it
-never parses what was said. `ccwho usage` lists it, and `ccwho usage name oai:codex
-<label>` names it.
+never parses what was said. A selected Codex row makes the entry of its limit bright: the
+limit of the last 5-hour or 7-day reading in its transcript. `ccwho usage` lists it, and
+`ccwho usage name oai:codex <label>` names it.
 
 ## Finding an old session
 

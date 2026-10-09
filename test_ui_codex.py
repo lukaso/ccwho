@@ -235,6 +235,32 @@ class TestTheCodexRows(UiTest):
                           "vite --port 5173", ":5173"):
                 self.assertIn(words, text)
 
+    async def test_its_usage_entry_is_bright_while_it_is_highlighted(self):
+        # as a Claude row's account: the snapshot the collector builds, from a
+        # Codex usage row that names the open thread spending it
+        import ccwho_usage as usage
+        from test_ui import NOW
+        codex = {"id": "codex:codex", "kind": "codex", "brand": "oai", "email": "",
+                 "label": "", "sessions": 1, "age": 60, "five_hour": None, "threads": [T],
+                 "seven_day": {"state": "ok", "pct": 65.0, "resets_at": NOW + 72 * 3600,
+                               "age": 60}}
+        snap = usage.snapshot([], NOW, set(), {"usage_roots": []}, codex=[codex])
+        collector = CodexCollector()
+        collector.fleet_value = ui.Fleet([LIVE], True, "12:00:00", procs=PROCS, usage=snap)
+        app = self.app(collector=collector)
+
+        def bright():
+            text = app.query_one("#usage").render()
+            dim = {i for s in text.spans if "dim" in str(s.style) for i in range(s.start, s.end)}
+            return "".join(c for i, c in enumerate(text.plain) if i not in dim)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            for sid, lit in ((T, True), (LIVE["sessionId"], False), (T, True)):
+                app.selected = sid
+                app.mark_selected()
+                await pilot.pause()
+                self.assertEqual("oai:codex" in bright(), lit, (sid, bright()))
+
 
 class TestACodexOnlyListKeepsItsHint(UiTest):
     """No Claude session, Codex threads open: the list is not empty, and it

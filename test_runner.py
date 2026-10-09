@@ -6958,6 +6958,13 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
         os.utime(moved, (self.now - 15 * 86400, self.now - 15 * 86400))   # control
         self.assertNotIn("codex:codex", listed())
 
+    def test_the_listing_names_no_threads(self):
+        # one-shot, `ccwho usage` knows no thread open: an empty list there
+        # would say that none spends the limit
+        row = next(r for r in json.loads(self.accounts_json()) if r["id"] == "codex:codex")
+        self.assertNotIn("threads", row)
+        self.assertEqual(row["sessions"], 1)                                # control
+
     def accounts_json(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

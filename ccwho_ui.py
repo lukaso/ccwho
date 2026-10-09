@@ -2996,7 +2996,8 @@ class Adapter:
         # on /dev/ttys022, and /dev/s022 is not a terminal that exists.
         tty = (row.get("tty") or "").strip()
         if not tty:
-            return f"pid {row.get('pid')} has no window - `ccwho show` for its resume line"
+            # never its resume line: it runs, and a resume is a second process
+            return f"pid {row.get('pid')} has no window"
         app = engine.terms.app_of(row)          # the app whose tab shows it (D9)
         if app is None:
             return engine.terms.no_app(tty)

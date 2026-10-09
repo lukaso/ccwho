@@ -3195,13 +3195,15 @@ def is_program(row):
 
 
 def no_window_note(row):
-    """What Enter says on a live row with no window to go to."""
+    """What Enter says on a live row with no window to go to. Never a resume
+    line: it runs, and `claude --resume` on it starts a second process on one
+    transcript (resolve_open) - where it runs is what you can act on."""
     sid = row.get("sessionId", "")
     if is_program(row):
         # resuming it would be a second process in a conversation the program runs
         return f"{brief.short_id(sid)} has no window - a program runs it."
-    return (f"{brief.short_id(sid)} has no window - it runs in the background."
-            f"  resume it: claude --resume {sid}")
+    tty = row.get("tty", "")
+    return f"{brief.short_id(sid)} has no window" + (f" - {terms.no_app(tty)}" if tty else "")
 
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",

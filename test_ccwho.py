@@ -6048,8 +6048,25 @@ class TestASessionAProgramStartedNeverNeedsYou(unittest.TestCase):
         self.assertNotIn("claude --resume", note)
         self.assertIn("program", note)
 
-    def test_enter_on_yours_still_says_resume(self):                      # control
-        self.assertIn("claude --resume a", ccwho.no_window_note(self.row("cli")))
+    def test_enter_on_yours_does_not_say_resume_either(self):
+        # it runs: `claude --resume` on it starts a second process on one
+        # transcript (resolve_open). Where it runs is what you can act on
+        for tty in ("/dev/ttys042", "ttys042", ""):
+            with self.subTest(tty=tty):
+                note = ccwho.no_window_note(dict(self.row("cli"), tty=tty))
+                self.assertNotIn("--resume", note)
+                self.assertIn("has no window", note)
+        # whole: the session it is about, and no tty part with no tty
+        for tty in ("/dev/ttys042", "ttys042"):
+            with self.subTest(tty=tty):
+                self.assertEqual(ccwho.no_window_note(dict(self.row("cli"), tty=tty)),
+                                 "a has no window - no terminal app ccwho knows shows ttys042")
+        self.assertEqual(ccwho.no_window_note(dict(self.row("cli"), tty="")), "a has no window")
+        # by its short id, as the list names it: "a" is its own short id
+        full = dict(self.row("cli"), sessionId="4f2b91ac-1111-4222-8333-abcdefabcdef",
+                    tty="ttys042")
+        self.assertEqual(ccwho.no_window_note(full),
+                         "4f2b has no window - no terminal app ccwho knows shows ttys042")
 
     def test_needs_you_leaves_it_out(self):
         rows = [self.row("cli"), self.row("sdk-cli")]

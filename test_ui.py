@@ -781,6 +781,8 @@ class TestTheAdapterTalksToIterm(unittest.TestCase):
             ui.subprocess.run = real
         self.assertEqual(ran, [])
         self.assertIn("42", said)
+        # it runs: a resume line would start a second process on it
+        self.assertNotIn("resume", said)
 
 
 class TestRestart(UiTest):
@@ -3186,7 +3188,9 @@ class TestItNeverOffersAJumpItCannotMake(UiTest):
             self.assertEqual(adapter.asked, [],
                              "and it does not ask iTerm2 to do the impossible")
 
-    async def test_it_says_how_to_reach_it_instead(self):
+    async def test_it_says_where_it_runs_instead(self):
+        # not a resume line: it runs, and `claude --resume` on it starts a
+        # second process on one transcript (owner, 2026-10-08)
         app = self.app(collector=FakeCollector(
             fleet=ui.Fleet([self.homeless()], True, "12:00:00")))
         async with app.run_test() as pilot:
@@ -3194,7 +3198,9 @@ class TestItNeverOffersAJumpItCannotMake(UiTest):
             await pilot.press("enter")
             await pilot.pause()
             await pilot.pause()
-            self.assertIn("resume", str(app.query_one("#header").content).lower())
+            header = str(app.query_one("#header").content)
+            self.assertIn("no terminal app ccwho knows shows ttys042", header)
+            self.assertNotIn("resume", header.lower())
 
     async def test_a_session_with_a_window_still_jumps(self):         # control
         adapter = FakeAdapter()

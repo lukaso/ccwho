@@ -1666,3 +1666,465 @@ class TestCodexOnTheUsageLine(unittest.TestCase):
         self.assertEqual(usage.resolve_id("oai:premium", ids), "codex:premium")
         self.assertIsNone(usage.resolve_id("ant:codex", ids))      # not a Claude account
         self.assertIsNone(usage.resolve_id("ant:codex", ["login:a", "codex:codex"]))
+
+
+# ------------------------------------------------------------ what a session leaves behind
+# The owner's report, 2026-10-11: one token showed no 7d at all, and another
+# showed 89% where it was at 100%. Both were readings ccwho had and then wrote
+# over: a window that Claude Code leaves out of a reply, and the newest
+# reading of an account that a session stopped spending.
+FIVE_ONLY = {"five_hour": {"used_percentage": 100, "resets_at": FIVE_RESET}}
+FP_B = "b" * 16
+
+
+class TestAWindowLeftOut(unittest.TestCase):
+    """Claude Code can hand the statusLine one window alone: at a window's reset
+    it runs it again with that window left out, and some replies carry one
+    window only (measured 2026-10-11: a reply at 15:08:58 had the 7d and no 5h,
+    while the 5h stood at 100% until 18:40). The other window is kept from the
+    session's last reading of the same account, with the time it was read."""
+
+    def setUp(self):
+        self.h = Home()
+        self.h.add(reply(NOW - 3600))
+
+    def rec(self, rl, previous=None, now=NOW, pid=PID, fp=FP, auth=None):
+        return usage.record(self.h.payload(rl), {}, self.h.dir, now, previous,
+                            claude_pid=pid,
+                            claude_auth={"token_fp": fp} if auth is None else auth)
+
+    def test_a_window_left_out_after_its_reset_stays_on_the_line_expired(self):
+        before = self.rec(limits(100, 63, week_reset=NOW - 2), now=NOW - 300)
+        after = self.rec(FIVE_ONLY, previous=before)
+        self.assertEqual(after["rate_limits"]["seven_day"],
+                         {"used_percentage": 63, "resets_at": NOW - 2,
+                          "measured_at": NOW - 3600, "received_at": NOW - 300})
+        row, = usage.accounts([after], NOW)
+        self.assertEqual(row["seven_day"]["state"], "expired")
+        self.assertIn(" · 7d expired ↻", text(usage.usage_lines(snap([row]), 200))[0])
+
+    def test_a_window_left_out_before_its_reset_keeps_its_number_and_its_age(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        self.h.add(reply(NOW - 10))
+        after = self.rec(FIVE_ONLY, previous=before)
+        row, = usage.accounts([after], NOW)
+        self.assertEqual((row["seven_day"]["pct"], row["seven_day"]["age"]), (63, 3600))
+        self.assertEqual((row["five_hour"]["pct"], row["five_hour"]["age"]), (100, 10))
+        line = text(usage.usage_lines(snap([row]), 200))[0]
+        self.assertEqual(line.count("ago"), 1)
+        self.assertTrue(line.endswith("(1h ago)"), line)
+
+    def test_a_newer_reading_elsewhere_beats_a_kept_window(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        self.h.add(reply(NOW - 10))
+        after = self.rec(FIVE_ONLY, previous=before)
+        other = reading("token:" + FP, week=(70, WEEK_RESET), measured=NOW - 100,
+                        sid="other", kind="token")
+        for order in ([after, other], [other, after]):
+            row, = usage.accounts(order, NOW)
+            self.assertEqual(row["seven_day"]["pct"], 70)
+        older = reading("token:" + FP, week=(50, WEEK_RESET), measured=NOW - 7200,
+                        sid="other", kind="token")                         # control
+        row, = usage.accounts([after, older], NOW)
+        self.assertEqual(row["seven_day"]["pct"], 63)
+
+    def test_a_window_kept_twice_keeps_the_time_it_was_read(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        self.h.add(reply(NOW - 1800))
+        once = self.rec(FIVE_ONLY, previous=before, now=NOW - 1700)
+        self.h.add(reply(NOW - 10))
+        twice = self.rec(FIVE_ONLY, previous=once)
+        self.assertEqual(twice["rate_limits"]["seven_day"]["measured_at"], NOW - 3600)
+        self.assertEqual(twice["rate_limits"]["seven_day"]["received_at"], NOW - 3500)
+
+    def test_a_window_from_an_unmeasured_reading_takes_no_new_time(self):
+        os.remove(self.h.transcript)
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        self.assertIsNone(before["measured_at"])                            # control
+        open(self.h.transcript, "w").close()
+        self.h.add(reply(NOW - 10))
+        after = self.rec(FIVE_ONLY, previous=before)
+        self.assertIsNone(after["rate_limits"]["seven_day"]["measured_at"])
+        row, = usage.accounts([after], NOW)
+        self.assertEqual(row["seven_day"]["age"], 3500)
+
+    def test_the_status_bar_says_a_kept_windows_age(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        self.h.add(reply(NOW - 10))
+        after = self.rec(FIVE_ONLY, previous=before)
+        out = usage.ANSI_RE.sub("", usage.status_text(after, NOW))
+        five, week = out.split(" · 7d ")
+        self.assertNotIn("ago", five)
+        self.assertIn("(1h ago)", week)
+
+    def test_a_kept_window_is_read_back_from_its_file(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        self.h.add(reply(NOW - 10))
+        after = self.rec(FIVE_ONLY, previous=before)
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, SID + ".json"), "w") as fh:
+            json.dump(after, fh)
+        row, = usage.accounts(usage.load_readings(d, NOW), NOW)
+        self.assertEqual(row["seven_day"]["age"], 3600)
+
+    def test_a_payload_names_no_time_of_its_own(self):
+        # the times are what ccwho kept: Claude Code's own fields are not taken
+        rl = limits(40, 63)
+        rl["seven_day"]["measured_at"] = NOW - 99999
+        rl["seven_day"]["received_at"] = NOW - 99999
+        r = self.rec(rl)
+        self.assertEqual(r["rate_limits"]["seven_day"], {"used_percentage": 63,
+                                                         "resets_at": WEEK_RESET})
+
+    def test_a_stored_reading_with_no_receipt_time_gives_nothing(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        del before["received_at"]
+        self.assertNotIn("seven_day", self.rec(FIVE_ONLY, previous=before)["rate_limits"])
+        before["received_at"] = NOW - 3500                                  # control
+        self.assertIn("seven_day", self.rec(FIVE_ONLY, previous=before)["rate_limits"])
+
+    def test_a_login_to_the_same_account_keeps_the_window(self):
+        before = self.rec(limits(100, 50), now=NOW - 3500, auth={})
+        self.h.add(login_success(NOW - 300))                      # the same account
+        self.h.add(reply(NOW - 10))
+        half = self.rec({"seven_day": {"used_percentage": 52, "resets_at": WEEK_RESET}},
+                        previous=before, auth={})
+        self.assertEqual(half["first_account"]["id"], "login:uuid-a")      # control
+        self.assertEqual(half["rate_limits"]["five_hour"]["used_percentage"], 100)
+
+    def test_a_window_older_than_two_weeks_is_not_kept(self):
+        old = self.rec(limits(40, 63), now=NOW - 15 * 86400)
+        self.assertNotIn("seven_day", self.rec(FIVE_ONLY, previous=old)["rate_limits"])
+        young = self.rec(limits(40, 63), now=NOW - 13 * 86400)              # control
+        self.assertIn("seven_day", self.rec(FIVE_ONLY, previous=young)["rate_limits"])
+
+    def test_a_window_that_comes_back_is_the_new_one(self):
+        before = self.rec(limits(100, 63, week_reset=NOW - 2), now=NOW - 300)
+        after = self.rec(limits(100, 0, week_reset=NOW + D7), previous=before)
+        self.assertEqual(after["rate_limits"]["seven_day"],
+                         {"used_percentage": 0, "resets_at": NOW + D7})
+
+    def test_a_new_claude_for_the_same_account_keeps_it(self):
+        before = self.rec(limits(100, 63, week_reset=NOW - 2), now=NOW - 300)
+        after = self.rec(FIVE_ONLY, previous=before, pid=PID + 1)
+        self.assertEqual(after["rate_limits"]["seven_day"]["resets_at"], NOW - 2)
+
+    def test_another_accounts_window_is_not_carried(self):
+        before = self.rec(limits(100, 63), now=NOW - 300)
+        after = self.rec(FIVE_ONLY, previous=before, pid=PID + 1, fp=FP_B)
+        self.assertEqual(after["first_account"]["id"], "token:" + FP_B)   # control
+        self.assertNotIn("seven_day", after["rate_limits"])
+
+    def test_no_window_goes_into_a_reading_that_is_not_sure(self):
+        before = self.rec(limits(40, 63), now=NOW - 3500)
+        after = self.rec(FIVE_ONLY, previous=before, auth={})       # the login: not sure
+        self.assertTrue(after["unsure"])                                    # control
+        self.assertNotIn("seven_day", after["rate_limits"])
+
+    def test_an_idle_window_is_kept_too(self):
+        rl = {"five_hour": {"used_percentage": 3, "resets_at": FIVE_RESET},
+              "seven_day": {"used_percentage": 0, "resets_at": None}}
+        before = self.rec(rl, now=NOW - 3500)
+        after = self.rec(FIVE_ONLY, previous=before)
+        self.assertEqual(after["rate_limits"]["seven_day"],
+                         {"used_percentage": 0, "resets_at": None,
+                          "measured_at": NOW - 3600, "received_at": NOW - 3500})
+
+    def test_an_unsure_readings_window_is_not_carried(self):
+        before = self.rec(limits(100, 63), now=NOW - 300)
+        before["unsure"] = True
+        after = self.rec(FIVE_ONLY, previous=before)
+        self.assertFalse(after["unsure"])                                   # control
+        self.assertNotIn("seven_day", after["rate_limits"])
+
+
+class TestASessionThatChangesAccount(unittest.TestCase):
+    """A session's file holds one account. When the session stops spending it
+    (a new claude with another token, a /login, a change it cannot be sure of),
+    that account's newest reading is kept in a file of its own."""
+
+    def setUp(self):
+        self.h = Home()
+        self.h.add(reply(NOW - 600))
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def rec(self, week, previous=None, now=NOW, pid=PID, auth=None):
+        return usage.record(self.h.payload(limits(0, week)), {}, self.h.dir, now, previous,
+                            claude_pid=pid,
+                            claude_auth={"token_fp": FP} if auth is None else auth)
+
+    def store(self, *named):
+        for name, rec in named:
+            with open(os.path.join(self.dir, name), "w") as fh:
+                json.dump(rec, fh)
+        return usage.load_readings(self.dir, NOW + 600)
+
+    def test_the_old_account_keeps_its_newest_reading(self):
+        # what the owner saw: d0a0 read 100% in a session, the session moved on
+        # to another token, and d0a0 fell back to a reading 3 days old
+        older = reading("token:" + FP, week=(89, WEEK_RESET), measured=NOW - 3 * 86400,
+                        sid="other", kind="token")
+        on_a = self.rec(100)
+        on_b = self.rec(37, previous=on_a, now=NOW + 60, pid=PID + 1,
+                        auth={"token_fp": FP_B})
+        name, kept = usage.retired(on_a, on_b, NOW + 60)
+        self.assertEqual(name, f"{SID}.token-{FP}.json")
+        readings = self.store(("other.json", older), (SID + ".json", on_b), (name, kept))
+        rows = {r["id"]: r for r in usage.accounts(readings, NOW + 600)}
+        self.assertEqual(rows["token:" + FP]["seven_day"]["pct"], 100)
+        self.assertEqual(rows["token:" + FP_B]["seven_day"]["pct"], 37)
+
+    def test_the_session_spends_its_new_account_whatever_the_file_order(self):
+        on_a = self.rec(100)
+        on_b = self.rec(37, previous=on_a, now=NOW + 60, pid=PID + 1,
+                        auth={"token_fp": FP_B})
+        name, kept = usage.retired(on_a, on_b, NOW + 60)
+        readings = self.store((SID + ".json", on_b), (name, kept))
+        for order in (readings, readings[::-1]):
+            self.assertEqual(usage.session_accounts(order), {SID: "token:" + FP_B})
+
+    def test_a_change_it_cannot_be_sure_of_keeps_the_old_reading(self):
+        on_a = self.rec(100, auth={})
+        self.h.login("b@example.com", "uuid-b")
+        unsure = self.rec(37, previous=on_a, now=NOW + 60, auth={})
+        self.assertTrue(unsure["unsure"])                                   # control
+        name, kept = usage.retired(on_a, unsure, NOW + 60)
+        self.assertEqual(name, f"{SID}.login-uuid-a.json")
+        self.assertEqual(kept["rate_limits"], on_a["rate_limits"])
+
+    def test_a_reading_from_before_the_fix_is_kept_for_no_login(self):
+        """A reading with no confirmed claude named a token session from the
+        login (#28). When its claude is read, record() drops that name: the
+        numbers were the token's, and the login must not get them."""
+        for drop in (lambda r: r.pop("claude_pid"), lambda r: r.update(claude_pid=None)):
+            old = usage.record(self.h.payload(limits(0, 100)), {}, self.h.dir, NOW, None)
+            drop(old)
+            self.assertEqual(old["first_account"]["id"], "login:uuid-a")    # control
+            now_read = self.rec(37, previous=old, now=NOW + 60)
+            self.assertEqual(now_read["first_account"]["id"], "token:" + FP)
+            self.assertIsNone(usage.retired(old, now_read, NOW + 60))
+
+    def test_an_unconfirmed_login_reading_is_kept_when_the_login_changes(self):
+        # the before-#28 rule is for a claude read now that holds a token: an
+        # unconfirmed login reading followed by another login is a real move
+        old = usage.record(self.h.payload(limits(0, 100)), {}, self.h.dir, NOW, None)
+        self.assertIsNone(old["claude_pid"])                                # control
+        self.h.login("b@example.com", "uuid-b")
+        moved = self.rec(37, previous=old, now=NOW + 60, auth={})
+        self.assertTrue(moved["unsure"])
+        self.assertEqual(usage.retired(old, moved, NOW + 60)[0], f"{SID}.login-uuid-a.json")
+
+    def test_an_unconfirmed_login_reading_is_kept_when_no_claude_is_read_now(self):
+        old = usage.record(self.h.payload(limits(0, 100)), {}, self.h.dir, NOW, None)
+        moved = usage.record(self.h.payload(limits(0, 37)), {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN},
+                             self.h.dir, NOW + 60, old)
+        self.assertTrue(moved["unsure"])                                    # control
+        self.assertEqual(usage.retired(old, moved, NOW + 60)[0], f"{SID}.login-uuid-a.json")
+
+    def test_a_login_session_whose_claude_changed_to_a_token_keeps_the_login(self):
+        on_login = self.rec(100, auth={})
+        self.assertEqual(on_login["first_account"]["id"], "login:uuid-a")   # control
+        on_token = self.rec(37, previous=on_login, now=NOW + 60, pid=PID + 1)
+        name, kept = usage.retired(on_login, on_token, NOW + 60)
+        self.assertEqual(name, f"{SID}.login-uuid-a.json")
+
+    def test_a_claude_that_can_no_longer_be_read_leaves_the_reading(self):
+        on_a = self.rec(100)
+        gap = usage.record(self.h.payload(limits(0, 37)), {}, self.h.dir, NOW + 60, on_a,
+                           claude_pid=None, claude_auth=None)
+        self.assertTrue(gap["unsure"])                                      # control
+        self.assertEqual(usage.retired(on_a, gap, NOW + 60)[0], f"{SID}.token-{FP}.json")
+        again = self.rec(37, previous=on_a, now=NOW + 60)                   # control
+        self.assertIsNone(usage.retired(on_a, again, NOW + 60))
+
+    def test_a_new_claude_whose_account_cannot_be_read_leaves_the_reading(self):
+        on_a = self.rec(100)
+        os.remove(os.path.join(self.h.dir, ".claude.json"))
+        unknown = self.rec(37, previous=on_a, now=NOW + 60, pid=PID + 1, auth={})
+        self.assertIsNone(unknown["first_account"]["id"])                   # control
+        self.assertEqual(usage.retired(on_a, unknown, NOW + 60)[0], f"{SID}.token-{FP}.json")
+
+    def test_a_session_back_on_an_account_takes_its_kept_reading_back(self):
+        # review 2: after a gap the kept reading stayed, and an unmeasured
+        # newer reading of the same session lost to it
+        on_a = self.rec(50)
+        gap = usage.record(self.h.payload(limits(0, 37)), {}, self.h.dir, NOW + 60, on_a,
+                           claude_pid=None, claude_auth=None)
+        back = self.rec(80, previous=gap, now=NOW + 120)
+        self.assertEqual(usage.taken_back(gap, back), f"{SID}.token-{FP}.json")
+        self.assertIsNone(usage.taken_back(on_a, self.rec(52, previous=on_a)))   # control
+        self.assertIsNone(usage.taken_back(on_a, gap))                            # control
+        moved = self.rec(37, previous=on_a, now=NOW + 60, pid=PID + 1, auth={"token_fp": FP_B})
+        self.assertEqual(usage.taken_back(on_a, moved), f"{SID}.token-{FP_B}.json")
+
+    def back_after_a_gap(self, rl, measured=True):
+        """(the kept reading, the session's reading back on the account)."""
+        on_a = self.rec(100)
+        gap = usage.record(self.h.payload(limits(0, 37)), {}, self.h.dir, NOW + 60, on_a,
+                           claude_pid=None, claude_auth=None)
+        _, kept = usage.retired(on_a, gap, NOW + 60)
+        if not measured:
+            os.remove(self.h.transcript)
+        back = usage.record(self.h.payload(rl), {}, self.h.dir, NOW + 120, gap,
+                            claude_pid=PID, claude_auth={"token_fp": FP})
+        return kept, back
+
+    def test_back_on_an_account_the_kept_reading_fills_the_window_it_lacks(self):
+        kept, back = self.back_after_a_gap({"seven_day": {"used_percentage": 52,
+                                                          "resets_at": WEEK_RESET}})
+        self.assertNotIn("five_hour", back["rate_limits"])                  # control
+        merged = usage.merge_kept(back, kept, NOW + 120)
+        self.assertEqual(merged["rate_limits"]["five_hour"],
+                         {"used_percentage": 0, "resets_at": FIVE_RESET,
+                          "measured_at": NOW - 600, "received_at": NOW})
+        self.assertEqual(merged["rate_limits"]["seven_day"]["used_percentage"], 52)
+
+    def test_back_with_no_reply_time_its_own_numbers_say_no_age(self):
+        # review 4: a time lent from the kept reading gave fresh numbers "(2h ago)"
+        kept, back = self.back_after_a_gap({"seven_day": {"used_percentage": 100,
+                                                          "resets_at": WEEK_RESET}},
+                                           measured=False)
+        merged = usage.merge_kept(back, kept, NOW + 600)
+        self.assertIsNone(merged["measured_at"])
+        out = usage.ANSI_RE.sub("", usage.status_text(merged, NOW + 600))
+        five, week = out.split(" · 7d ")
+        self.assertIn("(20m ago)", five)                    # the kept 5h: its own age
+        self.assertNotIn("ago", week)
+
+    def test_merged_windows_keep_the_times_they_were_read(self):
+        # the kept reading was itself half a reading: its 5h has older times
+        on_a = self.rec(100, now=NOW - 500)
+        self.h.add(reply(NOW - 100))
+        half = usage.record(self.h.payload({"seven_day": {"used_percentage": 40,
+                                                          "resets_at": WEEK_RESET}}),
+                            {}, self.h.dir, NOW - 40, on_a, claude_pid=PID,
+                            claude_auth={"token_fp": FP})
+        self.assertEqual(half["rate_limits"]["five_hour"]["measured_at"], NOW - 600)  # control
+        gap = usage.record(self.h.payload(limits(0, 37)), {}, self.h.dir, NOW, half,
+                           claude_pid=None, claude_auth=None)
+        _, kept = usage.retired(half, gap, NOW)
+        back = usage.record(self.h.payload({"seven_day": {"used_percentage": 41,
+                                                          "resets_at": WEEK_RESET}}),
+                            {}, self.h.dir, NOW + 60, gap, claude_pid=PID,
+                            claude_auth={"token_fp": FP})
+        merged = usage.merge_kept(back, kept, NOW + 60)
+        self.assertEqual(merged["rate_limits"]["five_hour"]["measured_at"], NOW - 600)
+        between = reading("token:" + FP, five=(30, FIVE_RESET), measured=NOW - 300,
+                          sid="other", kind="token")
+        row, = usage.accounts([merged, between], NOW + 60)
+        self.assertEqual(row["five_hour"]["pct"], 30)
+
+    def test_a_kept_file_older_than_two_weeks_merges_nothing(self):
+        kept, back = self.back_after_a_gap({"seven_day": {"used_percentage": 52,
+                                                          "resets_at": WEEK_RESET}})
+        old = dict(kept, received_at=NOW - 15 * 86400)
+        self.assertNotIn("five_hour", usage.merge_kept(back, old, NOW + 120)["rate_limits"])
+        young = dict(kept, received_at=NOW - 13 * 86400)                    # control
+        self.assertIn("five_hour", usage.merge_kept(back, young, NOW + 120)["rate_limits"])
+
+    def test_a_kept_file_the_session_is_back_on_never_wins(self):
+        # review 4: a run killed before it removed the kept file left it there
+        on_a = reading("token:" + FP, week=(50, WEEK_RESET), measured=NOW - 600, kind="token")
+        kept = dict(on_a, retired_at=NOW - 300)
+        main = reading("token:" + FP, week=(60, WEEK_RESET), received=NOW - 10, kind="token")
+        row, = usage.accounts([kept, main], NOW)
+        self.assertEqual(row["seven_day"]["pct"], 60)
+        moved = reading("token:" + FP_B, week=(5, WEEK_RESET), received=NOW - 10, kind="token")
+        rows = {r["id"]: r for r in usage.accounts([kept, moved], NOW)}       # control
+        self.assertEqual(rows["token:" + FP]["seven_day"]["pct"], 50)
+
+    def test_a_kept_reading_of_another_account_or_session_merges_nothing(self):
+        kept, back = self.back_after_a_gap({"seven_day": {"used_percentage": 52,
+                                                          "resets_at": WEEK_RESET}})
+        other_acct = dict(kept, first_account={"kind": "token", "id": "token:" + FP_B})
+        other_sid = dict(kept, session_id="other")
+        no_time = {k: v for k, v in kept.items() if k != "received_at"}
+        for junk in (None, "x", {}, other_acct, other_sid, dict(kept, unsure=True), no_time):
+            self.assertEqual(usage.merge_kept(back, junk, NOW + 120), back, junk)
+        self.assertNotEqual(usage.merge_kept(back, kept, NOW + 120), back)  # control
+
+    def test_the_same_account_leaves_nothing(self):                        # control
+        a1 = self.rec(10)
+        self.assertIsNone(usage.retired(a1, self.rec(12, previous=a1, now=NOW + 60), NOW + 60))
+
+    def test_an_unsure_or_missing_reading_leaves_nothing(self):
+        on_b = self.rec(37, pid=PID + 1, auth={"token_fp": FP_B})
+        unsure = dict(self.rec(100), unsure=True)
+        for previous in (None, "junk", {}, {"session_id": SID}, unsure,
+                         dict(self.rec(100), rate_limits={})):
+            self.assertIsNone(usage.retired(previous, on_b, NOW + 60), previous)
+
+    def test_an_odd_account_id_still_makes_a_plain_file_name(self):
+        on_a = self.rec(100, auth={})
+        on_a["first_account"] = {"kind": "login", "id": "login:../a b/ä", "email": ""}
+        name, kept = usage.retired(on_a, self.rec(37), NOW + 60)
+        self.assertNotIn(os.sep, name)
+        self.assertEqual(len(self.store((name, kept))), 1)
+
+    def test_a_kept_reading_is_read_and_its_temp_file_is_not(self):
+        on_a = self.rec(100)
+        name, kept = usage.retired(on_a, self.rec(37, pid=PID + 1, auth={"token_fp": FP_B}),
+                                   NOW + 60)
+        self.assertEqual(len(self.store((name, kept))), 1)
+        self.assertEqual(len(self.store((name + ".123.tmp", kept))), 1)     # still the one
+
+
+class TestAUsedUpWindowSaysWhenItResets(unittest.TestCase):
+    """At 100% the reset is what you wait for: its day alone ("↻Mon") is not
+    enough (owner, 2026-10-11)."""
+
+    FIVE = NOW + 0.2 * H5
+    WEEK = NOW + 3 * 86400 + 1234
+
+    def rows(self):
+        return [acct_row("token:d0a0d0a0", kind="token", five=(3, self.FIVE), week=(100, self.WEEK)),
+                acct_row("token:eedfeedf", kind="token", five=(40, self.FIVE), week=(40, self.WEEK))]
+
+    def test_short_of_room_it_says_the_day_before_it_drops_the_resets(self):
+        # the review's case: on its own line, the used-up account lost its
+        # 5h reset too, where the other account kept both
+        alone = text(usage.usage_lines(snap(self.rows()[:1]), 200))[0]
+        self.assertIn(_time.strftime("%a %H:%M", _time.localtime(self.WEEK)), alone)  # control
+        d0a0, eedf = text(usage.usage_lines(snap(self.rows()), len(alone) - 1))
+        self.assertIn("↻" + _time.strftime("%H:%M", _time.localtime(self.FIVE)), d0a0)
+        self.assertTrue(d0a0.endswith("↻" + _time.strftime("%a", _time.localtime(self.WEEK))),
+                        d0a0)
+        self.assertEqual(eedf.count("↻"), 2)                                # control
+
+    def test_short_of_room_one_line_says_the_day_before_it_stacks(self):
+        full = text(usage.usage_lines(snap(self.rows()), 300))
+        self.assertEqual(len(full), 1)                                      # control
+        line, = text(usage.usage_lines(snap(self.rows()), len(full[0]) - 1))
+        self.assertNotIn(_time.strftime("%a %H:%M", _time.localtime(self.WEEK)), line)
+        self.assertEqual(line.count("↻"), 4)
+
+    def line(self, pct, reset):
+        r = acct_row("token:1a2b3c4d", kind="token", week=(pct, reset))
+        return text(usage.usage_lines(snap([r]), 200))[0]
+
+    def test_a_used_up_window_says_the_day_and_the_time(self):
+        reset = NOW + 3 * 86400 + 1234
+        day_time = _time.strftime("%a %H:%M", _time.localtime(reset))
+        self.assertIn("7d 100%↑/", self.line(100, reset))
+        self.assertIn("↻" + day_time, self.line(100, reset))
+        self.assertIn("↻" + day_time, self.line(99.6, reset))     # shown as 100%
+
+    def test_below_100_it_says_the_day_only(self):                         # control
+        reset = NOW + 3 * 86400 + 1234
+        line = self.line(99, reset)
+        self.assertIn("↻" + _time.strftime("%a", _time.localtime(reset)), line)
+        self.assertNotIn(_time.strftime("%a %H:%M", _time.localtime(reset)), line)
+
+    def test_within_a_day_it_says_the_time_as_before(self):                # control
+        reset = NOW + 3600
+        line = self.line(100, reset)
+        self.assertIn("↻" + _time.strftime("%H:%M", _time.localtime(reset)), line)
+        self.assertNotIn(_time.strftime("%a %H:%M", _time.localtime(reset)), line)
+
+    def test_the_status_bar_says_it_too(self):
+        reset = NOW + 3 * 86400 + 1234
+        rec = reading("token:1a2b3c4d", week=(100, reset), kind="token", measured=NOW)
+        out = usage.ANSI_RE.sub("", usage.status_text(rec, NOW))
+        self.assertIn("↻" + _time.strftime("%a %H:%M", _time.localtime(reset)), out)

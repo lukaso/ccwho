@@ -3106,13 +3106,33 @@ def statusline(argv):
             except (OSError, ValueError):
                 previous = None
         claude_pid, claude_auth = statusline_claude(os.environ)
-        rec = usage.record(payload, os.environ, setup_home(), time.time(), previous,
+        now = time.time()
+        rec = usage.record(payload, os.environ, setup_home(), now, previous,
                            claude_pid=claude_pid, claude_auth=claude_auth)
         if rec is None:
             return 0
         try:
             os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        # the account the session moved on from keeps its newest reading; one
+        # it comes back to takes it back. Neither costs the session's own.
+        kept, back = usage.retired(previous, rec, now), usage.taken_back(previous, rec)
+        if back:
+            try:
+                with open(os.path.join(d, back)) as fh:
+                    rec = usage.merge_kept(rec, json.load(fh), now)
+            except (OSError, ValueError):
+                pass
+        try:
+            if kept:
+                write_atomic(os.path.join(d, kept[0]), json.dumps(kept[1]))
+        except Exception:         # noqa: BLE001
+            pass
+        try:
             write_atomic(path, json.dumps(rec))
+            if back:              # its reading is in the session's own file now
+                os.remove(os.path.join(d, back))
         except Exception:         # noqa: BLE001 - a failed write still prints
             pass
         # D10: the session's own entry, in its own status bar

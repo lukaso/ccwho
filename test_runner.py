@@ -6058,6 +6058,122 @@ class TestStatusline(unittest.TestCase):
         self.assertTrue(rec["unsure"])
         self.assertEqual(rec["first_account"]["id"], "login:uuid-a")
 
+    def test_a_session_that_changes_account_leaves_the_old_ones_reading(self):
+        # the owner's report, 2026-10-11: a session moved on to another token
+        # and took the old account's newest reading (100%) with it
+        import hashlib
+        self.claude_parent(["HOME=/x"])
+        self.run_with(self.payload())                       # the login: 7d 67%
+        with open(self.usage_file()) as fh:
+            first = json.load(fh)
+        self.assertEqual(first["account"]["id"], "login:uuid-a")           # control
+        # that claude ends; a new one for the session (--resume) holds a token
+        first["claude_pid"] = os.getppid() + 1
+        with open(self.usage_file(), "w") as fh:
+            json.dump(first, fh)
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        p = json.loads(self.payload())
+        p["rate_limits"]["seven_day"]["used_percentage"] = 5
+        rc, out, err = self.run_with(json.dumps(p))
+        self.assertEqual((rc, err), (0, ""))
+        d = os.path.dirname(self.usage_file())
+        self.assertEqual(sorted(os.listdir(d)),
+                         [self.SID + ".json", self.SID + ".login-uuid-a.json"])
+        now = time.time()
+        rows = {r["id"]: r for r in
+                runner.usage.accounts(runner.usage.load_readings(d, now), now)}
+        fp = hashlib.sha256(self.TOKEN.encode()).hexdigest()[:16]
+        self.assertEqual(rows["login:uuid-a"]["seven_day"]["pct"], 67)
+        self.assertEqual(rows["token:" + fp]["seven_day"]["pct"], 5)
+        self.assertNotIn("67%", runner.usage.ANSI_RE.sub("", out))   # the bar: the new one
+
+    def test_a_kept_reading_that_cannot_be_written_costs_the_session_nothing(self):
+        self.claude_parent(["HOME=/x"])
+        self.run_with(self.payload())
+        with open(self.usage_file()) as fh:
+            first = json.load(fh)
+        first["claude_pid"] = os.getppid() + 1
+        with open(self.usage_file(), "w") as fh:
+            json.dump(first, fh)
+        os.makedirs(os.path.join(os.path.dirname(self.usage_file()),
+                                 self.SID + ".login-uuid-a.json"))      # not writable
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        rc, out, err = self.run_with(self.payload())
+        self.assertEqual((rc, err), (0, ""))
+        with open(self.usage_file()) as fh:
+            self.assertEqual(json.load(fh)["account"]["kind"], "token")
+
+    def test_a_session_back_on_its_account_after_a_gap_shows_its_newest(self):
+        # review 2: the reading kept at the gap was measured; the newer one,
+        # with no reply in reach, was not - and lost to it
+        transcript = os.path.join(self.tmp, "t.jsonl")
+        with open(transcript, "w") as fh:
+            fh.write(json.dumps({"type": "assistant", "timestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 3600))}) + "\n")
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        p = json.loads(self.payload(transcript_path=transcript))
+        p["rate_limits"]["seven_day"]["used_percentage"] = 50
+        self.run_with(json.dumps(p))
+        os.environ.pop("CLAUDE_PID")                         # the claude cannot be read
+        self.run_with(json.dumps(p))
+        d = os.path.dirname(self.usage_file())
+        self.assertEqual(len(os.listdir(d)), 2)                             # control
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        p = json.loads(self.payload())                       # no reply in reach
+        p["rate_limits"]["seven_day"]["used_percentage"] = 80
+        self.run_with(json.dumps(p))
+        self.assertEqual(os.listdir(d), [self.SID + ".json"])
+        now = time.time()
+        row, = runner.usage.accounts(runner.usage.load_readings(d, now), now)
+        self.assertEqual(row["seven_day"]["pct"], 80)
+
+    def gap_then_back(self, back_limits, fail_main=False):
+        transcript = os.path.join(self.tmp, "t.jsonl")
+        with open(transcript, "w") as fh:
+            fh.write(json.dumps({"type": "assistant", "timestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 3600))}) + "\n")
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        p = json.loads(self.payload(transcript_path=transcript))
+        p["rate_limits"]["five_hour"]["used_percentage"] = 100
+        self.run_with(json.dumps(p))
+        os.environ.pop("CLAUDE_PID")                         # the claude cannot be read
+        self.run_with(json.dumps(p))
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        p["rate_limits"] = back_limits(p["rate_limits"])
+        real = runner.write_atomic
+
+        def write(path, text, *a, **kw):
+            if fail_main and path == self.usage_file():
+                raise OSError("disk full")
+            return real(path, text, *a, **kw)
+        with mock.patch.object(runner, "write_atomic", write):
+            self.run_with(json.dumps(p))
+        d = os.path.dirname(self.usage_file())
+        now = time.time()
+        rows = runner.usage.accounts(runner.usage.load_readings(d, now), now)
+        return sorted(os.listdir(d)), rows
+
+    def test_back_on_its_account_with_half_a_reading_keeps_the_other_half(self):
+        # review 3: the kept file went, and the 5h at 100% with it
+        files, rows = self.gap_then_back(lambda rl: {"seven_day": rl["seven_day"]})
+        self.assertEqual(files, [self.SID + ".json"])
+        self.assertEqual(rows[0]["five_hour"]["pct"], 100)
+
+    def test_a_main_write_that_fails_leaves_the_kept_file(self):
+        files, rows = self.gap_then_back(lambda rl: {"seven_day": rl["seven_day"]},
+                                         fail_main=True)
+        self.assertEqual(len(files), 2)
+        self.assertEqual(rows[0]["five_hour"]["pct"], 100)
+
+    def test_a_reading_from_before_the_fix_leaves_the_login_nothing(self):
+        # review 1: a reading with no confirmed claude named a token session
+        # from the login; once its claude is read, that name was wrong
+        self.run_with(self.payload())                       # no claude confirmed
+        self.claude_parent([f"CLAUDE_CODE_OAUTH_TOKEN={self.TOKEN}"])
+        self.run_with(self.payload())
+        self.assertEqual(os.listdir(os.path.dirname(self.usage_file())),
+                         [self.SID + ".json"])
+
     # #28: Claude Code gives the statusLine no CLAUDE_CODE_OAUTH_TOKEN; the claude
     # that runs it - its parent, named by CLAUDE_PID - still has it
     def claude_parent(self, env, pid=None):

@@ -24,6 +24,12 @@ Three things are easy to get wrong, and each has a rule here:
   transcript. Without one, usage in a window only rises, so the highest wins.
 - AFTER THE RESET. A window past its resets_at is expired, not 0%: another
   session or machine may already have spent the new one.
+- HALF A READING. Claude Code can hand over one window alone: at the other
+  one's reset, and in some replies. The reading keeps the other window from
+  the session's last one, with the time that one was read.
+
+A session's file holds one account. When the session moves on to another, the
+old account's newest reading is kept in a file of its own (retired).
 
 Pure over its inputs apart from reading the transcript tail and .claude.json it
 is pointed at. The runner owns stdin, the environment and every write.
@@ -51,7 +57,8 @@ SAME_WINDOW = 60                  # resets this close are one window, reported t
 TAIL_BYTES = 256 * 1024
 # Session ids are UUIDs. \Z, not $: $ lets a trailing newline through.
 _SID = re.compile(r"[0-9A-Za-z-]{1,64}\Z")
-_READING = re.compile(r"[0-9A-Za-z-]{1,64}\.json\Z")
+# <session>.json, or <session>.<account>.json: what a session left an account (retired)
+_READING = re.compile(r"[0-9A-Za-z-]{1,64}(\.[0-9A-Za-z-]{1,64})?\.json\Z")
 # What Claude Code writes after a /login inside the session. A plain string -
 # the same words inside a tool call or its output are not a login.
 _LOGIN_OK = "<local-command-stdout>Login successful"
@@ -141,8 +148,11 @@ def _pid(v):
     return isinstance(v, int) and not isinstance(v, bool) and 1 < v < 10 ** 7
 
 
-def clean_limits(rate_limits):
-    """Only the known windows and their two numbers. None if nothing usable."""
+def clean_limits(rate_limits, kept=False):
+    """Only the known windows and their two numbers. None if nothing usable.
+
+    kept: a stored reading, whose window may also hold the times of the earlier
+    reading it was kept from (HALF A READING) - never taken from a payload."""
     if not isinstance(rate_limits, dict):
         return None
     out = {}
@@ -154,7 +164,19 @@ def clean_limits(rate_limits):
         # An idle window is (0, null): a reading, not a missing one.
         out[name] = {"used_percentage": w["used_percentage"],
                      "resets_at": reset if _number(reset) else None}
+        if kept and _number(w.get("received_at")):
+            measured = w.get("measured_at")
+            out[name].update(measured_at=measured if _number(measured) else None,
+                             received_at=w["received_at"])
     return out or None
+
+
+def _times(r, w):
+    """(measured, received) of one window of a reading: the window's own when it
+    was kept from an earlier reading, else the reading's. measured may be None."""
+    src = w if _number(w.get("received_at")) else r
+    measured = src.get("measured_at")
+    return (measured if _number(measured) else None), src.get("received_at")
 
 
 def record(payload, env, home, now, previous=None, claude_pid=None, claude_auth=None):
@@ -222,10 +244,85 @@ def record(payload, env, home, now, previous=None, claude_pid=None, claude_auth=
         else:
             unsure = True
     unsure = unsure or gap
+    # HALF A READING (measured 2026-10-11: at a window's reset the statusLine
+    # runs again with that window left out, and a reply at 15:08:58 had the 7d
+    # alone while the 5h stood at 100%). The other window is kept from this
+    # session's last reading of the same account, with that reading's times:
+    # a newer reading elsewhere still wins, and its age is its own.
+    if counts_for(previous) == first.get("id") and first.get("id") and not unsure \
+            and _number(previous.get("received_at")):
+        for name, w in clean_limits(previous["rate_limits"], kept=True).items():
+            kept_measured, kept_received = _times(previous, w)
+            if name not in limits and now - kept_received <= KEEP_SECONDS:
+                limits[name] = dict(w, measured_at=kept_measured, received_at=kept_received)
     return {"v": VERSION, "session_id": sid, "received_at": now, "measured_at": measured,
             "rate_limits": limits, "account": acct, "first_account": first,
             "first_seen": first_seen, "login_at": login, "unsure": unsure,
             "claude_pid": claude_pid}
+
+
+def counts_for(rec):
+    """The account a stored reading counts for on the line, or None."""
+    if not isinstance(rec, dict) or rec.get("unsure"):
+        return None
+    acct = rec.get("first_account")
+    aid = acct.get("id") if isinstance(acct, dict) else None
+    if not isinstance(aid, str) or not aid or clean_limits(rec.get("rate_limits")) is None:
+        return None
+    return aid
+
+
+def retired(previous, rec, now):
+    """(file name, record) for what a session last read on an account it no
+    longer counts for, or None.
+
+    A session's file holds one account. A session that moves on - a new claude
+    with another token, a /login, a change it cannot be sure of - would take
+    that account's newest reading with it, and the account would fall back to
+    an older one (owner, 2026-10-11: 89%, 3 days old, where it was at 100%).
+    The kept record is still the session's, but names no account it spends."""
+    aid = counts_for(previous)
+    sid = rec.get("session_id") if isinstance(rec, dict) else None
+    if aid is None or counts_for(rec) == aid or not isinstance(sid, str) or not _SID.match(sid):
+        return None
+    # record()'s rule for a reading from before #28: with no claude confirmed,
+    # it named a token session from the login. Those numbers were the token's.
+    if not _pid(previous.get("claude_pid")) and _pid(rec.get("claude_pid")) \
+            and (rec.get("account") or {}).get("kind") == "token":
+        return None
+    return _retired_name(sid, aid), dict(previous, retired_at=now)
+
+
+def taken_back(previous, rec):
+    """The file retired() kept for the account a session counts for again, or
+    None. The session's own reading is newer: after a gap, an unmeasured one
+    would lose to the measured reading kept at the gap (review 2026-10-11)."""
+    aid = counts_for(rec)
+    sid = rec.get("session_id") if isinstance(rec, dict) else None
+    if aid is None or counts_for(previous) == aid or not isinstance(sid, str) \
+            or not _SID.match(sid):
+        return None
+    return _retired_name(sid, aid)
+
+
+def merge_kept(rec, kept, now):
+    """rec, with what taken_back()'s file kept for its account: the windows rec
+    lacks, with their own times (HALF A READING), no older than a reading is
+    kept. Merged into the session's own file, the kept one can go."""
+    aid = counts_for(rec)
+    if aid is None or counts_for(kept) != aid or kept.get("session_id") != rec["session_id"] \
+            or not _number(kept.get("received_at")):
+        return rec
+    limits = dict(rec["rate_limits"])
+    for name, w in clean_limits(kept["rate_limits"], kept=True).items():
+        measured, received = _times(kept, w)
+        if name not in limits and now - received <= KEEP_SECONDS:
+            limits[name] = dict(w, measured_at=measured, received_at=received)
+    return dict(rec, rate_limits=limits)
+
+
+def _retired_name(sid, aid):
+    return f"{sid}.{re.sub(r'[^0-9A-Za-z-]', '-', aid)[:64]}.json"
 
 
 # ------------------------------------------------------------ Codex (D20)
@@ -423,7 +520,7 @@ def load_readings(directory, now):
             continue
         # Only ccwho writes these, but a file on disk is not a promise: a bad
         # window is dropped here, so nothing downstream - the list - can trip on it.
-        limits = clean_limits(rec.get("rate_limits"))
+        limits = clean_limits(rec.get("rate_limits"), kept=True)
         if limits is None or not isinstance(rec.get("first_account"), dict):
             continue
         out.append(dict(rec, rate_limits=limits))
@@ -448,31 +545,33 @@ def prune(directory, now):
 
 def _window(readings, name, now):
     """The current value of one window across one account's readings."""
-    seen = [(r, r["rate_limits"][name]) for r in readings
+    # (window, measured, received): a window kept from an earlier reading
+    # (HALF A READING) has that reading's times
+    seen = [(r["rate_limits"][name], *_times(r, r["rate_limits"][name])) for r in readings
             if isinstance(r.get("rate_limits"), dict)
             and isinstance(r["rate_limits"].get(name), dict)]
     if not seen:
         return None
-    resets = [w["resets_at"] for _, w in seen if _number(w.get("resets_at"))]
+    resets = [w["resets_at"] for w, _, _ in seen if _number(w.get("resets_at"))]
     if resets:
         # A later reset is a later window, whatever its number.
         newest = max(resets)
         # An idle window (0, null) measured after that reset IS the new window.
-        idle = [r for r, w in seen if w.get("resets_at") is None
-                and _number(r.get("measured_at")) and r["measured_at"] > newest]
+        idle = [(w, m) for w, m, _ in seen if w.get("resets_at") is None
+                and m is not None and m > newest]
         if idle:
-            last = max(idle, key=lambda r: r["measured_at"])
-            return {"state": "ok", "pct": last["rate_limits"][name]["used_percentage"],
-                    "resets_at": None, "age": now - last["measured_at"]}
-        seen = [(r, w) for r, w in seen if _number(w.get("resets_at"))
-                and newest - w["resets_at"] <= SAME_WINDOW]
-    timed = [(r, w) for r, w in seen if _number(r.get("measured_at"))]
+            w, m = max(idle, key=lambda wm: wm[1])
+            return {"state": "ok", "pct": w["used_percentage"], "resets_at": None,
+                    "age": now - m}
+        seen = [s for s in seen if _number(s[0].get("resets_at"))
+                and newest - s[0]["resets_at"] <= SAME_WINDOW]
+    timed = [s for s in seen if s[1] is not None]
     if timed:
-        r, w = max(timed, key=lambda rw: rw[0]["measured_at"])
+        w, measured, received = max(timed, key=lambda s: s[1])
     else:
-        r, w = max(seen, key=lambda rw: rw[1]["used_percentage"])
+        w, measured, received = max(seen, key=lambda s: s[0]["used_percentage"])
     # each window keeps its own age: a fresh 5h must not vouch for an old 7d
-    age = now - (r["measured_at"] if _number(r.get("measured_at")) else r["received_at"])
+    age = now - (measured if measured is not None else received)
     reset = w.get("resets_at")
     if _number(reset) and reset <= now:
         return {"state": "expired", "resets_at": reset, "age": age}
@@ -482,10 +581,16 @@ def _window(readings, name, now):
 def accounts(readings, now, labels=None):
     """One row per account id: its windows, its sessions, and the reading's age."""
     labels = labels or {}
+    # a session back on an account it left holds that account's reading in its
+    # own file: what a run killed before removing the kept file left is older
+    current = {(r.get("session_id"), counts_for(r)) for r in readings
+               if not r.get("retired_at")}
     groups = {}
     for r in readings:
         acct = r.get("first_account")
         if r.get("unsure") or not isinstance(acct, dict) or not acct.get("id"):
+            continue
+        if r.get("retired_at") and (r.get("session_id"), acct["id"]) in current:
             continue
         groups.setdefault(acct["id"], (acct, []))[1].append(r)
     rows = []
@@ -679,6 +784,8 @@ def session_accounts(readings):
     out = {}
     for r in readings:
         acct = r.get("first_account") or {}
+        if r.get("retired_at"):
+            continue            # an account the session spent before (retired)
         if not r.get("unsure") and acct.get("id") and isinstance(r.get("session_id"), str):
             out[r["session_id"]] = acct["id"]
     return out
@@ -721,12 +828,16 @@ def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
             "sessions": sessions, "now": now}
 
 
-def _reset_label(epoch, now):
+def _reset_label(epoch, now, used_up=False):
     t = time.localtime(epoch)
-    return time.strftime("%H:%M" if abs(epoch - now) < 86400 else "%a", t)
+    if abs(epoch - now) < 86400:
+        return time.strftime("%H:%M", t)
+    # at 100% the reset is what you wait for: its day alone is not enough
+    # (owner, 2026-10-11)
+    return time.strftime("%a %H:%M" if used_up else "%a", t)
 
 
-def _window_spans(name, w, now, base, resets=True, age=True):
+def _window_spans(name, w, now, base, resets=True, age=True, reset_time=True):
     tag = SHORT[name]
     if w["state"] == "expired":
         out = [(f"{tag} expired", base)]
@@ -740,13 +851,16 @@ def _window_spans(name, w, now, base, resets=True, age=True):
     if arrow:
         out += [arrow, (f"/{el}%", base)]
     if resets and _number(w.get("resets_at")):
-        out.append((f" ↻{_reset_label(w['resets_at'], now)}", base))
+        # the number as shown: 99.6 prints as 100%
+        used_up = reset_time and _number(pct) and int(f"{pct:.0f}") >= 100
+        out.append((f" ↻{_reset_label(w['resets_at'], now, used_up)}", base))
     if age and _number(w.get("age")) and w["age"] > STALE_AFTER:
         out.append((f" ({_age(w['age'])} ago)", base))
     return out
 
 
-def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=True):
+def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=True,
+                reset_time=True):
     base = "plain" if selected else "dim"
     # "ant:lukaso" - the same words a row's tag says, so the eye joins them
     # (owner, 2026-10-01: a tag "lukaso" was not read as an account)
@@ -754,7 +868,8 @@ def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=Tru
     shown = [(wname, row[wname]) for wname in WINDOWS if row.get(wname)]
     for i, (wname, w) in enumerate(shown):
         out.append((" · " if i else " ", base))
-        out += _window_spans(wname, w, now, base, resets=resets, age=age)
+        out += _window_spans(wname, w, now, base, resets=resets, age=age,
+                             reset_time=reset_time)
     # an expired window says no age: when every one has, the entry says its
     # newest reading's - what tells an account last used days ago from today's
     ages = [w["age"] for _, w in shown if _number(w.get("age"))]
@@ -796,19 +911,21 @@ def usage_lines(snap, width, selected=None):
         return [cut_spans([(LEAD + EMPTY.get(state, EMPTY["unknown"]), "dim")], width)]
     now, names = snap.get("now", time.time()), snap.get("names", {})
     rows = snap.get("accounts", [])
-    full = [entry_spans(r, names.get(r["id"], r["id"]), now, selected=r["id"] == selected)
-            for r in rows]
-    one = [(LEAD, "dim")]
-    for i, e in enumerate(full):
-        one += ([(SEP, "dim")] if i else []) + e
-    if span_cells(one) <= width:
-        return [one]
+    # a used-up window's reset says its time; short of room, its day alone -
+    # before the line stacks, and before an entry drops its resets
+    for opts in (dict(), dict(reset_time=False)):
+        one = [(LEAD, "dim")]
+        for i, r in enumerate(rows):
+            one += ([(SEP, "dim")] if i else []) + entry_spans(
+                r, names.get(r["id"], r["id"]), now, selected=r["id"] == selected, **opts)
+        if span_cells(one) <= width:
+            return [one]
     lines = []
     for i, r in enumerate(rows):
         lead = [(LEAD if i == 0 else INDENT, "dim")]
         name, sel = names.get(r["id"], r["id"]), r["id"] == selected
-        tries = [dict(), dict(resets=False), dict(resets=False, age=False),
-                 dict(resets=False, age=False, brand=False)]
+        tries = [dict(), dict(reset_time=False), dict(resets=False),
+                 dict(resets=False, age=False), dict(resets=False, age=False, brand=False)]
         for opts in tries:
             line = lead + entry_spans(r, name, now, selected=sel, **opts)
             if span_cells(line) <= width:
@@ -853,14 +970,15 @@ def status_text(rec, now, labels=None, names=None):
     """What `ccwho statusline` prints in the session's own status bar."""
     if not isinstance(rec, dict):
         return ""
-    limits = clean_limits(rec.get("rate_limits"))
+    limits = clean_limits(rec.get("rate_limits"), kept=True)
     if not limits:
         return ""
     acct = rec.get("first_account") if isinstance(rec.get("first_account"), dict) else {}
-    when = rec["measured_at"] if _number(rec.get("measured_at")) else rec.get("received_at", now)
     row = {"id": acct.get("id") or "?", "kind": acct.get("kind"), "email": acct.get("email", ""),
            "brand": "ant"}
     for name, w in limits.items():
+        measured, received = _times(rec, w)
+        when = measured if measured is not None else received if _number(received) else now
         reset = w.get("resets_at")
         row[name] = ({"state": "expired", "resets_at": reset, "age": now - when}
                      if _number(reset) and reset <= now else

@@ -828,13 +828,18 @@ def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
             "sessions": sessions, "now": now}
 
 
-def _reset_label(epoch, now, used_up=False):
+def _reset_label(epoch, now, with_time=True):
     t = time.localtime(epoch)
     if abs(epoch - now) < 86400:
         return time.strftime("%H:%M", t)
-    # at 100% the reset is what you wait for: its day alone is not enough
-    # (owner, 2026-10-11)
-    return time.strftime("%a %H:%M" if used_up else "%a", t)
+    # its day alone is not enough to plan by (owner, 2026-10-11); short of
+    # room, the line has it say its day alone
+    return time.strftime("%a %H:%M" if with_time else "%a", t)
+
+
+# reset_time: every reset says its time; USED_UP: a window shown as 100% only
+# (at 100% the reset is what you wait for); False: none
+USED_UP = "used up"
 
 
 def _window_spans(name, w, now, base, resets=True, age=True, reset_time=True):
@@ -842,7 +847,7 @@ def _window_spans(name, w, now, base, resets=True, age=True, reset_time=True):
     if w["state"] == "expired":
         out = [(f"{tag} expired", base)]
         if resets:
-            out.append((f" ↻{_reset_label(w['resets_at'], now)}", base))
+            out.append((f" ↻{_reset_label(w['resets_at'], now, reset_time is True)}", base))
         return out
     pct = w["pct"]
     out = [(f"{tag} ", base), (f"{pct:.0f}%", used_style(pct, base))]
@@ -852,8 +857,9 @@ def _window_spans(name, w, now, base, resets=True, age=True, reset_time=True):
         out += [arrow, (f"/{el}%", base)]
     if resets and _number(w.get("resets_at")):
         # the number as shown: 99.6 prints as 100%
-        used_up = reset_time and _number(pct) and int(f"{pct:.0f}") >= 100
-        out.append((f" ↻{_reset_label(w['resets_at'], now, used_up)}", base))
+        with_time = reset_time is True or (reset_time == USED_UP and _number(pct)
+                                           and int(f"{pct:.0f}") >= 100)
+        out.append((f" ↻{_reset_label(w['resets_at'], now, with_time)}", base))
     if age and _number(w.get("age")) and w["age"] > STALE_AFTER:
         out.append((f" ({_age(w['age'])} ago)", base))
     return out
@@ -911,9 +917,9 @@ def usage_lines(snap, width, selected=None):
         return [cut_spans([(LEAD + EMPTY.get(state, EMPTY["unknown"]), "dim")], width)]
     now, names = snap.get("now", time.time()), snap.get("names", {})
     rows = snap.get("accounts", [])
-    # a used-up window's reset says its time; short of room, its day alone -
-    # before the line stacks, and before an entry drops its resets
-    for opts in (dict(), dict(reset_time=False)):
+    # a reset days away says its time; short of room, its day alone - a used-up
+    # window's last - before the line stacks, and before an entry drops its resets
+    for opts in (dict(), dict(reset_time=USED_UP), dict(reset_time=False)):
         one = [(LEAD, "dim")]
         for i, r in enumerate(rows):
             one += ([(SEP, "dim")] if i else []) + entry_spans(
@@ -924,7 +930,7 @@ def usage_lines(snap, width, selected=None):
     for i, r in enumerate(rows):
         lead = [(LEAD if i == 0 else INDENT, "dim")]
         name, sel = names.get(r["id"], r["id"]), r["id"] == selected
-        tries = [dict(), dict(reset_time=False), dict(resets=False),
+        tries = [dict(), dict(reset_time=USED_UP), dict(reset_time=False), dict(resets=False),
                  dict(resets=False, age=False), dict(resets=False, age=False, brand=False)]
         for opts in tries:
             line = lead + entry_spans(r, name, now, selected=sel, **opts)

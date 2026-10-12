@@ -285,8 +285,14 @@ pass the token to the statusLine, so `ccwho statusline` reads it from its claude
 process's environment and keeps only the hash. A session reports after its next
 reply - including sessions that were already running when setup added the line
 (measured: they reload the settings). `ccwho usage` lists every account seen in the last
-two weeks; `ccwho usage name <id> <label>` gives one a name. `ccwho setup --no-usage` turns it
-off again: the line goes, Codex's entry with it, once no running session spends an account on it.
+two weeks; `ccwho usage name <id> <label>` gives one a name. A name is at most 16 characters
+wide and holds no `:`. A name that another account on the line has is refused, and so is
+another account's hash or email name; `ccwho usage name <id> ""` removes it. `ccwho ls`
+says the name at once, the live list at its next scan, and a session's status bar after
+that session's next reply, when Claude Code draws the bar again. A
+`~/.ccwho/accounts.json` that is not valid JSON is refused, not written over.
+`ccwho setup --no-usage` turns it off again: the line goes, Codex's entry with it, once no
+running session spends an account on it.
 
 Codex has an entry too, after the Claude accounts, named by its limit:
 `oai:codex 7d 69%↑/60% ↻Sun08:00 (42m ago)`. It is kept two weeks after its last reading, the same

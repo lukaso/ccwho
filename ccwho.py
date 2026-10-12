@@ -3178,8 +3178,9 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
                                  threads=list(codex_threads))
         except Exception:         # noqa: BLE001 - an odd rollout costs Codex's entry only
             codex = None
+    labels = read_labels()
     snap = u.snapshot(readings, now, engine.live_ids(rows),
-                      lambda: usage_facts(now, readings), read_labels(),
+                      lambda: usage_facts(now, readings), labels,
                       **({"codex": codex} if codex else {}))
     # only a snapshot over the whole fleet is recorded: a filtered `ls` leaves
     # the shared names and shown-log to the list
@@ -3187,28 +3188,88 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
         path = os.path.join(ccwho_dir(), "usage-shown.jsonl")
         _SHOWN_LAST[path] = u.append_shown(path, u.shown_records(snap),
                                            _SHOWN_LAST.get(path), now)
-        save_names(snap.get("names") or {})
+        _publish_names(u, snap, labels)
     return snap
+
+
+NAMES_LOCK_SECONDS = 1.0      # a save waits this long for the names lock: the list never freezes
+
+
+def names_lock_path():
+    return os.path.join(ccwho_dir(), ".names.lock")
+
+
+@contextlib.contextmanager
+def _names_locked(wait=0.0):
+    """One writer at a time of accounts.json and usage-names.json: a save (the
+    list's, or `ccwho usage name`) and a scan's write of the names, in this
+    process or another. Without it a scan that read the stored names before a
+    save wrote the old names for the status bars after it, two writers of one
+    process shared write_atomic's temp file, and of two saves at once one was
+    lost (eng review 2026-10-12, R2). Yields True when the lock is had, False
+    when another still held it after `wait` seconds: the caller then writes
+    nothing. A scan does not wait - its next round writes; a save waits
+    NAMES_LOCK_SECONDS, then says so. Nothing slow runs under it. A holder
+    that dies lets go: the lock is the kernel's. Raises OSError when the lock
+    file cannot be had at all."""
+    os.makedirs(ccwho_dir(), exist_ok=True)
+    fd = os.open(names_lock_path(), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        end, held = time.monotonic() + wait, False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+                break
+            except BlockingIOError:     # another holds it
+                if time.monotonic() >= end:
+                    break
+                time.sleep(0.02)
+        yield held
+    finally:
+        os.close(fd)                    # closing it lets the lock go
+
+
+def _publish_names(u, snap, labels):
+    """The names this scan shows, for the status bars - from the stored names
+    as they are NOW, under the names lock: a name saved since the scan read
+    `labels` must not be written over with the old one (the status bars then
+    kept the hash until the next scan - outside voice, 2026-10-12). The names
+    never cost a scan its snapshot."""
+    names = snap.get("names") or {}
+    if not names:
+        return                          # no account: no lock, and no dir made for one
+    try:
+        with _names_locked() as held:
+            if not held:
+                return                  # the next scan writes
+            stored = read_labels()
+            if stored != labels:
+                names = u.short_names(snap.get("accounts") or [], stored)
+            save_names(names)
+    except Exception:                   # noqa: BLE001 - see the docstring
+        pass
 
 
 def names_path():
     return os.path.join(ccwho_dir(), "usage-names.json")
 
 
-def save_names(names):
+def save_names(names, drop=()):
     """The names the list uses, for the status bar: one name per account in
-    both places, clashes and all. Written only when they change."""
-    if not names:
-        return
+    both places, clashes and all. Written only when they change. `drop`: the
+    accounts whose name is no longer known - a status bar then takes the
+    stored name, or the account's own. False when they could not be written.
+    Its callers hold the names lock."""
     old = read_names()
-    merged = dict(old, **names)
+    merged = {k: v for k, v in dict(old, **names).items() if k not in drop}
     if merged == old:
-        return
+        return True
     try:
-        os.makedirs(ccwho_dir(), exist_ok=True)
-        write_atomic(names_path(), json.dumps(merged))
+        write_atomic(names_path(), json.dumps(merged))      # the lock made the dir
     except OSError:
-        pass
+        return False
+    return True
 
 
 def read_names():
@@ -3216,7 +3277,7 @@ def read_names():
         with open(names_path(), encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
         return {}
 
 
@@ -3233,12 +3294,88 @@ def with_usage(rows, fleet, record=True):
 
 
 def read_labels():
+    """The stored names, for a scan: forgiving - a file that cannot be read is
+    no name at all - and only the values that are text: a number or a list
+    there (a file edited by hand) made every scan's snapshot raise, and the
+    usage line said "unknown". A save reads strictly (_stored_labels)."""
     try:
         with open(labels_path()) as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
         return {}
+    return {k: v for k, v in data.items() if isinstance(v, str)} if isinstance(data, dict) else {}
+
+
+def _stored_labels():
+    """(the stored names, None) for a save - or (None, why they cannot be
+    read). Strict where read_labels forgives: a save that took a file it could
+    not read for an empty one wrote back one name, and every other was lost."""
+    path = labels_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}, None
+    except (ValueError, RecursionError):        # RecursionError: nested too deep to be ours
+        data = None
+    except OSError as ex:
+        return None, f"could not read {engine._tilde(path)}: {ex.strerror or ex} - not touched"
+    if not isinstance(data, dict):
+        return None, f"{engine._tilde(path)} is not valid JSON - not touched"
+    return data, None
+
+
+def name_account(aid, label, rows):
+    """Give account `aid` the name `label` ("" removes it): the list's name
+    box and `ccwho usage name` both come here. `rows`: the accounts on the
+    line, as the caller shows them - never read here: the command's listing
+    reads Codex's whole history, and Enter in the list must not.
+
+    Under the names lock: the stored names are read strictly, the rules
+    (usage.name_change) say what changes, accounts.json is written, and the
+    names the status bars read (usage-names.json) with it - a status bar took
+    a name only at the list's next scan, and kept the hash with no list open.
+
+    Says what happened, never raises. `result`: "set", "removed", "same"
+    (nothing to write), "refused" (a rule: `why`), "unreadable" (the stored
+    names: `why`), "busy" (the lock: `why`) or "failed" (the write: `why`).
+    `labels`: the stored names after it; `names`: what the accounts show;
+    `names_saved`: False when only the status bars' copy could not be written."""
+    out = {"result": "failed", "why": "", "aid": aid, "labels": None, "names": None,
+           "names_saved": True}
+    # the module in sys.modules, not this file's handle: see usage_snapshot
+    u = sys.modules.get("ccwho_usage", usage)
+    try:
+        with _names_locked(NAMES_LOCK_SECONDS) as held:
+            if not held:
+                return dict(out, result="busy", why="could not save: the names files are in use")
+            labels, why = _stored_labels()
+            if labels is None:
+                return dict(out, result="unreadable", why=why)
+            result, value = u.name_change(label, aid, rows, labels)
+            if result == "refused":
+                return dict(out, result=result, why=value)
+            if result != "same":
+                labels = value
+                try:
+                    write_atomic(labels_path(), json.dumps(labels, indent=2))
+                # an OSError's file name is a temp file's: not said. RecursionError:
+                # a stored value nested too deep to write back (Python 3.12)
+                except (OSError, RecursionError) as ex:
+                    return dict(out, why=f"could not save: {getattr(ex, 'strerror', None) or ex}"
+                                         " - nothing changed")
+            # the status bars' copy also when nothing changed here: a name the
+            # command stored before it wrote that copy left the hash in it
+            known = {k: v for k, v in labels.items() if isinstance(v, str)}
+            names = u.short_names(rows, known)
+            # an account that left the line while its box was open has no row:
+            # its old entry goes, and a status bar takes the stored name or its own
+            drop = () if aid in names else (aid,)
+            return dict(out, result=result, labels=labels, names=names,
+                        names_saved=save_names(names, drop))
+    except OSError as ex:               # the lock could not be had at all: its file, by name
+        return dict(out, why=f"could not save: {ex.strerror or ex}"
+                             f" ({engine._tilde(names_lock_path())}) - nothing changed")
 
 
 def accounts(argv):
@@ -3258,12 +3395,6 @@ def accounts(argv):
         if len(argv) != 3:
             print("usage: ccwho usage name <id> <label>", file=sys.stderr)
             return 2
-        if ":" in argv[2]:
-            # "work:home" reads as the brand "work" where a narrow line drops
-            # the brand ("ant:work" -> "work")
-            print("ccwho usage: a label cannot hold ':' - it reads as a brand",
-                  file=sys.stderr)
-            return 2
         hits = usage.matching_ids(argv[1], [r["id"] for r in rows])
         if len(hits) != 1:
             print(f"ccwho usage: {argv[1]!r} matches {len(hits)} accounts" if hits else
@@ -3271,12 +3402,20 @@ def accounts(argv):
                   "- `ccwho usage --json` lists the ids", file=sys.stderr)
             return 2 if hits else 1         # several: say more; none: not found
         aid = hits[0]
-        labels = read_labels()
-        labels[aid] = argv[2]
-        os.makedirs(ccwho_dir(), exist_ok=True)
-        write_atomic(labels_path(), json.dumps(labels, indent=2))
-        print(f"{aid} -> {argv[2]}")
-        return 0
+        done = name_account(aid, argv[2], rows)
+        result, why = done["result"], done["why"]
+        if result in ("set", "removed", "same"):
+            print(f"{aid} -> {done['labels'][aid]}" if result == "set" else
+                  f"{aid}: name removed" if result == "removed" else f"{aid}: no change")
+            if not done["names_saved"]:
+                print("ccwho usage: the status bars follow at the list's next scan",
+                      file=sys.stderr)
+            return 0
+        # 2: the name breaks a rule; 4: the stored names could not be read;
+        # 1: not saved
+        print(f"ccwho usage: {why}{' - run it again' if result == 'busy' else ''}",
+              file=sys.stderr)
+        return {"refused": 2, "unreadable": 4}.get(result, 1)
     if "--json" in argv:
         print(json.dumps(rows, indent=2))
         return 0

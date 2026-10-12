@@ -6355,6 +6355,467 @@ class TestStatusline(unittest.TestCase):
         self.assertFalse(os.path.exists(old))
 
 
+# a second ccwho that saves a name: argv: repo, account id, name, its wait
+# for the lock in seconds. It says
+# "ready" when it is about to save, then how the save ended.
+NAME_SAVER = r"""
+import sys, time
+repo, aid, name, wait = sys.argv[1:5]
+sys.path.insert(0, repo)
+import ccwho as r
+r.NAMES_LOCK_SECONDS = float(wait)      # the test lets the lock go; a slow machine must not win
+now = time.time()
+rows = r.usage.accounts(r.usage.load_readings(r.usage_dir(), now), now, {})
+print("ready", flush=True)
+print(r.name_account(aid, name, rows)["result"], flush=True)
+"""
+
+
+class TestNameAccount(unittest.TestCase):
+    """Naming an account (name_account): the stored names, and the names the
+    status bars read, change in one step, one writer at a time. The list's
+    name box and `ccwho usage name` both go through it."""
+
+    T1, T2 = "token:7980b01e4f3a2c1d", "token:d0a0fe42aa11bb22"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for var, value in (("CCWHO_DIR", os.path.join(self.tmp, "ccwho")),
+                           (runner.TEST_HOME_VAR, self.tmp)):
+            old = os.environ.get(var)
+            self.addCleanup(lambda var=var, old=old: os.environ.pop(var, None) if old is None
+                            else os.environ.__setitem__(var, old))
+            os.environ[var] = value
+        self.dir = os.environ["CCWHO_DIR"]
+        testkit.patch(self, runner, "usage_facts", lambda *a, **k: {"usage_roots": []})
+        self.now = time.time()
+        for sid, aid in (("s1", self.T1), ("s2", self.T2)):
+            self.reading(sid, aid)
+
+    def reading(self, sid, aid):
+        """A session that spends that account: its reading, as the status line
+        recorded it."""
+        acct = {"kind": "token", "id": aid}
+        rec = {"v": 1, "session_id": sid, "received_at": self.now, "measured_at": self.now,
+               "rate_limits": {"five_hour": {"used_percentage": 5,
+                                             "resets_at": self.now + 3600}},
+               "account": acct, "first_account": acct, "first_seen": self.now,
+               "login_at": None, "unsure": False}
+        os.makedirs(os.path.join(self.dir, "usage"), exist_ok=True)
+        with open(os.path.join(self.dir, "usage", sid + ".json"), "w") as fh:
+            json.dump(rec, fh)
+
+    def store(self, name, value):
+        """A file of ccwho's dir, as an earlier ccwho left it."""
+        with open(os.path.join(self.dir, name), "w") as fh:
+            json.dump(value, fh)
+
+    def rows(self):
+        u = runner.usage
+        return u.accounts(u.load_readings(runner.usage_dir(), self.now), self.now, {})
+
+    def data(self, name):
+        """The bytes of a file in ccwho's dir, or None."""
+        try:
+            with open(os.path.join(self.dir, name), "rb") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
+
+    def stored(self):
+        raw = self.data("accounts.json")
+        return None if raw is None else json.loads(raw)
+
+    def names(self):
+        raw = self.data("usage-names.json")
+        return None if raw is None else json.loads(raw)
+
+    def a_scan_left_the_hashes(self):
+        """The names file as a scan wrote it before any name was given."""
+        with open(os.path.join(self.dir, "usage-names.json"), "w") as fh:
+            json.dump({self.T1: "7980", self.T2: "d0a0"}, fh)
+
+    def bar(self, sid="s1"):
+        """What that session's status bar prints now."""
+        rec = json.loads(self.data(os.path.join("usage", sid + ".json")))
+        return runner.usage.ANSI_RE.sub("", runner.usage.status_text(
+            rec, time.time(), runner.read_labels(), names=runner.read_names()))
+
+    def command(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def hold_the_lock(self):
+        """Another holder of the names lock: its own open file, as another
+        thread or another ccwho has. Returns what lets it go."""
+        os.makedirs(self.dir, exist_ok=True)
+        fd = os.open(runner.names_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(lambda: os.close(fd) if fd in held else None)
+        held = {fd}
+
+        def let_go():
+            held.discard(fd)
+            os.close(fd)
+        return let_go
+
+    def no_room(self, *paths):
+        """write_atomic fails for these files, as on a full disk; any other
+        file is written."""
+        real = runner.write_atomic
+
+        def write(path, text, mode=None):
+            if path in paths:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, text, mode)
+        testkit.patch(self, runner, "write_atomic", write)
+
+    # ---- the save
+
+    def test_a_name_is_stored_and_the_status_bar_says_it_with_no_list_open(self):
+        self.a_scan_left_the_hashes()
+        self.assertTrue(self.bar().startswith("7980 "), self.bar())             # control
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["why"], r["names_saved"]), ("set", "", True))
+        self.assertEqual(self.stored(), {self.T1: "work"})
+        self.assertEqual(self.names(), {self.T1: "work", self.T2: "d0a0"})
+        self.assertTrue(self.bar().startswith("work "), self.bar())
+        self.assertTrue(self.bar("s2").startswith("d0a0 "), self.bar("s2"))     # control
+
+    def test_the_command_makes_the_status_bar_say_the_name(self):
+        self.a_scan_left_the_hashes()
+        # the name as it is stored: without the spaces around what was typed
+        rc, out, err = self.command("usage", "name", "7980", " work ")
+        self.assertEqual((rc, out, err), (0, f"{self.T1} -> work\n", ""))
+        self.assertTrue(self.bar().startswith("work "), self.bar())
+
+    def test_a_removed_name_gives_the_status_bar_the_hash_again(self):
+        runner.name_account(self.T1, "work", self.rows())
+        r = runner.name_account(self.T1, "", self.rows())
+        self.assertEqual(r["result"], "removed")
+        self.assertEqual(self.stored(), {})
+        self.assertTrue(self.bar().startswith("7980 "), self.bar())
+
+    def test_the_command_removes_a_name_and_says_so(self):
+        self.command("usage", "name", "7980", "work")
+        rc, out, err = self.command("usage", "name", "7980", "")
+        self.assertEqual((rc, out, err), (0, f"{self.T1}: name removed\n", ""))
+        self.assertEqual(self.stored(), {})
+
+    def test_the_same_name_again_writes_nothing(self):
+        runner.name_account(self.T1, "work", self.rows())
+        path = os.path.join(self.dir, "accounts.json")
+        before = os.stat(path).st_mtime_ns, os.stat(path).st_ino
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual(r["result"], "same")
+        self.assertEqual((os.stat(path).st_mtime_ns, os.stat(path).st_ino), before)
+        self.assertEqual(self.command("usage", "name", "7980", "work"),
+                         (0, f"{self.T1}: no change\n", ""))
+
+    def test_the_same_name_again_brings_the_status_bars_copy_up_to_date(self):
+        # what `ccwho usage name` left before it wrote that copy: the name
+        # stored, the hash still in the names file (review of slice 1)
+        self.store("accounts.json", {self.T1: "work"})
+        self.a_scan_left_the_hashes()
+        self.assertTrue(self.bar().startswith("7980 "), self.bar())             # control
+        path = os.path.join(self.dir, "accounts.json")
+        before = os.stat(path).st_mtime_ns, os.stat(path).st_ino
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["names_saved"]), ("same", True))
+        self.assertEqual((os.stat(path).st_mtime_ns, os.stat(path).st_ino), before)
+        self.assertEqual(self.names(), {self.T1: "work", self.T2: "d0a0"})
+        self.assertTrue(self.bar().startswith("work "), self.bar())
+        names = os.path.join(self.dir, "usage-names.json")
+        written = os.stat(names).st_ino
+        runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual(os.stat(names).st_ino, written)                        # control
+
+    def test_an_account_that_left_the_line_has_its_name_in_the_status_bars_copy(self):
+        # its box was open when it left the line: the rows no longer hold it,
+        # and a session of it can still report
+        gone = "token:9999aaaa00001111"
+        self.reading("s9", gone)
+        rows = [r for r in self.rows() if r["id"] != gone]
+        self.store("usage-names.json", {gone: "9999", self.T1: "7980"})
+        self.assertEqual(runner.name_account(gone, "work", rows)["result"], "set")
+        self.assertTrue(self.bar("s9").startswith("work "), self.bar("s9"))
+        self.assertEqual(runner.name_account(gone, "", rows)["result"], "removed")
+        self.assertTrue(self.bar("s9").startswith("9999 "), self.bar("s9"))
+        self.assertTrue(self.bar().startswith("7980 "), self.bar())             # control
+
+    def test_a_stored_value_that_is_no_name_does_not_stop_a_save(self):
+        self.store("accounts.json", {self.T2: ["x"]})
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["names_saved"]), ("set", True))
+        self.assertEqual(self.stored(), {self.T1: "work", self.T2: ["x"]})
+        self.assertEqual(self.names(), {self.T1: "work", self.T2: "d0a0"})
+
+    def test_a_stored_value_that_is_no_name_does_not_stop_a_scan(self):
+        # a file edited by hand: every scan's snapshot raised, and the usage
+        # line said "unknown" for every account
+        for odd in (["x"], 7, {"a": 1}, None):
+            self.store("accounts.json", {self.T2: odd, self.T1: "work"})
+            snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+            self.assertEqual((snap["state"], snap["names"]),
+                             ("ok", {self.T1: "work", self.T2: "d0a0"}), odd)
+
+    def test_a_save_makes_ccwhos_dir(self):
+        rows = self.rows()
+        shutil.rmtree(self.dir)
+        self.assertEqual(runner.name_account(self.T1, "work", rows)["result"], "set")
+        self.assertEqual(self.stored(), {self.T1: "work"})
+
+    def test_a_refused_name_writes_nothing(self):
+        r = runner.name_account(self.T1, "work:max", self.rows())
+        self.assertEqual((r["result"], r["why"]),
+                         ("refused", 'a name cannot hold ":" - it would read as a brand'
+                                     " (ant:, oai:)"))
+        self.assertIsNone(self.stored())
+        self.assertIsNone(self.names())
+
+    def test_the_command_refuses_with_the_rules_own_words(self):
+        self.command("usage", "name", "d0a0", "home")
+        for name, words in (
+                ("home", "ant:d0a0 is called home already - choose another name"),
+                ("a" * 17, "a name is 16 characters at most"),
+                ("wo\x1brk", "a name cannot hold control characters")):
+            rc, out, err = self.command("usage", "name", "7980", name)
+            self.assertEqual((rc, out, err), (2, "", f"ccwho usage: {words}\n"), name)
+        self.assertEqual(self.stored(), {self.T2: "home"})
+
+    # ---- a file that cannot be read or written
+
+    def test_a_broken_accounts_file_is_not_touched(self):
+        for broken in (b'{"token:other": "old-name"', b"[1, 2]", b"", b"[" * 200000):
+            with open(os.path.join(self.dir, "accounts.json"), "wb") as fh:
+                fh.write(broken)
+            r = runner.name_account(self.T1, "work", self.rows())
+            where = runner.engine._tilde(runner.labels_path())
+            self.assertEqual((r["result"], r["why"]),
+                             ("unreadable", f"{where} is not valid JSON - not touched"), broken)
+            self.assertEqual(self.data("accounts.json"), broken)
+            self.assertIsNone(self.names())
+
+    def test_an_accounts_file_nested_too_deep_stops_nothing_but_the_save(self):
+        # review 2 of slice 1: of the three readers of the two name files, one
+        # took it; the command and every scan raised
+        deep = b"[" * 200000
+        with open(os.path.join(self.dir, "accounts.json"), "wb") as fh:
+            fh.write(deep)
+        snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        self.assertEqual((snap["state"], snap["names"]),
+                         ("ok", {self.T1: "7980", self.T2: "d0a0"}))
+        where = runner.engine._tilde(runner.labels_path())
+        self.assertEqual(self.command("usage", "name", "7980", "work"),
+                         (4, "", f"ccwho usage: {where} is not valid JSON - not touched\n"))
+        self.assertEqual(self.data("accounts.json"), deep)
+
+    def test_a_names_file_nested_too_deep_is_written_again(self):
+        with open(os.path.join(self.dir, "usage-names.json"), "wb") as fh:
+            fh.write(b"[" * 200000)
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["names_saved"]), ("set", True))
+        self.assertEqual(self.names(), {self.T1: "work", self.T2: "d0a0"})
+        self.assertTrue(self.bar().startswith("work "), self.bar())
+
+    def test_the_command_does_not_touch_a_broken_accounts_file(self):
+        broken = b'{"token:other": "old-name"'
+        with open(os.path.join(self.dir, "accounts.json"), "wb") as fh:
+            fh.write(broken)
+        rc, out, err = self.command("usage", "name", "7980", "work")
+        where = runner.engine._tilde(runner.labels_path())
+        self.assertEqual((rc, out, err),
+                         (4, "", f"ccwho usage: {where} is not valid JSON - not touched\n"))
+        self.assertEqual(self.data("accounts.json"), broken)
+
+    def test_an_accounts_file_that_cannot_be_read_is_not_touched(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads a file of mode 000")
+        self.store("accounts.json", {self.T2: "home"})
+        path = os.path.join(self.dir, "accounts.json")
+        before = self.data("accounts.json")
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        where = runner.engine._tilde(runner.labels_path())
+        words = f"could not read {where}: Permission denied - not touched"
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["why"]), ("unreadable", words))
+        self.assertEqual(self.command("usage", "name", "7980", "work"),
+                         (4, "", f"ccwho usage: {words}\n"))
+        os.chmod(path, 0o600)
+        self.assertEqual(self.data("accounts.json"), before)
+        self.assertIsNone(self.names())
+
+    def test_a_lock_file_that_cannot_be_opened_is_named(self):
+        if os.geteuid() == 0:
+            self.skipTest("root opens a file of mode 000")
+        lock = runner.names_lock_path()
+        with open(lock, "w"):
+            pass
+        os.chmod(lock, 0)
+        self.addCleanup(os.chmod, lock, 0o600)
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["why"]),
+                         ("failed", f"could not save: Permission denied"
+                                    f" ({runner.engine._tilde(lock)}) - nothing changed"))
+        self.assertIsNone(self.stored())
+
+    def test_a_save_that_fails_changes_nothing(self):
+        runner.name_account(self.T2, "home", self.rows())
+        before = self.data("accounts.json"), self.data("usage-names.json")
+        self.no_room(runner.labels_path())
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["why"]),
+                         ("failed", "could not save: No space left on device - nothing changed"))
+        self.assertEqual((self.data("accounts.json"), self.data("usage-names.json")), before)
+
+    def test_a_save_that_fails_names_no_temp_file(self):
+        # the error of a real write holds write_atomic's temp path: not a
+        # file a person knows
+        def write(path, text, mode=None):
+            raise PermissionError(errno.EACCES, "Permission denied",
+                                  os.path.join(self.dir, ".accounts.json.123.tmp"))
+        testkit.patch(self, runner, "write_atomic", write)
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["why"]),
+                         ("failed", "could not save: Permission denied - nothing changed"))
+
+    def test_stored_names_that_cannot_be_written_as_json_fail_the_save(self):
+        # a value nested too deep under another account, in a file that loads:
+        # Python 3.12 raises when it writes it back (review 3 of slice 1)
+        self.store("accounts.json", {self.T2: "home"})
+        before = self.data("accounts.json")
+
+        def dumps(*a, **k):
+            raise RecursionError("maximum recursion depth exceeded")
+        rows = self.rows()
+        testkit.patch(self, runner.json, "dumps", dumps)
+        r = runner.name_account(self.T1, "work", rows)
+        self.assertEqual((r["result"], r["why"]),
+                         ("failed", "could not save: maximum recursion depth exceeded"
+                                    " - nothing changed"))
+        self.assertEqual(self.data("accounts.json"), before)
+
+    def test_the_command_says_a_save_that_failed(self):
+        self.no_room(runner.labels_path())
+        self.assertEqual(self.command("usage", "name", "7980", "work"),
+                         (1, "", "ccwho usage: could not save: No space left on device"
+                                 " - nothing changed\n"))
+        self.assertIsNone(self.stored())
+
+    def test_a_names_file_that_cannot_be_written_is_said(self):
+        self.no_room(runner.names_path())
+        r = runner.name_account(self.T1, "work", self.rows())
+        self.assertEqual((r["result"], r["names_saved"]), ("set", False))
+        self.assertEqual(self.stored(), {self.T1: "work"})
+
+    def test_the_command_says_when_only_the_status_bars_copy_failed(self):
+        self.command("usage", "name", "d0a0", "home")
+        self.no_room(runner.names_path())
+        note = "ccwho usage: the status bars follow at the list's next scan\n"
+        self.assertEqual(self.command("usage", "name", "7980", "work"),
+                         (0, f"{self.T1} -> work\n", note))
+        self.assertEqual(self.command("usage", "name", "d0a0", ""),
+                         (0, f"{self.T2}: name removed\n", note))
+        self.assertEqual(self.stored(), {self.T1: "work"})
+
+    # ---- one writer at a time
+
+    def test_another_holder_of_the_lock_refuses_the_save_in_about_a_second(self):
+        let_go = self.hold_the_lock()
+        began = time.monotonic()
+        r = runner.name_account(self.T1, "work", self.rows())
+        took = time.monotonic() - began
+        self.assertEqual((r["result"], r["why"]),
+                         ("busy", "could not save: the names files are in use"))
+        self.assertTrue(0.9 <= took < 15, took)     # it waited its second; 15: a loaded machine
+        self.assertIsNone(self.stored())
+        let_go()
+        self.assertEqual(runner.name_account(self.T1, "work", self.rows())["result"],
+                         "set")                                                 # control
+
+    def test_the_command_says_that_the_names_files_are_in_use(self):
+        self.hold_the_lock()
+        self.assertEqual(self.command("usage", "name", "7980", "work"),
+                         (1, "", "ccwho usage: could not save: the names files are in use"
+                                 " - run it again\n"))
+
+    def test_a_scan_does_not_wait_for_the_lock_and_leaves_the_names_file(self):
+        let_go = self.hold_the_lock()
+        real, waits = time.sleep, []
+        testkit.patch(self, runner.time, "sleep", lambda s: (waits.append(s), real(s))[1])
+        snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        self.assertEqual(waits, [])     # not once: counted, not timed (review of slice 1)
+        self.assertEqual(snap["names"], {self.T1: "7980", self.T2: "d0a0"})
+        self.assertIsNone(self.names())
+        let_go()
+        runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        self.assertEqual(self.names(), {self.T1: "7980", self.T2: "d0a0"})      # control
+
+    def test_a_lock_file_that_cannot_be_opened_does_not_cost_a_scan_its_snapshot(self):
+        if os.geteuid() == 0:
+            self.skipTest("root opens a file of mode 000")
+        lock = runner.names_lock_path()
+        with open(lock, "w"):
+            pass
+        os.chmod(lock, 0)
+        self.addCleanup(os.chmod, lock, 0o600)
+        snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        self.assertEqual((snap["state"], snap["names"]),
+                         ("ok", {self.T1: "7980", self.T2: "d0a0"}))
+        self.assertIsNone(self.names())
+
+    def test_a_scan_with_no_account_makes_no_dir_and_no_lock(self):
+        fresh = os.path.join(self.tmp, "fresh")
+        os.environ["CCWHO_DIR"] = fresh         # put back by setUp's cleanup
+        snap = runner.usage_snapshot([], self.now)
+        self.assertEqual(snap["accounts"], [])
+        self.assertFalse(os.path.exists(fresh))
+
+    def test_a_scan_that_read_the_names_before_a_save_does_not_bring_the_hash_back(self):
+        # the scan read the stored names, then a name is saved, then the scan
+        # writes the names for the status bars: they must be the new ones
+        real, saved = runner.usage.append_shown, []
+
+        def save_then_log(*a, **k):
+            if not saved:
+                saved.append(self.command("usage", "name", "7980", "work")[0])
+            return real(*a, **k)
+        testkit.patch(self, runner.usage, "append_shown", save_then_log)
+        snap = runner.usage_snapshot([{"sessionId": "s1"}], self.now)
+        self.assertEqual(saved, [0])
+        self.assertEqual(snap["names"][self.T1], "7980")    # what this scan read: the old name
+        self.assertEqual(self.names(), {self.T1: "work", self.T2: "d0a0"})
+        self.assertTrue(self.bar().startswith("work "), self.bar())
+
+    def test_a_saver_that_waited_for_the_lock_keeps_the_other_savers_name(self):
+        # another ccwho starts a save while this one is inside its own: it
+        # must read the file after this one wrote it, not before
+        let_go = self.hold_the_lock()
+        repo = os.path.dirname(os.path.abspath(runner.__file__))
+        # -B: a second Python must leave no __pycache__ in the repo; 60: it
+        # waits for this test, however slow the machine
+        child = subprocess.Popen([sys.executable, "-B", "-c", NAME_SAVER, repo, self.T2, "home",
+                                  "60"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            time.sleep(0.25)            # it now waits for the lock
+            with open(os.path.join(self.dir, "accounts.json"), "w") as fh:
+                json.dump({self.T1: "work"}, fh)
+            let_go()
+            out, err = child.communicate(timeout=20)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        self.assertEqual((out.strip(), err), ("set", ""))
+        self.assertEqual(self.stored(), {self.T1: "work", self.T2: "home"})
+
+
 class TestUsageSetup(unittest.TestCase):
     """The first time ccwho writes another tool's file. Every guard is here:
     only where no statusLine is set, the diff shown, y/N asked, a backup kept,

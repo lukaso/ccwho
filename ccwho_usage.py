@@ -42,6 +42,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 
 import ccwho_procs
 import ccwho_text
@@ -771,6 +772,91 @@ def short_names(rows, labels):
             elif _ == 1:
                 out[aid] = aid
     return out
+
+
+NAME_CELLS = 16                   # a name at most: every row's tag pays for it (owner, 2026-10-12)
+
+
+# the two format characters that are text: an emoji made of two, a Persian or
+# an Indic word, need the joiner between their parts
+_JOINERS = "\u200c\u200d"
+
+
+def _name_key(text):
+    """What two names are compared by: capitals, the Unicode form of a letter
+    and the spaces between words make no other name. Nothing is dropped. A
+    key that dropped "what does not show" was tried, and twice made one name
+    of two that differ to the eye (reviews 3 and 4 of slice 1): a mark on a
+    Thai letter, the tag characters of a flag. A mark, a joiner and a
+    selector change what is drawn."""
+    return " ".join(unicodedata.normalize("NFC", text).split()).casefold()
+
+
+def _shows(text):
+    """Whether anything of a name shows: a letter, a number, a sign or a
+    symbol. A mark with no letter under it, or a joiner alone, is nothing to
+    read."""
+    return any(unicodedata.category(c)[0] in "LNPS" for c in text)
+
+
+def name_change(label, aid, rows, labels):
+    """What naming account `aid` `label` does to the stored names - the one
+    rule for the list's name box and `ccwho usage name`:
+
+    ("set", names) or ("removed", names): the stored names to write;
+    ("same", None): nothing to write; ("refused", why): the words to show.
+
+    `rows` are the accounts on the line now, `labels` the stored names. Pure:
+    the caller reads and writes. A name another account on the line has - its
+    stored name, the name it shows, or its own before a clash made that longer
+    - is refused (owner, 2026-10-12: you get the name you typed, and no other
+    account's tag changes); a name kept for an account that left the line does
+    not block. `aid` need not be on the line: an account can leave it while
+    its box is open. A stored name that breaks a rule stays until it is
+    changed: the rules are for what is typed now. A stored value that is no
+    text (a file edited by hand) is no name, and is left as it is.
+
+    Two names a person cannot tell apart are one name (_name_key): a name is
+    stored with one Unicode form for a letter (NFC) and one space between
+    words. A control character, a lone surrogate (a byte of the command line
+    that is no text) and a format character other than a joiner are refused:
+    they break a line of a terminal, or hide in a name."""
+    label = label.strip() if isinstance(label, str) else ""
+    known = {k: v for k, v in labels.items() if isinstance(v, str)}
+    stored = known.get(aid, "")
+    if label == stored:
+        return "same", None
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs") and c not in _JOINERS for c in label):
+        return "refused", "a name cannot hold control characters"
+    label = " ".join(unicodedata.normalize("NFC", label).split())
+    if label == stored:
+        return "same", None
+    plain = short_names(rows, {})
+    mine = next((r for r in rows if r.get("id") == aid), None)
+    if not label or (mine and label in (_base_name(mine), plain.get(aid))):
+        # its own name is what it shows with no name stored
+        if not stored:
+            return "same", None
+        return "removed", {k: v for k, v in labels.items() if k != aid}
+    if not _shows(label):
+        return "refused", "a name must hold a character that shows"
+    if ":" in label:
+        # "work:home" reads as the brand "work" where a narrow line drops
+        # the brand ("ant:work" -> "work")
+        return "refused", 'a name cannot hold ":" - it would read as a brand (ant:, oai:)'
+    if ccwho_text.cells(label) > NAME_CELLS:
+        return "refused", f"a name is {NAME_CELLS} characters at most"
+    shown, want = short_names(rows, known), _name_key(label)
+    for r in rows:
+        other = r.get("id")
+        if other == aid:
+            continue
+        theirs = (known.get(other), plain.get(other), _base_name(r), shown.get(other))
+        hit = next((t for t in theirs if isinstance(t, str) and _name_key(t) == want), None)
+        if hit:
+            return "refused", (f"{r.get('brand', 'ant')}:{plain.get(other, other)} is called"
+                               f" {hit} already - choose another name")
+    return "set", dict(labels, **{aid: label})
 
 
 def ordered(rows, names):

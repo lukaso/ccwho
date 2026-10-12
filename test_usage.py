@@ -786,6 +786,218 @@ class TestShortNames(unittest.TestCase):
         self.assertEqual(len(set(names.values())), 40)
 
 
+class TestNameChange(unittest.TestCase):
+    """What a new name does to the stored names (name_change): one rule for
+    the list's name box and `ccwho usage name`. Pure: the caller gives the
+    accounts on the line and the stored names; nothing here reads a file."""
+
+    T1, T2, LOGIN, CODEX = "token:7980b01e", "token:d0a0fe42", "login:u1", "codex:codex"
+
+    def rows(self):
+        return [acct_row(self.LOGIN, email="lukaso@gmail.com"),
+                acct_row(self.T1, kind="token"), acct_row(self.T2, kind="token"),
+                {"id": self.CODEX, "kind": "codex", "brand": "oai", "email": "",
+                 "label": "codex"}]
+
+    def change(self, label, aid=None, labels=None, rows=None):
+        return usage.name_change(label, aid or self.T1, self.rows() if rows is None else rows,
+                                 {} if labels is None else labels)
+
+    def test_a_name_is_stored_without_the_spaces_around_it(self):
+        self.assertEqual(self.change("  work \n"), ("set", {self.T1: "work"}))
+
+    def test_the_other_stored_names_are_kept_and_the_input_is_not_changed(self):
+        stored = {self.T2: "home"}
+        self.assertEqual(self.change("work", labels=stored),
+                         ("set", {self.T1: "work", self.T2: "home"}))
+        self.assertEqual(stored, {self.T2: "home"})
+
+    def test_the_stored_name_again_writes_nothing(self):
+        self.assertEqual(self.change("work", labels={self.T1: "work"}), ("same", None))
+        self.assertEqual(self.change(" work ", labels={self.T1: "work"}), ("same", None))
+
+    def test_an_empty_name_removes_the_stored_one(self):
+        self.assertEqual(self.change("", labels={self.T1: "work", self.T2: "home"}),
+                         ("removed", {self.T2: "home"}))
+        self.assertEqual(self.change("   ", labels={self.T1: "work"}), ("removed", {}))
+
+    def test_an_empty_name_for_an_account_with_no_name_writes_nothing(self):   # control
+        self.assertEqual(self.change(""), ("same", None))
+
+    def test_the_accounts_own_name_is_no_name(self):
+        # its hash, or the name in its email: what it shows with no name stored
+        self.assertEqual(self.change("7980"), ("same", None))
+        self.assertEqual(self.change("7980", labels={self.T1: "work"}), ("removed", {}))
+        self.assertEqual(self.change("lukaso", aid=self.LOGIN, labels={self.LOGIN: "me"}),
+                         ("removed", {}))
+
+    def test_a_colon_is_refused(self):
+        self.assertEqual(self.change("work:max"),
+                         ("refused", 'a name cannot hold ":" - it would read as a brand'
+                                     " (ant:, oai:)"))
+
+    def test_16_cells_at_most(self):
+        self.assertEqual(self.change("a" * 16), ("set", {self.T1: "a" * 16}))       # control
+        self.assertEqual(self.change("a" * 17), ("refused", "a name is 16 characters at most"))
+
+    def test_the_limit_counts_cells_not_characters(self):
+        self.assertEqual(self.change("名" * 8), ("set", {self.T1: "名" * 8}))        # 16 cells
+        self.assertEqual(self.change("名" * 9), ("refused", "a name is 16 characters at most"))
+
+    def test_a_longer_name_that_is_stored_already_stays(self):
+        old = "x" * 30
+        self.assertEqual(self.change(old, labels={self.T1: old}), ("same", None))
+
+    def test_control_characters_are_refused(self):
+        for bad in ("wo\x1b[31mrk", "wo\trk", "wo\nrk", "work\x7f1"):
+            self.assertEqual(self.change(bad),
+                             ("refused", "a name cannot hold control characters"), bad)
+
+    def test_characters_that_do_not_show_are_refused(self):
+        # review of slice 1: "work" with a zero-width space after it looked
+        # like another account's "work" and passed; a lone surrogate (a byte of
+        # the command line that is no text) stopped the command when it printed
+        for bad in ("work\u200b", "\u200b", "wo\u202erk", "work\udcff"):
+            self.assertEqual(self.change(bad, labels={self.T2: "work"}),
+                             ("refused", "a name cannot hold control characters"), ascii(bad))
+
+    def test_a_joiner_is_part_of_a_name(self):
+        # an emoji made of two, a Persian word: the joiner between them is
+        # text. Review 2 of slice 1: "control characters" was the wrong word
+        # for it, and a refusal the wrong answer
+        coder = "dev \U0001F469\u200d\U0001F4BB"
+        self.assertEqual(self.change(coder), ("set", {self.T1: coder}))
+        self.assertEqual(self.change("\u0645\u06cc\u200c\u0631\u0648\u0645"),
+                         ("set", {self.T1: "\u0645\u06cc\u200c\u0631\u0648\u0645"}))
+
+    def test_a_name_with_nothing_to_see_is_refused(self):
+        # an accent or a ring with no letter under it, a selector alone, a
+        # joiner alone
+        for blank in ("\u0301", "\u20dd", "\ufe0f", "\u200d", "\u0301\u0300", "\u200d \u200c"):
+            self.assertEqual(self.change(blank),
+                             ("refused", "a name must hold a character that shows"), ascii(blank))
+        # control: a letter, a number, a sign and a symbol each show
+        for shows in ("\u00e9", "42", "!?", "+", "\u2764"):
+            self.assertEqual(self.change(shows), ("set", {self.T1: shows}), ascii(shows))
+
+    def test_what_shows_makes_another_name(self):
+        # nothing of a name is dropped when two are compared. Review 3 of
+        # slice 1: a comparison that dropped the marks made Thai "team" the
+        # name of the account called "Tim"; review 4: one that dropped format
+        # characters made two flags one name. A mark, a joiner and a selector
+        # change what is drawn
+        for typed, theirs in (("\u0e17\u0e35\u0e21", "\u0e17\u0e34\u0e21"),     # Thai: team, Tim
+                              ("\u092a\u0941\u0932", "\u092a\u0932"),           # Hindi: bridge, moment
+                              ("1\ufe0f\u20e3", "1"),                             # a keycap, a digit
+                              ("x\u0304", "x"),                                   # x with a line over it
+                              ("r\u00e9sum\u00e9", "resume"),
+                              # a woman at a computer (one sign), a woman and a computer
+                              ("\U0001F469\u200d\U0001F4BB", "\U0001F469\U0001F4BB"),
+                              ("\u2764\ufe0f", "\u2764")):       # a red heart, a plain one
+            self.assertEqual(self.change(typed, labels={self.T2: theirs})[0], "set", ascii(typed))
+
+    def test_the_spaces_of_a_stored_name_make_no_other_name(self):
+        # stored before names were kept with single spaces
+        for stored in ("work\u00a0max", "work  max"):
+            self.assertEqual(self.change("work max", labels={self.T2: stored}),
+                             ("refused", f"ant:d0a0 is called {stored} already"
+                                         " - choose another name"), ascii(stored))
+        self.assertEqual(self.change("workmax", labels={self.T2: "work max"})[0], "set")   # control
+
+    def test_a_letter_in_another_unicode_form_is_the_same_letter(self):
+        one, two = "caf\u00e9", "cafe\u0301"         # é as one character, and as e + accent
+        self.assertEqual(self.change(two), ("set", {self.T1: one}))
+        self.assertEqual(self.change(two, labels={self.T1: one}), ("same", None))
+        self.assertEqual(self.change(two, labels={self.T2: one}),
+                         ("refused", f"ant:d0a0 is called {one} already - choose another name"))
+        # a name stored in the other form, before this rule: still the same name
+        self.assertEqual(self.change(one, labels={self.T2: two}),
+                         ("refused", f"ant:d0a0 is called {two} already - choose another name"))
+
+    def test_a_stored_name_that_breaks_a_rule_stays_when_it_is_given_again(self):
+        for old in ("wo\u200brk", "cafe\u0301", "work\u00a0max", "work:max"):
+            self.assertEqual(self.change(old, labels={self.T1: old}), ("same", None), ascii(old))
+
+    def test_the_spaces_inside_a_name_are_single_spaces(self):
+        # a no-break space looks like a space: one name, not two
+        self.assertEqual(self.change("work\u00a0 max"), ("set", {self.T1: "work max"}))
+        self.assertEqual(self.change("work\u00a0max", labels={self.T2: "work max"}),
+                         ("refused", "ant:d0a0 is called work max already - choose another name"))
+
+    def test_a_stored_value_that_is_no_name_does_not_stop_a_change(self):
+        # a file edited by hand: the odd value stays, and is no name in use
+        odd = {self.T2: ["x"], "token:gone0000": 7}
+        self.assertEqual(self.change("work", labels=odd), ("set", dict(odd, **{self.T1: "work"})))
+        self.assertEqual(self.change("", aid=self.T2, labels=odd), ("same", None))
+
+    def test_a_name_another_account_on_the_line_has_is_refused(self):
+        self.assertEqual(self.change("work", labels={self.T2: "work"}),
+                         ("refused", "ant:d0a0 is called work already - choose another name"))
+
+    def test_capital_letters_do_not_make_a_name_another_one(self):
+        self.assertEqual(self.change("WORK", labels={self.T2: "work"}),
+                         ("refused", "ant:d0a0 is called work already - choose another name"))
+
+    def test_another_accounts_own_name_is_refused(self):
+        self.assertEqual(self.change("d0a0"),
+                         ("refused", "ant:d0a0 is called d0a0 already - choose another name"))
+        self.assertEqual(self.change("Lukaso"),
+                         ("refused", "ant:lukaso is called lukaso already - choose another name"))
+        self.assertEqual(self.change("codex"),
+                         ("refused", "oai:codex is called codex already - choose another name"))
+
+    def test_another_accounts_own_name_under_its_stored_name_is_refused(self):
+        # d0a0 is called home: its hash is still its own, and comes back when
+        # the name is removed
+        self.assertEqual(self.change("d0a0", labels={self.T2: "home"}),
+                         ("refused", "ant:d0a0 is called d0a0 already - choose another name"))
+
+    def test_a_name_from_before_a_clash_was_resolved_is_refused(self):
+        # two tokens that start alike show 6 hex; the 4 hex is still theirs
+        rows = [acct_row("token:1a2b3c4d", kind="token"), acct_row("token:1a2b9f00", kind="token"),
+                acct_row(self.T1, kind="token")]
+        self.assertEqual(sorted(usage.short_names(rows[:2], {}).values()), ["1a2b3c", "1a2b9f"])
+        self.assertEqual(self.change("1a2b", rows=rows),
+                         ("refused", "ant:1a2b3c is called 1a2b already - choose another name"))
+        self.assertEqual(self.change("1a2b9f", rows=rows),
+                         ("refused", "ant:1a2b9f is called 1a2b9f already - choose another name"))
+
+    def test_the_name_another_account_shows_now_is_refused(self):
+        # two names stored alike before this rule show with their own name
+        # after them: that whole name is taken too
+        alike = {self.T2: "work", self.LOGIN: "work"}
+        self.assertEqual(usage.short_names(self.rows(), alike)[self.T2], "work d0a0")
+        self.assertEqual(self.change("work d0a0", labels=alike),
+                         ("refused", "ant:d0a0 is called work d0a0 already - choose another name"))
+
+    def test_a_name_two_accounts_have_already_is_refused_for_a_third(self):
+        # stored alike before this rule: each shows "work <its own name>", and
+        # the plain "work" is still theirs
+        alike = {self.T2: "work", self.LOGIN: "work"}
+        self.assertEqual(self.change("work", labels=alike),
+                         ("refused", "ant:lukaso is called work already - choose another name"))
+
+    def test_the_longer_own_name_under_a_stored_name_is_refused(self):
+        # 1a2b3c4d is called home; with no name it shows 1a2b3c (a clash made
+        # it longer): that comes back when its name is removed
+        rows = [acct_row("token:1a2b3c4d", kind="token"), acct_row("token:1a2b9f00", kind="token"),
+                acct_row(self.T1, kind="token")]
+        self.assertEqual(self.change("1a2b3c", rows=rows, labels={"token:1a2b3c4d": "home"}),
+                         ("refused", "ant:1a2b3c is called 1a2b3c already - choose another name"))
+
+    def test_an_account_can_change_the_capitals_of_its_own_name(self):         # control
+        self.assertEqual(self.change("Work", labels={self.T1: "work"}),
+                         ("set", {self.T1: "Work"}))
+
+    def test_a_name_kept_for_an_account_that_left_the_line_does_not_block(self):   # control
+        self.assertEqual(self.change("work", labels={"token:gone0000": "work"}),
+                         ("set", {self.T1: "work", "token:gone0000": "work"}))
+
+    def test_an_account_that_left_the_line_can_still_be_named(self):
+        self.assertEqual(self.change("work", aid="token:gone0000"),
+                         ("set", {"token:gone0000": "work"}))
+
+
 class TestOrder(unittest.TestCase):
     def test_brand_then_login_before_token_then_name(self):
         rows = [acct_row("token:ffff", kind="token"), acct_row("login:b", email="zed@x.com"),

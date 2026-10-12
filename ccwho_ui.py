@@ -28,6 +28,7 @@ problem this tool exists to solve.
 """
 from __future__ import annotations
 
+import copy
 import inspect
 import os
 import subprocess
@@ -173,6 +174,19 @@ class Fleet:
         except Exception:
             tag = ""
         return dict(row, usage_tag=tag) if tag else row
+
+    def with_usage(self, usage):
+        """A fleet as this one with another usage snapshot - one with a name
+        saved here (ccwho_usage.with_labels) - as a scan makes it: the row of
+        a Claude session says its account by it, a Codex row is as it was. A
+        new fleet, and this one stays as it is: what the list keeps by the
+        fleet it came from (the rows a search found) is made again."""
+        new = copy.copy(self)
+        new.usage = usage
+        new.rows = [r if r.get("kind") == "codex"
+                    else new.tagged({k: v for k, v in r.items() if k != "usage_tag"})
+                    for r in self.rows]
+        return new
 
     def visible(self, query):
         return engine.ui_filter(self.rows, query)
@@ -802,6 +816,201 @@ class SavesMenu(ModalScreen):
         self.query_one("#saves").action_cursor_up()
 
 
+# an account in the accounts list has this many cells of text: with the box's
+# frame, its padding and the list's own (BOX_FRAME: the 70 of the CSS) it fits
+# an 80-column terminal; in a narrower window the box takes the whole width
+BOX_CELLS, BOX_FRAME = 64, 6
+# `a` with no account on the line: one line that says why, and no box
+NO_ACCOUNTS = {"not_set_up": "no account to name - ccwho setup adds the usage line",
+               "waiting": "no account to name yet - sessions report after their next reply",
+               "off": "usage is off - ccwho setup --usage turns it on"}
+
+
+class AnswersOnce:
+    """A box that answers one time. A key or a click that was on its way when
+    the box closed (Enter held down, a click made two times) reaches the box
+    after that: it closed again, Textual raised, and the list went down
+    (review of slice 2)."""
+
+    answered = False
+
+    def answer(self, value):
+        if not self.answered:
+            self.answered = True
+            self.dismiss(value)
+
+
+class AccountsBox(AnswersOnce, ModalScreen):
+    """Every account on the usage line, to name one (a user, 2026-10-11: "the
+    fingerprint is not easy to remember"). Each has who it is - its name on the
+    line, its kind, its whole hash, email or limit - and under that who spends
+    it now: a hash does not say which account it is, its sessions do. A first
+    line too long for the box wraps; nothing of it is cut.
+
+    Enter or a click on an account answers its id; Esc, ✕ or a click outside
+    answers None. The entries are its own: a scan changes nothing in here."""
+
+    DEFAULT_CSS = """
+    AccountsBox { align: center middle; }
+    #accountsbox { width: 70; max-width: 100%; height: auto;
+                   border: round $accent; background: $surface; padding: 0 1; }
+    #accountstop { height: auto; }
+    #accountshead { width: 1fr; text-style: bold; }
+    #accountsclose { width: 3; color: $text-muted; }
+    #accountsclose:hover { background: $accent; color: $text; }
+    #accounts { height: auto; border: none; }
+    .accountsnote { color: $text-muted; height: auto; }
+    """
+
+    # before the list's own keys (priority): its up and down go round from
+    # the last account to the first, and here the highlight stops at the ends
+    BINDINGS = [
+        Binding("escape", "close", "close"),
+        Binding("down,j", "down", "down", show=False, priority=True),
+        Binding("up,k", "up", "up", show=False, priority=True),
+    ]
+
+    def __init__(self, entries, start=None):
+        super().__init__()
+        self.entries, self.start = list(entries), start
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="accountsbox"):
+            with Horizontal(id="accountstop"):
+                yield Static("accounts", id="accountshead", markup=False)
+                # iTerm2 passes only a plain left click: Esc is not the only way out
+                yield Static(" ✕ ", id="accountsclose", markup=False)
+            yield OptionList(*[Option(self.lines(e), id=e["id"]) for e in self.entries],
+                             id="accounts")
+            yield Static("Enter or a click names the account · Esc closes",
+                         classes="accountsnote", markup=False)
+
+    @staticmethod
+    def lines(entry):
+        text = Text(f"{entry['shown']} · {entry['who']}")
+        text.append(f"\n  {entry['now']}", style="dim")
+        return text
+
+    def on_mount(self):
+        box = self.query_one("#accounts")
+        self.fit()
+        box.focus()
+        ids = [e["id"] for e in self.entries]
+        box.highlighted = ids.index(self.start) if self.start in ids else 0
+
+    def on_resize(self, event):
+        self.fit()
+
+    def fit(self):
+        """More accounts than fit: the list scrolls, and the top line and the
+        key line stay (the frame, those two lines and a row of the screen)."""
+        self.query_one("#accounts").styles.max_height = max(2, self.app.size.height - 6)
+
+    @on(OptionList.OptionSelected, "#accounts")
+    def chosen(self, event):
+        self.answer(event.option.id)
+
+    def action_close(self):
+        self.answer(None)
+
+    @on(events.Click)
+    def clicked(self, event):
+        """The ✕, or anywhere outside the box, closes it."""
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget.id == "accountsclose":
+            self.answer(None)
+            return
+        while widget is not None and widget.id != "accountsbox":
+            widget = widget.parent
+        if widget is None:
+            self.answer(None)
+
+    def action_down(self):
+        self.move(1)
+
+    def action_up(self):
+        self.move(-1)
+
+    def move(self, step):
+        box = self.query_one("#accounts")
+        box.highlighted = max(0, min(box.option_count - 1, (box.highlighted or 0) + step))
+
+
+class NameBox(AnswersOnce, ModalScreen):
+    """Name one account: who it is, who spends it now, one line to type. Enter
+    hands the text to `save` (the list's: ccwho.name_account). A name it
+    refuses, or a save that fails, stays in the box with the reason, and the
+    text stays. Esc or ✕ closes with no change; a click outside does nothing:
+    a stray click must not lose what was typed. The answer is what the save
+    said, or None. The field starts with the stored name, selected, so typing
+    takes its place; an empty field removes the name. Nothing here is about
+    the status bars (a user, 2026-10-12: no qualifier)."""
+
+    DEFAULT_CSS = """
+    NameBox { align: center middle; }
+    #namebox { width: 70; max-width: 100%; height: auto;
+               border: round $accent; background: $surface; padding: 0 1; }
+    #nametop { height: auto; }
+    #namehead { width: 1fr; text-style: bold; }
+    #nameclose { width: 3; color: $text-muted; }
+    #nameclose:hover { background: $accent; color: $text; }
+    .namenote { color: $text-muted; height: auto; }
+    #namewhy { color: $warning; height: auto; }
+    """
+
+    BINDINGS = [Binding("escape", "close", "close")]
+
+    def __init__(self, entry, stored, save):
+        super().__init__()
+        self.entry, self.stored, self.save = entry, stored or "", save
+
+    def compose(self) -> ComposeResult:
+        e = self.entry
+        with Vertical(id="namebox"):
+            with Horizontal(id="nametop"):
+                yield Static(f"name the account {e['shown']}", id="namehead", markup=False)
+                yield Static(" ✕ ", id="nameclose", markup=False)
+            yield Static(e["who"], classes="namenote", markup=False)
+            yield Static(e["now"], classes="namenote", markup=False)
+            yield Input(value=self.stored, placeholder="a name, for example work",
+                        id="namefield")
+            yield Static("", id="namewhy", markup=False)
+            again = f"empty: {e['own']} again · " if self.stored else ""
+            yield Static(f"Enter names it · {again}Esc closes", classes="namenote", markup=False)
+
+    def on_mount(self):
+        self.query_one("#namewhy").display = False
+        self.query_one("#namefield", Input).focus()
+
+    @on(Input.Submitted, "#namefield")
+    def submitted(self, event):
+        event.stop()
+        if self.answered:               # a second Enter: the first saved it
+            return
+        try:
+            done = self.save(event.value)
+            result, why = done.get("result"), done.get("why")
+        except Exception as ex:         # never the reason the list goes down
+            result, why = "failed", f"could not save ({type(ex).__name__}) - nothing changed"
+        if result in ("set", "removed", "same"):
+            self.answer(done)
+            return
+        if not (isinstance(why, str) and why):      # an engine that changed under the list
+            why = "could not save - nothing changed"
+        if result == "busy":
+            why += " - press Enter again"
+        box = self.query_one("#namewhy")
+        box.update(why)
+        box.display = True
+
+    def on_click(self, event):
+        if getattr(getattr(event, "widget", None), "id", None) == "nameclose":
+            self.answer(None)
+
+    def action_close(self):
+        self.answer(None)
+
+
 class CcwhoUi(App):
     """The screen. Everything it knows comes from a Fleet snapshot."""
 
@@ -850,6 +1059,10 @@ class CcwhoUi(App):
         Binding("left,escape", "back", "back"),
         Binding("slash", "search", "search"),
         Binding("p", "procs", "processes"),
+        # every account on the usage line, to name one. Used a few times a
+        # year, and in the footer all the time (a user, 2026-10-12): the place
+        # to find it again when a new hash appears
+        Binding("a", "accounts", "accounts"),
         Binding("j,down", "next", "down", show=False),
         Binding("k,up", "prev", "up", show=False),
         Binding("o", "reopen", "reopen"),
@@ -903,6 +1116,14 @@ class CcwhoUi(App):
         # session id -> (ts, note) parked here, or (ts, None) unparked here:
         # until a scan agrees, one that read the parks before is not shown
         self.parks_here = {}
+        # the stored names after a save made here, and the number of the newest
+        # scan started then - or None: kept over a scan that read the names
+        # before the save (keep_names)
+        self.names_here = None
+        self.usage_lit = None       # the account of the usage line under the mouse
+        # the last press of the mouse: where, when, and the screen that the
+        # first press at that place was made on (second_press)
+        self.press_last = None
         self.loading = False    # the saves are being read for the o menu
         self.note = ""          # an `o` that missed iTerm2's panes: shown until a key
         self.note_at = 0.0      # when it came: time.monotonic, the clock of a key's .time
@@ -1070,11 +1291,28 @@ class CcwhoUi(App):
         """A scan that read the marks before you looked, arriving after: the
         turn you saw stays seen. Every fleet that reaches the screen comes
         through here - the held one included."""
+        fleet = self.keep_names(fleet)
         for row in fleet.rows:
             self.keep_park(row)
             if row.get("attention") == "review" and row.get("ts") \
                     and self.seen.get(row.get("sessionId")) == row.get("ts"):
                 row["attention"] = "stopped"
+        return fleet
+
+    def keep_names(self, fleet):
+        """A name saved here, on a scan that read the stored names before the
+        save: shown as saved - the usage line said the hash again until the
+        next scan. Scans are numbered when they start (next_seq): one numbered
+        after the save read the file with the name in it, and is shown as it
+        is - the file is the truth. Answers the fleet to show."""
+        if self.names_here:
+            labels, upto = self.names_here
+            if 0 < getattr(fleet, "seq", 0) <= upto:
+                try:
+                    return fleet.with_usage(
+                        engine.ccwho_usage.with_labels(fleet.usage, labels))
+                except Exception:       # a usage problem never costs the list
+                    pass
         return fleet
 
     def keep_park(self, row):
@@ -1634,13 +1872,16 @@ class CcwhoUi(App):
             row = self.selected_row()
             selected = (snap.get("sessions", {}).get(row.get("sessionId"))
                         if row and isinstance(snap, dict) else None)
-            lines = engine.ccwho_usage.usage_lines(snap, max(10, self.size.width - 2),
-                                                   selected=selected)
+            # each piece of an account's entry carries the account: a click
+            # and the mouse read it from the event (clicked_usage)
+            lines = engine.ccwho_usage.usage_marked(snap, max(10, self.size.width - 2),
+                                                    selected=selected, hint=True)
         except Exception:               # a usage problem never costs the list
-            lines = [[("usage  unknown", "dim")]]
+            lines = [[("usage  unknown", "dim", None)]]
         # the cursor moves far more often than anything here changes: the same
-        # snapshot, account and width is the same line, so the box is left alone
-        painted = (snap, selected, self.size.width)
+        # snapshot, account, width and account under the mouse is the same
+        # line, so the box is left alone
+        painted = (snap, selected, self.size.width, self.usage_lit)
         last = getattr(self, "usage_painted", None)
         if last and last[0] is painted[0] and last[1:] == painted[1:]:
             return
@@ -1649,8 +1890,14 @@ class CcwhoUi(App):
         for i, line in enumerate(lines):
             if i:
                 text.append("\n")
-            for part, style in line:
-                text.append(part, style=USAGE_STYLE.get(style, ""))
+            for part, style, who in line:
+                look = Style.parse(USAGE_STYLE.get(style, ""))
+                if who:
+                    # what a click here names; under the mouse it is lit, as a
+                    # row's own targets are
+                    look += Style(meta={"account": who},
+                                  reverse=True if who == self.usage_lit else None)
+                text.append(part, style=look)
         box.update(text)
         if box.display != bool(lines):
             box.display = bool(lines)
@@ -1882,6 +2129,131 @@ class CcwhoUi(App):
         event.stop()
         if self.detail_open:
             self.action_back()
+
+    @on(events.Click, "#usage")
+    def clicked_usage(self, event):
+        """A click on an account of the usage line names it; a click on the
+        hint opens the accounts list. The lead and what stands between two
+        accounts are no target. The account is the mark of the text under the
+        mouse, not a place worked out a second time: a scan may put the line
+        in a new order between the paint and the click."""
+        if isinstance(self.screen, ModalScreen):
+            return                      # the second click of two: a box is open
+        who = (event.style.meta or {}).get("account")
+        if who == "hint":
+            self.action_accounts()
+        elif who:
+            self.name_box(who)
+
+    def on_mouse_move(self, event):
+        """What a click on the usage line would act on is lit: the account, or
+        the hint, under the mouse. Every move over the list is read, not only
+        those over the line: a box that opens takes the mouse, and Textual
+        does not tell the line that the mouse left it - an account stayed lit
+        with the mouse on the rows (review 2 of slice 2). A move in an open
+        box is read too: the mouse is not on the line then. An extra sign:
+        iTerm2 can hold mouse motion back until the first click (#19)."""
+        who = (event.style.meta or {}).get("account")
+        if who != self.usage_lit:
+            self.usage_lit = who
+            self.paint_usage()
+
+    @on(events.Leave, "#usage")
+    def left_usage(self, event):
+        """From the line straight to a scrollbar: a scrollbar keeps the moves
+        of the mouse to itself, and on_mouse_move sees none."""
+        if self.usage_lit is not None:
+            self.usage_lit = None
+            self.paint_usage()
+
+    def account_entries(self):
+        """Every account on the usage line as the accounts list shows it; []
+        when there is none. A session is named by its title, as its row is."""
+        titles = {}
+        for row in self.fleet.rows:
+            title = " ".join(engine.procs.printable(str(row.get("title") or "")).split())
+            if row.get("sessionId"):
+                titles[row["sessionId"]] = title or engine.session_handle(row)
+        try:
+            # the cells the box has in this window; two less for the line that
+            # says who spends the account: it is set in
+            cells = min(BOX_CELLS, max(20, self.size.width - BOX_FRAME))
+            return engine.ccwho_usage.account_entries(self.fleet.usage, titles, cells - 2)
+        except Exception:               # an engine from before, or an odd snapshot
+            return []
+
+    def action_accounts(self, start=None):
+        """`a`, or a click on the usage line's hint: every account, to name
+        one. The highlight starts on `start`, else on the account the selected
+        row spends. With no account: one line that says why, and no box."""
+        entries = self.account_entries()
+        if not entries:
+            snap = self.fleet.usage
+            state = snap.get("state") if isinstance(snap, dict) else None
+            # a state that is no text is no key of the table: it raised
+            self.said(NO_ACCOUNTS.get(state if isinstance(state, str) else None,
+                                      "cannot read the accounts now"))
+            return
+        if start is None:
+            row = self.selected_row() or {}
+            start = (self.fleet.usage.get("sessions") or {}).get(row.get("sessionId"))
+        self.push_screen(AccountsBox(entries, start),
+                         callback=lambda aid: aid and self.name_box(aid, back=True))
+
+    def name_box(self, aid, back=False):
+        """The name box for one account. `back`: it was chosen in the accounts
+        list, and that list comes back when the box closes - saved or not."""
+        entry = next((e for e in self.account_entries() if e["id"] == aid), None)
+        if entry is None:               # a scan took it off the line
+            self.said("that account is no longer on the usage line")
+            return
+        # the stored name as the file has it now, not as the last scan read
+        # it; and not the name the line shows, which can have the account's
+        # own after it
+        import ccwho as runner
+        stored = runner.read_labels().get(aid, "")
+        self.push_screen(NameBox(entry, stored, lambda text: self.save_name(aid, text)),
+                         callback=lambda done: self.named(aid, entry, done, back))
+
+    def save_name(self, aid, text):
+        """What the save says (ccwho.name_account): the accounts on the line
+        are the ones the list shows - the save reads no account itself."""
+        import ccwho as runner
+        snap = self.fleet.usage
+        rows = (snap.get("accounts") if isinstance(snap, dict) else None) or []
+        return runner.name_account(aid, text, rows)
+
+    def named(self, aid, entry, done, back):
+        """The name box closed: `done` is what the save said, None with no
+        save. A new name is on the usage line and the rows' tags now, not at
+        the next scan."""
+        result = (done or {}).get("result")
+        if result in ("set", "removed"):
+            labels = done.get("labels")
+            # an engine that changed under the list: never the reason it goes down
+            labels = labels if isinstance(labels, dict) else {}
+            self.names_here = (labels, self.started)
+            try:
+                self.fleet = self.fleet.with_usage(
+                    engine.ccwho_usage.with_labels(self.fleet.usage, labels))
+                names = self.fleet.usage.get("names") or {}
+            except Exception:           # a usage problem never costs the list
+                names = {}
+            # the account under the mouse has another place on the line now:
+            # none is lit until the mouse moves
+            self.usage_lit = None
+            self.rebuild()
+            self.paint_usage()
+            brand = entry["shown"].split(":", 1)[0]
+            # an account that a scan took off the line has no name there: the
+            # name that was saved
+            now = f"{brand}:{names.get(aid) or labels.get(aid) or entry['own']}"
+            self.said("named - status bars follow at the list's next scan"
+                      if not done.get("names_saved", True)
+                      else f"{entry['shown']} is {now} again" if result == "removed"
+                      else f"{entry['shown']} is now {now}")
+        if back:
+            self.action_accounts(start=aid)
 
     @on(events.Click)
     def clicked(self, event):
@@ -2708,7 +3080,28 @@ class CcwhoUi(App):
                 and not isinstance(self.screen, ModalScreen)):
             self.note = ""
             self.paint_header(self.groups())
+        if (isinstance(event, events.MouseDown) and not event.is_forwarded
+                and self.second_press(event)):
+            return
         await super().on_event(event)
+
+    def second_press(self, event):
+        """Whether this press of the mouse is the second of two at one place -
+        or the third - and the screen is not the one the first was made on: a
+        box that the first click opened, or what a box that it closed was
+        over. That press is not for what is there now, and is not passed on:
+        the second click on an account of the accounts list landed in the name
+        field - the stored name was not selected any more, and "home" was
+        saved as "resthome"; the second on a ✕ chose what was under it; the
+        second outside the accounts list went to a session (reviews 2 and 3 of
+        slice 2). What counts as two clicks of one is Textual's own time. With
+        no press passed on, Textual makes no click of its release."""
+        at, last = event.screen_offset, self.press_last
+        again = (last is not None and last[0] == at
+                 and event.time - last[1] <= self.CLICK_CHAIN_TIME_THRESHOLD)
+        first = last[2] if again else self.screen
+        self.press_last = (at, event.time, first)
+        return first is not self.screen
 
     def action_restart(self):
         # result, not message: run() returns the result, and `message` is only

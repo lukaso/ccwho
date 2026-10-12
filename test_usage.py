@@ -720,7 +720,7 @@ def acct_row(aid, five=None, week=None, kind="login", email="a@example.com",
 def snap(rows, sessions=None, state="ok", labels=None):
     names = usage.short_names(rows, labels or {})
     return {"state": state, "accounts": usage.ordered(rows, names), "names": names,
-            "sessions": sessions or {}, "now": NOW}
+            "sessions": sessions or {}, "now": NOW, "labels": dict(labels or {})}
 
 
 def text(lines):
@@ -996,6 +996,238 @@ class TestNameChange(unittest.TestCase):
     def test_an_account_that_left_the_line_can_still_be_named(self):
         self.assertEqual(self.change("work", aid="token:gone0000"),
                          ("set", {"token:gone0000": "work"}))
+
+
+class TestTheListsUsageLine(unittest.TestCase):
+    """What the live list draws and no other caller: on each piece of an
+    account's entry the account itself (a mark the mouse reads), and a hint
+    that an account can be named. `ccwho ls` and the status bar take the same
+    lines as pairs, with no hint (usage_lines)."""
+
+    LOGIN, T1, T2, CODEX = "login:u1", "token:7980b01e", "token:d0a0fe42", "codex:codex"
+
+    def rows(self):
+        return [acct_row(self.LOGIN, five=(42, FIVE_RESET), email="lukaso@gmail.com"),
+                acct_row(self.T1, five=(5, FIVE_RESET), kind="token"),
+                acct_row(self.T2, five=(9, FIVE_RESET), kind="token"),
+                dict(acct_row(self.CODEX, week=(1, WEEK_RESET), kind="codex"), brand="oai")]
+
+    def marked(self, width, labels=None, **kw):
+        return usage.usage_marked(snap(self.rows(), labels=labels), width, **kw)
+
+    def who(self, line):
+        """The text each account has on a line, and the text that is no account's."""
+        out = {}
+        for t, _, mark in line:
+            out[mark] = out.get(mark, "") + t
+        return out
+
+    def test_each_piece_of_an_entry_carries_its_account_on_one_line(self):
+        line, = self.marked(400)
+        by = self.who(line)
+        self.assertEqual(sorted(k for k in by if k), sorted([self.LOGIN, self.T1, self.T2,
+                                                             self.CODEX]))
+        self.assertTrue(by[self.T1].startswith("ant:7980 5h 5%"), by[self.T1])
+        self.assertTrue(by[self.CODEX].startswith("oai:codex 7d 1%"), by[self.CODEX])
+        # the lead and what stands between two entries are no account's
+        self.assertEqual(by[None], usage.LEAD + usage.SEP * 3)
+
+    def test_each_piece_of_an_entry_carries_its_account_when_they_stack(self):
+        lines = self.marked(60)
+        self.assertEqual(len(lines), 4)
+        for line, aid in zip(lines, (self.LOGIN, self.T1, self.T2, self.CODEX)):
+            by = self.who(line)
+            self.assertEqual(sorted(k for k in by if k), [aid])
+            self.assertIn(by[None], (usage.LEAD, usage.INDENT))
+
+    def test_the_pairs_of_the_other_callers_are_the_same_lines(self):
+        # one builder: what the mouse reads is what was drawn
+        for width in (400, 120, 60, 30, 12):
+            for selected in (None, self.T1):
+                pairs = usage.usage_lines(snap(self.rows()), width, selected=selected)
+                marked = self.marked(width, selected=selected)
+                self.assertEqual([[(t, st) for t, st, _ in line] for line in marked], pairs,
+                                 (width, selected))
+
+    def test_a_line_that_is_cut_keeps_its_marks(self):
+        line = self.marked(12)[1]           # too narrow for the shortest form of the entry
+        self.assertEqual(usage.span_cells(line), 12)
+        self.assertEqual(line[-1], ("…", "dim", None))
+        self.assertEqual({m for t, _, m in line[1:-1]}, {self.T1})
+
+    def test_a_state_with_no_account_has_no_mark(self):
+        for state in ("waiting", "not_set_up"):
+            lines = usage.usage_marked(snap([], state=state), 80, hint=True)
+            self.assertEqual({m for line in lines for _, _, m in line}, {None})
+        self.assertEqual(usage.usage_marked(snap([], state="off"), 80, hint=True), [])
+        self.assertEqual(usage.usage_marked(None, 80, hint=True),
+                         [[(usage.LEAD + "unknown", "dim", None)]])
+
+    # ---- the hint
+
+    HINT = [(" · ", "dim", None), ("a to name", "dim", "hint")]
+
+    def test_the_hint_stands_after_the_first_token_account_with_no_name(self):
+        line, = self.marked(400, hint=True)
+        at = line.index(self.HINT[1])
+        self.assertEqual(line[at - 1], self.HINT[0])
+        self.assertEqual(line[at - 2][2], self.T1)          # the entry before it
+        self.assertEqual(line[at + 1], (usage.SEP, "dim", None))
+        self.assertEqual(sum(1 for s in line if s[2] == "hint"), 1)
+        stacked = self.marked(60, hint=True)
+        self.assertEqual(stacked[1][-2:], self.HINT)
+        self.assertNotIn(self.HINT[1], stacked[0] + stacked[2] + stacked[3])
+
+    def test_the_hint_goes_to_the_next_token_account_when_the_first_has_a_name(self):
+        stacked = self.marked(60, labels={self.T1: "work"}, hint=True)
+        # named accounts are in the order of their names: d0a0, then work
+        self.assertEqual([self.who(l).get(self.T2) is not None for l in stacked],
+                         [False, True, False, False])
+        self.assertEqual(stacked[1][-2:], self.HINT)
+
+    def test_no_hint_when_every_token_account_has_a_name(self):
+        named = {self.T1: "work", self.T2: "home"}
+        for width in (400, 60):
+            marks = {m for line in self.marked(width, labels=named, hint=True) for _, _, m in line}
+            self.assertNotIn("hint", marks, width)
+        # the login and Codex's limit have a name of their own: no hint for them
+        login_only = snap([self.rows()[0], self.rows()[3]])
+        self.assertNotIn("hint", {m for line in usage.usage_marked(login_only, 400, hint=True)
+                                  for _, _, m in line})
+
+    def test_no_hint_unless_the_caller_asks(self):
+        for width in (400, 60):
+            self.assertNotIn("hint", {m for line in self.marked(width) for _, _, m in line})
+            self.assertNotIn("a to name", "".join(text(usage.usage_lines(snap(self.rows()), width))))
+
+    def test_no_hint_from_a_snapshot_that_does_not_say_which_names_are_stored(self):
+        old = snap(self.rows())
+        del old["labels"]               # an engine from before this change
+        self.assertNotIn("hint", {m for line in usage.usage_marked(old, 400, hint=True)
+                                  for _, _, m in line})
+
+    def test_short_of_room_the_hint_is_the_first_thing_left_out(self):
+        full, = self.marked(400)
+        fits = usage.span_cells(full)
+        with_hint, = self.marked(400, hint=True)
+        self.assertEqual(usage.span_cells(with_hint), fits + usage.span_cells(self.HINT))
+        # room for the line, not for the hint: the same one line, no hint
+        self.assertEqual(self.marked(fits, hint=True), self.marked(fits))
+        self.assertEqual(self.marked(fits + usage.span_cells(self.HINT) - 1, hint=True),
+                         self.marked(fits + usage.span_cells(self.HINT) - 1))
+        self.assertEqual(len(self.marked(fits + usage.span_cells(self.HINT), hint=True)), 1)
+        self.assertIn(self.HINT[1], self.marked(fits + usage.span_cells(self.HINT), hint=True)[0])
+        # stacked: the entry keeps its reset time and loses the hint first
+        entry = usage.span_cells(self.marked(60)[1])
+        self.assertEqual(self.marked(entry + 1, hint=True)[1], self.marked(entry + 1)[1])
+        self.assertEqual(self.marked(entry + usage.span_cells(self.HINT), hint=True)[1][-2:],
+                         self.HINT)
+
+
+class TestStoredNamesInTheSnapshot(unittest.TestCase):
+    """The list must know which accounts have a stored name (the hint), and
+    show a new name before the next scan (with_labels)."""
+
+    T1, T2 = "token:7980b01e4f3a2c1d", "token:d0a0fe42aa11bb22"
+
+    def test_the_snapshot_holds_the_stored_names_of_its_accounts(self):
+        readings = [reading(self.T1, five=(5, FIVE_RESET), kind="token", sid="s1"),
+                    reading(self.T2, five=(9, FIVE_RESET), kind="token", sid="s2")]
+        stored = {self.T1: "work", "token:gone0000": "old"}
+        got = usage.snapshot(readings, NOW, ["s1"], {}, stored)
+        self.assertEqual(got["labels"], {self.T1: "work"})
+        self.assertEqual(usage.snapshot(readings, NOW, ["s1"], {})["labels"], {})
+
+    def test_new_stored_names_give_the_names_and_the_order_again(self):
+        rows = [acct_row(self.T1, kind="token"), acct_row(self.T2, kind="token")]
+        before = snap(rows, sessions={"s1": self.T1})
+        after = usage.with_labels(before, {self.T1: "work", "token:gone0000": "old"})
+        self.assertEqual(after["names"], {self.T1: "work", self.T2: "d0a0"})
+        self.assertEqual([r["id"] for r in after["accounts"]], [self.T2, self.T1])
+        self.assertEqual(after["labels"], {self.T1: "work"})
+        self.assertEqual(after["sessions"], {"s1": self.T1})
+        # the snapshot given is not changed: a scan may still hold it
+        self.assertEqual(before["names"], {self.T1: "7980", self.T2: "d0a0"})
+        self.assertEqual([r["id"] for r in before["accounts"]], [self.T1, self.T2])
+        self.assertEqual(usage.with_labels(after, {})["names"], before["names"])
+
+    def test_a_snapshot_with_no_account_is_given_back_as_it_is(self):
+        for odd in (None, {"state": "unknown"}, {"state": "waiting", "accounts": []}):
+            self.assertIs(usage.with_labels(odd, {self.T1: "work"}), odd)
+
+
+class TestWhoAnAccountIs(unittest.TestCase):
+    """The accounts list: who each account is, and who spends it now."""
+
+    LOGIN, T1, T2, CODEX = "login:u1", "token:7980b01e4f3a2c1d", "token:d0a0fe42aa11bb22", \
+        "codex:codex"
+
+    def snap(self, labels=None, sessions=None):
+        rows = [acct_row(self.LOGIN, email="lukaso@gmail.com", age=9),
+                acct_row(self.T1, kind="token", age=3600),
+                acct_row(self.T2, kind="token", age=3 * 86400),
+                dict(acct_row(self.CODEX, kind="codex", age=7 * 3600), brand="oai")]
+        return snap(rows, sessions=sessions or {}, labels=labels)
+
+    def entries(self, handles=None, width=64, **kw):
+        return usage.account_entries(self.snap(**kw), handles or {}, width)
+
+    def test_one_entry_for_each_account_in_the_order_of_the_line(self):
+        got = self.entries(labels={self.T1: "work"})
+        self.assertEqual([e["id"] for e in got], [self.LOGIN, self.T2, self.T1, self.CODEX])
+        self.assertEqual([e["shown"] for e in got],
+                         ["ant:lukaso", "ant:d0a0", "ant:work", "oai:codex"])
+
+    def test_who_it_is_is_its_kind_and_its_whole_hash_email_or_limit(self):
+        # whole: the 16 hex of a token (review of slice 2: 8 of them were
+        # shown, and the words said "whole")
+        self.assertEqual([e["who"] for e in self.entries()],
+                         ["login lukaso@gmail.com", "token 7980b01e4f3a2c1d",
+                          "token d0a0fe42aa11bb22", "Codex limit codex"])
+
+    def test_the_stored_name_and_the_accounts_own_name(self):
+        got = {e["id"]: e for e in self.entries(labels={self.T1: "work"})}
+        self.assertEqual((got[self.T1]["stored"], got[self.T1]["own"]), ("work", "7980"))
+        self.assertEqual((got[self.T2]["stored"], got[self.T2]["own"]), ("", "d0a0"))
+        self.assertEqual(got[self.LOGIN]["own"], "lukaso")
+
+    def test_who_spends_it_now_in_the_order_of_the_list(self):
+        handles = {"s3": "Release queue", "s1": "liveapp issue 343", "s2": "Blabberate", "t1": "A thread"}
+        got = {e["id"]: e for e in self.entries(
+            handles, sessions={"s1": self.T1, "s2": self.T2, "s3": self.T1, "t1": self.CODEX,
+                               "gone": self.T1})}
+        self.assertEqual(got[self.T1]["now"], "now: Release queue · liveapp issue 343")
+        self.assertEqual(got[self.T2]["now"], "now: Blabberate")
+        self.assertEqual(got[self.CODEX]["now"], "now: A thread")
+
+    def test_no_open_session_says_so_and_how_old_the_reading_is(self):
+        got = {e["id"]: e for e in self.entries()}
+        self.assertEqual(got[self.T2]["now"], "no open session · last read 3d ago")
+        self.assertEqual(got[self.LOGIN]["now"], "no open session · last read 9s ago")
+        self.assertEqual(got[self.CODEX]["now"], "no open thread · last read 7h ago")
+
+    def test_short_of_room_titles_are_left_out_and_counted(self):
+        handles = {f"s{i}": f"Session number {i}" for i in range(5)}
+        sessions = {sid: self.T1 for sid in handles}
+        now = {e["id"]: e for e in self.entries(handles, sessions=sessions)}[self.T1]["now"]
+        self.assertEqual(now, "now: Session number 0 · Session number 1 · Session number 2 +2")
+        self.assertLessEqual(usage.ccwho_text.cells(now), 64)
+        # one cell less than it needs: one title fewer, one more counted
+        narrow = {e["id"]: e for e in self.entries(handles, width=usage.ccwho_text.cells(now) - 1,
+                                                   sessions=sessions)}[self.T1]["now"]
+        self.assertEqual(narrow, "now: Session number 0 · Session number 1 +3")
+
+    def test_a_title_longer_than_the_room_is_cut_and_the_count_stays(self):
+        handles = {"s1": "x" * 100, "s2": "second"}
+        got = {e["id"]: e for e in self.entries(handles, width=30,
+                                                sessions={"s1": self.T1, "s2": self.T1})}
+        now = got[self.T1]["now"]
+        self.assertEqual(usage.ccwho_text.cells(now), 30)
+        self.assertTrue(now.startswith("now: xxxx") and now.endswith("… +1"), now)
+
+    def test_no_entry_from_a_snapshot_with_no_account(self):
+        for odd in (None, {"state": "unknown"}, snap([], state="waiting")):
+            self.assertEqual(usage.account_entries(odd, {}, 64), [])
 
 
 class TestOrder(unittest.TestCase):

@@ -169,6 +169,7 @@ ccwho                         # on a terminal
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session; a word finds its forms too, `wake` finds woke, woken and waking) - and lists the sessions only that finds under MORE RESULTS, last: the closest first, each row showing the message that matched |
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
+| `a` | every account on the usage line, to name one: who each is - its whole hash, email or Codex limit - and which open sessions spend it now. ↑ ↓ move; Enter, or a click, opens the name box for it. There Enter names the account, an empty name removes its name, Esc closes; then you are back in the accounts, on the one you named. A click on an account in the usage line opens its name box at once |
 | `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. In the box: `l` the stuck items, `p` its processes, `s` stop. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
 | `z` | park the session: you keep it, but not now. A box asks why (Enter parks, Esc parks nothing; the note may stay empty), and the row moves to a quiet PARKED group with your note as its second line. A click on `[park]` on a row with a question for you (▲) opens the same box; a finished turn (△) does not show it, as Enter or a click on it moves it to STOPPED; `z` still parks it. The highlight stays in the group the row left, on the next row (the one above when it was the last), so Enter goes on to the next session that needs you; with no other row there, or when the row stays where it is (under MORE RESULTS in a search), it stays on the parked row. The park ends when the session writes a new turn, when you go to it (Enter or a click that brings its window forward or gives it one, or Enter on an ended one, which reopens it), or with `z` on the parked row - then the row is as if it was never parked. Notes are kept in `parked.json` in `~/.ccwho` (or `$CCWHO_DIR`), so they outlive a restart, which text left unsent in a prompt box does not. Not on a busy row (its next turn would end the park), a program's, an ended one or a Codex thread |
@@ -274,7 +275,9 @@ have all expired ends with the age of its newest reading. With two or more Claud
 the line, each row ends with the account it spends, in the line's own words (`· ant:work`; `?`:
 no reading yet), and the entry of the selected row's account is bright. The same line
 and tags are in the live list and `ccwho ls`, and each session's own status bar
-shows its entry.
+shows its entry. In the live list, while a token account has no name, the line says
+`· a to name` after the first one, where it has the room: `a`, or a click on those words,
+opens the accounts to name one.
 
 Where it comes from: Claude Code hands a statusLine command the rate limits of the
 account the session spends. `ccwho setup` offers to add `ccwho statusline` in each
@@ -288,8 +291,9 @@ reply - including sessions that were already running when setup added the line
 two weeks; `ccwho usage name <id> <label>` gives one a name. A name is at most 16 characters
 wide and holds no `:`. A name that another account on the line has is refused, and so is
 another account's hash or email name; `ccwho usage name <id> ""` removes it. `ccwho ls`
-says the name at once, the live list at its next scan, and a session's status bar after
-that session's next reply, when Claude Code draws the bar again. A
+says the name at once, the live list at its next scan (at once when you named it there,
+with `a`), and a session's status bar after that session's next reply, when Claude Code
+draws the bar again. A
 `~/.ccwho/accounts.json` that is not valid JSON is refused, not written over.
 `ccwho setup --no-usage` turns it off again: the line goes, Codex's entry with it, once no
 running session spends an account on it.

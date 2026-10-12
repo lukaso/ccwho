@@ -911,8 +911,75 @@ def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
     if state == "off":
         shown = []          # nothing to tag, log or name while usage is off
     names = short_names(shown, labels)
+    # `labels`: the stored names of the accounts shown - the list says that an
+    # account can be named while a token account has none (usage_marked)
     return {"state": state, "accounts": ordered(shown, names), "names": names,
-            "sessions": sessions, "now": now}
+            "sessions": sessions, "now": now,
+            "labels": {r["id"]: labels[r["id"]] for r in shown
+                       if isinstance(labels.get(r["id"]), str) and labels[r["id"]]}}
+
+
+def with_labels(snap, labels):
+    """The snapshot as it is with these stored names: its names and its order
+    again. The list shows a name it saved before the next scan, and keeps it
+    over a scan that read the names before the save. A new snapshot: the one
+    given may still be a scan's. A snapshot with no account is given back."""
+    if not isinstance(snap, dict) or snap.get("state") != "ok":
+        return snap
+    rows = list(snap.get("accounts") or [])
+    known = {r["id"]: labels[r["id"]] for r in rows
+             if isinstance(labels.get(r["id"]), str) and labels[r["id"]]}
+    names = short_names(rows, known)
+    return dict(snap, names=names, accounts=ordered(rows, names), labels=known)
+
+
+def _spenders(titles, width):
+    """"now: A · B +2" in `width` cells: the sessions that spend an account,
+    as many titles as fit whole, the rest counted. The first is cut when even
+    it does not fit: the count stays."""
+    lead, shown, rest = "now: ", [], list(titles)
+    while rest:
+        more = len(rest) - 1
+        text = lead + " · ".join(shown + rest[:1]) + (f" +{more}" if more else "")
+        if ccwho_text.cells(text) > width:
+            break
+        shown.append(rest.pop(0))
+    if shown:
+        return lead + " · ".join(shown) + (f" +{len(rest)}" if rest else "")
+    tail = f" +{len(rest) - 1}" if len(rest) > 1 else ""
+    room = width - ccwho_text.cells(lead) - ccwho_text.cells(tail)
+    return lead + ccwho_text.cut(rest[0], max(1, room)) + tail
+
+
+def account_entries(snap, handles, width):
+    """The accounts list of the live list: one entry for each account on the
+    line, in the line's order. `shown`: its name as the line says it; `who`:
+    its kind and its whole hash, email or limit - what tells two apart; `now`:
+    the sessions that spend it now, by the titles the list shows (`handles`:
+    session id -> title, in the list's order), or that none does and how old
+    its reading is; `stored`: its stored name, "" for none; `own`: the name it
+    shows with no stored name."""
+    if not isinstance(snap, dict) or snap.get("state") != "ok":
+        return []
+    rows = snap.get("accounts") or []
+    names, labels = snap.get("names") or {}, snap.get("labels") or {}
+    sessions, plain, out = snap.get("sessions") or {}, short_names(rows, {}), []
+    for r in rows:
+        aid, kind = r["id"], r.get("kind")
+        body = aid.split(":", 1)[-1]
+        who = (f"token {body}" if kind == "token" else
+               f"login {r.get('email') or body}" if kind == "login" else
+               f"Codex limit {body}" if kind == "codex" else aid)
+        titles = [h for sid, h in handles.items() if sessions.get(sid) == aid]
+        if titles:
+            now = _spenders(titles, width)
+        else:
+            none = "no open thread" if kind == "codex" else "no open session"
+            now = f"{none} · last read {_age(r.get('age') or 0)} ago"
+        out.append({"id": aid, "shown": f"{r.get('brand', 'ant')}:{names.get(aid, aid)}",
+                    "who": who, "now": now, "stored": labels.get(aid, ""),
+                    "own": plain.get(aid, aid)})
+    return out
 
 
 def _reset_label(epoch, now, with_time=True):
@@ -973,58 +1040,87 @@ def entry_spans(row, name, now, selected=False, brand=True, resets=True, age=Tru
 
 
 def span_cells(spans):
-    return sum(ccwho_text.cells(t) for t, _ in spans)
+    return sum(ccwho_text.cells(span[0]) for span in spans)
 
 
 def cut_spans(spans, width):
-    """At most `width` cells, `…` marking a cut; styles never split."""
+    """At most `width` cells, `…` marking a cut; styles never split. A span is
+    (text, style), or (text, style, mark): what follows the text is kept."""
     if span_cells(spans) <= width:
         return list(spans)
     out, room = [], max(0, width - 1)
-    for t, st in spans:
+    for span in spans:
         if room <= 0:
             break
+        t = span[0]
         piece = t if ccwho_text.cells(t) <= room else ccwho_text.cut(t, room + 1)[:-1]
         if piece:
-            out.append((piece, st))
+            out.append((piece,) + tuple(span[1:]))
             room -= ccwho_text.cells(piece)
         if piece != t:
             break
-    return out + [("…", "dim")] if width > 0 else []
+    return out + [("…", "dim") + (None,) * (len(spans[0]) - 2)] if width > 0 else []
 
 
-def usage_lines(snap, width, selected=None):
-    """The usage line(s) under the header, as span lists; [] for none."""
+# after the entry of the first token account with no stored name: the form of
+# the bottom line's " · p to see". The key opens the accounts list, and so does
+# a click on the words (their mark)
+HINT = [(" · ", "dim", None), ("a to name", "dim", "hint")]
+
+
+def usage_marked(snap, width, selected=None, hint=False):
+    """The usage line(s) under the header, as lists of (text, style, mark);
+    [] for none. The mark of each piece of an account's entry is the account's
+    id: the live list reads it from the mouse, so a click or a hover never
+    works out a place on the line a second time (eng review 2026-10-12, R1).
+    `hint`: the live list's - while a token account has no stored name, HINT
+    after the first such account's entry; left out first when room is short."""
     if not isinstance(snap, dict):
-        return [[(LEAD + EMPTY["unknown"], "dim")]]
+        return [[(LEAD + EMPTY["unknown"], "dim", None)]]
     state = snap.get("state")
     if state == "off":
         return []
     if state != "ok":
-        return [cut_spans([(LEAD + EMPTY.get(state, EMPTY["unknown"]), "dim")], width)]
+        return [cut_spans([(LEAD + EMPTY.get(state, EMPTY["unknown"]), "dim", None)], width)]
     now, names = snap.get("now", time.time()), snap.get("names", {})
     rows = snap.get("accounts", [])
+    # a snapshot that does not say which names are stored gives no hint
+    labels = snap.get("labels") if hint else None
+    unnamed = next((r["id"] for r in rows if r.get("kind") == "token"
+                    and not labels.get(r["id"])), None) if isinstance(labels, dict) else None
+
+    def entry(r, **opts):
+        return [(t, st, r["id"]) for t, st in entry_spans(
+            r, names.get(r["id"], r["id"]), now, selected=r["id"] == selected, **opts)]
     # a reset days away says its time; short of room, its day alone - a used-up
     # window's last - before the line stacks, and before an entry drops its resets
     for opts in (dict(), dict(reset_time=USED_UP), dict(reset_time=False)):
-        one = [(LEAD, "dim")]
-        for i, r in enumerate(rows):
-            one += ([(SEP, "dim")] if i else []) + entry_spans(
-                r, names.get(r["id"], r["id"]), now, selected=r["id"] == selected, **opts)
-        if span_cells(one) <= width:
-            return [one]
+        for hinted in ((unnamed, None) if unnamed else (None,)):
+            one = [(LEAD, "dim", None)]
+            for i, r in enumerate(rows):
+                one += ([(SEP, "dim", None)] if i else []) + entry(r, **opts)
+                one += HINT if r["id"] == hinted else []
+            if span_cells(one) <= width:
+                return [one]
     lines = []
     for i, r in enumerate(rows):
-        lead = [(LEAD if i == 0 else INDENT, "dim")]
-        name, sel = names.get(r["id"], r["id"]), r["id"] == selected
+        lead = [(LEAD if i == 0 else INDENT, "dim", None)]
         tries = [dict(), dict(reset_time=USED_UP), dict(reset_time=False), dict(resets=False),
                  dict(resets=False, age=False), dict(resets=False, age=False, brand=False)]
         for opts in tries:
-            line = lead + entry_spans(r, name, now, selected=sel, **opts)
+            line = lead + entry(r, **opts)
             if span_cells(line) <= width:
                 break
+        if r["id"] == unnamed and span_cells(lead + entry(r) + HINT) <= width:
+            line = lead + entry(r) + HINT
         lines.append(cut_spans(line, width))
     return lines
+
+
+def usage_lines(snap, width, selected=None):
+    """The usage line(s) as lists of (text, style): what `ccwho ls` and a
+    status bar draw - usage_marked's lines, with no mark and no hint."""
+    return [[(t, st) for t, st, _ in line] for line in usage_marked(snap, width, selected)]
 
 
 def plain(lines):

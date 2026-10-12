@@ -4754,6 +4754,1161 @@ class TestAMalformedSnapshotNeverCrashesTheList(UiTest):
             self.assertIn("usage  unknown", str(app.query_one("#usage").render()))
 
 
+class NamesTest(UiTest):
+    """Naming an account from the list (owner, 2026-10-11: "the fingerprint is
+    not easy to remember"): the usage line's hint and clicks, `a` and the
+    accounts list, the name box. LIVE spends the first token, BUSY the login."""
+
+    T1, T2, LOGIN = "token:7980b01e4f3a2c1d", "token:d0a0fe42aa11bb22", "login:a"
+
+    def snap(self, labels=None, sessions=None, email="lukaso@gmail.com"):
+        import ccwho_usage as usage
+
+        def acct(aid, kind, email="", pct=5):
+            return {"id": aid, "kind": kind, "email": email, "brand": "ant", "label": "",
+                    "sessions": 1, "age": 5, "seven_day": None,
+                    "five_hour": {"state": "ok", "pct": pct, "resets_at": NOW + 7200, "age": 5}}
+        rows = [acct(self.LOGIN, "login", email, 42), acct(self.T1, "token"),
+                acct(self.T2, "token", pct=9)]
+        labels = dict(labels or {})
+        names = usage.short_names(rows, labels)
+        if sessions is None:
+            sessions = {LIVE["sessionId"]: self.T1, BUSY["sessionId"]: self.LOGIN}
+        return {"state": "ok", "accounts": usage.ordered(rows, names), "names": names,
+                "sessions": sessions, "now": NOW, "labels": labels}
+
+    def names_app(self, snap=None, rows=None):
+        fleet = ui.Fleet(rows or [LIVE, BUSY], True, "12:00:00",
+                         usage=self.snap() if snap is None else snap)
+        return self.app(collector=FakeCollector(fleet=fleet))
+
+    def set(self, aid, name, labels=None, **more):
+        """What ccwho.name_account says after it stored `name` for `aid`."""
+        labels = dict(labels or {}, **{aid: name})
+        return dict({"result": "set", "why": "", "aid": aid, "labels": labels, "names": {},
+                     "names_saved": True}, **more)
+
+    def runner_says(self, *results, stored=None):
+        """ccwho.name_account and the stored names it reads, replaced: what
+        each save says, in order - the last one again after that. Returns the
+        calls: (account, name typed, the accounts it was given)."""
+        import ccwho as runner
+        import testkit
+        calls, left = [], list(results)
+
+        def name_account(aid, label, rows):
+            calls.append((aid, label, [r["id"] for r in rows]))
+            return left.pop(0) if len(left) > 1 else left[0]
+        testkit.patch(self, runner, "name_account", name_account)
+        testkit.patch(self, runner, "read_labels", lambda: dict(stored or {}))
+        return calls
+
+    def usage_text(self, app):
+        box = app.query_one("#usage")
+        return "\n".join(box.render_line(y).text.rstrip() for y in range(box.size.height))
+
+    def place(self, app, text):
+        """Where `text` starts on the usage line: the offset a click takes."""
+        box = app.query_one("#usage")
+        left = box.content_region.x - box.region.x      # the box's padding
+        for y in range(box.size.height):
+            line = box.render_line(y).text
+            if text in line:
+                return line.index(text) + left, y
+        self.fail(f"{text!r} is not on the usage line:\n{self.usage_text(app)}")
+
+    def lit(self, app):
+        """The text of the usage line that is drawn as under the mouse."""
+        box = app.query_one("#usage")
+        return "".join(seg.text for y in range(box.size.height) for seg in box.render_line(y)
+                       if seg.style and seg.style.reverse)
+
+    def lines_of(self, box):
+        """The accounts of the accounts list: (id, its lines)."""
+        opts = box.query_one("#accounts")
+        return [(opts.get_option_at_index(i).id,
+                 opts.get_option_at_index(i).prompt.plain.split("\n"))
+                for i in range(opts.option_count)]
+
+    def on_account(self, box):
+        opts = box.query_one("#accounts")
+        return opts.get_option_at_index(opts.highlighted).id
+
+    def words(self, screen):
+        return "\n".join(str(w.content) for w in screen.query(ui.Static))
+
+    def stack(self, app):
+        return [type(s).__name__ for s in app.screen_stack]
+
+    def enter_twice(self, app):
+        """Enter two times with no wait between: the second is on its way
+        before the first is handled (a held key, a busy machine)."""
+        for _ in range(2):
+            app.post_message(ui.events.Key("enter", "\r"))
+
+    def spot(self, app, text):
+        """Where `text` of the usage line is on the screen."""
+        box = app.query_one("#usage")
+        x, y = self.place(app, text)
+        return box.region.x + x + 1, box.region.y + y
+
+    def click_at(self, app, x, y):
+        """A click as a terminal sends it: Textual makes the click of it, and
+        counts it as the second of two or not."""
+        for kind in (ui.events.MouseDown, ui.events.MouseUp):
+            app.post_message(kind(None, x, y, 0, 0, 1, False, False, False,
+                                  screen_x=x, screen_y=y))
+
+    def click_twice(self, app, text):
+        """Two clicks on `text` of the usage line with no wait between."""
+        at = self.spot(app, text)
+        self.click_at(app, *at)
+        self.click_at(app, *at)
+
+    async def until(self, pilot, done, wait=3.0):
+        for _ in range(int(wait / 0.05)):
+            if done():
+                return True
+            await pilot.pause(0.05)
+        return done()
+
+    async def settled(self, pilot):
+        await pilot.pause(0.3)
+        await pilot.pause()
+
+    async def open_box(self, pilot, app, *keys):
+        """`a`, then the keys: the screen after them."""
+        await pilot.press("a", *keys)
+        await pilot.pause()
+        await pilot.pause()
+        return app.screen
+
+
+class TestTheUsageLineSaysThatAnAccountCanBeNamed(NamesTest):
+    async def test_the_hint_stands_after_the_first_token_account_with_no_name(self):
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            self.assertIn("ant:7980 5h 5%", self.usage_text(app))
+            self.assertRegex(self.usage_text(app), r"ant:7980 [^│]* · a to name  │  ant:d0a0")
+
+    async def test_no_hint_when_every_token_account_has_a_name(self):
+        app = self.names_app(self.snap({self.T1: "work", self.T2: "home"}))
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            self.assertIn("ant:work", self.usage_text(app))                     # control
+            self.assertNotIn("a to name", self.usage_text(app))
+
+    async def test_a_click_on_the_hint_opens_the_accounts_list(self):
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await pilot.click("#usage", offset=self.place(app, "a to name"))
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ui.AccountsBox)
+
+    async def test_a_click_on_an_account_opens_its_name_box(self):
+        self.runner_says(self.set(self.T2, "x"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            # on its name, and on its numbers: the whole entry is the target
+            for text, more in (("ant:d0a0", 0), ("ant:d0a0", 12)):
+                x, y = self.place(app, text)
+                await pilot.click("#usage", offset=(x + more, y))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, ui.NameBox, (text, more))
+                self.assertIn("name the account ant:d0a0", self.words(app.screen))
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, ui.ModalScreen)
+
+    async def test_a_click_beside_the_accounts_does_nothing(self):
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            lead, sep = self.place(app, "usage"), self.place(app, "│")
+            for x, y in (lead, sep):
+                await pilot.click("#usage", offset=(x, y))
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, ui.ModalScreen, (x, y))
+
+    async def test_a_click_on_a_row_still_goes_to_the_session(self):      # control
+        adapter = FakeAdapter()
+        fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage=self.snap())
+        app = self.app(collector=FakeCollector(fleet=fleet), adapter=adapter)
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            row = next(w for w in app.query(ui.Row) if w.row["sessionId"] == BUSY["sessionId"])
+            await pilot.click(row, offset=(20, 0))
+            await pilot.pause(0.2)
+            self.assertEqual(adapter.asked, [BUSY["sessionId"]])
+            self.assertNotIsInstance(app.screen, ui.ModalScreen)
+
+    async def test_two_clicks_with_no_wait_open_one_box(self):
+        # review of slice 2: each click opened a box, one on the other
+        self.runner_says(self.set(self.T2, "x"))
+        for text, stack in (("ant:d0a0", ["Screen", "NameBox"]),
+                            ("a to name", ["Screen", "AccountsBox"])):
+            with self.subTest(text=text):
+                app = self.names_app()
+                async with app.run_test(size=(200, 30)) as pilot:
+                    await pilot.pause()
+                    self.click_twice(app, text)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), stack)
+
+    async def test_after_a_name_from_a_click_no_account_is_lit(self):
+        # the mouse did not move, and the account it was on has another
+        # place on the line now
+        self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            at = self.place(app, "ant:7980")
+            await pilot.hover("#usage", offset=at)
+            await pilot.pause()
+            self.assertTrue(self.lit(app).startswith("ant:7980 "), self.lit(app))   # control
+            await pilot.click("#usage", offset=at)
+            await pilot.pause()
+            await pilot.press(*"work", "enter")
+            await self.settled(pilot)
+            self.assertIn("ant:work", self.usage_text(app))                     # control
+            self.assertEqual(self.lit(app), "")
+
+    async def test_a_box_that_closes_with_no_save_leaves_no_light_behind(self):
+        # reviews 2 and 3 of slice 2: with a box open Textual does not tell
+        # the line that the mouse left it - the account, or the hint, stayed
+        # lit with the mouse in the box, and after that on the rows
+        self.runner_says(self.set(self.T2, "x"))
+        for text, box, x in (("ant:d0a0", "#namebox", "#nameclose"),
+                             ("a to name", "#accountsbox", "#accountsclose")):
+            for close in ("escape", x):
+                with self.subTest(text=text, close=close):
+                    app = self.names_app()
+                    async with app.run_test(size=(200, 30)) as pilot:
+                        await pilot.pause()
+                        at = self.place(app, text)
+                        at = (at[0] + 1, at[1])
+                        await pilot.hover("#usage", offset=at)
+                        await pilot.pause()
+                        self.assertTrue(self.lit(app).startswith(text), self.lit(app))  # control
+                        await pilot.click("#usage", offset=at)
+                        await pilot.pause()
+                        self.assertIsInstance(app.screen, ui.ModalScreen)           # control
+                        await pilot.hover(box)      # the mouse is in the box now:
+                        await pilot.pause()         # nothing on the line is lit
+                        self.assertEqual(self.lit(app), "")
+                        if close == "escape":
+                            await pilot.press("escape")
+                        else:
+                            await pilot.click(close)
+                        await pilot.pause()
+                        self.assertEqual(self.stack(app), ["Screen"])
+                        self.assertEqual(self.lit(app), "")     # with no move after it
+                        await pilot.hover("#list")
+                        await pilot.pause()
+                        self.assertEqual(self.lit(app), "")
+
+    async def test_with_no_move_of_the_mouse_the_light_stays_until_it_moves(self):
+        # the mouse is on the account as before: Esc changes nothing of that
+        self.runner_says(self.set(self.T2, "x"))
+        for text in ("ant:d0a0", "a to name"):
+            with self.subTest(text=text):
+                app = self.names_app()
+                async with app.run_test(size=(200, 30)) as pilot:
+                    await pilot.pause()
+                    at = self.place(app, text)
+                    at = (at[0] + 1, at[1])
+                    await pilot.hover("#usage", offset=at)
+                    await pilot.click("#usage", offset=at)
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, ui.ModalScreen)               # control
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    self.assertTrue(self.lit(app).startswith(text), self.lit(app))
+                    await pilot.hover("#list")
+                    await pilot.pause()
+                    self.assertEqual(self.lit(app), "")
+
+    async def test_the_light_goes_when_the_mouse_leaves_the_line_for_a_scrollbar(self):
+        # a scrollbar keeps the moves of the mouse to itself: what tells the
+        # list is that the mouse left the line (review 3 of slice 2)
+        rows = [row(f"{i:04d}aaaa-0000-4000-8000-{i:012d}", "busy", title=f"Session {i}")
+                for i in range(30)]
+        app = self.names_app(self.snap(sessions={}), rows=rows)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            lst = app.query_one("#list")
+            self.assertTrue(lst.show_vertical_scrollbar)                        # control
+            await pilot.hover("#usage", offset=self.place(app, "ant:d0a0"))
+            await pilot.pause()
+            self.assertTrue(self.lit(app).startswith("ant:d0a0"), self.lit(app))    # control
+            bar = lst.vertical_scrollbar.region
+            await pilot.hover(offset=(bar.x, bar.y + 2))
+            await pilot.pause()
+            self.assertEqual(self.lit(app), "")
+
+    async def test_the_account_under_the_mouse_lights_up_alone(self):
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.lit(app), "")
+            x, y = self.place(app, "ant:d0a0")
+            await pilot.hover("#usage", offset=(x + 1, y))
+            await pilot.pause()
+            self.assertTrue(self.lit(app).startswith("ant:d0a0 5h 9%"), self.lit(app))
+            self.assertNotIn("ant:7980", self.lit(app))
+            self.assertNotIn("│", self.lit(app))
+            # a move inside the same account paints nothing again
+            box, paints = app.query_one("#usage"), []
+            real = box.update
+            box.update = lambda *a, **k: paints.append(1) or real(*a, **k)
+            await pilot.hover("#usage", offset=(x + 6, y))
+            await pilot.pause()
+            self.assertEqual(paints, [])
+            await pilot.hover("#usage", offset=self.place(app, "ant:7980"))    # control
+            await pilot.pause()
+            self.assertEqual(paints, [1])
+            self.assertTrue(self.lit(app).startswith("ant:7980 "), self.lit(app))
+            box.update = real
+            await pilot.hover("#header")
+            await pilot.pause()
+            self.assertEqual(self.lit(app), "")
+
+    async def test_the_hint_lights_up_under_the_mouse_too(self):
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await pilot.hover("#usage", offset=self.place(app, "a to name"))
+            await pilot.pause()
+            self.assertEqual(self.lit(app), "a to name")
+
+
+class TestAOpensTheAccountsList(NamesTest):
+    async def test_the_footer_names_a_after_p(self):
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            shown = [(b.key, b.description) for b in app.BINDINGS if b.show]
+            self.assertEqual(shown[shown.index(("p", "processes")) + 1], ("a", "accounts"))
+            active = app.active_bindings.get("a")
+            self.assertTrue(active and active.binding.show)
+
+    async def test_a_typed_in_the_search_is_a_letter(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("slash", "a")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.ModalScreen)
+            self.assertEqual(app.query_one("#search", ui.Input).value, "a")
+            await pilot.press("escape", "a")                                    # control
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ui.AccountsBox)
+
+    async def test_a_shows_every_account_who_it_is_and_who_spends_it_now(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            self.assertIsInstance(box, ui.AccountsBox)
+            self.assertEqual(self.lines_of(box), [
+                (self.LOGIN, ["ant:lukaso · login lukaso@gmail.com", "  now: Release queue"]),
+                (self.T1, ["ant:7980 · token 7980b01e4f3a2c1d", "  now: Issue 362"]),
+                (self.T2, ["ant:d0a0 · token d0a0fe42aa11bb22", "  no open session · last read 5s ago"])])
+            words = self.words(box)
+            self.assertIn("accounts", words)
+            self.assertIn("Enter or a click names the account · Esc closes", words)
+
+    async def test_the_highlight_starts_on_the_account_of_the_selected_row(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.selected, LIVE["sessionId"])
+            box = await self.open_box(pilot, app)
+            self.assertEqual(self.on_account(box), self.T1)
+            self.assertIs(app.focused, box.query_one("#accounts"))
+
+    async def test_a_row_that_spends_no_account_starts_on_the_first(self):
+        app = self.names_app(self.snap(sessions={}))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            self.assertEqual(self.on_account(box), self.LOGIN)
+
+    async def test_the_arrows_and_j_k_move_and_stop_at_the_ends(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            for keys, at in ((("j",), self.T2), (("j", "down"), self.T2),
+                             (("k",), self.T1), (("up", "k", "k"), self.LOGIN)):
+                await pilot.press(*keys)
+                await pilot.pause()
+                self.assertEqual(self.on_account(box), at, keys)
+
+    async def test_esc_the_x_and_a_click_outside_close_it_on_the_same_row(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("j")              # to another row than the first
+            await pilot.pause()
+            row = app.selected
+            self.assertNotEqual(row, LIVE["sessionId"])
+            for close in ("escape", "#accountsclose", (1, 1)):
+                await self.open_box(pilot, app)
+                self.assertIsInstance(app.screen, ui.AccountsBox)
+                if close == "escape":
+                    await pilot.press("escape")
+                elif isinstance(close, str):
+                    await pilot.click(close)
+                else:
+                    await pilot.click(offset=close)
+                await pilot.pause()
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, ui.ModalScreen, close)
+                self.assertEqual(app.selected, row, close)
+                self.assertIsInstance(app.focused, ui.Row, close)
+                self.assertEqual(app.focused.row["sessionId"], row, close)
+
+    async def test_with_no_account_a_says_why_and_opens_no_box(self):
+        for usage, says in (
+                ({"state": "not_set_up"}, "no account to name - ccwho setup adds the usage line"),
+                ({"state": "waiting"},
+                 "no account to name yet - sessions report after their next reply"),
+                ({"state": "off"}, "usage is off - ccwho setup --usage turns it on"),
+                ({"state": "unknown"}, "cannot read the accounts now"),
+                # a state that is no text: never the reason the list goes down
+                ({"state": ["odd"]}, "cannot read the accounts now"),
+                (None, "cannot read the accounts now")):
+            with self.subTest(usage=usage):
+                fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage=usage)
+                app = self.app(collector=FakeCollector(fleet=fleet))
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("a")
+                    await pilot.pause()
+                    self.assertNotIsInstance(app.screen, ui.ModalScreen)
+                    self.assertEqual(app.status, says)
+
+    async def test_enter_two_times_with_no_wait_opens_one_name_box(self):
+        # review of slice 2: the second Enter closed a box that was closed
+        # already - Textual raised, and the list went down
+        self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app)
+            self.enter_twice(app)
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen", "NameBox"])
+
+    async def test_the_second_click_of_two_on_the_hint_leaves_the_list_open(self):
+        # review 2 of slice 2: the first click opened the list, the second -
+        # on the hint, and so outside the box - closed it
+        for chain_time, stack in ((60, ["Screen", "AccountsBox"]),
+                                  (0, ["Screen"])):     # control: a click of its own
+            with self.subTest(chain_time=chain_time):
+                app = self.names_app()
+                # what Textual takes for two clicks of one: any wait, or none
+                app.CLICK_CHAIN_TIME_THRESHOLD = chain_time
+                async with app.run_test(size=(200, 30)) as pilot:
+                    await pilot.pause()
+                    at = self.spot(app, "a to name")
+                    self.click_at(app, *at)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen", "AccountsBox"])    # control
+                    self.click_at(app, *at)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), stack)
+                    if chain_time:          # and a third
+                        self.click_at(app, *at)
+                        await self.settled(pilot)
+                        self.assertEqual(self.stack(app), stack)
+
+    async def test_the_second_click_of_two_outside_the_list_does_not_go_to_a_session(self):
+        # review 3 of slice 2: the first click closed the list, and the second
+        # was a click on the row under it
+        for chain_time, asked in ((60, []), (0, [LIVE["sessionId"]])):     # control
+            with self.subTest(chain_time=chain_time):
+                app = self.names_app()
+                app.CLICK_CHAIN_TIME_THRESHOLD = chain_time
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    live = next(w for w in app.query(ui.Row)
+                                if w.row["sessionId"] == LIVE["sessionId"]).region
+                    x, y = live.x + 12, live.y
+                    await self.open_box(pilot, app)
+                    self.assertFalse(app.screen.query_one("#accountsbox").region.contains(x, y))
+                    self.click_at(app, x, y)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen"])               # control
+                    self.click_at(app, x, y)
+                    await self.until(pilot, lambda: bool(app.adapter.asked), wait=1.0)
+                    self.assertEqual(app.adapter.asked, asked)
+
+    async def test_a_click_at_another_place_acts_at_once(self):
+        # only the second click at ONE place is left out: the hint, then an
+        # account of the list, with no wait
+        self.runner_says(self.set(self.T2, "x"))
+        app = self.names_app()
+        app.CLICK_CHAIN_TIME_THRESHOLD = 60
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            self.click_at(app, *self.spot(app, "a to name"))
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen", "AccountsBox"])        # control
+            opts = app.screen.query_one("#accounts").region
+            self.click_at(app, opts.x + 4, opts.y + 4)
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen", "NameBox"])
+            self.assertIn("name the account ant:d0a0", self.words(app.screen))
+
+    async def test_a_click_on_either_line_of_an_account_opens_its_name_box(self):
+        self.runner_says(self.set(self.T2, "x"))
+        for y in (4, 5):            # the third account: its two lines
+            with self.subTest(y=y):
+                app = self.names_app()
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app)
+                    self.assertEqual(self.on_account(box), self.T1)             # control
+                    await pilot.click("#accounts", offset=(4, y))
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen", "NameBox"])
+                    self.assertIn("name the account ant:d0a0", self.words(app.screen))
+
+    async def test_a_scan_under_the_open_list_changes_nothing_in_it(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "j")
+            before, at = self.lines_of(box), self.on_account(box)
+            later = ui.Fleet([LIVE, BUSY], True, "12:00:05",
+                             usage=self.snap({self.T1: "work", self.T2: "aaa"}))
+            later.seq = app.started + 1
+            app.show(later)
+            await pilot.pause()
+            self.assertIn("ant:work", self.usage_text(app))                     # control
+            self.assertIs(app.screen, box)
+            self.assertEqual((self.lines_of(box), self.on_account(box)), (before, at))
+
+    async def test_at_80_and_at_40_columns_no_name_and_no_identity_is_cut(self):
+        mail = "firstname.lastname@a-long-company-name.example.com"
+        old = "a-name-from-before-the-limit-x"        # 30 cells: stored before the rule
+        for width in (80, 40):
+            with self.subTest(width=width):
+                app = self.names_app(self.snap({self.T1: old}, email=mail))
+                async with app.run_test(size=(width, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app)
+                    opts = box.query_one("#accounts")
+                    drawn = [opts.render_line(y).text for y in range(opts.size.height)]
+                    whole = "".join("".join(drawn).split())
+                    self.assertIn(mail, whole)
+                    self.assertIn(old, whole)
+                    self.assertNotIn("…", whole)
+                    self.assertLessEqual(max(len(line.rstrip()) for line in drawn), width)
+                    # the highlight covers every line of its account - the
+                    # wrapped ones too - and no line of the next
+                    await pilot.press("home")
+                    await pilot.pause()
+                    self.assertEqual(self.on_account(box), self.LOGIN)
+
+                    def colour(y):
+                        return {seg.style.bgcolor for seg in opts.render_line(y)
+                                if seg.style and seg.text.strip()}
+                    lit = [y for y in range(opts.size.height) if colour(y) == colour(0)]
+                    texts = [opts.render_line(y).text.strip() for y in lit]
+                    self.assertEqual(lit, list(range(len(lit))))
+                    self.assertGreaterEqual(len(lit), 3, texts)
+                    self.assertEqual(texts[-1], "now: Release queue")
+                    self.assertIn(mail, "".join(texts).replace(" ", ""))
+                    close = box.query_one("#accountsclose")
+                    self.assertTrue(close.region.width and close.region.right <= width)
+
+    async def test_more_accounts_than_fit_scroll_and_the_top_and_the_keys_stay(self):
+        import ccwho_usage as usage
+        rows = [{"id": f"token:{i:04x}aaaa", "kind": "token", "email": "", "brand": "ant",
+                 "label": "", "sessions": 1, "age": 5, "seven_day": None,
+                 "five_hour": {"state": "ok", "pct": 5, "resets_at": NOW + 7200, "age": 5}}
+                for i in range(1, 15)]
+        names = usage.short_names(rows, {})
+        snap = {"state": "ok", "accounts": usage.ordered(rows, names), "names": names,
+                "sessions": {}, "now": NOW, "labels": {}}
+        app = self.names_app(snap)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            opts = box.query_one("#accounts")
+            self.assertEqual(opts.option_count, 14)
+            frame = box.query_one("#accountsbox").region
+            self.assertTrue(0 <= frame.y and frame.bottom <= 24, frame)
+            self.assertLess(opts.size.height, 2 * 14)       # it scrolls
+            for part in ("#accountshead", "#accountsclose", ".accountsnote"):
+                r = box.query_one(part).region
+                self.assertTrue(r.height and frame.y < r.y < frame.bottom, (part, r))
+            # the last account is reached with the keys
+            await pilot.press(*["j"] * 20)
+            await pilot.pause()
+            self.assertEqual(self.on_account(box), "token:000eaaaa")
+            drawn = [opts.render_line(y).text for y in range(opts.size.height)]
+            self.assertTrue(any("ant:000e" in line for line in drawn), drawn)
+
+    async def test_in_a_narrow_window_titles_are_cut_for_the_width_it_has(self):
+        one = row("cccc3333-0000-4000-8000-000000000003", "busy",
+                  title="A session with a title that is long, number one")
+        two = row("dddd4444-0000-4000-8000-000000000004", "busy",
+                  title="A session with a title that is long, number two")
+        snap = self.snap(sessions={one["sessionId"]: self.T1, two["sessionId"]: self.T1})
+        for width, last in ((80, "  now: A session with a title that is long, number one +1"),
+                            # 40 columns: 34 cells of text, and the line fills them
+                            (40, "  now: A session with a title … +1")):
+            with self.subTest(width=width):
+                app = self.names_app(snap, rows=[one, two])
+                async with app.run_test(size=(width, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app)
+                    lines = dict(self.lines_of(box))[self.T1]
+                    self.assertEqual(lines[-1], last)
+                    opts = box.query_one("#accounts")
+                    drawn = [opts.render_line(y).text.rstrip() for y in range(opts.size.height)]
+                    self.assertIn(last, drawn)        # on one line: not wrapped
+                    if width == 40:         # cut to the cells the box has: no less
+                        self.assertEqual(len(last), width - ui.BOX_FRAME)
+
+
+class TestTheNameBox(NamesTest):
+    async def test_enter_on_an_account_opens_its_name_box_with_who_it_is(self):
+        self.runner_says(self.set(self.T1, "x"))
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "enter")
+            self.assertIsInstance(box, ui.NameBox)
+            field = box.query_one(ui.Input)
+            self.assertIs(app.focused, field, "type at once")
+            self.assertEqual((field.value, field.placeholder), ("", "a name, for example work"))
+            self.assertEqual([str(w.content) for w in box.query(ui.Static) if w.display],
+                             ["name the account ant:7980", " ✕ ", "token 7980b01e4f3a2c1d",
+                              "now: Issue 362", "Enter names it · Esc closes"])
+
+    async def test_an_account_with_a_name_opens_with_the_stored_name_selected(self):
+        # the stored name, read from the file when the box opens - not the
+        # name the line shows, which can have the account's own name after it
+        calls = self.runner_says(self.set(self.T1, "max"), stored={self.T1: "work"})
+        # the last scan read two accounts with one name, stored before the
+        # rule: the line shows "old 7980", and the file has a newer name
+        app = self.names_app(self.snap({self.T1: "old", self.LOGIN: "old"}))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertIn("ant:old 7980", self.usage_text(app))                 # control
+            box = await self.open_box(pilot, app, "enter")
+            self.assertIn("name the account ant:old 7980", self.words(box))
+            field = box.query_one(ui.Input)
+            self.assertEqual(field.value, "work")
+            self.assertIn("Enter names it · empty: 7980 again · Esc closes", self.words(box))
+            # selected: what you type takes its place
+            await pilot.press("m", "a", "x", "enter")
+            await pilot.pause()
+            self.assertEqual(calls[0][:2], (self.T1, "max"))
+
+    async def test_enter_saves_and_goes_back_to_the_accounts_list_on_that_account(self):
+        calls = self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter")
+            await pilot.press("w", "o", "r", "k", "enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(calls, [(self.T1, "work", [self.LOGIN, self.T1, self.T2])])
+            box = app.screen
+            self.assertIsInstance(box, ui.AccountsBox)
+            # it moved: named accounts are in the order of their names
+            self.assertEqual([aid for aid, _ in self.lines_of(box)],
+                             [self.LOGIN, self.T2, self.T1])
+            self.assertEqual(self.lines_of(box)[2][1][0], "ant:work · token 7980b01e4f3a2c1d")
+            self.assertEqual(self.on_account(box), self.T1)
+            self.assertIs(app.focused, box.query_one("#accounts"))
+            # behind it the list says the name now, not at the next scan
+            self.assertIn("ant:work 5h 5%", self.usage_text(app))
+            self.assertNotIn("ant:7980", self.usage_text(app))
+            self.assertEqual(app.status, "ant:7980 is now ant:work")
+            tags = {w.row["sessionId"]: w.row.get("usage_tag") for w in app.query(ui.Row)}
+            self.assertEqual(tags[LIVE["sessionId"]], "ant:work")
+            self.assertEqual(tags[BUSY["sessionId"]], "ant:lukaso")             # control
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.ModalScreen)
+            self.assertEqual(app.focused.row["sessionId"], LIVE["sessionId"])
+
+    async def test_a_save_that_is_refused_or_fails_keeps_the_box_and_the_text(self):
+        def said(result, why):
+            return {"result": result, "why": why, "labels": None, "names": None,
+                    "names_saved": True}
+        calls = self.runner_says(
+            said("refused", "ant:d0a0 is called work already - choose another name"),
+            said("busy", "could not save: the names files are in use"),
+            said("failed", "could not save: No space left on device - nothing changed"),
+            said("unreadable", "~/.ccwho/accounts.json is not valid JSON - not touched"),
+            self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "enter")
+            self.assertFalse(box.query_one("#namewhy").display)
+            await pilot.press("w", "o", "r", "k")
+            for why in ("ant:d0a0 is called work already - choose another name",
+                        "could not save: the names files are in use - press Enter again",
+                        "could not save: No space left on device - nothing changed",
+                        "~/.ccwho/accounts.json is not valid JSON - not touched"):
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIs(app.screen, box, why)
+                self.assertTrue(box.query_one("#namewhy").display)
+                self.assertEqual(str(box.query_one("#namewhy").content), why)
+                self.assertEqual(box.query_one(ui.Input).value, "work")
+                self.assertIs(app.focused, box.query_one(ui.Input))
+            self.assertNotIn("ant:work", self.usage_text(app))
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ui.AccountsBox)
+            self.assertEqual([c[1] for c in calls], ["work"] * 5)
+
+    async def test_an_account_that_is_no_longer_on_the_line_opens_no_box(self):
+        # a scan took it off the line between the paint and the click
+        self.runner_says(self.set(self.T1, "x"))
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.name_box("token:gone0000")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.ModalScreen)
+            self.assertEqual(app.status, "that account is no longer on the usage line")
+            app.name_box(self.T2)                                               # control
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ui.NameBox)
+
+    async def test_enter_two_times_with_no_wait_saves_one_time(self):
+        # review of slice 2: the second Enter saved again and closed a box
+        # that was closed already - Textual raised, and the list went down
+        for how, stack in (("list", ["Screen", "AccountsBox"]), ("line", ["Screen"])):
+            with self.subTest(how=how):
+                calls = self.runner_says(self.set(self.T1, "work"))
+                app = self.names_app()
+                async with app.run_test(size=(200, 30)) as pilot:
+                    await pilot.pause()
+                    if how == "list":
+                        await self.open_box(pilot, app, "enter")
+                    else:
+                        await pilot.click("#usage", offset=self.place(app, "ant:7980"))
+                        await pilot.pause()
+                    await pilot.press("w")
+                    self.assertIsInstance(app.screen, ui.NameBox)               # control
+                    self.enter_twice(app)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), stack)
+                    self.assertEqual([c[1] for c in calls], ["w"])
+                    self.assertEqual(app.adapter.asked, [])     # no Enter fell to a row
+
+    async def test_a_save_while_a_search_is_open_shows_each_session_one_time(self):
+        # review of slice 2: the rows the search had found were the ones from
+        # before the save - the session was in the list two times, and the
+        # list went down
+        self.runner_says(self.set(self.T1, "work"))
+        for word, said in (("issue", "nothing of it"),          # its row has the word
+                           ("flamingo", "flamingo deploy"),     # only the index has it
+                           ("", "")):                           # control: no search
+            with self.subTest(word=word):
+                app = self.names_app()
+                app.collector.index_value = {LIVE["sessionId"]: ended_entry(
+                    LIVE["sessionId"], title="Issue 362", you_said=said)}
+                async with app.run_test(size=(200, 30)) as pilot:
+                    await pilot.pause()
+                    if word:
+                        await pilot.press("slash", *word)
+                        # the index is read off the UI thread
+                        self.assertTrue(await self.until(
+                            pilot, lambda: app.ended_index is not None))
+                        await pilot.pause()
+                        await pilot.press("enter")
+                        await pilot.pause()
+                    await self.open_box(pilot, app, "enter", *"work", "enter")
+                    await pilot.press("escape")
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen"])
+                    self.assertEqual([w.row.get("usage_tag") for w in app.query(ui.Row)
+                                      if w.row["sessionId"] == LIVE["sessionId"]], ["ant:work"])
+
+    THREAD = "0199aaaa-0000-7000-8000-00000000c0de"
+    PROCS = {"collected": True, "codex_threads": [
+        {"thread": THREAD, "name": "a codex thread", "cwd": "/tmp/x", "mtime": NOW - 5, "ts": "t"}]}
+
+    def test_a_fleet_with_another_usage_is_the_fleet_a_scan_makes_with_it(self):
+        # review of slice 2: a Codex row got a tag that a scan never gives it,
+        # and the fleet was changed in place - what the list keeps by its
+        # fleet (the rows a search found) was not made again
+        import ccwho_usage as usage
+
+        def acct(aid, kind, brand="ant"):
+            return {"id": aid, "kind": kind, "email": "a@b.c" if kind == "login" else "",
+                    "brand": brand, "label": "", "sessions": 1, "age": 5, "seven_day": None,
+                    "five_hour": {"state": "ok", "pct": 5, "resets_at": NOW + 7200, "age": 5}}
+
+        def snap(rows, sessions, labels):
+            names = usage.short_names(rows, labels)
+            return {"state": "ok", "accounts": usage.ordered(rows, names), "names": names,
+                    "sessions": sessions, "now": NOW, "labels": labels}
+
+        def tags(fleet):
+            return {r["sessionId"]: r.get("usage_tag") for r in fleet.rows}
+        live, codex = LIVE["sessionId"], [acct("codex:codex", "codex", "oai")]
+        for mix, (rows, sessions) in enumerate((
+                # two Claude accounts; the Codex thread has no reading
+                ([acct(self.LOGIN, "login"), acct(self.T1, "token")], {live: self.T1}),
+                ([acct(self.LOGIN, "login"), acct(self.T1, "token")] + codex,
+                 {live: self.T1, self.THREAD: "codex:codex"}),
+                # two Codex limits
+                ([acct(self.T1, "token"), acct("codex:spark", "codex", "oai")] + codex,
+                 {live: self.T1, self.THREAD: "codex:codex"}))):
+            with self.subTest(mix=mix):
+                was, now = snap(rows, sessions, {}), snap(rows, sessions, {self.T1: "work"})
+                old = ui.Fleet([LIVE], True, "12:00:00", procs=self.PROCS, usage=was)
+                old.seq, before = 7, tags(old)
+                new = old.with_usage(now)
+                scan = ui.Fleet([LIVE], True, "12:00:00", procs=self.PROCS, usage=now)
+                self.assertEqual(tags(new), tags(scan))
+                self.assertEqual(len(new.rows), 2)                              # control
+                if mix == 0:
+                    self.assertEqual((before[live], tags(new)[live]),           # control
+                                     ("ant:7980", "ant:work"))
+                # a new fleet, with the scan's number; the old one is as it was
+                self.assertIsNot(new, old)
+                self.assertEqual((new.seq, new.at, new.usage), (7, "12:00:00", now))
+                self.assertEqual((tags(old), old.usage), (before, was))
+
+    async def test_a_save_leaves_a_codex_row_as_the_scan_made_it(self):
+        self.runner_says(self.set(self.T1, "work"))
+        fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", procs=self.PROCS, usage=self.snap())
+        app = self.app(collector=FakeCollector(fleet=fleet))
+
+        def thread():
+            row = next(w for w in app.query(ui.Row) if w.row["sessionId"] == self.THREAD)
+            return row.row.get("usage_tag"), "".join(t for t, _ in row.spans())
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            before = thread()
+            self.assertIsNone(before[0])                                        # control
+            await self.open_box(pilot, app, "enter", *"work", "enter")
+            await pilot.press("escape")
+            await self.settled(pilot)
+            self.assertEqual([w.row.get("usage_tag") for w in app.query(ui.Row)  # control
+                              if w.row["sessionId"] == LIVE["sessionId"]], ["ant:work"])
+            self.assertEqual(thread(), before)
+
+    async def test_a_name_for_an_account_that_left_the_line_is_said_as_saved(self):
+        # a scan took the account off the line while its box was open: the
+        # save is made - it was said as "ant:7980 is now ant:7980"
+        self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "enter", *"work")
+            self.assertIn("name the account ant:7980", self.words(box))        # control
+            later = self.snap()
+            later["accounts"] = [r for r in later["accounts"] if r["id"] != self.T1]
+            del later["names"][self.T1]
+            app.show(ui.Fleet([LIVE, BUSY], True, "12:00:05", usage=later))
+            await pilot.pause()
+            await pilot.press("enter")
+            await self.settled(pilot)
+            self.assertEqual(app.status, "ant:7980 is now ant:work")
+
+    async def test_a_save_answer_with_odd_names_does_not_take_the_list_down(self):
+        # an engine that changed under the list: its names are no table
+        self.runner_says({"result": "set", "why": "", "labels": ["odd"], "names_saved": True})
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter", "w", "enter")
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen", "AccountsBox"])
+
+    async def test_the_second_click_of_two_on_an_account_leaves_its_name_selected(self):
+        # review 3 of slice 2: the second click landed in the field of the
+        # name box that the first opened - the stored name was not selected
+        # any more, and "home" was saved as "resthome"
+        stored = {self.LOGIN: "main", self.T1: "work", self.T2: "rest"}
+        for chain_time in (60, 0):          # 0, the control: a click of its own
+            with self.subTest(chain_time=chain_time):
+                calls = self.runner_says(self.set(self.T1, "home", stored), stored=stored)
+                app = self.names_app(self.snap(stored))
+                app.CLICK_CHAIN_TIME_THRESHOLD = chain_time
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app, "enter")
+                    field = box.query_one("#namefield").region      # where the field is
+                    x, y = field.x + 6, field.y + 1
+                    await pilot.press("escape")
+                    await self.settled(pilot)
+                    # control: a line of an account is at that place
+                    self.assertTrue(app.screen.query_one("#accounts").region.contains(x, y))
+                    self.click_at(app, x, y)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen", "NameBox"])    # control
+                    self.click_at(app, x, y)
+                    await self.settled(pilot)
+                    field = app.screen.query_one("#namefield", ui.Input)
+                    whole = tuple(field.selection) == (0, len(field.value))
+                    self.assertEqual(whole, bool(chain_time), field.selection)
+                    await pilot.press(*"home", "enter")
+                    await self.settled(pilot)
+                    self.assertEqual(calls[-1][1] == "home", bool(chain_time), calls)
+
+    async def test_the_second_click_of_two_on_the_x_does_not_act_on_the_accounts(self):
+        # review 3 of slice 2: the first click closed the name box and the
+        # accounts came back; the second acted on what was under it there
+        self.runner_says(self.set(self.T1, "x"))
+        for chain_time in (60, 0):          # 0, the control: a click of its own
+            with self.subTest(chain_time=chain_time):
+                app = self.names_app()
+                app.CLICK_CHAIN_TIME_THRESHOLD = chain_time
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app, "enter")
+                    close = box.query_one("#nameclose").region
+                    self.click_at(app, close.x + 1, close.y)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen", "AccountsBox"])    # control
+                    self.click_at(app, close.x + 1, close.y)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app) == ["Screen", "AccountsBox"],
+                                     bool(chain_time), self.stack(app))
+
+    async def test_a_save_answer_that_is_no_table_stays_in_the_box(self):
+        # an engine that changed under the list (review 3 of slice 2)
+        for answer, why in (
+                (None, "could not save (AttributeError) - nothing changed"),
+                ({"result": "failed", "why": 5}, "could not save - nothing changed"),
+                ({"result": "busy", "why": ["odd"]},
+                 "could not save - nothing changed - press Enter again")):
+            with self.subTest(answer=answer):
+                self.runner_says(answer)
+                app = self.names_app()
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app, "enter", "w", "enter")
+                    self.assertIs(app.screen, box)
+                    self.assertEqual(str(box.query_one("#namewhy").content), why)
+
+    async def test_a_save_that_raises_stays_in_the_box(self):
+        # never the reason the list goes down
+        import ccwho as runner
+        import testkit
+
+        def boom(aid, label, rows):
+            raise TypeError("an engine that changed under the list")
+        testkit.patch(self, runner, "name_account", boom)
+        testkit.patch(self, runner, "read_labels", lambda: {})
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "enter", "w", "enter")
+            self.assertIs(app.screen, box)
+            self.assertEqual(str(box.query_one("#namewhy").content),
+                             "could not save (TypeError) - nothing changed")
+            self.assertEqual(box.query_one(ui.Input).value, "w")
+
+    async def test_esc_and_the_x_save_nothing_and_a_click_outside_does_nothing(self):
+        calls = self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "j", "enter")
+            self.assertIn("name the account ant:d0a0", self.words(box))
+            await pilot.press("w")
+            await pilot.click(offset=(1, 1))
+            await pilot.pause()
+            self.assertIs(app.screen, box, "a click outside loses no text")
+            self.assertEqual(box.query_one(ui.Input).value, "w")
+            for close in ("escape", "#nameclose"):
+                if app.screen is not box:       # back in the accounts list: open it again
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    box = app.screen
+                    self.assertIsInstance(box, ui.NameBox)
+                if close == "escape":
+                    await pilot.press("escape")
+                else:
+                    await pilot.click(close)
+                await pilot.pause()
+                await pilot.pause()
+                # back in the accounts list, on the account it was opened for
+                self.assertIsInstance(app.screen, ui.AccountsBox, close)
+                self.assertEqual(self.on_account(app.screen), self.T2, close)
+            self.assertEqual(calls, [])
+            self.assertEqual(app.status, "")
+
+    async def test_enter_with_no_change_closes_and_says_nothing(self):
+        same = {"result": "same", "why": "", "labels": {self.T1: "work"}, "names": {},
+                "names_saved": True}
+        self.runner_says(same, stored={self.T1: "work"})
+        app = self.names_app(self.snap({self.T1: "work"}))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter", "enter")
+            self.assertIsInstance(app.screen, ui.AccountsBox)
+            self.assertEqual(app.status, "")
+            self.assertIn("ant:work", self.usage_text(app))
+
+    async def test_a_removed_name_says_the_accounts_own_name_again(self):
+        gone = {"result": "removed", "why": "", "labels": {}, "names": {}, "names_saved": True}
+        self.runner_says(gone, stored={self.T1: "work"})
+        app = self.names_app(self.snap({self.T1: "work"}))
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "enter")
+            await pilot.press("backspace", "enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(app.status, "ant:work is ant:7980 again")
+            self.assertIn("ant:7980 5h 5%", self.usage_text(app))
+            self.assertIn("a to name", self.usage_text(app))     # a token with no name again
+
+    async def test_a_name_saved_without_the_status_bars_copy_says_so(self):
+        self.runner_says(self.set(self.T1, "work", names_saved=False))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter", "w", "enter")
+            self.assertEqual(app.status, "named - status bars follow at the list's next scan")
+            self.assertIn("ant:work", self.usage_text(app))
+
+    async def test_the_letters_that_are_keys_of_the_list_are_typed(self):
+        calls = self.runner_says(self.set(self.T1, "ajkqxzop"))
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "enter")
+            await pilot.press(*"ajkqxzop")
+            await pilot.pause()
+            self.assertIs(app.screen, box)
+            self.assertEqual(box.query_one(ui.Input).value, "ajkqxzop")
+            self.assertTrue(app.is_running)
+
+    async def test_from_a_click_on_the_line_enter_goes_back_to_the_sessions(self):
+        calls = self.runner_says(self.set(self.T2, "home"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await pilot.click("#usage", offset=self.place(app, "ant:d0a0"))
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ui.NameBox)
+            await pilot.press("h", "o", "m", "e", "enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.ModalScreen)
+            self.assertEqual(calls[0][:2], (self.T2, "home"))
+            self.assertIn("ant:home", self.usage_text(app))
+            self.assertEqual(app.status, "ant:d0a0 is now ant:home")
+            self.assertEqual(app.focused.row["sessionId"], LIVE["sessionId"])
+
+    async def test_a_scan_from_before_the_save_does_not_bring_the_hash_back(self):
+        self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter", "w", "o", "r", "k", "enter")
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIn("ant:work", self.usage_text(app))
+            # a scan that was numbered before the save, and read the old names
+            old = ui.Fleet([LIVE, BUSY], True, "12:00:05", usage=self.snap())
+            old.seq = app.started
+            app.show(old)
+            await pilot.pause()
+            self.assertIn("ant:work 5h 5%", self.usage_text(app))
+            self.assertNotIn("ant:7980", self.usage_text(app))
+            tags = {w.row["sessionId"]: w.row.get("usage_tag") for w in app.query(ui.Row)}
+            self.assertEqual(tags[LIVE["sessionId"]], "ant:work")
+            # control: the next scan read the file after the save - it is the truth
+            new = ui.Fleet([LIVE, BUSY], True, "12:00:25", usage=self.snap())
+            new.seq = app.started + 1
+            app.show(new)
+            await pilot.pause()
+            self.assertIn("ant:7980", self.usage_text(app))
+
+    async def test_two_saves_before_the_next_scan_both_stay(self):
+        self.runner_says(self.set(self.T1, "work"),
+                         self.set(self.T2, "home", labels={self.T1: "work"}))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter", "w", "o", "r", "k", "enter")
+            self.assertEqual(self.on_account(app.screen), self.T1)
+            await pilot.press("up", "enter")
+            await pilot.pause()
+            self.assertIn("name the account ant:d0a0", self.words(app.screen))
+            await pilot.press("h", "o", "m", "e", "enter")
+            await pilot.pause()
+            await pilot.pause()
+            old = ui.Fleet([LIVE, BUSY], True, "12:00:05", usage=self.snap())
+            old.seq = app.started
+            app.show(old)
+            await pilot.pause()
+            self.assertIn("ant:work", self.usage_text(app))
+            self.assertIn("ant:home", self.usage_text(app))
+            self.assertNotIn("a to name", self.usage_text(app))
+
+    async def test_the_row_you_were_on_ends_while_the_box_is_open(self):
+        self.runner_says(self.set(self.T1, "work"))
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.selected, LIVE["sessionId"])
+            await self.open_box(pilot, app, "enter")
+            later = ui.Fleet([BUSY], True, "12:00:05", usage=self.snap())
+            later.seq = app.started + 1
+            app.show(later)
+            await pilot.pause()
+            await pilot.press("escape", "escape")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, ui.ModalScreen)
+            self.assertEqual(app.focused.row["sessionId"], BUSY["sessionId"])
+
+    async def test_the_real_save_stores_the_name_and_the_list_says_it(self):
+        # no fake: ccwho.name_account, into the test module's own ccwho dir
+        import ccwho as runner
+        import json
+        import os
+        for name in ("accounts.json", "usage-names.json"):
+            self.addCleanup(lambda n=name: os.path.exists(os.path.join(runner.ccwho_dir(), n))
+                            and os.remove(os.path.join(runner.ccwho_dir(), n)))
+        app = self.names_app()
+        async with app.run_test(size=(200, 30)) as pilot:
+            await pilot.pause()
+            await self.open_box(pilot, app, "enter", "w", "o", "r", "k", "enter")
+            self.assertIsInstance(app.screen, ui.AccountsBox)
+            with open(runner.labels_path()) as fh:
+                self.assertEqual(json.load(fh), {self.T1: "work"})
+            with open(runner.names_path()) as fh:
+                self.assertEqual(json.load(fh)[self.T1], "work")
+            self.assertIn("ant:work", self.usage_text(app))
+            # a name in use: the rule's own words, in the box
+            await pilot.press("up", "enter")
+            await pilot.pause()
+            await pilot.press("W", "O", "R", "K", "enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ui.NameBox)
+            self.assertEqual(str(app.screen.query_one("#namewhy").content),
+                             "ant:7980 is called work already - choose another name")
+
+
 class TestAClickInTheDetailCopiesWhatYouClicked(UiTest):
     """Selecting text in the list never reached iTerm2: the list takes the mouse.
     So the detail offers its values to copy - each one a left-click target, as

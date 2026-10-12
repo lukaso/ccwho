@@ -4,7 +4,7 @@ Which Claude Code session needs you, and what is it about.
 
 ```
 16 sessions: 2 blocked · 12 stopped · 2 busy
-usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 12%↓/30% ↻Thu 21:00
+usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 12%↓/30% ↻Thu21:00
 
 liveapp-4e       s071  NEEDS YOU   ✳ Fix the gate       Bash: run the gate        4d
 liveapp-06       s012  busy        ◐ Landing page       Edit: index.html         23h
@@ -257,7 +257,7 @@ Code sessions only.
 ## Subscription usage
 
 ```
-usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu 21:00  │  ant:1a2b 5h expired ↻Wed 09:10 · 7d 67%↑/40% ↻Mon 17:00 (2d ago)
+usage  ant:work 5h 42%↓/60% ↻15:30 · 7d 2%↓/30% ↻Thu21:00  │  ant:1a2b 5h expired ↻Wed09:10 · 7d 67%↑/40% ↻Mon17:00 (2d ago)
 ```
 
 One dim line under the header, one entry per account read in the last two weeks: the
@@ -266,7 +266,7 @@ names clash), a `CLAUDE_CODE_OAUTH_TOKEN` by the first 4 hex of its fingerprint.
 the one you left is still there, with its age - and leaves two weeks after its last
 reading. `5h 42%↓/60%` is 42% of the 5-hour budget used with 60% of the 5 hours
 gone: `↓` (green) is on pace, `↑` (red) is faster than time passes. `↻15:30` is when
-the window resets; a reset more than a day away says its day too (`↻Thu 21:00`), and
+the window resets; a reset more than a day away says its day too (`↻Thu21:00`), and
 its day alone when the line is short of room - a window at 100% last. The used number
 turns yellow at 80% and bold at 95%. A window past its reset says `expired`; a window
 whose newest reading is older than 15 minutes says how old, and an entry whose windows
@@ -289,7 +289,7 @@ two weeks; `ccwho usage name <id> <label>` gives one a name. `ccwho setup --no-u
 off again: the line goes, Codex's entry with it, once no running session spends an account on it.
 
 Codex has an entry too, after the Claude accounts, named by its limit:
-`oai:codex 7d 69%↑/60% ↻Sun 08:00 (42m ago)`. It is kept two weeks after its last reading, the same
+`oai:codex 7d 69%↑/60% ↻Sun08:00 (42m ago)`. It is kept two weeks after its last reading, the same
 as an account, a Codex thread open or not. ccwho reads it from Codex's own transcripts - the
 `rate_limits` of their `token_count` events - with no app-server and no credential, and it
 never parses what was said. A selected Codex row makes the entry of its limit bright: the

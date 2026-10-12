@@ -648,7 +648,8 @@ def _clock(epoch, now):
     # a day either way: a reset three days gone is no "15:50" (kept two weeks)
     if abs(epoch - now) < 86400:
         return time.strftime("%H:%M", t)
-    return time.strftime("%a %H:%M", t)
+    # "Thu06:00", as on the usage line
+    return time.strftime("%a%H:%M", t)
 
 
 def format_window(name, w, now):
@@ -832,9 +833,9 @@ def _reset_label(epoch, now, with_time=True):
     t = time.localtime(epoch)
     if abs(epoch - now) < 86400:
         return time.strftime("%H:%M", t)
-    # its day alone is not enough to plan by (owner, 2026-10-11); short of
-    # room, the line has it say its day alone
-    return time.strftime("%a %H:%M" if with_time else "%a", t)
+    # its day alone is not enough to plan by (owner, 2026-10-11); "Thu06:00",
+    # no space (owner, 2026-10-12); short of room, the line has it say its day alone
+    return time.strftime("%a%H:%M" if with_time else "%a", t)
 
 
 # reset_time: every reset says its time; USED_UP: a window shown as 100% only

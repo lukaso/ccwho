@@ -671,7 +671,7 @@ class TestFormat(unittest.TestCase):
                "five_hour": {"state": "expired", "resets_at": NOW - 3 * 86400},
                "seven_day": {"state": "expired", "resets_at": NOW - 60}}
         line = usage.format_row(row, NOW)
-        day = _time.strftime("%a %H:%M", _time.localtime(NOW - 3 * 86400))
+        day = _time.strftime("%a%H:%M", _time.localtime(NOW - 3 * 86400))
         self.assertIn(f"5h expired (reset {day})", line)
         self.assertIn("7d expired (reset " + _time.strftime("%H:%M", _time.localtime(NOW - 60))
                       + ")", line)                                         # control
@@ -935,7 +935,7 @@ class TestUsageLines(unittest.TestCase):
         self.assertTrue(lines[0].startswith("usage  ant:lukaso "))
         self.assertTrue(lines[1].startswith("       ant:1a2b "))
         # each on its own line has the room to say its reset's time
-        self.assertIn("↻" + _time.strftime("%a %H:%M", _time.localtime(NOW + 0.7 * D7)),
+        self.assertIn("↻" + _time.strftime("%a%H:%M", _time.localtime(NOW + 0.7 * D7)),
                       lines[0])
 
     def test_all_live_accounts_are_shown_no_cap(self):
@@ -947,7 +947,7 @@ class TestUsageLines(unittest.TestCase):
                        week=(2, NOW + 0.7 * D7), week_age=7200)
         week_reset = _time.localtime(NOW + 0.7 * D7)
         full = text(usage.usage_lines(snap([old]), 200))[0]
-        self.assertIn("↻" + _time.strftime("%a %H:%M", week_reset), full)
+        self.assertIn("↻" + _time.strftime("%a%H:%M", week_reset), full)
         self.assertIn("(2h ago)", full)
         day_only = text(usage.usage_lines(snap([old]), len(full) - 1))[0]
         self.assertIn("↻" + _time.strftime("%a", week_reset) + " (2h ago)", day_only)
@@ -1019,14 +1019,14 @@ class TestUsageLines(unittest.TestCase):
                      age=4 * 86400)
         r["seven_day"]["resets_at"] = long_ago
         line = text(usage.usage_lines(snap([r]), 200))[0]
-        self.assertIn("7d expired ↻" + _time.strftime("%a %H:%M", _time.localtime(long_ago)),
+        self.assertIn("7d expired ↻" + _time.strftime("%a%H:%M", _time.localtime(long_ago)),
                       line)
         self.assertIn("5h expired ↻" + _time.strftime("%H:%M", _time.localtime(NOW - 60)),
                       line)                                                # control
         # short of room, its day alone
         short, = text(usage.usage_lines(snap([r]), len(line) - 1))
         self.assertIn("7d expired ↻" + _time.strftime("%a", _time.localtime(long_ago)), short)
-        self.assertNotIn(_time.strftime("%a %H:%M", _time.localtime(long_ago)), short)
+        self.assertNotIn(_time.strftime("%a%H:%M", _time.localtime(long_ago)), short)
 
     def test_expired_window_has_no_number(self):
         r = acct_row("login:a", email="lukaso@gmail.com", five="expired", week=(2, NOW + 0.7 * D7))
@@ -2085,7 +2085,7 @@ class TestASessionThatChangesAccount(unittest.TestCase):
 
 
 class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
-    """A reset more than a day away says its day and its time ("↻Mon 21:00"):
+    """A reset more than a day away says its day and its time ("↻Mon21:00"):
     its day alone is not enough to plan by (owner, 2026-10-11)."""
 
     FIVE = NOW + 0.2 * H5
@@ -2097,19 +2097,20 @@ class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
 
     def test_short_of_room_one_line_keeps_the_used_up_time_longest(self):
         # review 1: at 100% the reset is what you wait for (owner, 2026-10-11)
-        day_time = _time.strftime("%a %H:%M", _time.localtime(self.WEEK))
+        day_time = _time.strftime("%a%H:%M", _time.localtime(self.WEEK))
+        cut = len(day_time) - len(_time.strftime("%a", _time.localtime(self.WEEK)))
         for pct in (100, 99.6):                                   # 99.6 prints as 100%
             full = text(usage.usage_lines(snap(self.rows(pct)), 300))
             self.assertEqual(len(full), 1)                                  # control
             self.assertEqual(full[0].count(day_time), 2)                    # control
-            line, = text(usage.usage_lines(snap(self.rows(pct)), len(full[0]) - 6))
+            line, = text(usage.usage_lines(snap(self.rows(pct)), len(full[0]) - cut))
             d0a0, eedf = line.split(usage.SEP)
             self.assertIn("7d 100%↑/57% ↻" + day_time, d0a0)
             self.assertTrue(eedf.endswith("↻" + _time.strftime("%a", _time.localtime(self.WEEK))),
                             eedf)
         # review 2: 99% is not used up - its time goes with the others'
         full = text(usage.usage_lines(snap(self.rows(99)), 300))
-        line, = text(usage.usage_lines(snap(self.rows(99)), len(full[0]) - 6))
+        line, = text(usage.usage_lines(snap(self.rows(99)), len(full[0]) - cut))
         self.assertNotIn(day_time, line)
 
     def test_short_of_room_a_stacked_entry_keeps_the_used_up_time_longest(self):
@@ -2117,19 +2118,19 @@ class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
         mixed = acct_row("token:d0a0d0a0", kind="token", five="expired", week=(100, self.WEEK))
         mixed["five_hour"]["resets_at"] = long_ago
         alone, = text(usage.usage_lines(snap([mixed]), 300))
-        self.assertIn("5h expired ↻" + _time.strftime("%a %H:%M", _time.localtime(long_ago)),
+        self.assertIn("5h expired ↻" + _time.strftime("%a%H:%M", _time.localtime(long_ago)),
                       alone)                                                # control
         first, _ = text(usage.usage_lines(snap([mixed, self.rows()[1]]), len(alone) - 1))
         self.assertIn("5h expired ↻" + _time.strftime("%a", _time.localtime(long_ago)) + " · ",
                       first)
-        self.assertIn("7d 100%↑/57% ↻" + _time.strftime("%a %H:%M", _time.localtime(self.WEEK)),
+        self.assertIn("7d 100%↑/57% ↻" + _time.strftime("%a%H:%M", _time.localtime(self.WEEK)),
                       first)
 
     def test_short_of_room_it_says_the_day_before_it_drops_the_resets(self):
         # the review's case: on its own line, the used-up account lost its
         # 5h reset too, where the other account kept both
         alone = text(usage.usage_lines(snap(self.rows()[:1]), 200))[0]
-        self.assertIn(_time.strftime("%a %H:%M", _time.localtime(self.WEEK)), alone)  # control
+        self.assertIn(_time.strftime("%a%H:%M", _time.localtime(self.WEEK)), alone)  # control
         d0a0, eedf = text(usage.usage_lines(snap(self.rows()), len(alone) - 1))
         self.assertIn("↻" + _time.strftime("%H:%M", _time.localtime(self.FIVE)), d0a0)
         self.assertTrue(d0a0.endswith("↻" + _time.strftime("%a", _time.localtime(self.WEEK))),
@@ -2137,10 +2138,12 @@ class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
         self.assertEqual(eedf.count("↻"), 2)                                # control
 
     def test_short_of_room_one_line_says_the_day_before_it_stacks(self):
+        week = _time.localtime(self.WEEK)
+        cut = len(_time.strftime("%a%H:%M", week)) - len(_time.strftime("%a", week))
         full = text(usage.usage_lines(snap(self.rows()), 300))
         self.assertEqual(len(full), 1)                                      # control
-        line, = text(usage.usage_lines(snap(self.rows()), len(full[0]) - 7))
-        self.assertNotIn(_time.strftime("%a %H:%M", _time.localtime(self.WEEK)), line)
+        line, = text(usage.usage_lines(snap(self.rows()), len(full[0]) - cut - 1))
+        self.assertNotIn(_time.strftime("%a%H:%M", _time.localtime(self.WEEK)), line)
         self.assertEqual(line.count("↻"), 4)
 
     def line(self, pct, reset):
@@ -2149,7 +2152,7 @@ class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
 
     def test_a_used_up_window_says_the_day_and_the_time(self):
         reset = NOW + 3 * 86400 + 1234
-        day_time = _time.strftime("%a %H:%M", _time.localtime(reset))
+        day_time = _time.strftime("%a%H:%M", _time.localtime(reset))
         self.assertIn("7d 100%↑/", self.line(100, reset))
         self.assertIn("↻" + day_time, self.line(100, reset))
         self.assertIn("↻" + day_time, self.line(99.6, reset))     # shown as 100%
@@ -2157,7 +2160,7 @@ class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
     def test_below_100_it_says_the_day_and_the_time_too(self):
         # owner, 2026-10-11: "add the 7d reset time as well as day"
         reset = NOW + 3 * 86400 + 1234
-        day_time = _time.strftime("%a %H:%M", _time.localtime(reset))
+        day_time = _time.strftime("%a%H:%M", _time.localtime(reset))
         for pct in (99, 40, 0):
             self.assertIn("↻" + day_time, self.line(pct, reset), pct)
 
@@ -2166,11 +2169,27 @@ class TestAResetDaysAwaySaysItsTime(unittest.TestCase):
         for pct in (100, 40):
             line = self.line(pct, reset)
             self.assertIn("↻" + _time.strftime("%H:%M", _time.localtime(reset)), line)
-            self.assertNotIn(_time.strftime("%a %H:%M", _time.localtime(reset)), line)
+            self.assertNotIn(_time.strftime("%a%H:%M", _time.localtime(reset)), line)
+
+    def test_the_day_and_the_time_have_no_space_between(self):
+        # owner, 2026-10-12: "Thu 06:00" becomes "Thu06:00"
+        reset, gone = NOW + 3 * 86400 + 1234, NOW - 3 * 86400
+        rec = reading("token:1a2b3c4d", week=(40, reset), kind="token", measured=NOW)
+        row = {"id": "x", "label": "x", "sessions": 1, "age": 5,
+               "five_hour": {"state": "expired", "resets_at": gone},
+               "seven_day": {"state": "ok", "pct": 40, "resets_at": reset}}
+        joined = r"[A-Z][a-z]{2}[0-2][0-9]:[0-5][0-9]"
+        spaced = r"[A-Z][a-z]{2} [0-2][0-9]:[0-5][0-9]"
+        for where, out in (("usage line", self.line(40, reset)),
+                           ("status bar", usage.ANSI_RE.sub("", usage.status_text(rec, NOW))),
+                           ("ccwho usage", usage.format_row(row, NOW))):
+            self.assertRegex(out, "↻" + joined, where)
+            self.assertNotRegex(out, spaced, where)
+        self.assertRegex(usage.format_row(row, NOW), r"5h expired \(reset " + joined + r"\)")
 
     def test_the_status_bar_says_it_too(self):
         reset = NOW + 3 * 86400 + 1234
         for pct in (100, 40):
             rec = reading("token:1a2b3c4d", week=(pct, reset), kind="token", measured=NOW)
             out = usage.ANSI_RE.sub("", usage.status_text(rec, NOW))
-            self.assertIn("↻" + _time.strftime("%a %H:%M", _time.localtime(reset)), out, pct)
+            self.assertIn("↻" + _time.strftime("%a%H:%M", _time.localtime(reset)), out, pct)

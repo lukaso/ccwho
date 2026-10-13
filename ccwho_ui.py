@@ -488,7 +488,26 @@ class Row(Static):
 KILL_FIELDS = ("proc", "clean")
 
 
-class KillBox(ModalScreen):
+class AnswersOnce:
+    """A box that answers one time. A key or a click that was on its way when
+    the box closed (Enter held down, a click made two times) reaches the box
+    after that: it closed again, Textual raised, and the list went down
+    (review of name-accounts slice 2, 2026-10-12). Every box of the list
+    answers through here: none calls dismiss itself."""
+
+    answered = False
+
+    def answer(self, value):
+        # not under another box - one that a worker put over this one while
+        # a key was on its way (`o` reads the saves off the UI thread):
+        # dismiss takes the top screen off, whichever it is, and this box
+        # then could not be closed (review of slice 3)
+        if not self.answered and self.app.screen is self:
+            self.answered = True
+            self.dismiss(value)
+
+
+class KillBox(AnswersOnce, ModalScreen):
     """What a kill takes, before it does: every process with what ccwho doubts
     about it, and what it spares and why - the list `ccwho kill` prints. Enter,
     `y` or a click on [kill] kills; Esc, `n` or ✕ closes. The result then
@@ -609,6 +628,8 @@ class KillBox(ModalScreen):
         self.query_one("#killhint").update(self.hint())
 
     def action_go(self):
+        if self.answered:               # closed: a click on [kill] was on its way
+            return
         if self.state == "ask" and self.unseen():
             self.paint()                    # nothing is killed that was not seen
             return
@@ -618,11 +639,11 @@ class KillBox(ModalScreen):
             if self.on_kill:
                 self.on_kill()
         elif self.state == "done":
-            self.dismiss(None)
+            self.answer(None)
 
     def action_close(self):
         if self.state != "killing":     # a kill under way reports here when it ends
-            self.dismiss(None)
+            self.answer(None)
 
     def show_result(self, lines):
         self.state = "done"
@@ -636,7 +657,7 @@ class KillBox(ModalScreen):
             self.action_close()
 
 
-class ChoiceBox(ModalScreen):
+class ChoiceBox(AnswersOnce, ModalScreen):
     """What `x` can do to one session (the owner's D10, 2026-09-27): only the
     choices that fit it, each a key and a line to click. Every choice asks again
     on its own before it acts - the stuck items' `l` in the kill dialog about
@@ -676,21 +697,21 @@ class ChoiceBox(ModalScreen):
     def on_key(self, event):
         if event.key in {k for k, _ in self.choices}:
             event.stop()
-            self.dismiss(event.key)
+            self.answer(event.key)
 
     def on_click(self, event):
         widget = getattr(event, "widget", None)
         wid = getattr(widget, "id", None) or ""
         if wid == "choiceclose":
-            self.dismiss(None)
+            self.answer(None)
         elif wid.startswith("choice-"):
-            self.dismiss(wid[len("choice-"):])
+            self.answer(wid[len("choice-"):])
 
     def action_close(self):
-        self.dismiss(None)
+        self.answer(None)
 
 
-class ParkBox(ModalScreen):
+class ParkBox(AnswersOnce, ModalScreen):
     """Park one session: a line for why you keep it, which may stay empty.
     Enter parks, Esc or ✕ parks nothing. The answer is the note ("" for none),
     or None. Used now and then, so it says what it does (and when the park
@@ -729,17 +750,17 @@ class ParkBox(ModalScreen):
 
     @on(Input.Submitted, "#parknote")
     def submitted(self, event):
-        self.dismiss(event.value)
+        self.answer(event.value)
 
     def on_click(self, event):
         if getattr(getattr(event, "widget", None), "id", None) == "parkclose":
-            self.dismiss(None)
+            self.answer(None)
 
     def action_close(self):
-        self.dismiss(None)
+        self.answer(None)
 
 
-class SavesMenu(ModalScreen):
+class SavesMenu(AnswersOnce, ModalScreen):
     """Which save to reopen: every one, newest first and highlighted.
 
     Enter or a click on a line reopens that save; Esc closes. The answer is the
@@ -792,22 +813,22 @@ class SavesMenu(ModalScreen):
 
     @on(OptionList.OptionSelected, "#saves")
     def chosen(self, event):
-        self.dismiss(event.option.id)
+        self.answer(event.option.id)
 
     def action_close(self):
-        self.dismiss(None)
+        self.answer(None)
 
     @on(events.Click)
     def clicked(self, event):
         """The ✕, or anywhere outside the box, closes it."""
         widget = getattr(event, "widget", None)
         if widget is not None and widget.id == "savesclose":
-            self.dismiss(None)
+            self.answer(None)
             return
         while widget is not None and widget.id != "savesbox":
             widget = widget.parent
         if widget is None:
-            self.dismiss(None)
+            self.answer(None)
 
     def action_down(self):
         self.query_one("#saves").action_cursor_down()
@@ -824,20 +845,6 @@ BOX_CELLS, BOX_FRAME = 64, 6
 NO_ACCOUNTS = {"not_set_up": "no account to name - ccwho setup adds the usage line",
                "waiting": "no account to name yet - sessions report after their next reply",
                "off": "usage is off - ccwho setup --usage turns it on"}
-
-
-class AnswersOnce:
-    """A box that answers one time. A key or a click that was on its way when
-    the box closed (Enter held down, a click made two times) reaches the box
-    after that: it closed again, Textual raised, and the list went down
-    (review of slice 2)."""
-
-    answered = False
-
-    def answer(self, value):
-        if not self.answered:
-            self.answered = True
-            self.dismiss(value)
 
 
 class AccountsBox(AnswersOnce, ModalScreen):

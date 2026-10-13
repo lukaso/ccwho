@@ -198,6 +198,32 @@ class UiTest(unittest.IsolatedAsyncioTestCase):
         # Textual 8 keeps a Static's text in .content (older versions: .renderable)
         return "\n".join(str(getattr(w, "content", "")) for w in app.query("Static"))
 
+    def stack(self, app):
+        return [type(s).__name__ for s in app.screen_stack]
+
+    def twice(self, app, key, char=None):
+        """A key two times with no wait between: the second is on its way
+        before the first is handled (a held key, a busy machine)."""
+        for _ in range(2):
+            app.post_message(ui.events.Key(key, char))
+
+    def click_at(self, app, x, y):
+        """A click as a terminal sends it: Textual makes the click of it, and
+        counts it as the second of two or not."""
+        for kind in (ui.events.MouseDown, ui.events.MouseUp):
+            app.post_message(kind(None, x, y, 0, 0, 1, False, False, False,
+                                  screen_x=x, screen_y=y))
+
+    def click_twice_on(self, app, selector):
+        """Two clicks on a part of the open box with no wait between."""
+        at = app.screen.query_one(selector).region
+        self.click_at(app, at.x + 1, at.y)
+        self.click_at(app, at.x + 1, at.y)
+
+    async def settled(self, pilot):
+        await pilot.pause(0.3)
+        await pilot.pause()
+
 
 class TestTheList(UiTest):
     async def test_the_panel_is_kept_in_front_from_the_start(self):
@@ -2997,6 +3023,36 @@ class TestOOffersTheSaves(UiTest):
             await self.opened(pilot)
             self.assertIsInstance(app.screen, ui.SavesMenu)
 
+    async def test_enter_two_times_with_no_wait_reopens_one_time(self):
+        # the second Enter was on its way when the first closed the menu: the
+        # menu closed again, Textual raised, and the list went down (review 2
+        # of name-accounts slice 2, 2026-10-12)
+        app = self.app()
+        async with app.run_test() as pilot:
+            await self.opened(pilot)
+            self.assertIsInstance(app.screen, ui.SavesMenu)                     # control
+            self.twice(app, "enter", "\r")
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen"])
+            self.assertEqual(self.restored, ["/r/2026-09-26T1310.json"])
+            self.assertEqual(app.adapter.asked, [])     # no Enter fell to a row
+
+    async def test_two_clicks_with_no_wait_close_the_menu_one_time(self):
+        for where in ("#savesclose", "outside"):
+            with self.subTest(where=where):
+                app = self.app()
+                async with app.run_test() as pilot:
+                    await self.opened(pilot)
+                    self.assertIsInstance(app.screen, ui.SavesMenu)             # control
+                    if where == "outside":
+                        self.click_at(app, 0, 0)
+                        self.click_at(app, 0, 0)
+                    else:
+                        self.click_twice_on(app, where)
+                    await self.settled(pilot)
+                    self.assertEqual(self.stack(app), ["Screen"])
+                    self.assertEqual(self.restored, [])
+
     async def test_o_opens_the_menu_on_an_empty_list(self):
         app = self.app(collector=self.empty())
         async with app.run_test() as pilot:
@@ -4837,27 +4893,14 @@ class NamesTest(UiTest):
     def words(self, screen):
         return "\n".join(str(w.content) for w in screen.query(ui.Static))
 
-    def stack(self, app):
-        return [type(s).__name__ for s in app.screen_stack]
-
     def enter_twice(self, app):
-        """Enter two times with no wait between: the second is on its way
-        before the first is handled (a held key, a busy machine)."""
-        for _ in range(2):
-            app.post_message(ui.events.Key("enter", "\r"))
+        self.twice(app, "enter", "\r")
 
     def spot(self, app, text):
         """Where `text` of the usage line is on the screen."""
         box = app.query_one("#usage")
         x, y = self.place(app, text)
         return box.region.x + x + 1, box.region.y + y
-
-    def click_at(self, app, x, y):
-        """A click as a terminal sends it: Textual makes the click of it, and
-        counts it as the second of two or not."""
-        for kind in (ui.events.MouseDown, ui.events.MouseUp):
-            app.post_message(kind(None, x, y, 0, 0, 1, False, False, False,
-                                  screen_x=x, screen_y=y))
 
     def click_twice(self, app, text):
         """Two clicks on `text` of the usage line with no wait between."""
@@ -4871,10 +4914,6 @@ class NamesTest(UiTest):
                 return True
             await pilot.pause(0.05)
         return done()
-
-    async def settled(self, pilot):
-        await pilot.pause(0.3)
-        await pilot.pause()
 
     async def open_box(self, pilot, app, *keys):
         """`a`, then the keys: the screen after them."""
@@ -9174,6 +9213,90 @@ OTHER = row("dddd4444-0000-4000-8000-000000000004", "asks", ts="2026-09-22T11:00
 THIRD = row("eeee5555-0000-4000-8000-000000000005", "asks", ts="2026-09-22T12:00:00.000Z",
             title="Third question", tab_title="✳ Third question (claude)",
             name="liveapp-d4")
+
+
+class TestEveryBoxAnswersOneTime(unittest.TestCase):
+    """A box of the list closes through AnswersOnce.answer. One that calls
+    dismiss itself closes two times on two events with no wait, and the list
+    goes down: so no box does, the next one that is written too."""
+
+    def boxes(self):
+        return [c for c in vars(ui).values()
+                if isinstance(c, type) and issubclass(c, ui.ModalScreen)
+                and c.__module__ == ui.__name__]
+
+    def test_every_box_of_the_list_is_one_that_answers_one_time(self):
+        names = {c.__name__ for c in self.boxes()}
+        self.assertLessEqual({"KillBox", "ChoiceBox", "ParkBox", "SavesMenu", "AccountsBox",
+                              "NameBox"}, names)                                # control
+        for box in self.boxes():
+            self.assertTrue(issubclass(box, ui.AnswersOnce), box.__name__)
+
+    def test_no_box_closes_by_itself(self):
+        # not by a call, by another name for it, or by a binding: the words
+        # are in no box (review of slice 3)
+        import inspect
+        self.assertIn("dismiss", inspect.getsource(ui.AnswersOnce))             # control
+        for box in self.boxes():
+            for word in ("dismiss", "pop_screen"):
+                self.assertNotIn(word, inspect.getsource(box), box.__name__)
+
+
+class TestTheParkBoxAnswersOneTime(ParkTest):
+    """Enter held down, or a click made two times: the second is on its way
+    when the first closed the box. The box closed again, Textual raised, and
+    the list went down (review 2 of name-accounts slice 2, 2026-10-12)."""
+
+    async def test_enter_two_times_with_no_wait_parks_one_time(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertIsNotNone(self.box(app))                                 # control
+            await pilot.press("w")
+            self.twice(app, "enter", "\r")
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen"])
+            self.assertEqual([p[2] for p in self.parks], ["w"])
+            self.assertEqual(app.adapter.asked, [])     # no Enter fell to a row
+
+    async def test_an_enter_that_arrives_under_another_box_closes_no_box(self):
+        # review of slice 3: `o` reads the saves off the UI thread, and its
+        # menu landed over the park box while the box's Enter was on its way.
+        # The Enter closed the menu, and the park box could not be closed
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.press("w")
+            box = self.box(app)
+            field = box.query_one("#parknote")
+            box.post_message(ui.Input.Submitted(field, field.value))    # Enter, on its way
+            app.offer_saves([dict(p) for p in POINTS])                  # the menu lands
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen", "ParkBox", "SavesMenu"])
+            self.assertEqual(self.parks, [])
+            await pilot.press("escape")         # the menu closes, and the park box works
+            await pilot.pause()
+            self.assertEqual(self.stack(app), ["Screen", "ParkBox"])
+            await pilot.press("enter")
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen"])
+            self.assertEqual([p[2] for p in self.parks], ["w"])
+
+    async def test_two_clicks_on_the_x_with_no_wait_close_it_one_time(self):
+        app = self.app(collector=self.fleet(ASKING))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertIsNotNone(self.box(app))                                 # control
+            self.click_twice_on(app, "#parkclose")
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen"])
+            self.assertEqual(self.parks, [])
 
 
 class TestTheHighlightStaysInItsGroup(ParkTest):

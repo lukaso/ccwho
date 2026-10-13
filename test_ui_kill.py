@@ -299,6 +299,66 @@ class TestTheBoxEnds(KillTest):
             self.assertNotIn("sk-ant-", text)
 
 
+class TestTheKillBoxAnswersOneTime(KillTest):
+    """A click made two times: the second is on its way when the first closed
+    the box. The box closed again, Textual raised, and the list went down
+    (review 2 of name-accounts slice 2, 2026-10-12)."""
+
+    async def test_two_clicks_on_the_x_with_no_wait_close_it_one_time(self):
+        for after_a_kill in (False, True):
+            with self.subTest(after_a_kill=after_a_kill):
+                c = KillCollector()
+                app = self.app(collector=c)
+                async with app.run_test(size=(160, 40)) as pilot:
+                    await self.open_box(app, pilot)
+                    if after_a_kill:
+                        await pilot.press("y")
+                        await self.settle(app, pilot)
+                    self.assertEqual((len(c.carried), self.box(app).state),     # control
+                                     (1, "done") if after_a_kill else (0, "ask"))
+                    self.click_twice_on(app, "#killclose")
+                    await self.settled(pilot)
+                    self.assertNotIn("KillBox", self.stack(app))
+                    self.assertTrue(app.is_running)
+                    self.assertEqual(len(c.carried), int(after_a_kill))
+
+
+    async def test_a_click_on_kill_after_the_box_closed_kills_nothing(self):
+        # review of slice 3: the x and then [kill], with no wait - the kill
+        # ran after the box had closed, and its result was shown nowhere
+        import threading
+        # the control: [kill], and the x when the kill is under way. With no
+        # wait between them the x can reach the box first: its way there is
+        # shorter
+        for first, second, carried in (("#killclose", "#killgo", 0),
+                                       ("#killgo", "#killclose", 1)):
+            with self.subTest(first=first):
+                c, gate = KillCollector(), threading.Event()
+                self.addCleanup(gate.set)
+
+                def carry(prepared, c=c, gate=gate):
+                    # a kill takes time: the x comes while it is under way
+                    c.carried.append(prepared)
+                    gate.wait(5)
+                    return c.report_value
+                c.kill_carry = carry
+                app = self.app(collector=c)
+                async with app.run_test(size=(160, 40)) as pilot:
+                    await self.open_box(app, pilot)
+                    self.assertEqual(self.box(app).state, "ask")                # control
+                    for part in (first, second):
+                        at = app.screen.query_one(part).region
+                        self.click_at(app, at.x + 1, at.y)
+                        if carried:
+                            await self.settled(pilot)
+                    await self.settled(pilot)
+                    self.assertEqual(len(c.carried), carried)
+                    # a kill under way keeps its box: the result is said there
+                    self.assertEqual(self.box(app) is not None, bool(carried))
+                    gate.set()
+                    await self.settle(app, pilot)
+
+
 class TestTheEdges(KillTest):
     async def test_x_on_a_brief_value_does_nothing(self):
         c = KillCollector()
@@ -917,6 +977,40 @@ class RowBoxTest(KillTest):
         await pilot.pause()
         await pilot.press("x")
         await pilot.pause()
+
+
+class TestTheChoiceBoxAnswersOneTime(RowBoxTest):
+    """A key held down, or a click made two times: the second is on its way
+    when the first closed the box. The box closed again, Textual raised, and
+    the list went down (review 2 of name-accounts slice 2, 2026-10-12)."""
+
+    async def test_a_choice_two_times_with_no_wait_asks_one_time(self):
+        for how in ("key", "click"):
+            with self.subTest(how=how):
+                c = RowCollector()
+                app = self.app(collector=c)
+                async with app.run_test(size=(160, 40)) as pilot:
+                    await self.open_choices(app, pilot)
+                    self.assertIsNotNone(self.choices(app))                     # control
+                    if how == "key":
+                        self.twice(app, "p", "p")
+                    else:
+                        self.click_twice_on(app, "#choice-p")
+                    await self.settled(pilot)
+                    await self.settle(app, pilot)
+                    self.assertEqual(self.stack(app), ["Screen", "KillBox"])
+                    self.assertEqual(len(c.prepared), 1)
+
+    async def test_two_clicks_on_the_x_with_no_wait_close_it_one_time(self):
+        c = RowCollector()
+        app = self.app(collector=c)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await self.open_choices(app, pilot)
+            self.assertIsNotNone(self.choices(app))                             # control
+            self.click_twice_on(app, "#choiceclose")
+            await self.settled(pilot)
+            self.assertEqual(self.stack(app), ["Screen"])
+            self.assertEqual(c.prepared, [])
 
 
 class TestXOnARow(RowBoxTest):

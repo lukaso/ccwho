@@ -1092,6 +1092,83 @@ def stdin_reader(cmd):
     return program in _STDIN_WITHOUT_FILES and all(w.startswith("-") for w in words[1:])
 
 
+# `codex exec` reads its stdin to the end before it starts, when stdin is no
+# terminal: as the prompt when none is given (or `-`), and since codex 0.118
+# (2026-03-31) next to a prompt too, as a <stdin> block. Its subcommands read
+# it only with `-`, so a subcommand is not judged. Its flags as of 0.154, top
+# level and exec's: one that is not here may take a subcommand's place, so it
+# is not judged either. A line codex itself rejects never lives to be judged.
+_CODEX_VALUE_FLAGS = {"-c", "--config", "--enable", "--disable", "-m", "--model",
+                      "--local-provider", "-p", "--profile", "-s", "--sandbox", "-C", "--cd",
+                      "--add-dir", "--thread-source", "--output-schema", "--color", "-o",
+                      "--output-last-message", "--remote", "--remote-auth-token-env", "-a",
+                      "--ask-for-approval"}
+_CODEX_LIST_FLAGS = {"-i", "--image"}           # values up to the next flag
+_CODEX_BARE_FLAGS = {"--strict-config", "--oss", "--approve-for-me",
+                     "--dangerously-bypass-approvals-and-sandbox",
+                     "--dangerously-bypass-hook-trust", "--worktree", "--skip-git-repo-check",
+                     "--ephemeral", "--ignore-user-config", "--ignore-rules", "--json",
+                     "--search", "--no-alt-screen", "--yolo", "--experimental-json"}
+_CODEX_EXEC_SUBCOMMANDS = {"resume", "fork", "review", "help"}
+
+
+def codex_reads_stdin(cmd):
+    """Does `cmd` run the codex executable as `codex exec` (or `e`) with no
+    subcommand - the way that reads its stdin to the end before it starts?
+    Not its npm wrapper (node running .../bin/codex): that waits on its child.
+    ps shows no quotes, so a prompt whose first word is a subcommand's name
+    is not judged."""
+    toks = (cmd or "").split()
+    if not toks:
+        return False
+    prog, used = _program(toks)
+    if prog.rsplit("/", 1)[-1] != "codex":
+        return False
+    rest, i, verb = toks[used:], 0, None
+    while i < len(rest):
+        word = rest[i]
+        i += 1
+        if word == "--":
+            return verb is not None             # the prompt follows
+        if word.startswith("-") and word != "-":
+            name = word.split("=", 1)[0]
+            if name in _CODEX_VALUE_FLAGS:
+                i += "=" not in word
+            elif name in _CODEX_LIST_FLAGS:
+                while "=" not in word and i < len(rest) and not rest[i].startswith("-"):
+                    i += 1
+            elif word not in _CODEX_BARE_FLAGS:
+                return False                    # a flag ccwho does not know
+        elif verb is None:
+            if word not in ("exec", "e"):
+                return False                    # the TUI, or another subcommand
+            verb = word
+        else:
+            return word not in _CODEX_EXEC_SUBCOMMANDS     # the prompt's first word
+    return verb is not None                     # no prompt: it is read from stdin
+
+
+# what codex writes to stderr right before it reads its stdin (codex-rs
+# exec/src/lib.rs); with a prompt, a codex before 0.118 never reads it, and says
+# nothing of it
+_CODEX_WAITS = {"Reading prompt from stdin...", "Reading additional input from stdin..."}
+
+
+def codex_log_waits(fds, pid, tail):
+    """Does `pid`'s stderr say codex waits for its stdin? fd 2 must be a file
+    (parse_lsof_fds's answer names it) whose last line is the one codex writes
+    right before it reads: a line after it says codex got past it. `tail(path)`
+    is the file's end, or None. Not a file, or not read: None - unknown, never
+    no."""
+    _access, kind, name = ((fds or {}).get(pid) or {}).get("2", ("", "", ""))
+    if kind != "REG" or not name.startswith("/"):
+        return None
+    text = tail(name)
+    if text is None:
+        return None
+    return text.rstrip("\n").rsplit("\n", 1)[-1] in _CODEX_WAITS
+
+
 # The Bash tool's own shell (measured 2026-09-27): the user's shell, sourcing
 # Claude Code's snapshot of it before the command. Not an MCP server, a hook or
 # the status line - claude's other children, whose stdin it does write to

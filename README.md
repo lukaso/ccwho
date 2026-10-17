@@ -376,7 +376,7 @@ or Terminal.app timed out, its line says when ccwho asks again (`asks it again i
 | usage | `~/.ccwho/usage/` (from `ccwho statusline`); Codex's from its transcripts |
 | a session's iTerm2 pane (save) | iTerm2, by Apple Event; while iTerm2 is not asked, `ITERM_SESSION_ID` in its process's environment, else the last save of this boot |
 | Terminal.app tabs | `ps` (the `login` on each tty); their names by Apple Event |
-| stuck work | each task's output file, its wait loop's own `grep`; for a reader: `lsof -U` (its stdin), `lsof` (its other fds), `sample` (its stack), `ps -o time=` (its CPU); verdicts kept in `~/.cache/ccwho/readers.json` |
+| stuck work | each task's output file, its wait loop's own `grep`; for a reader: `lsof -U` (its stdin), `lsof` (its other fds), `sample` (its stack), `ps -o time=` (its CPU), for a `codex exec` the end of its stderr file; verdicts kept in `~/.cache/ccwho/readers.json` |
 
 `sessionId` from the agents feed **is** the transcript filename, which is what makes
 the topic column possible.
@@ -814,7 +814,9 @@ over when `turn_duration` or `stop_hook_summary` follows the last message
 (measured over 300 transcripts: 2235 of 2251 ended turns carry one, and 0 of 44860
 steps inside a turn do). Then a question is ASKED YOU, whatever is running; a
 finished turn without one stays in BUSY as running - the task will wake it, so it
-is not news.
+is not news. The summary a compaction writes is no message of a turn: an idle
+compaction writes one about 55 minutes after the turn ended, and a row sat in BUSY
+behind it over a stuck reader.
 
 Unless the task cannot end. Only one loop shape is judged: `until grep ...
 <task>.output; do sleep N; done` (or `while ! grep`), where the grep is the whole
@@ -849,7 +851,18 @@ hours while the row said `running`; a `python3` script reading its stdin waited 
 hours. So a process in a Bash tool task, older than two minutes, whose fd 0 lsof
 shows is the claude's socket, and which reads it, makes the row STUCK: `cat N waits
 for input Claude Code never sends`. A stdin reader by its command (`cat`, `tr`,
-`cut`, `head`, `tail`, `wc`, `sort`, `uniq` with no file) reads it. Any other
+`cut`, `head`, `tail`, `wc`, `sort`, `uniq` with no file) reads it. So does
+`codex exec` with no subcommand, which reads its stdin to the end before it starts -
+as its prompt when it has none, and since codex 0.118 next to one; one waited hours.
+Its log is the proof: codex writes `Reading prompt from stdin...` or `Reading
+additional input from stdin...` to stderr right before it reads, so the end of its
+stderr file (the Bash tool command's output file, or the file it was sent to) must
+be that line. A line after it says codex got past it, and an older codex given a
+prompt writes none. The end is read again after five minutes. Not judged: a
+subcommand (`resume`, `fork`, `review`), a flag ccwho does not know, a prompt whose
+first word is a subcommand's name (ps shows no quotes), a codex that has started
+anything, or one whose stderr is no file (`2>/dev/null`, a pipe). `codex exec -`
+writes no such line, so it is not found. Any other
 program with no live children (a shell or wrapper waits on its child; one that ended
 unreaped, `<defunct>`, does not count) needs
 two more facts. Its read can wait on no other fd: fd 0 is still that socket, fds 1
@@ -878,9 +891,11 @@ verdicts are kept in `~/.cache/ccwho/readers.json`, under a hash of each process
 process every time, does not sample again what the list or an earlier `ccwho ls`
 already did. A program whose
 name is not a short plain word is called `a program`. Never one under an MCP server (Claude Code
-does write to that socket) or under an agent. Its kill box stops the reader's whole
+does write to that socket) or under an agent - but for a stuck codex under codex's
+own processes (its npm wrapper). Its kill box stops the reader's whole
 task, parents first, so the tool shell cannot go on to its next command (a script
-that traps TERM is not reached); ccwho and any agent in the task are spared.
+that traps TERM is not reached); ccwho and any agent in the task are spared - not the
+stuck codex, nor its wrapper.
 
 A dead loop or reader makes the row STUCK whenever the session is not asking you
 and not mid-turn - idle or waiting too, not only busy with the turn over.
@@ -934,8 +949,8 @@ sessions where recency matters. Measured skew on a live fleet:
     idle     12h     2d          Docker high CPU usage
     busy     7s      7s          (accurate only while active)
 
-`since` reads the `timestamp` of the last `assistant`/`user` entry instead, falling
-back to mtime only when no turn carries one.
+`since` reads the `timestamp` of the last `assistant`/`user` entry instead (not a
+compaction's summary), falling back to mtime only when no turn carries one.
 
 ### Cost
 

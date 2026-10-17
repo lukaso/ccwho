@@ -235,11 +235,18 @@ def extract_doing(lines):
 _TURN_TYPES = ("assistant", "user")
 
 
+def _is_turn(d):
+    """A message of a turn. Not the summary a compaction writes as a "user"
+    record: an idle compaction writes it ~55 minutes after the turn ended
+    (2026-10-17: a row said BUSY for hours over a stuck reader)."""
+    return d.get("type") in _TURN_TYPES and not d.get("isCompactSummary")
+
+
 def last_turn_ts(lines):
     """Epoch seconds of the last real turn, from its `timestamp` field."""
     latest = None
     for d in as_records(lines):
-        if d.get("type") not in _TURN_TYPES:
+        if not _is_turn(d):
             continue
         raw = d.get("timestamp")
         if not raw:
@@ -435,7 +442,7 @@ def turn_ended(lines):
     """
     ended = False
     for d in as_records(lines):
-        if d.get("type") in ("assistant", "user"):
+        if _is_turn(d):
             ended = False
         elif d.get("type") == "system" and d.get("subtype") in _TURN_END:
             ended = True
@@ -581,11 +588,13 @@ def find_dead_loops(pid, ptable, read=task_file, grace=DEAD_LOOP_GRACE,
 
 def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
                     matches=None, unix=None, own=None, started=None, starts=None,
-                    report=None, fds=None, stack=None, cache=None, now=None):
+                    report=None, fds=None, stack=None, cache=None, now=None, tail=None):
     """SIGTERM each of `pids` that is STILL a dead loop of that session - and
     for a dead reader, its whole task: the tool shell under the claude and all
     below it, parents first. Never ccwho (`own`) or what runs it, and never an
     agent the task started, nor anything under one: those go to report["spared"].
+    A stuck codex listed, and the codex processes it runs under, are no such
+    agent: the codex is the reader.
 
     Looked for again, not taken from the last scan: by the time you press the
     key the loop may have ended and its pid gone to something else. A reader
@@ -622,7 +631,8 @@ def kill_dead_loops(session_pid, pids, ps=None, read=task_file, kill=None,
     keyed = ptable if cache is None else {
         pid: (ppid, (table().get(pid) or ("",))[0], cmd) for pid, (ppid, _s, cmd) in ptable.items()}
     readers = [d for d in find_dead_readers(session_pid, keyed, unix=unix, grace=0, cache=seen,
-                                            fds=fds, stack=stack, only=wanted, now=now)
+                                            fds=fds, stack=stack, only=wanted, now=now,
+                                            tail=tail)
                if d["pid"] in wanted]
     if seen:
         adopt_verdicts(cache, seen)
@@ -716,8 +726,10 @@ def _stop_reader_tasks(session_pid, readers, rows, send, own, started, starts, r
             by_root.setdefault(d["root"], []).append(d["pid"])
     for root, wanted_here in sorted(by_root.items()):
         task = below(root)
-        # a claude or codex the task started is a session of its own
-        agents = sorted(p for p in task if procs._is_an_agent(ptable[p][2]))
+        # a claude or codex the task started is a session of its own - not a
+        # stuck codex listed here, nor the wrapper it runs under
+        chain = {a for p in wanted_here for a in (p, *procs._ancestors(ptable, p))}
+        agents = sorted(p for p in task if procs._is_an_agent(ptable[p][2]) and p not in chain)
         out = set().union(*(below(a) for a in agents)) if agents else set()
         if report is not None:
             report.setdefault("spared", []).extend(
@@ -893,8 +905,14 @@ def save_verdicts(cache, path=None, now=None):
         pass                            # a verdict not kept is only asked again
 
 
+def _log_tail(path):
+    """The end of a file a process writes to, or None (task_file's guards)."""
+    got = task_file(path)
+    return got[0] if got else None
+
+
 def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, cache=None,
-                      fds=None, stack=None, only=None, names=None):
+                      fds=None, stack=None, only=None, names=None, tail=None):
     """A session's readers that cannot end: [{"pid", "tasks", "kind", "program",
     "root", "start"}] - `tasks` empty, there for a script reading dead_loops as
     loops; `start` so a kill knows it is still the reader that was listed.
@@ -917,6 +935,14 @@ def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, c
     `only`: the pids a kill asked about - no other is sampled, and each of them
     is. `names`: pid -> `ps -o comm`, the name a row prints. What `cache`
     gains is marked "_verdicts_new", for collect to keep (save_verdicts).
+
+    A codex is an agent, and its tree is its own - but a `codex exec` that
+    reads its stdin (procs.codex_reads_stdin) and has started nothing never
+    began its work (2026-10-17: hours on that socket). It is reached through
+    codex's own processes (its npm wrapper) and proven by its log: the end of
+    its stderr file (`fds`, `tail`) is the line codex writes right before it
+    reads (procs.codex_log_waits). Read again after STACK_RESAMPLE seconds;
+    no sample is spent.
     """
     kids = {}
     for cpid, (ppid, _start, _cmd) in (ptable or {}).items():
@@ -926,27 +952,39 @@ def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, c
     # and Claude Code writes to that one
     found, seen = [], {pid}
     todo = [(c, c) for c in sorted(kids.get(pid, [])) if procs.is_tool_shell(ptable[c][2])]
-    cands, others = {}, {}
+    cands, others, logs = {}, {}, set()
     while todo:
         cpid, root = todo.pop()
         if cpid in seen:
             continue
         seen.add(cpid)
         _ppid, start, cmd = ptable[cpid]
+        # a child that ended and was never reaped is no child it waits on (review 4)
+        live = [k for k in kids.get(cpid, []) if not procs._ZOMBIE.match(ptable[k][2] or "")]
+        named = procs.stdin_reader(cmd)
         if procs._is_an_agent(cmd):
-            continue            # a claude the task started: its socket, its work
-        todo += [(k, root) for k in sorted(kids.get(cpid, []))]
+            # a claude or codex the task started: its socket, its work - but a
+            # `codex exec` reading its stdin never started any (2026-10-17).
+            # Through codex's own processes (its npm wrapper) to it, no further
+            if procs._agent_kind(cmd) == "Codex agent":
+                todo += [(k, root) for k in sorted(live)
+                         if procs._agent_kind(ptable[k][2]) == "Codex agent"]
+            named = not live and procs.codex_reads_stdin(cmd)
+            if not named:
+                continue
+        else:
+            todo += [(k, root) for k in sorted(kids.get(cpid, []))]
         if procs._ZOMBIE.match(cmd or ""):
             continue            # ended, not reaped: it holds no fd, it reads nothing
         began = _started(start)
         if not (grace <= 0 or began is not None and now - began >= grace):
             continue
-        if procs.stdin_reader(cmd):
+        if named:
             cands[cpid] = root
-        elif (not [k for k in kids.get(cpid, []) if not procs._ZOMBIE.match(ptable[k][2] or "")]
-              and (only is None or cpid in only)):
-            # a shell or wrapper waits on its child, not on its stdin - a child
-            # that ended and was never reaped is no child it waits on (review 4)
+            if procs._is_an_agent(cmd):
+                logs.add(cpid)
+        elif not live and (only is None or cpid in only):
+            # a shell or wrapper waits on its child, not on its stdin
             others[cpid] = root
     if not cands and not others:
         return []
@@ -980,6 +1018,19 @@ def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, c
         said = stacks.get(key[c])
         # a stamp later than now: a clock set back (review 3)
         return said is None or not 0 <= now - said[1] < STACK_RESAMPLE
+    # a codex is stuck only while its log says it waits: one that reads no
+    # stdin says nothing of it, one that got past it writes on
+    waiting = [c for c in sorted(logs) if proven(c) and due(c)]
+    if waiting:
+        listing = (fds or open_fds)(waiting)
+        for c in waiting:
+            said = (None if listing is None
+                    else procs.codex_log_waits(listing, c, tail or _log_tail))
+            if said is None and stacks.get(key[c]):
+                said = stacks[key[c]][0]        # unknown, never no: the last verdict stands
+            stacks[key[c]] = [said, now]
+            if cache is not None:
+                cache["_verdicts_new"] = True
     asked = [c for c in on_socket if due(c)]
     if asked and (left is None or left > 0):     # no sample left: not even lsof
         # fd 0 proven again before a new sample: a dup2 may have put another
@@ -1008,7 +1059,8 @@ def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, c
     if left is not None and cache is not None and "_sample_budget" in cache:
         cache["_sample_budget"] = left
     for c in sorted(every):
-        if proven(c) and (c in cands or (stacks.get(key[c]) or (None,))[0] is True):
+        if proven(c) and ((c in cands and c not in logs)
+                          or (stacks.get(key[c]) or (None,))[0] is True):
             found.append({"pid": c, "tasks": [], "kind": "reader",
                           "program": procs.reader_name(ptable[c][2], (names or {}).get(c)),
                           "root": every[c], "start": ptable[c][1]})

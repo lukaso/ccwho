@@ -735,6 +735,15 @@ class TestLastTurnTs(unittest.TestCase):
                  json.dumps({"type": "bridge-session", "timestamp": "2026-08-31T12:00:00.000Z"})]
         self.assertAlmostEqual(ccwho.last_turn_ts(lines), 1788091200.0, places=0)
 
+    def test_a_compaction_summary_is_no_turn(self):
+        # an idle compaction writes it an hour after the last turn: since stays
+        # on the turn
+        summary = json.dumps({"type": "user", "isCompactSummary": True,
+                              "timestamp": "2026-08-31T12:00:00.000Z",
+                              "message": {"content": "This session is being continued"}})
+        lines = [self._entry("assistant", "2026-08-30T12:00:00.000Z"), summary]
+        self.assertAlmostEqual(ccwho.last_turn_ts(lines), 1788091200.0, places=0)
+
     def test_none_when_no_timestamps(self):
         self.assertIsNone(ccwho.last_turn_ts([json.dumps({"type": "assistant"})]))
 
@@ -952,6 +961,18 @@ class TestBusyWithTheTurnOver(unittest.TestCase):
     def test_a_turn_that_ended_without_asking_is_running_not_news(self):
         tail = [self._said("Suite is running in the background; I'll report.")] + self.END
         self.assertEqual(self._attention(tail), "running")
+
+    def test_a_stuck_reader_after_an_idle_compaction_is_stuck(self):
+        # liveapp-0c, 2026-10-17: the turn ended, an idle compaction wrote its
+        # summary 55 minutes later, and the row said BUSY over a codex that
+        # waited on Claude Code's socket for hours
+        tail = ([self._said("I wait for the Codex check.")] + self.END
+                + TestTurnEnded.COMPACTED)
+        reader = {"pid": 14162, "tasks": [], "kind": "reader", "program": "codex",
+                  "root": 12179, "start": "Sat Oct 17 19:24:43 2026"}
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1790267620.0, work=1,
+                              dead_loops=[reader])
+        self.assertEqual(row["attention"], "stuck")
 
     def test_no_process_to_see_is_still_running(self):
         # a background subagent is no child process, but the feed still knows
@@ -1792,6 +1813,212 @@ class TestKillDeadReaders(unittest.TestCase):
         k = self.machine()
         k.table[86083] = (82755, self.START, "npm exec some-mcp")
         got, k = self._kill(k)
+        self.assertEqual((got, k.sent), ([], []))
+
+
+class CodexWorld:
+    """The tree measured on 2026-10-17 (liveapp-0c), pids changed: a heredoc
+    command ran `codex exec -m … PROMPT > log 2>&1` in the background. codex
+    read its stdin - Claude Code's socket - for hours, its log saying only
+    "Reading additional input from stdin...". npm's codex is a node wrapper
+    that runs the codex executable; both hold the socket on fd 0. Three fakes:
+    lsof -U (fd 0's socket), lsof (every fd: fd 2 is the log) and the log's end."""
+    CLAUDE, TOOL_PID, WRAPPER, CODEX, MCP = 71139, 71179, 71070, 71162, 71216
+    START = "Sat Oct 17 19:24:43 2026"
+    NOW = 1792265083.0 + 3600                   # an hour later
+    TOOL = TestFindDeadReaders.TOOL
+    ARGS = " exec -m gpt-6-astra -s read-only -C /Users/u/wt -o /tmp/x/out.md Review ONLY it"
+    NODE = "node /Users/u/.nvm/versions/node/v24.9.0/bin/codex" + ARGS
+    EXE = ("/Users/u/.nvm/versions/node/v24.9.0/lib/node_modules/@openai/codex/node_modules/"
+           "@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex" + ARGS)
+    LOG = "/tmp/x/codex.log"
+    WAITS = "Reading additional input from stdin...\n"     # all the log said
+
+    def table(self, extra=()):
+        t = {self.CLAUDE: (1, self.START, "claude"),
+             self.MCP: (self.CLAUDE, self.START, "npm exec chrome-devtools-mcp@latest --isolated"),
+             self.TOOL_PID: (self.CLAUDE, self.START, self.TOOL),
+             self.WRAPPER: (self.TOOL_PID, self.START, self.NODE),
+             self.CODEX: (self.WRAPPER, self.START, self.EXE)}
+        t.update(dict(extra))
+        return t
+
+    def unix(self, peer="0x7974", seen=None):
+        """fd 0 of the task's processes is the socket whose other end the claude holds."""
+        def read(pids):
+            if seen is not None:
+                seen.append(sorted(pids))
+            out = {self.CLAUDE: {"19": ("0x7974", "->0x5b45")}}
+            out.update({p: {"0": ("0x5b45", "->" + peer)} for p in pids if p != self.CLAUDE})
+            return out
+        return read
+
+    def fds(self, err=("w", "REG", LOG)):
+        """fd 2 of each pid asked about: the log file, as measured."""
+        return lambda pids: {p: {"0": ("u", "unix", "->0x7974"), "1": err, "2": err}
+                             for p in pids}
+
+    def tail(self, text=WAITS, seen=None):
+        def read(path):
+            if seen is not None:
+                seen.append(path)
+            return text if path == self.LOG else None
+        return read
+
+
+class TestFindDeadCodex(CodexWorld, unittest.TestCase):
+    """A codex is an agent, whose work ccwho leaves alone - but a `codex exec`
+    reading Claude Code's socket never started any: it is the stuck reader.
+    Its log is the proof: codex says it reads its stdin right before it does,
+    and anything after that line says it got past it."""
+
+    def find(self, t=None, unix=None, now=None, fds=None, tail=None, **kw):
+        # no real lsof, sample or file: every pid and path here is made up
+        return ccwho.find_dead_readers(self.CLAUDE, t or self.table(), unix=unix or self.unix(),
+                                       now=now or self.NOW, fds=fds or self.fds(),
+                                       tail=tail or self.tail(), stack=lambda pid: None, **kw)
+
+    def test_the_codex_that_waited_hours_is_found(self):
+        self.assertEqual(self.find(), [{"pid": self.CODEX, "tasks": [], "kind": "reader",
+                                        "program": "codex", "root": self.TOOL_PID,
+                                        "start": self.START}])
+
+    def test_a_codex_with_no_prompt_is_found(self):
+        t = self.table({self.CODEX: (self.WRAPPER, self.START, "codex exec --json")})
+        self.assertEqual([d["pid"] for d in self.find(t, tail=self.tail(
+            "Reading prompt from stdin...\n"))], [self.CODEX])
+
+    def test_a_codex_with_no_wrapper_is_found(self):
+        # Homebrew's codex, the ChatGPT app's: the executable under the tool shell
+        t = self.table({self.CODEX: (self.TOOL_PID, self.START, self.EXE)})
+        del t[self.WRAPPER]
+        self.assertEqual([d["pid"] for d in self.find(t)], [self.CODEX])
+
+    def test_only_the_executable_is_asked_about(self):
+        # the wrapper waits on its child: it is no candidate of its own
+        seen = []
+        self.find(unix=self.unix(seen=seen))
+        self.assertEqual(seen, [sorted([self.CODEX, self.CLAUDE])])
+
+    def test_a_codex_past_its_stdin_is_not_judged(self):                   # control
+        # a codex that reads no stdin says nothing of it (before 0.118, with a
+        # prompt); one that got past it writes on
+        for text in ("", self.WAITS + "thinking\n", "codex exec -m o3\nworking\n"):
+            with self.subTest(text=text):
+                self.assertEqual(self.find(tail=self.tail(text)), [])
+
+    def test_a_log_ccwho_cannot_read_proves_nothing(self):                 # control
+        for fds, tail in ((self.fds(("w", "PIPE", "->0xa")), None),
+                          (self.fds(("w", "CHR", "/dev/null")), None),
+                          (lambda pids: None, None), (None, lambda path: None)):
+            with self.subTest(fds=fds, tail=tail):
+                self.assertEqual(self.find(fds=fds, tail=tail), [])
+
+    def test_its_log_is_read_again_only_after_a_while(self):
+        seen, cache = [], {}
+        self.find(tail=self.tail(seen=seen), cache=cache)
+        again = self.find(tail=self.tail(seen=seen), cache=cache)
+        self.assertEqual((seen, [d["pid"] for d in again]), ([self.LOG], [self.CODEX]))
+        later = self.find(tail=self.tail(self.WAITS + "go\n", seen=seen), cache=cache,
+                          now=self.NOW + ccwho.STACK_RESAMPLE + 1)
+        self.assertEqual((len(seen), later), (2, []))
+
+    def test_a_log_not_read_again_keeps_its_verdict(self):
+        # lsof failing, or the file gone for a look: unknown, never no
+        cache = {}
+        self.find(cache=cache)
+        later = self.NOW + ccwho.STACK_RESAMPLE + 1
+        for fds, tail in ((lambda pids: None, None), (None, lambda path: None)):
+            with self.subTest(fds=fds, tail=tail):
+                self.assertEqual([d["pid"] for d in self.find(fds=fds, tail=tail, cache=cache,
+                                                              now=later)], [self.CODEX])
+
+    def test_the_real_tail_path_runs(self):
+        # every test above injects `tail`: this one reads a real file
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "codex.log")
+            with open(log, "w") as fh:
+                fh.write("Reading additional input from stdin...\n")
+            got = ccwho.find_dead_readers(self.CLAUDE, self.table(), unix=self.unix(),
+                                          now=self.NOW, fds=self.fds(("w", "REG", log)),
+                                          stack=lambda pid: None)
+        self.assertEqual([d["pid"] for d in got], [self.CODEX])
+
+    def test_its_stdin_from_anyone_else_is_not_dead(self):                  # control
+        self.assertEqual(self.find(unix=self.unix(peer="0x1")), [])
+
+    def test_a_codex_younger_than_the_grace_is_not_judged(self):            # control
+        self.assertEqual(self.find(now=1792265083.0 + 60), [])
+
+    def test_a_codex_that_started_its_work_is_not_judged(self):             # control
+        # what it runs is its own: it got past its stdin
+        self.assertEqual(self.find(self.table({71555: (self.CODEX, self.START, "/bin/zsh -lc ls")})),
+                         [])
+
+    def test_a_codex_subcommand_is_not_judged(self):                        # control
+        t = self.table({self.CODEX: (self.WRAPPER, self.START,
+                                     self.EXE.replace(" exec ", " exec review --uncommitted "))})
+        self.assertEqual(self.find(t), [])
+
+    def test_what_a_codex_runs_is_not_looked_at(self):                     # control
+        # under its wrapper, only the codex it runs: a `cat` there is codex's
+        t = self.table({self.CODEX: (self.WRAPPER, self.START, "cat")})
+        self.assertEqual(self.find(t), [])
+
+    def test_a_codex_under_claude_p_is_not_this_sessions(self):            # control
+        t = self.table({71400: (self.TOOL_PID, self.START, "claude -p hi"),
+                        self.WRAPPER: (71400, self.START, self.NODE)})
+        self.assertEqual(self.find(t), [])
+
+
+class TestKillDeadCodex(CodexWorld, unittest.TestCase):
+    """The stuck codex's task is stopped as any reader's is: the tool shell and
+    all below it, parents first - the codex and its wrapper too. Any other
+    agent in the task is still spared. Its log is read again first."""
+
+    def _kill(self, extra=(), peer="0x7974", report=None, text=CodexWorld.WAITS):
+        k = FakeKernel(self.table(extra), shells={self.TOOL_PID})
+        got = ccwho.kill_dead_loops(self.CLAUDE, [self.CODEX], ps=k.ps, kill=k.kill,
+                                    starts=k.starts, unix=self.unix(peer),
+                                    started={self.CODEX: self.START}, report=report,
+                                    fds=self.fds(), tail=self.tail(text), stack=lambda pid: None,
+                                    read=lambda path: None, matches=lambda a, f: False)
+        return got, k
+
+    def test_the_whole_task_is_gone(self):
+        report = {}
+        got, k = self._kill(report=report)
+        self.assertEqual(got, [self.CODEX])
+        self.assertFalse({self.TOOL_PID, self.WRAPPER, self.CODEX} & set(k.table))
+        self.assertEqual(report.get("spared", []), [])
+
+    def test_nothing_outside_the_task(self):                                # control
+        _, k = self._kill()
+        self.assertFalse({self.CLAUDE, self.MCP} & {p for p, _ in k.sent})
+
+    def test_another_agent_in_the_task_is_still_spared(self):               # control
+        report = {}
+        got, k = self._kill({71400: (self.TOOL_PID, self.START, "claude -p hi"),
+                             71401: (71400, self.START, "cat")}, report=report)
+        self.assertEqual(got, [self.CODEX])
+        self.assertFalse({71400, 71401} & {p for p, _ in k.sent})
+        self.assertEqual(report.get("spared"), [71400])
+
+    def test_a_working_codex_beside_it_is_spared(self):                     # control
+        # `codex exec A < /dev/null & codex exec B &`: A got past its stdin
+        report = {}
+        got, k = self._kill({71556: (self.TOOL_PID, self.START, "codex exec -m o3 fix it"),
+                             71557: (71556, self.START, "/bin/zsh -lc make")}, report=report)
+        self.assertEqual(got, [self.CODEX])
+        self.assertFalse({71556, 71557} & {p for p, _ in k.sent})
+        self.assertEqual(report.get("spared"), [71556])
+
+    def test_a_codex_no_longer_proven_is_left_alone(self):                  # control
+        got, k = self._kill(peer="0x1")
+        self.assertEqual((got, k.sent), ([], []))
+
+    def test_a_codex_past_its_stdin_since_the_list_is_left_alone(self):    # control
+        got, k = self._kill(text=CodexWorld.WAITS + "working\n")
         self.assertEqual((got, k.sent), ([], []))
 
 
@@ -2820,6 +3047,25 @@ class TestTurnEnded(unittest.TestCase):
         self.assertFalse(ccwho.turn_ended([
             {"type": "system", "subtype": "turn_duration"},
             {"type": "user", "message": {"content": "go"}}]))
+
+    # what an idle compaction writes after an ended turn (2026-10-17, liveapp-0c):
+    # the row sat in BUSY over a codex that could never start
+    COMPACTED = [{"type": "system", "subtype": "compact_boundary",
+                  "compactMetadata": {"trigger": "auto", "preTokens": 522219}},
+                 {"type": "user", "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+                  "message": {"content": "This session is being continued from a previous"
+                                         " conversation that ran out of context."}},
+                 {"type": "system", "subtype": "informational",
+                  "content": "Compacted while idle, before the prompt cache expired"}]
+
+    def test_a_compaction_after_the_marker_does_not_reopen_it(self):
+        self.assertTrue(ccwho.turn_ended([
+            {"type": "assistant", "message": {"content": []}},
+            {"type": "system", "subtype": "turn_duration"}] + self.COMPACTED))
+
+    def test_a_compaction_inside_a_turn_does_not_end_it(self):         # control
+        self.assertFalse(ccwho.turn_ended(
+            [{"type": "assistant", "message": {"content": []}}] + self.COMPACTED))
 
     def test_an_empty_tail_has_not_ended(self):
         self.assertFalse(ccwho.turn_ended([]))

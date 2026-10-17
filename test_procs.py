@@ -1163,6 +1163,97 @@ class TestStdinReader(unittest.TestCase):
                 self.assertFalse(procs.stdin_reader(cmd))
 
 
+class TestCodexReadsStdin(unittest.TestCase):
+    """`codex exec` reads its stdin to the end before it starts, when stdin is
+    no terminal: as the prompt when none is given, and since codex 0.118 next
+    to a prompt too. On 2026-10-17 one in a heredoc command waited hours on
+    Claude Code's socket, its log saying "Reading additional input from
+    stdin...". Its subcommands read stdin only with `-`: not judged."""
+
+    # the codex executable as ps showed it, its prompt cut short
+    MEASURED = ("/Users/u/.nvm/versions/node/v24.9.0/lib/node_modules/@openai/codex/"
+                "node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+                " exec -m gpt-6-astra -s read-only -C /Users/u/.liveapp-wt/wv2-review"
+                " -o /private/tmp/x/wv2-fix10-codex.md Filesystem boundary: do not read")
+
+    def test_readers(self):
+        for cmd in (self.MEASURED, "codex exec x", "codex e x", "/opt/homebrew/bin/codex exec Fix it",
+                    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/"
+                    "Contents/MacOS/codex exec x",
+                    # no prompt, or `-`: the prompt is read from stdin
+                    "codex exec", "codex exec -", "codex exec --json --ephemeral",
+                    "codex exec --skip-git-repo-check --model=o3 x", "codex exec -c a.b=1 -c c=2 x",
+                    "codex exec --add-dir /a --output-schema s.json --color never x",
+                    # an image list runs to the next flag - over a subcommand's
+                    # name too, as codex 0.154 parses it
+                    "codex exec -i a.png b.png", "codex exec --image a.png --json x",
+                    "codex exec -i a.png help",
+                    # codex 0.154's hidden aliases
+                    "codex exec --yolo x", "codex --yolo exec x", "codex exec --experimental-json x",
+                    # after `--`, a word is the prompt's
+                    "codex exec -- review this", "codex -c k=v exec x"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(procs.codex_reads_stdin(cmd))
+
+    def test_not_readers(self):                                         # control
+        for cmd in ("codex exec resume --last", "codex exec resume abc go on",
+                    "codex exec fork abc", "codex exec review --uncommitted", "codex exec help",
+                    "codex exec -m o3 review --base main", "codex e review --uncommitted",
+                    "codex exec --model=o3 resume abc", "codex exec --yolo review x",
+                    # `--image=` takes one value: then a subcommand (as codex 0.154 parses it)
+                    "codex exec --image=a.png review x",
+                    # ps shows no quotes: a prompt that starts with a subcommand's
+                    # name may be one - not judged
+                    "codex exec review this diff",
+                    # the TUI, other subcommands
+                    "codex", "codex fix it", "codex review x", "codex exec-server --remote x",
+                    "codex app-server", "codex -- exec x",
+                    # a flag ccwho does not know may take the subcommand's place
+                    "codex exec --new-flag x", "codex exec -mo3 x",
+                    "codex exec -h", "codex exec --help", "codex exec -V", "codex exec --version",
+                    # the npm wrapper waits on its child, the codex executable
+                    "node /Users/u/.nvm/versions/node/v24.9.0/bin/codex exec x",
+                    "codex-x exec x", "/x/codex2 exec x", "cat", "", None):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(procs.codex_reads_stdin(cmd))
+
+
+class TestCodexLogWaits(unittest.TestCase):
+    """Proof that a codex waits for its stdin: codex writes "Reading prompt from
+    stdin..." or "Reading additional input from stdin..." to stderr right
+    before it reads, and nothing after while it waits. fd 2 must be a file
+    lsof names; unknown is None, never no."""
+    LOG = "/tmp/x/codex.log"
+
+    def waits(self, text, err=("w", "REG", LOG), fds=None):
+        listing = {7: {"0": ("u", "unix", "->0xa"), "1": err, "2": err}} if fds is None else fds
+        return procs.codex_log_waits(listing, 7, lambda path: text if path == self.LOG else None)
+
+    def test_waiting(self):
+        for text in ("Reading additional input from stdin...\n", "Reading prompt from stdin...\n",
+                     "ok\nReading additional input from stdin...\n",
+                     "Reading prompt from stdin..."):
+            with self.subTest(text=text):
+                self.assertIs(self.waits(text), True)
+
+    def test_past_its_stdin(self):                                      # control
+        for text in ("", "Reading prompt from stdin...\nthinking\n", "working\n",
+                     "No prompt provided via stdin.\n"):
+            with self.subTest(text=text):
+                self.assertIs(self.waits(text), False)
+
+    def test_unknown(self):                                             # control
+        # not a file: never read, whatever reading it would give
+        said = lambda path: "Reading prompt from stdin...\n"           # noqa: E731
+        for err, fds in ((("w", "PIPE", "->0xa"), None), (("w", "CHR", "/dev/null"), None),
+                         (("w", "FIFO", "/tmp/f"), None), (("w", "REG", "x.log"), None),
+                         (None, {}), (None, {7: {"0": ("u", "unix", "->0xa")}})):
+            with self.subTest(err=err, fds=fds):
+                listing = {7: {"2": err}} if fds is None else fds
+                self.assertIsNone(procs.codex_log_waits(listing, 7, said))
+        self.assertIsNone(self.waits(None))                             # a file not read
+
+
 class TestIsToolShell(unittest.TestCase):
     """The Bash tool's own shell, as ps shows it (measured 2026-09-27)."""
 

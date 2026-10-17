@@ -2072,11 +2072,21 @@ def codex_rows(fleet, now=None):
         folder = _tilde(cwd)
         # what is drawn: one line, no mark that reorders it (U+202E) or hides in it
         clean = (lambda text: procs._shown_line(_one_line(text)))
+        # parked at this turn, as a Claude session is (build_row): a new turn
+        # ends it, and a program's thread is never yours to park
+        attention, park, ts = codex_attention(t, now), t.get("park"), t.get("ts")
+        park_note = park_was = ""
+        if ts is not None and isinstance(park, dict) and park.get("ts") == ts \
+                and attention != "program":
+            # your own words, kept as a session's (build_row) and as the box
+            # showed them: a scan must not change them
+            park_note, park_was, attention = _one_line(park.get("note") or ""), attention, "parked"
         # a UUIDv7 starts with its time (the same four hex for weeks): the short
         # id is its random end
         out.append({"sessionId": t["thread"], "short": t["thread"][-4:],
-                    "kind": "codex", "attention": codex_attention(t, now),
-                    "ask": clean(t.get("ask") or ""), "ts": t.get("ts"),
+                    "kind": "codex", "attention": attention,
+                    "park_note": park_note, "park_was": park_was,
+                    "ask": clean(t.get("ask") or ""), "ts": ts,
                     "project": clean(os.path.basename(cwd.rstrip("/"))) or "codex",
                     # "Title (codex)", as iTerm2 shows a Claude session's tab
                     # "✳ Title (claude)" (D21); its age as a Claude row's
@@ -2151,11 +2161,12 @@ def read_codex_threads(env=None, cache=None):
         return None
 
 
-def codex_fleet(threads, att, ports_ok, reviewed=None):
+def codex_fleet(threads, att, ports_ok, reviewed=None, parks=None):
     """Each open Codex thread with its work: the processes whose Codex mark names
-    it (helpers left out) and their ports - None when the ports were not read.
-    None when the threads are not known. A Codex process whose thread is not
-    open is in no thread: it stays in att["codex"], state unknown (D17)."""
+    it (helpers left out) and their ports - None when the ports were not read -
+    and its park (load_parks), None when it has none. None when the threads
+    are not known. A Codex process whose thread is not open is in no thread:
+    it stays in att["codex"], state unknown (D17)."""
     if threads is None:
         return None
     out = []
@@ -2165,6 +2176,8 @@ def codex_fleet(threads, att, ports_ok, reviewed=None):
         out.append(dict(t, procs=summary["procs"],
                         # the finished turn you looked at: it leaves NEEDS YOU
                         seen_ts=(reviewed or {}).get(t["thread"]),
+                        # the turn you parked it at: it leaves NEEDS YOU too
+                        park=(parks or {}).get(t["thread"]),
                         ports=summary["ports"] if ports_ok else None,
                         pids=sorted(p["pid"] for p in mine if not p.get("helper"))))
     return out
@@ -3737,7 +3750,8 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
     fleet["unknown_holders"] = unknown_holders
     # Codex threads open now (Phase 3, D15): their own list, never session rows
     fleet["codex_threads"] = codex_fleet(read_codex_threads(cache=cache), att,
-                                         ports_ok=ports is not None, reviewed=reviewed)
+                                         ports_ok=ports is not None, reviewed=reviewed,
+                                         parks=parks)
     return rows, fleet
 
 
@@ -4034,12 +4048,11 @@ def loop_kill_offered(row):
 
 
 def parkable(row):
-    """Can `z` park this row? A Claude session whose turn has ended: a busy
-    one's next turn would end the park at once, a program answers its own,
-    an ended one has no turn to come, and a Codex thread lives in its app."""
+    """Can `z` park this row? A session or a Codex thread whose turn has ended:
+    a busy one's next turn would end the park at once, a program answers its
+    own, and an ended one has no turn to come."""
     return (row.get("attention") not in ("busy", "program", "ended", "parked")
-            and row.get("kind") != "codex" and bool(row.get("ts"))
-            and bool(row.get("sessionId")))
+            and bool(row.get("ts")) and bool(row.get("sessionId")))
 
 
 def park_offered(row):
@@ -4149,10 +4162,11 @@ def ui_row_cells(row, width=100, tag=""):
     # The age goes FIRST. At the end of a long recap it is the first thing
     # truncation eats, and a recap whose age you cannot see reads as the current
     # state of the work - which is exactly the mistake the age exists to prevent.
-    if row.get("kind") == "codex":
+    if row.get("kind") == "codex" and not (row.get("attention") == "parked"
+                                           and row.get("park_note")):
         # what it waits for, when it waits; else where it works. A program's
         # question is the program's to answer (D22): never a line that reads
-        # as a question to you
+        # as a question to you. Parked with a note: the note, as a session's
         mark = ""
         ask = "" if row.get("attention") == "program" else row.get("ask")
         body = ("waiting? (maybe an approval)" if row.get("attention") == "waiting"

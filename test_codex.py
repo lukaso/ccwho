@@ -1408,6 +1408,107 @@ class TestTheStateReachesTheFleet(unittest.TestCase):
         self.assertEqual(engine.codex_fleet(threads, att, True, reviewed={A: 42})[0]["seen_ts"], 42)
         self.assertIsNone(engine.codex_fleet(threads, att, True)[0]["seen_ts"])
 
+    def test_the_fleet_carries_its_park(self):
+        threads = [{"thread": A, "name": "", "cwd": "", "host_pid": 1, "originator": "",
+                    "source": "", "turn": "done", "ask": "", "ts": 42, "mtime": 1.0}]
+        att, park = {"codex": []}, {"ts": 42, "note": "checked later"}
+        self.assertEqual(engine.codex_fleet(threads, att, True, parks={A: park})[0]["park"], park)
+        self.assertIsNone(engine.codex_fleet(threads, att, True, parks={C: park})[0]["park"])
+        self.assertIsNone(engine.codex_fleet(threads, att, True)[0]["park"])
+
+
+class TestACodexThreadCanBeParked(unittest.TestCase):
+    """A Codex thread parks as a Claude session does (owner, 2026-10-17): its
+    question stayed in NEEDS YOU, and Enter on it cannot answer it. Parked at
+    its turn: a new turn ends the park."""
+
+    NOW = 1790000000.0
+
+    def row(self, park=None, turn="done", ask="Shall I land it?", ts=42, source="vscode"):
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], turn=turn, ask=ask, ts=ts,
+                 mtime=self.NOW, seen_ts=None, pending_tool=True, source=source, park=park)
+        return engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+
+    def line(self, row):
+        return "".join(t for t, _ in engine.ui_row_cells(row, width=140)[1])
+
+    def test_parked_at_its_turn_it_is_parked(self):
+        r = self.row(park={"ts": 42, "note": "checked later"})
+        self.assertEqual((r["attention"], r["park_note"], r["park_was"]),
+                         ("parked", "checked later", "asks"))
+        self.assertEqual([g["heading"] for g in engine.ui_groups([r])], ["PARKED"])
+
+    def test_not_parked_it_is_as_before(self):                         # control
+        r = self.row()
+        self.assertEqual((r["attention"], r["park_note"], r["park_was"]), ("asks", "", ""))
+
+    def test_a_finished_turn_can_be_parked(self):
+        r = self.row(park={"ts": 42, "note": ""}, ask="")
+        self.assertEqual((r["attention"], r["park_was"]), ("parked", "review"))
+
+    def test_a_new_turn_ends_the_park(self):
+        r = self.row(park={"ts": 41, "note": "checked later"})
+        self.assertEqual((r["attention"], r["park_note"], r["park_was"]), ("asks", "", ""))
+        # a turn under way has no time yet: the park of the last one is over
+        busy = self.row(park={"ts": 42, "note": ""}, turn="open", ask="", ts=None)
+        self.assertEqual(busy["attention"], "busy")
+
+    def test_a_turn_with_no_time_is_never_parked(self):
+        r = self.row(park={"ts": None, "note": ""}, turn="aborted", ask="", ts=None)
+        self.assertEqual(r["attention"], "stopped")
+
+    def test_a_programs_thread_stays_a_programs(self):
+        r = self.row(park={"ts": 42, "note": ""}, source="exec")
+        self.assertEqual((r["attention"], r["park_was"]), ("program", ""))
+
+    def test_the_note_is_one_printable_line(self):
+        r = self.row(park={"ts": 42, "note": "two\nlines \x1b[31m"})
+        self.assertEqual(r["attention"], "parked")
+        self.assertNotIn("\n", r["park_note"])
+        self.assertNotIn("\x1b", r["park_note"])
+        self.assertTrue(r["park_note"].startswith("two lines"), r["park_note"])
+
+    def test_the_note_is_kept_as_a_sessions_is(self):
+        # as the box shows it at once (park_here) and a Claude row keeps it: the
+        # next scan must not change it (review 1 of this slice)
+        for note in ("ask Ana \U0001F468\u200d\U0001F469\u200d\U0001F467", "a\u202eb"):
+            with self.subTest(note=note):
+                shown = " ".join(engine.procs.printable(note).split())
+                self.assertEqual(self.row(park={"ts": 42, "note": note})["park_note"],
+                                 shown)
+
+    def test_line_two_is_the_note_in_place_of_the_question(self):
+        line = self.line(self.row(park={"ts": 42, "note": "checked later"}))
+        self.assertIn("parked · checked later", line)
+        self.assertNotIn("Shall I land it?", line)
+        # no note: what it says when not parked, as a Claude row its recap
+        self.assertIn("Shall I land it?", self.line(self.row(park={"ts": 42, "note": ""})))
+
+    def test_a_question_offers_park(self):
+        _, second = engine.ui_row_cells(self.row(), width=140)
+        self.assertEqual([t for t, r in second if r == "park"], [engine.UI_PARK])
+        self.assertTrue(engine.parkable(self.row()))
+
+    def test_z_parks_a_finished_turn_that_offers_no_park(self):
+        # △, as a Claude row's: Enter on it moves it to STOPPED
+        done = self.row(ask="")
+        self.assertTrue(engine.parkable(done))
+        self.assertFalse(engine.park_offered(done))
+
+    def test_what_has_no_turn_to_park_at_is_not_parked(self):          # control
+        quiet = engine.CODEX_QUIET + 1
+        for name, r in (("busy", self.row(turn="open", ask="", ts=None)),
+                        ("program", self.row(source="exec")),
+                        ("aborted", self.row(turn="aborted", ask="", ts=None)),
+                        ("parked", self.row(park={"ts": 42, "note": ""}))):
+            with self.subTest(name=name):
+                self.assertFalse(engine.parkable(r))
+        t = dict(TestACodexThreadIsARow.FLEET["codex_threads"][0], turn="open", ask="",
+                 ts=None, mtime=self.NOW - quiet, seen_ts=None, pending_tool=True)
+        waiting = engine.codex_rows({"codex_threads": [t]}, now=self.NOW)[0]
+        self.assertEqual(waiting["attention"], "waiting")
+        self.assertFalse(engine.parkable(waiting))
+
 
 class TestASubagentThreadIsNoRow(unittest.TestCase):
     """Review 1 of D19: half of all finished turns are subagents' - each would

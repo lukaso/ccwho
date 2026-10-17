@@ -35,7 +35,7 @@ class TestNoTestHereWritesTheRealParks(unittest.TestCase):
 def tearDownModule():
     while _UNPIN:
         _UNPIN.pop()()
-from test_ui import LIVE, FakeAdapter, FakeCollector, UiTest
+from test_ui import BUSY, LIVE, FakeAdapter, FakeCollector, ParkTest, UiTest
 from test_ui_kill import KillCollector, RowBoxTest, prep
 
 T = "01a0eca7-7b42-72f0-b19a-ff0ae32db6a3"
@@ -260,6 +260,168 @@ class TestTheCodexRows(UiTest):
                 app.mark_selected()
                 await pilot.pause()
                 self.assertEqual("oai:codex" in bright(), lit, (sid, bright()))
+
+
+def asks(**kw):
+    """PROCS with its thread on a finished turn that asks you (▲) - or as `kw` says."""
+    t = dict(PROCS["codex_threads"][0], turn="done", ask="Shall I land it?", ts=42, mtime=1.0)
+    return dict(PROCS, codex_threads=[dict(t, **kw)])
+
+
+class TestParkACodexThread(ParkTest):
+    """[park] and `z` on a Codex thread, as on a Claude session (owner,
+    2026-10-17): its question stayed in NEEDS YOU, and Enter on it cannot
+    answer it."""
+
+    def fleet(self, procs):
+        return FakeCollector(fleet=ui.Fleet([dict(BUSY)], True, "12:00:00", procs=procs))
+
+    async def test_z_parks_its_question_with_your_note(self):
+        app = self.app(collector=self.fleet(asks()))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            self.assertEqual(self.z_says(app), "park")
+            await self.park_it(app, pilot, "checked later")
+            self.assertEqual(self.parks, [(T, 42, "checked later")])
+            self.assertEqual(self.state(app, T), ["parked"], "now, not on the next scan")
+            self.assertEqual(self.heading_of(app, T), "PARKED")
+            self.assertIn("checked later", self.screen_text(app))
+
+    async def test_a_click_on_park_opens_the_box_and_goes_nowhere(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.fleet(asks()))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            w = next(w for w in app.query(ui.Row) if w.row["sessionId"] == T)
+            line = "".join(t for t, _ in w.spans_lines()[1])
+            self.assertIn(ui.engine.UI_PARK, line)
+            await pilot.click(w, offset=(line.index(ui.engine.UI_PARK) + 2, 1))
+            await pilot.pause()
+            self.assertIsNotNone(self.box(app))
+            self.assertEqual(adapter.asked, [], "a click on [park] is not a jump")
+            self.assertNotIn("open it there", app.status)
+
+    def box_text(self, app):
+        return "\n".join(str(w.content) for w in self.box(app).query(ui.Static))
+
+    async def test_the_box_names_it_by_its_rows_id_and_says_when_the_park_ends(self):
+        # a thread id starts with its time: its row's id is its random end. And
+        # Enter on it goes nowhere: no "or you go to it"
+        app = self.app(collector=self.fleet(asks()))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            await pilot.press("z")
+            await pilot.pause()
+            text = self.box_text(app)
+            self.assertIn(f"park {T[-4:]}", text)
+            self.assertNotIn(T[:4], text)
+            self.assertIn("writes a new turn", text)
+            self.assertNotIn("you go to it", text)
+
+    async def test_a_sessions_box_says_going_to_it_ends_it(self):         # control
+        from test_ui import ASKING
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([dict(ASKING)], True,
+                                                              "12:00:00")))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            text = self.box_text(app)
+            self.assertIn(f"park {ASKING['sessionId'][:4]}", text)
+            self.assertIn("writes a new turn or you go to it", text)
+
+    async def test_an_unpark_not_saved_names_it_by_its_rows_id(self):
+        self.saves = False
+        app = self.app(collector=self.fleet(asks(park={"ts": 42, "note": "checked later"})))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertEqual(self.state(app, T), ["parked"])
+            self.assertIn(f"{T[-4:]} stays parked - could not save the unpark", app.note)
+
+    async def test_a_park_leaves_the_highlight_on_the_next_that_needs_you(self):
+        # the thread first, the session under it: the fixture's time is text, not known
+        from test_ui import ASKING
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet(
+            [dict(ASKING), dict(BUSY)], True, "12:00:00", procs=asks())))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            await self.park_it(app, pilot, "later")
+            self.assertEqual(self.heading_of(app, T), "PARKED")
+            self.assertEqual(app.selected, ASKING["sessionId"])
+
+    async def test_a_busy_thread_has_no_z(self):                          # control
+        import time
+        app = self.app(collector=self.fleet(asks(turn="open", ask="", ts=None,
+                                                 mtime=time.time())))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            self.assertIsNone(self.z_says(app))
+
+    async def test_z_on_its_parked_row_unparks_it(self):
+        app = self.app(collector=self.fleet(asks(park={"ts": 42, "note": "checked later"})))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.heading_of(app, T), "PARKED")
+            self.assertIn("checked later", self.screen_text(app))
+            await self.select(app, pilot, T)
+            self.assertEqual(self.z_says(app), "unpark")
+            await pilot.press("z")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIsNone(self.box(app), "no box: nothing to ask")
+            self.assertEqual(self.unparks, [T])
+            self.assertEqual(self.state(app, T), ["asks"])
+            self.assertEqual(self.heading_of(app, T), "NEEDS YOU")
+
+    async def test_enter_on_its_parked_row_says_where_it_runs_and_keeps_it(self):
+        # Enter goes nowhere - it runs in its app - as on a Claude row with no
+        # window: it stays parked, whatever it was when parked - every state a
+        # thread parks in (parkable): a question, a finished turn, one you have
+        # seen - and with no note too: a row is parked by its state, not by a note
+        was = set()
+        for kw in (dict(), dict(ask=""), dict(ask="", seen_ts=42)):
+            for note in ("checked later", ""):
+                with self.subTest(**kw, note=note):
+                    await self.enter_keeps_the_park(was, note, **kw)
+        self.assertEqual(was, {"asks", "review", "stopped"})                 # control
+
+    async def enter_keeps_the_park(self, was, note, **kw):
+        """Enter on the thread parked with `note`, its turn as `kw` says: it
+        stays parked. Adds the state it was parked in to `was`."""
+        self.unparks.clear(), self.marks.clear()
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=self.fleet(
+            asks(park={"ts": 42, "note": note}, **kw)))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            was.add(app.selected_row()["park_was"])
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertIn("open it there", app.status)
+            self.assertEqual((adapter.asked, self.unparks, self.marks), ([], [], []))
+            self.assertEqual(self.state(app, T), ["parked"])
+
+    async def test_a_new_turn_ends_it(self):
+        app = self.app(collector=self.fleet(asks()))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot, T)
+            await self.park_it(app, pilot, "later")
+            app.show(ui.Fleet([dict(BUSY)], True, "12:00:05", procs=asks()))
+            await pilot.pause()
+            self.assertEqual(self.state(app, T), ["parked"], "a scan from before the park")
+            app.show(ui.Fleet([dict(BUSY)], True, "12:00:10", procs=asks(ts=43)))
+            await pilot.pause()
+            self.assertEqual(self.state(app, T), ["asks"])
 
 
 class TestACodexOnlyListKeepsItsHint(UiTest):

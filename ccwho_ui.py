@@ -730,17 +730,17 @@ class ParkBox(AnswersOnce, ModalScreen):
 
     BINDINGS = [Binding("escape", "close", "close")]
 
-    def __init__(self, title):
+    def __init__(self, title, until="it writes a new turn or you go to it"):
         super().__init__()
-        self.title_text = title
+        self.title_text, self.until = title, until
 
     def compose(self) -> ComposeResult:
         with Vertical(id="parkbox"):
             with Horizontal(id="parktop"):
                 yield Static(f"park {self.title_text}", id="parkhead", markup=False)
                 yield Static(" ✕ ", id="parkclose", markup=False)
-            yield Static("why do you keep it? (optional) - it moves to PARKED until it"
-                         " writes a new turn or you go to it; z on it there unparks it",
+            yield Static(f"why do you keep it? (optional) - it moves to PARKED until"
+                         f" {self.until}; z on it there unparks it",
                          classes="parknote", markup=False)
             yield Input(placeholder="a note for yourself", id="parknote")
             yield Static("Enter parks · Esc closes", classes="parknote", markup=False)
@@ -2340,9 +2340,13 @@ class CcwhoUi(App):
         row = self.selected_row()
         if not row:
             return
-        title = "  ".join(t for t in (engine.brief.short_id(row.get("sessionId", "")),
-                                       engine.session_handle(row)) if t)
-        self.push_screen(ParkBox(title),
+        # a Codex row's own short id (its random end); a Claude session's prefix
+        short = row.get("short") or engine.brief.short_id(row.get("sessionId", ""))
+        title = "  ".join(t for t in (short, engine.session_handle(row)) if t)
+        # Enter on a Codex row goes nowhere: only a new turn ends its park
+        until = ("it writes a new turn" if row.get("kind") == "codex"
+                 else "it writes a new turn or you go to it")
+        self.push_screen(ParkBox(title, until),
                          callback=lambda note, row=row: self.parked_with(row, note))
 
     def parked_with(self, row, note):
@@ -2373,7 +2377,8 @@ class CcwhoUi(App):
         if not engine.unpark(sid):
             # on the warning line until a key, not the status line a scan
             # clears: going to it brings another window to the front
-            self.note, self.note_at = (f"{engine.brief.short_id(sid)} stays parked"
+            short = row.get("short") or engine.brief.short_id(sid)
+            self.note, self.note_at = (f"{short} stays parked"
                                        " - could not save the unpark", time.monotonic())
             self.status = ""
             self.paint_header(self.groups())
@@ -2814,6 +2819,8 @@ class CcwhoUi(App):
             self.said(f"{row.get('short')}"
                       f"  {engine.cut_codex_title(row.get('tab_title'), 40)}:"
                       f" {engine.codex_there(row, 'open')}")
+            if row.get("attention") == "parked":
+                return      # you went nowhere, as on a row with no window: it stays parked
             self.going_to(row)
             self.looked_at(row, row.get("ts"))
             return

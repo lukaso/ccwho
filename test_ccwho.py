@@ -5847,7 +5847,9 @@ class TestAParkedRow(unittest.TestCase):
         row = self.build(parks={"s1": {"ts": ts, "note": "two\nlines"}})
         self.assertEqual(row["park_note"], "two lines")
 
-    def test_a_scan_reads_the_parks(self):
+    def scan_with_parks_at(self, threads=()):
+        """collect() on one Claude session and the Codex `threads`, its parks in
+        a temp file: the file's path."""
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         path = os.path.join(tmp, "parked.json")
@@ -5860,16 +5862,34 @@ class TestAParkedRow(unittest.TestCase):
                            ("live_file_sessions", lambda *a, **k: ([], 0)),
                            ("ps_table", lambda: {}), ("listen_ports", lambda: {}),
                            ("stdin_sockets", lambda pids: {}),
-                           ("read_codex_threads", lambda env=None, cache=None: []),
+                           ("read_codex_threads",
+                            lambda env=None, cache=None: [dict(t) for t in threads]),
                            ("verdicts_path", lambda: os.path.join(tmp, "readers.json"))):
             testkit.patch(self, ccwho, name, fake)
         for app in ccwho.terms.APPS:
             testkit.patch(self, app, "titles", lambda timeout=5.0, **k: {})
+        return path
+
+    def test_a_scan_reads_the_parks(self):
+        path = self.scan_with_parks_at()
         rows, _ = ccwho.collect(cache={})
         self.assertEqual(rows[0]["attention"], "asks")                # control
         ccwho.park("s1", rows[0]["ts"], "later", path=path)
         rows, _ = ccwho.collect(cache={})
         self.assertEqual((rows[0]["attention"], rows[0]["park_note"]), ("parked", "later"))
+
+    def test_a_scan_reads_a_codex_threads_park(self):
+        thread = {"thread": "01a0eca7-7b42-72f0-b19a-ff0ae32db6a3", "name": "fix the navbar",
+                  "cwd": "/Users/x/projects/liveapp", "host_pid": 4215,
+                  "originator": "Codex Desktop", "source": "vscode", "turn": "done",
+                  "ask": "Shall I land it?", "ts": 42, "pending_tool": False, "mtime": 1.0}
+        path = self.scan_with_parks_at([thread])
+        _, fleet = ccwho.collect(cache={})
+        self.assertEqual(ccwho.codex_rows(fleet)[0]["attention"], "asks")    # control
+        ccwho.park(thread["thread"], 42, "later", path=path)
+        _, fleet = ccwho.collect(cache={})
+        row = ccwho.codex_rows(fleet)[0]
+        self.assertEqual((row["attention"], row["park_note"]), ("parked", "later"))
 
 
 class TestParkedInTheList(unittest.TestCase):
@@ -5953,9 +5973,10 @@ class TestTheParkTarget(unittest.TestCase):
                 _, second = ccwho.ui_row_cells(self.row(att), width=100)
                 self.assertNotIn("park", [r for _, r in second])
 
-    def test_a_codex_thread_is_not_parked(self):
-        _, second = ccwho.ui_row_cells(self.row(kind="codex"), width=100)
-        self.assertNotIn("park", [r for _, r in second])
+    def test_a_codex_threads_question_offers_it(self):
+        # Enter on it cannot answer it either (owner, 2026-10-17)
+        _, second = ccwho.ui_row_cells(self.row(kind="codex", ts=42), width=100)
+        self.assertEqual([t for t, r in second if r == "park"], [ccwho.UI_PARK])
 
     def test_a_row_with_no_turn_is_not_parked(self):
         _, second = ccwho.ui_row_cells(self.row(ts=None), width=100)
@@ -6002,13 +6023,17 @@ class TestTheParkTarget(unittest.TestCase):
         for att in ("asks", "review", "blocked", "waiting", "stopped", "running", "stuck"):
             with self.subTest(att=att):
                 self.assertTrue(ccwho.parkable(self.row(att)))
+        for att in ("asks", "review", "stopped"):       # a Codex thread's too
+            with self.subTest(att=att, kind="codex"):
+                self.assertTrue(ccwho.parkable(self.row(att, kind="codex", ts=42)))
 
     def test_the_key_does_not_park_what_cannot_wait(self):           # control
         # busy: its next turn ends the park at once; a program's is not yours;
-        # an ended one has no turn to come; a Codex thread is its app's
+        # an ended one has no turn to come
         for row in (self.row("busy"), self.row("program"), self.row("ended"),
-                    self.row("parked"), self.row(kind="codex"), self.row(ts=None),
-                    self.row(ts=""), self.row(sessionId="")):
+                    self.row("parked"), self.row(ts=None), self.row(ts=""),
+                    self.row(sessionId=""), self.row("busy", kind="codex", ts=None),
+                    self.row("program", kind="codex", ts=42)):
             with self.subTest(row=(row["attention"], row.get("kind"), row["ts"])):
                 self.assertFalse(ccwho.parkable(row))
 

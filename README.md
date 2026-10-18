@@ -800,7 +800,7 @@ So `ccwho` derives the state instead:
 | busy | harness says busy, mid-turn | busy |
 | running | background work is in flight: not busy, or busy with the turn over | running |
 | program | a program started it (see [Started by a program](#started-by-a-program)), and it is not stuck | program |
-| parked | you parked it at its last turn (`z` in the live list), and it has written nothing since. `--json` gives your note as `park_note`, and the state it has when not parked as `park_was` | PARKED |
+| parked | you parked it at its last turn (`z` in the live list), and it has had no turn since (a compaction or a local command is none). `--json` gives your note as `park_note`, and the state it has when not parked as `park_was` | PARKED |
 
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.
@@ -817,7 +817,12 @@ steps inside a turn do). Then a question is ASKED YOU, whatever is running; a
 finished turn without one stays in BUSY as running - the task will wake it, so it
 is not news. The summary a compaction writes is no message of a turn: an idle
 compaction writes one about 55 minutes after the turn ended, and a row sat in BUSY
-behind it over a stuck reader.
+behind it over a stuck reader. Nor is a local command you run at the prompt
+(`/compact`, `/model`, `/cost`, `/clear`): Claude Code writes its caveat, its name and
+its output (as a message, or as a system record: a failed `/compact`'s error), and no
+turn follows (123 of 123 in 542 transcripts). It is known by its output; until that is
+written it may be a skill, typed the same way, and that is a turn. A `/compact` writes
+its own line first; a prompt that only starts like one (`/tmp is full`) is a turn.
 
 Unless the task cannot end. Only one loop shape is judged: `until grep ...
 <task>.output; do sleep N; done` (or `while ! grep`), where the grep is the whole
@@ -951,7 +956,8 @@ sessions where recency matters. Measured skew on a live fleet:
     busy     7s      7s          (accurate only while active)
 
 `since` reads the `timestamp` of the last `assistant`/`user` entry instead (not a
-compaction's summary), falling back to mtime only when no turn carries one.
+compaction's summary, nor a local command), falling back to mtime only when no turn
+carries one.
 
 ### Cost
 

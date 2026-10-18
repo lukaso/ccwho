@@ -233,20 +233,58 @@ def extract_doing(lines):
 # bridge-session, mode), so file mtime says "4m" for a session last worked six days
 # ago - wrong on exactly the parked sessions where recency matters.
 _TURN_TYPES = ("assistant", "user")
+# A local command you run at the prompt (/compact, /model, /cost, /clear):
+# Claude Code writes its caveat and its name as "user" records, then its output
+# - a "user" record, or a system one of its own (every failed /compact's error,
+# /clear's output) - and no turn follows (2026-10-18, 542 transcripts: 123 of
+# 123). A /compact writes its own line first, and its summary within. Known by
+# its output: until that is written it may be a skill - and that is a turn.
+_LOCAL_PARTS = ("<local-command-caveat>", "<command-name>")
+_LOCAL_OUTPUT = ("<local-command-stdout>", "<local-command-stderr>")
+_COMMAND_NAME = re.compile(r"<command-name>/([\w:-]+)")
+_SLASH_LINE = re.compile(r"/([\w:-]+)(?:\s|\Z)")
 
 
-def _is_turn(d):
-    """A message of a turn. Not the summary a compaction writes as a "user"
-    record: an idle compaction writes it ~55 minutes after the turn ended
-    (2026-10-17: a row said BUSY for hours over a stuck reader)."""
-    return d.get("type") in _TURN_TYPES and not d.get("isCompactSummary")
+def _turn_ids(records):
+    """The ids of the records of `records` that are messages of a turn. Not the
+    summary a compaction writes as a "user" record - an idle compaction writes
+    it ~55 minutes after the turn ended (2026-10-17: a row said BUSY for hours
+    over a stuck reader) - nor the records of a local command. A line that
+    starts like a command (`/compact`) is the command's own only when the
+    command it names is the one that ran: `/tmp is full` is a prompt."""
+    out, run, ran = set(), [], set()
+    for d in records:
+        kind = d.get("type")
+        if kind == "system" and d.get("subtype") == "local_command":
+            text = str(d.get("content") or "").lstrip()
+        elif kind in _TURN_TYPES and not d.get("isCompactSummary"):
+            text = _text_of(d.get("message", {}).get("content")).lstrip() if kind == "user" else ""
+        else:
+            continue
+        if text.startswith(_LOCAL_OUTPUT):
+            out.difference_update(i for i, line in run if line is None or line in ran)
+            run, ran = [], set()
+            continue
+        if kind == "system":
+            continue                # no message of a turn, and no break in one
+        line = None if text.startswith(_LOCAL_PARTS) else _SLASH_LINE.match(text)
+        if line or text.startswith(_LOCAL_PARTS):
+            run.append((id(d), line.group(1) if line else None))
+            if name := _COMMAND_NAME.match(text):
+                ran.add(name.group(1))
+        else:
+            run, ran = [], set()
+        out.add(id(d))
+    return out
 
 
 def last_turn_ts(lines):
     """Epoch seconds of the last real turn, from its `timestamp` field."""
     latest = None
-    for d in as_records(lines):
-        if not _is_turn(d):
+    records = as_records(lines)
+    turns = _turn_ids(records)
+    for d in records:
+        if id(d) not in turns:
             continue
         raw = d.get("timestamp")
         if not raw:
@@ -441,8 +479,10 @@ def turn_ended(lines):
     and left a task running.
     """
     ended = False
-    for d in as_records(lines):
-        if _is_turn(d):
+    records = as_records(lines)
+    turns = _turn_ids(records)
+    for d in records:
+        if id(d) in turns:
             ended = False
         elif d.get("type") == "system" and d.get("subtype") in _TURN_END:
             ended = True

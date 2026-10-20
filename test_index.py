@@ -690,6 +690,24 @@ class TestGrep(Base):
             with self.subTest(q=q):
                 self.assertEqual(self.found(q), set())
 
+    def test_it_says_how_many_sessions_it_has_read_of_how_many(self):
+        # the owner, 2026-10-18: "impossible to tell if the search is continuing
+        # or if it's done" - the first search reads every transcript, 5-9 s
+        C = "cccc3333-0000-4000-8000-000000000003"
+        self.write(self.A, [user("flamingo")])
+        self.write(self.B, [user("hello")])
+        self.write(C, [rec(type="user", entrypoint="sdk-cli", timestamp=self.TS,
+                           message={"role": "user", "content": "flamingo"})])
+        idx = self.entries()
+        idx["d"] = {"sessionId": "d", "path": None, "entrypoint": "cli"}    # no transcript
+        told = []
+        self.found("flamingo", idx=idx, progress=lambda done, of: told.append((done, of)))
+        self.assertEqual(told, [(0, 2), (1, 2), (2, 2)], "not a program's, nor one with no file")
+        told.clear()
+        self.found("flamingo", idx=idx, everything=True,
+                   progress=lambda done, of: told.append((done, of)))
+        self.assertEqual(told, [(0, 3), (1, 3), (2, 3), (3, 3)])           # control
+
 
 def queued(prompt, ts="2026-09-18T10:02:00.000Z"):
     """A prompt typed while Claude worked: only an attachment, never a user record."""

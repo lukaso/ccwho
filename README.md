@@ -167,7 +167,7 @@ ccwho                         # on a terminal
 | → | the brief: what it was working on, and the processes it started - ↑ ↓ still move between sessions under it |
 | → again | into the brief, as in Finder's column view: ↑ ↓ move between its values, Enter copies one, ← back to the list. In a window too narrow for both, the brief covers the list: there → goes straight in, and one ← closes it |
 | ← / Esc | back |
-| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session; a word finds its forms too, `wake` finds woke, woken and waking) - and lists the sessions only that finds under MORE RESULTS, last: the closest first, each row showing the message that matched |
+| `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session; a word finds its forms too, `wake` finds woke, woken and waking) - and lists the sessions only that finds under MORE RESULTS, last: the closest first, each row showing the message that matched. The frame of the search box says whether that grep still runs (a spinner) or is done (✓ and how many more it found) |
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
 | `a` | every account on the usage line, to name one: who each is - its whole hash, email or Codex limit - and which open sessions spend it now. ↑ ↓ move; Enter, or a click, opens the name box for it. There Enter names the account, an empty name removes its name, Esc closes; then you are back in the accounts, on the one you named. A click on an account in the usage line opens its name box at once |
 | `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
@@ -330,11 +330,16 @@ In the live list, `/` searches the same index: the ended sessions it finds show
 under the running ones, under ENDED (ten at most, the heading says how many). Half a
 second after the last key it also greps what was said - your prompts and Claude's
 replies. The first search after the list starts reads every transcript once and keeps
-what was said in memory; a later search reads only what was appended. Sessions only
-that finds show last, under MORE RESULTS (ten at most), the closest first: most of
-your words in one message, then a message of yours before one of Claude's, then the
-words as you typed them, then running before ended, then the newest. Each of them
-shows that message, its age and who said it, in place of the recap.
+what was said in memory; a later search reads only what was appended. Until the grep
+is back, the bottom edge of the search box turns a spinner and counts the sessions it
+has read (`searching the conversations ⠹ 40 of 125`). Then it says what it found
+(`✓ searched the conversations: 3 more`, or `nothing more`), that it could not search
+them, or that they did not answer in a minute. A narrow box shows a shorter form
+(`searching ⠹ 40 of 125`, `✓ 3 more`). Sessions only that finds show last, under
+MORE RESULTS (ten at most), the closest first: most of your words in one message, then
+a message of yours before one of Claude's, then the words as you typed them, then
+running before ended, then the newest. Each of them shows that message, its age and
+who said it, in place of the recap.
 
 A word also finds its forms, from the word to its forms: `wake` finds wakes, waking,
 woke and woken; `merge` finds merging. Not the other way: `woken` finds only "woken",

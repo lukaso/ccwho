@@ -145,7 +145,7 @@ class FakeCollector:
     grep_value = None
     grep_calls = None
 
-    def grep(self, entries, query, stop=None):
+    def grep(self, entries, query, stop=None, progress=None):
         self.grep_calls = (self.grep_calls or []) + [(query, stop)]
         found = (self.grep_value or {}).get(query, ())
         return dict(found) if isinstance(found, dict) else dict.fromkeys(found)
@@ -8484,7 +8484,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         gate = threading.Event()
         real = c.grep
 
-        def later(entries, query, stop=None):
+        def later(entries, query, stop=None, progress=None):
             if query != "flamingo":
                 gate.wait(5)                        # the new text's grep is still out
             return real(entries, query, stop)
@@ -8506,7 +8506,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
     async def test_a_grep_dropped_while_two_were_out_runs_once_they_are_back(self):
         c, gate = self.collector(found={"abc": {ENDED_SID}}), threading.Event()
 
-        def hung(entries, query, stop=None):
+        def hung(entries, query, stop=None, progress=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             if query != "abc":
                 gate.wait(5)                        # and never looks at stop
@@ -8565,7 +8565,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
     async def test_a_grep_that_hangs_stops_saying_it_searches_after_a_while(self):
         c, gate = self.collector(found={}), threading.Event()
 
-        def hung(entries, query, stop=None):
+        def hung(entries, query, stop=None, progress=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gate.wait(5)                    # a root on a volume that is gone
             return {}
@@ -8710,7 +8710,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         """Each grep waits for the gate - recorded as it starts, not as it ends."""
         gate = threading.Event()
 
-        def slow(entries, query, stop=None):
+        def slow(entries, query, stop=None, progress=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gate.wait(5)
             found = (c.grep_value or {}).get(query, ())
@@ -8744,7 +8744,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
         c = self.collector(found={"flam": {BUSY["sessionId"]}, "flamingo": {ENDED_SID}})
         gates = {"flam": threading.Event(), "flamingo": threading.Event()}
 
-        def slow(entries, query, stop=None):
+        def slow(entries, query, stop=None, progress=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gates[query].wait(5)            # and never looks at stop: it lands late
             return dict.fromkeys(c.grep_value[query])
@@ -8818,7 +8818,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
     async def test_a_grep_that_fails_leaves_the_search_working(self):
         c = self.collector()
 
-        def broken(entries, query, stop=None):
+        def broken(entries, query, stop=None, progress=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             raise OSError("unreadable")
         c.grep = broken
@@ -8836,7 +8836,7 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
     async def test_greps_that_never_come_back_take_two_threads_at_most(self):
         c, gate = self.collector(found={}), threading.Event()
 
-        def hung(entries, query, stop=None):
+        def hung(entries, query, stop=None, progress=None):
             c.grep_calls = (c.grep_calls or []) + [(query, stop)]
             gate.wait(5)                    # and never looks at stop
             return {}
@@ -8856,6 +8856,401 @@ class TestTheSearchFindsWhatWasSaid(UiTest):
                     gate.set()
 
 
+class TestTheSearchBoxSaysHowTheGrepGoes(UiTest):
+    """The owner, 2026-10-18: "when doing an extended search, it's impossible to
+    tell if the search is continuing or if it's done". The frame of the search
+    box - where you type - turns a spinner while the grep of what was said is to
+    come back, with how many sessions it has read, and says once it is back what
+    it found. The header only said it, at the top, and when it was done said
+    nothing at all."""
+
+    _W = TestTheSearchFindsWhatWasSaid
+    until, read, collector, search = _W.until, _W.read, _W.collector, _W.search
+
+    def app(self, collector=None, adapter=None):
+        self.app_now = super().app(collector=collector, adapter=adapter)
+        return self.app_now
+
+    def frame(self, app):
+        return str(app.query_one("#search").border_subtitle or "")
+
+    def gated(self, c, told=None):
+        """Each grep says how far it is - `told`, {query: [(done, of), ...]} -
+        then waits for the gate."""
+        gate = threading.Event()
+
+        def slow(entries, query, stop=None, progress=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            for done, of in (told or {}).get(query, ()):
+                progress(done, of)
+            gate.wait(5)
+            found = (c.grep_value or {}).get(query, ())
+            return dict(found) if isinstance(found, dict) else dict.fromkeys(found)
+        c.grep = slow
+        return gate
+
+    async def test_while_the_grep_runs_the_frame_turns_a_spinner(self):
+        c = self.collector(found={})
+        gate = self.gated(c)
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    seen = set()
+                    for _ in range(8):
+                        await pilot.pause(0.05)
+                        seen.add(self.frame(app))
+                    self.assertTrue(all(f.startswith("searching the conversations ") for f in seen),
+                                    seen)
+                    self.assertGreater(len(seen), 1, "the same frame for 0.4 s: a list that hangs")
+                finally:
+                    gate.set()
+
+    async def test_the_frame_says_it_searches_in_the_pause_before_the_grep(self):
+        c = self.collector(found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 30):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                self.assertEqual(c.grep_calls, None, "no grep yet")
+                self.assertTrue(self.frame(app).startswith("searching the conversations "))
+                app.query_one("#search").value = ""          # the 30 s timer goes
+
+    async def test_the_frame_counts_the_sessions_the_grep_has_read(self):
+        c = self.collector(found={})
+        gate = self.gated(c, told={"zzzz": [(0, 125), (40, 125)]})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: "40 of 125" in self.frame(app)),
+                                    self.frame(app))
+                    self.assertRegex(self.frame(app), r"^searching the conversations \S 40 of 125$")
+                finally:
+                    gate.set()
+
+    async def test_an_older_greps_count_is_not_the_newer_ones(self):
+        c = self.collector(found={})
+        gate = self.gated(c, told={"flam": [(40, 125)]})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "flam")
+                    self.assertTrue(await self.until(pilot, lambda: "40 of 125" in self.frame(app)))
+                    app.query_one("#search").value = "flamingo"
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 2))
+                    await pilot.pause(0.2)
+                    self.assertTrue(self.frame(app).startswith("searching the conversations "))
+                    self.assertNotIn("of 125", self.frame(app), "flamingo said no count yet")
+                finally:
+                    gate.set()
+
+    async def test_back_the_frame_says_how_many_more_it_found(self):
+        c = self.collector()                                # flamingo: the ended session
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "flamingo")
+                self.assertTrue(await self.until(pilot, lambda: "MORE RESULTS" in self.screen_text(app)))
+                await pilot.pause()
+                self.assertEqual(self.frame(app), "✓ searched the conversations: 1 more")
+
+    async def test_back_with_nothing_more_the_frame_says_so(self):
+        # the running session it found is in the list by its name: not one more
+        c = self.collector(found={"release": {BUSY["sessionId"]}})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "release")
+                self.assertTrue(await self.until(pilot, lambda: c.grep_calls and not app.content_out))
+                await pilot.pause()
+                self.assertIn("Release queue", self.screen_text(app))
+                self.assertNotIn("MORE RESULTS", self.screen_text(app))
+                self.assertEqual(self.frame(app), "✓ searched the conversations: nothing more")
+
+    async def test_once_back_the_spinner_stops(self):
+        c = self.collector(found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                self.assertIsNone(app.spinner, "no timer that paints nothing new")
+
+    async def test_a_key_after_it_is_back_says_it_searches_again(self):
+        c = self.collector(found={})
+        gate = self.gated(c)
+        gate.set()
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                    gate.clear()
+                    app.query_one("#search").value = "zzzzy"
+                    await pilot.pause()
+                    self.assertTrue(self.frame(app).startswith("searching the conversations "),
+                                    self.frame(app))
+                finally:
+                    gate.set()
+
+    async def test_with_no_search_text_the_frame_says_nothing(self):
+        c = self.collector(found={})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                app.query_one("#search").value = ""
+                await pilot.pause()
+                self.assertEqual(self.frame(app), "")
+                self.assertIsNone(app.spinner)
+
+    async def test_a_grep_that_fails_says_it_could_not_search(self):
+        c = self.collector()
+
+        def broken(entries, query, stop=None, progress=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            raise OSError("unreadable")
+        c.grep = broken
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "release")
+                self.assertTrue(await self.until(pilot, lambda: c.grep_calls and not app.content_out))
+                await pilot.pause()
+                self.assertEqual(self.frame(app), "could not search the conversations")
+                self.assertIsNone(app.spinner)
+
+    async def test_a_grep_that_hangs_says_it_did_not_answer(self):
+        c = self.collector(found={})
+        gate = self.gated(c)
+        app = self.app(collector=c)
+        # a patience of 1 s: under load the first look came 0.13 s in (review1 F4)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05), \
+                mock.patch.object(ui, "CONTENT_PATIENCE", 1.0):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    await pilot.pause()
+                    self.assertTrue(self.frame(app).startswith("searching the conversations "))
+                    await pilot.pause(1.4)              # past its patience: no key, no scan
+                    self.assertEqual(self.frame(app), "the conversations did not answer in 1s")
+                    self.assertIsNone(app.spinner)
+                finally:
+                    gate.set()
+
+    async def test_an_index_that_cannot_be_read_says_it_could_not_search(self):
+        # no grep runs without the index: the frame must not turn for good
+        c, gate = self.collector(found={}), threading.Event()
+
+        def late_and_broken():
+            c.index_calls += 1
+            gate.wait(5)
+            raise OSError("index unreadable")
+        c.index = late_and_broken
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    await pilot.pause(0.2)              # the pause is over: the grep waits
+                    self.assertTrue(app.content_waiting)
+                    self.assertTrue(self.frame(app).startswith("searching the conversations "))
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(pilot, lambda: not app.index_reading))
+                await pilot.pause()
+                self.assertEqual(self.frame(app), "could not search the conversations")
+                self.assertIsNone(app.spinner)
+
+    async def test_before_the_sessions_are_read_it_does_not_say_nothing_more(self):
+        # review1 F2: what it found shows once the running sessions are read -
+        # "nothing more" said it had found none
+        c = GatedFleetCollector()
+        c.index_value = {ENDED_SID: dict(ENDED_ENTRY)}
+        c.grep_value = {"flamingo": {ENDED_SID}}
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "flamingo")
+                    self.assertTrue(await self.until(pilot, lambda: c.grep_calls and not app.content_out))
+                    await pilot.pause()
+                    self.assertEqual(self.frame(app), "✓ searched the conversations")
+                finally:
+                    c.gate.set()
+                self.assertTrue(await self.until(
+                    pilot, lambda: self.frame(app) == "✓ searched the conversations: 1 more"),
+                    self.frame(app))                                        # control
+
+    def bottom_line(self, app):
+        """The frame's line as the terminal shows it: a text too long is cut, with …"""
+        from textual.geometry import Region
+        box = app.query_one("#search")
+        return box.render_lines(Region(0, 0, *box.outer_size))[-1].text
+
+    async def test_a_narrow_box_cuts_no_number_and_keeps_the_spinner(self):
+        # review1 F3: at 44 columns the frame said "40 of 1…"; at 30 the spinner
+        # was cut off - and a frame that does not move is a list that hangs
+        for width, said in ((44, r"^searching \S 40 of 125$"), (20, r"^searching \S$")):
+            with self.subTest(width=width):
+                c = self.collector(found={})
+                gate = self.gated(c, told={"zzzz": [(40, 125)]})
+                app = self.app(collector=c)
+                with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+                    async with app.run_test(size=(width, 30)) as pilot:
+                        try:
+                            await pilot.pause()
+                            await self.search(pilot, "zzzz")
+                            self.assertTrue(await self.until(pilot, lambda: app.content_progress))
+                            await pilot.pause(0.2)
+                            self.assertRegex(self.frame(app), said)
+                            line = self.bottom_line(app)
+                            self.assertNotIn("…", line)
+                            self.assertTrue(any(ch in line for ch in ui.SPINNER), line)
+                        finally:
+                            gate.set()
+                        self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                        await pilot.pause()
+                        self.assertNotIn("…", self.bottom_line(app))
+        c = self.collector(found={"zzzz": {ENDED_SID}})
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(30, 30)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                await pilot.pause()
+                self.assertEqual(self.frame(app), "✓ 1 more")
+        app = self.app(collector=self.collector(found={}))
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                self.assertEqual(self.frame(app), "✓ searched the conversations: nothing more")  # control
+
+    async def test_a_resize_shows_the_form_that_fits_the_new_width(self):
+        # review2 R2-1: the list's own width check could paint before the box
+        # had its new width, and the frame kept a form cut with … until a scan
+        c = self.collector()                                # flamingo: the ended session
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 30)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "flamingo")
+                self.assertTrue(await self.until(
+                    pilot, lambda: self.frame(app) == "✓ searched the conversations: 1 more"))
+                app.painted_width = 30              # the list's width check paints nothing
+                await pilot.resize_terminal(30, 30)
+                await pilot.pause(0.6)
+                self.assertEqual(self.frame(app), "✓ 1 more")
+                self.assertNotIn("…", self.bottom_line(app))
+                app.painted_width = 140
+                await pilot.resize_terminal(140, 30)
+                await pilot.pause(0.6)
+                self.assertEqual(self.frame(app), "✓ searched the conversations: 1 more")   # control
+
+    async def test_a_narrow_box_says_a_failure_whole(self):
+        # review2 R2-2: at 20 columns it said "could not sea…"
+        c = self.collector()
+
+        def broken(entries, query, stop=None, progress=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            raise OSError("unreadable")
+        c.grep = broken
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(20, 30)) as pilot:
+                await pilot.pause()
+                await self.search(pilot, "zzzz")
+                self.assertTrue(await self.until(pilot, lambda: c.grep_calls and not app.content_out))
+                await pilot.pause()
+                self.assertNotIn("…", self.bottom_line(app))
+                self.assertIn("search", self.frame(app))
+
+    async def test_a_grep_that_hangs_after_one_that_failed_says_it_did_not_answer(self):
+        # review2 R2-3: the failure of an earlier grep for the same words outranked it
+        c, gate = self.collector(found={}), threading.Event()
+
+        def fails_then_hangs(entries, query, stop=None, progress=None):
+            c.grep_calls = (c.grep_calls or []) + [(query, stop)]
+            if len(c.grep_calls) == 1:
+                raise OSError("unreadable")
+            gate.wait(5)
+            return {}
+        c.grep = fails_then_hangs
+        app = self.app(collector=c)
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05), \
+                mock.patch.object(ui, "CONTENT_PATIENCE", 1.0):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(
+                        pilot, lambda: self.frame(app) == "could not search the conversations"))
+                    box = app.query_one("#search")
+                    box.value = ""
+                    await pilot.pause()
+                    box.value = "zzzz"                  # the same words: a new grep, that hangs
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    await pilot.pause(1.4)              # past its patience
+                    self.assertEqual(self.frame(app), "the conversations did not answer in 1s")
+                finally:
+                    gate.set()
+
+    async def test_one_spinner_turns_however_often_the_list_paints(self):
+        # review1 F5: a timer for each paint would double them at every turn
+        c = self.collector(found={})
+        gate = self.gated(c)
+        app = self.app(collector=c)
+        started, real = [], app.set_interval
+
+        def counted(interval, callback, *a, **kw):
+            if callback != app.paint_frame:
+                return real(interval, callback, *a, **kw)
+            started.append(interval)
+            if len(started) > 1:                # no second timer: no flood if one is asked
+                return mock.Mock()
+            return real(interval, callback, *a, **kw)
+        app.set_interval = counted
+        with mock.patch.object(ui, "CONTENT_PAUSE", 0.05):
+            async with app.run_test(size=(140, 40)) as pilot:
+                try:
+                    await pilot.pause()
+                    await self.search(pilot, "zzzz")
+                    self.assertTrue(await self.until(pilot, lambda: app.content_out == 1))
+                    for _ in range(3):
+                        app.rebuild()
+                        await pilot.pause(0.15)     # and the spinner's own turns
+                    self.assertEqual(started, [ui.SPIN])
+                finally:
+                    gate.set()
+                self.assertTrue(await self.until(pilot, lambda: self.frame(app).startswith("✓")))
+                self.assertIsNone(app.spinner)
+                self.assertEqual(started, [ui.SPIN], "none once it is back")
+
+
 QUIT_WHILE_IT_GREPS = """
 import sys, threading
 sys.path.insert(0, sys.argv[1])
@@ -8863,7 +9258,7 @@ import ccwho_ui as ui, test_ui
 ui.CONTENT_PAUSE = 0.05
 c = test_ui.FakeCollector()
 c.index_value = {"x": {"sessionId": "x"}}
-c.grep = lambda entries, query, stop=None: threading.Event().wait(20) or set()
+c.grep = lambda entries, query, stop=None, progress=None: threading.Event().wait(20) or set()
 
 app = ui.CcwhoUi(adapter=test_ui.FakeAdapter(), collector=c)
 
@@ -8914,17 +9309,42 @@ class TestTheCollectorGreps(unittest.TestCase):
         asked = []
         stop = lambda: False                        # noqa: E731
         with mock.patch.object(ccwho_index, "grep",
-                               lambda entries, query, stop=None, store=None: asked.append(
+                               lambda entries, query, stop=None, store=None, progress=None: asked.append(
                                    (entries, query, stop)) or {"x": None}):
             self.assertEqual(ui.Collector().grep({"e": {}}, "flamingo", stop), {"x": None})
         self.assertEqual(asked, [({"e": {}}, "flamingo", stop)])
+
+    def test_it_passes_on_how_far_the_grep_is(self):
+        # the search box's frame counts the sessions read (2026-10-18)
+        import ccwho_index
+        asked = []
+        told = lambda done, of: None                # noqa: E731
+        with mock.patch.object(ccwho_index, "grep",
+                               lambda entries, query, stop=None, store=None, progress=None:
+                               asked.append(progress) or {}):
+            ui.Collector().grep({}, "flamingo", progress=told)
+        self.assertEqual(asked, [told])
+
+    def test_an_older_index_is_asked_with_no_count(self):
+        # review1 F1: a hot reload onto an older checkout - its grep takes no
+        # count, and every search said it could not search the conversations
+        import ccwho_index
+        asked = []
+
+        def before(idx, query, stop=None, everything=False, store=None):
+            asked.append(query)
+            return {"x": None}
+        with mock.patch.object(ccwho_index, "grep", before):
+            self.assertEqual(ui.Collector().grep({}, "flamingo", progress=lambda done, of: None),
+                             {"x": None})
+        self.assertEqual(asked, ["flamingo"], "asked once")
 
     def test_every_grep_reads_from_one_store_of_what_was_said(self):
         # read once for the life of the list: the next search reads what was appended
         import ccwho_index
         stores = []
         with mock.patch.object(ccwho_index, "grep",
-                               lambda entries, query, stop=None, store=None: stores.append(
+                               lambda entries, query, stop=None, store=None, progress=None: stores.append(
                                    store) or {}):
             c = ui.Collector()
             c.grep({}, "flamingo")
@@ -8947,7 +9367,7 @@ class TestTheCollectorGreps(unittest.TestCase):
         self.addCleanup(os.remove, edited)
         stores = []
         with mock.patch.object(ccwho_index, "grep",
-                               lambda entries, query, stop=None, store=None: stores.append(
+                               lambda entries, query, stop=None, store=None, progress=None: stores.append(
                                    store) or {}), \
                 mock.patch.object(ccwho_index, "SOURCES", (edited,)):
             c = ui.Collector()

@@ -543,7 +543,7 @@ def _neg(ts):
     return tuple(-ord(c) for c in ts)
 
 
-def grep(idx, query, stop=None, everything=False, store=None):
+def grep(idx, query, stop=None, everything=False, store=None, progress=None):
     """What each session said that holds every word of `query`: {sessionId:
     Said}, for the sessions in which every word was said - in your prompts or
     Claude's replies, in any case, as typed or by a form (Word). Not what Claude
@@ -563,20 +563,22 @@ def grep(idx, query, stop=None, everything=False, store=None):
     2026-10-07 over the owner's 125 sessions: 0.04-0.26 s, against 1.5-3 s for
     a grep of the 1.2 GB of transcripts. A new one is read whole: 5-8 s.
     `stop()`, asked before each session, each line read and every 200 messages,
-    ends it early with None: a newer search has started."""
+    ends it early with None: a newer search has started. `progress(done, of)`,
+    told before each session and at the end, is how many sessions it has read
+    of how many it reads: the list's search box counts them (2026-10-18)."""
     words = _words(query)
     if not words:
         return {}
     store = store if store is not None else SaidStore()
     ranked = [w for w in words if len(w.word) >= 3] or words
     found = {}
-    for entry in list((idx or {}).values()):
-        if not everything and not is_yours(entry):
-            continue
+    entries = [e for e in list((idx or {}).values())
+               if (everything or is_yours(e)) and e.get("path")]
+    for done, entry in enumerate(entries):
+        if progress:
+            progress(done, len(entries))
         if stop and stop():
             return None
-        if not entry.get("path"):
-            continue
         messages = store.messages(entry["path"], stop)
         if messages is None:
             return None
@@ -585,6 +587,8 @@ def grep(idx, query, stop=None, everything=False, store=None):
             return None
         if said:
             found[entry.get("sessionId")] = said
+    if progress:
+        progress(len(entries), len(entries))
     # a stopped grep forgets nothing: it may not have seen every transcript
     store.prune({e.get("path") for e in (idx or {}).values() if e.get("path")})
     return found

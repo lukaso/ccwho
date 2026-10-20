@@ -128,6 +128,10 @@ CONTENT_PAUSE = 0.5
 # A grep not back by this is not said to be searching any more: one that hangs
 # (a root on a volume that is gone) said so for good (review 2).
 CONTENT_PATIENCE = 60.0
+# The search box's frame turns this while the grep is to come back: a frame
+# that moves is a list that has not hung (the owner, 2026-10-18).
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPIN = 0.1                     # seconds a turn
 NOTHING_SAID = types.MappingProxyType({})   # one object: the cache compares by identity
 
 
@@ -1020,6 +1024,15 @@ class NameBox(AnswersOnce, ModalScreen):
         self.answer(None)
 
 
+class SearchBox(Input):
+    """The search box. Its frame says how the grep of what was said goes, in
+    the form that fits its width - known here first: the list's own width check
+    could paint before the box had its new width (review2 R2-1)."""
+
+    def on_resize(self, event):
+        self.app.paint_frame()
+
+
 class CcwhoUi(App):
     """The screen. Everything it knows comes from a Fleet snapshot."""
 
@@ -1155,6 +1168,10 @@ class CcwhoUi(App):
         self.content_since = 0.0        # when the latest grep started: time.monotonic
         self.content_timer = None   # the pause after the last key
         self.content_waiting = False    # the pause is over, the index not read yet
+        self.content_failed = None      # the text the latest grep failed for
+        # (grep number, sessions read, of how many): set by the grep's thread
+        self.content_progress = None
+        self.spinner = None         # repaints the search box's frame while it greps
         # the ended session being reopened, or "" - not `reopening`: that is
         # the worker `o` starts, and an attribute of its name hid it
         self.reopening_sid = ""
@@ -1178,7 +1195,7 @@ class CcwhoUi(App):
                                  Brief("", id="brief", markup=False), id="detail")
         # what was left behind, and Codex's: one collapsed line each
         yield Static("", id="procline", markup=False)
-        yield Input(placeholder="search", id="search")
+        yield SearchBox(placeholder="search", id="search")
         yield Footer()
 
     def on_mount(self):
@@ -1520,6 +1537,8 @@ class CcwhoUi(App):
         once you have not typed for CONTENT_PAUSE - not on every key."""
         self.content_n += 1
         self.content_waiting = self.content_dropped = False
+        # an earlier grep's failure is not the next one's: that one may hang (review2 R2-3)
+        self.content_failed = None
         if self.content_timer is not None:
             self.content_timer.stop()
             self.content_timer = None
@@ -1555,8 +1574,11 @@ class CcwhoUi(App):
                          name="ccwho-grep").start()
 
     def _grep(self, n, query, entries):
+        def told(done, of):         # on this thread: the spinner reads it
+            self.content_progress = (n, done, of)
         try:
-            ids = self.collector.grep(entries, query, lambda: n != self.content_n)
+            ids = self.collector.grep(entries, query, lambda: n != self.content_n,
+                                      progress=told)
         except Exception:
             ids = None              # the search still finds by names
         try:
@@ -1577,8 +1599,11 @@ class CcwhoUi(App):
         self.content_out -= 1
         if self.content_running == n:
             self.content_running = None
-        if n == self.content_n and ids is not None and query == self.filter_text:
-            self.content_found = (query, dict(ids))    # {id: Said}
+        if n == self.content_n and query == self.filter_text:
+            if ids is None:
+                self.content_failed = query
+            else:
+                self.content_found = (query, dict(ids))    # {id: Said}
         if self.filter_text:
             self.rebuild()
         else:
@@ -1819,9 +1844,67 @@ class CcwhoUi(App):
                      + " · esc to clear"
                      if self.filter_text else "")
         header.update("   ".join(part for part in (counts, searching, self.status) if part))
+        self.paint_frame()
         self.paint_banner()
         self.paint_procs_lines()
         self.paint_usage()
+
+    def grep_pending(self):
+        """Is the grep for the search text still to come back: in the pause
+        after the last key, waiting for the index it greps, or under way?"""
+        return bool(self.filter_text) and (self.content_timer is not None or self.grepping()
+                                           or (self.content_waiting and self.reading()))
+
+    def search_frame(self):
+        """What the search box's frame says of the grep of what was said: that
+        it is still to come back - a spinner that turns, and how many sessions
+        it has read - then what it found (how many sessions under MORE RESULTS,
+        as the header counts them), or that there is no answer. The owner,
+        2026-10-18: "it's impossible to tell if the search is continuing or if
+        it's done".
+
+        In forms, the one to show first: the frame shows the first that fits,
+        so a narrow box cuts no number and keeps the spinner (review1 F3)."""
+        if not self.filter_text:
+            return [""]
+        if self.grep_pending():
+            told = self.content_progress
+            count = (f" {told[1]} of {told[2]}"
+                     if told and told[0] == self.content_n and told[2] else "")
+            turn = SPINNER[int(time.monotonic() / SPIN) % len(SPINNER)]
+            return [f"searching the conversations {turn}{count}", f"searching {turn}{count}",
+                    f"searching {turn}", turn]
+        if self.content_found and self.content_found[0] == self.filter_text:
+            if not (self.fleet.source_ok and self.fleet.at):
+                # what it found shows once the running sessions are read (review1 F2)
+                return ["✓ searched the conversations", "✓"]
+            more = sum(g.get("total", len(g["rows"])) for g in self.index_found()[2])
+            found = f"{more} more" if more else "nothing more"
+            return [f"✓ searched the conversations: {found}", f"✓ {found}", "✓"]
+        if self.content_failed == self.filter_text or self.content_waiting:
+            # nor read the index it greps
+            return ["could not search the conversations", "could not search", "search failed"]
+        if self.content_running == self.content_n or self.content_dropped:
+            return [f"the conversations did not answer in {CONTENT_PATIENCE:g}s", "no answer"]
+        return [""]
+
+    def paint_frame(self):
+        """The search box's frame, and its spinner: a timer while the grep is
+        still to come back, and none after - it would paint nothing new."""
+        box = self.part("#search")
+        if box is None:
+            return
+        pending = self.grep_pending()
+        forms = self.search_frame()
+        # the frame holds as many cells as the box's text: one more is cut, with …
+        text = next((t for t in forms if len(t) <= box.size.width), forms[-1])
+        if box.border_subtitle != text:
+            box.border_subtitle = text
+        if pending and self.spinner is None:
+            self.spinner = self.set_interval(SPIN, self.paint_frame)
+        elif not pending and self.spinner is not None:
+            self.spinner.stop()
+            self.spinner = None
 
     def stale_line(self):
         """"not updated since 14:02 (3 min)" once no scan has landed for
@@ -3308,7 +3391,7 @@ class Collector:
         except Exception as ex:
             return f"could not reopen ({type(ex).__name__})"
 
-    def grep(self, entries, query, stop=None):
+    def grep(self, entries, query, stop=None, progress=None):
         """Grep what the sessions the index knows said (ccwho_index.grep), as
         the engine's index module has it now - it is reloaded beside the engine -
         from one store of what was said, kept for the life of the list: the
@@ -3324,7 +3407,14 @@ class Collector:
             if getattr(self.said_store, "source", None) != index.SOURCE:
                 self.said_store = index.SaidStore()
             store = self.said_store
-        return index.grep(entries, query, stop=stop, store=store)
+        # a hot reload onto an older checkout: its grep takes no count, and
+        # every search said it could not search (review1 F1)
+        try:
+            takes = "progress" in inspect.signature(index.grep).parameters
+        except (TypeError, ValueError):
+            takes = False
+        return index.grep(entries, query, stop=stop, store=store,
+                          **({"progress": progress} if takes else {}))
 
     def index(self):
         """The session index `ccwho ls` searches, brought up to date. It raises

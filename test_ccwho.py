@@ -844,6 +844,283 @@ class TestBuildRow(unittest.TestCase):
         self.assertEqual(row["title"], "Gate red triage")
 
 
+NOW = 1788177600.0                      # 2026-08-31T12:00:00Z
+
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+
+def _request(at, read=600_000, write=40_000, fresh=2, ttl="1h", mid="msg_1", **extra):
+    """One assistant record of a main-thread request, as Claude Code writes it:
+    the context it sent is fresh input + what it wrote to the cache + what it read."""
+    cache = {"ephemeral_1h_input_tokens": write if ttl == "1h" else 0,
+             "ephemeral_5m_input_tokens": write if ttl == "5m" else 0}
+    rec = {"type": "assistant", "timestamp": _iso(at), "isSidechain": False,
+           "message": {"id": mid, "model": "claude-opus-5-5", "content": [
+               {"type": "text", "text": "done."}],
+               "usage": {"input_tokens": fresh, "cache_creation_input_tokens": write,
+                         "cache_read_input_tokens": read, "output_tokens": 50,
+                         "cache_creation": cache}}}
+    rec.update(extra)
+    return json.dumps(rec)
+
+
+def _away(at):
+    return json.dumps({"type": "system", "subtype": "away_summary", "isSidechain": False,
+                       "content": "You asked for the gate.", "timestamp": _iso(at)})
+
+
+class TestCacheState(unittest.TestCase):
+    """How big a session's context is, and until when its prompt cache lives -
+    read off the last request the main thread made (issue #49)."""
+
+    def test_the_context_is_what_the_last_request_sent(self):
+        got = ccwho.cache_state([_request(NOW - 3000, read=100_000, write=5_000),
+                                 _request(NOW - 600, mid="msg_2")])
+        self.assertEqual(got, {"ctx": 640_002, "at": NOW - 600, "ttl": 3600})
+
+    def test_the_request_starts_at_its_first_record(self):
+        # one request writes a record per content block: the cache counts from
+        # the request, so from the first of them
+        got = ccwho.cache_state([_request(NOW - 600), _request(NOW - 540)])
+        self.assertEqual(got["at"], NOW - 600)
+        other = ccwho.cache_state([_request(NOW - 600), _request(NOW - 540, mid="msg_2")])
+        self.assertEqual(other["at"], NOW - 540)                         # control
+
+    def test_every_main_request_s_cache_lives_an_hour(self):
+        # Claude Code asks for the five-minute cache while extra usage pays, and
+        # a request may write nothing; measured (2026-10-18), all of them read
+        # their context back after pauses of up to an hour, and lost it after
+        # more than an hour, as the hour writes do
+        for tail in ([_request(NOW - 60, ttl="5m")], [_request(NOW - 60, write=0)],
+                     [_request(NOW - 900, ttl="5m"), _request(NOW - 60, mid="msg_2")]):
+            with self.subTest(tail=tail):
+                self.assertEqual(ccwho.cache_state(tail)["ttl"], 3600)
+
+    def test_a_subagent_or_an_error_is_not_the_main_request(self):
+        tail = [_request(NOW - 600),
+                _request(NOW - 60, read=50_000, mid="msg_2", isSidechain=True),
+                _request(NOW - 30, read=0, write=0, fresh=0, mid="msg_3")]
+        self.assertEqual(ccwho.cache_state(tail)["at"], NOW - 600)
+        main = [_request(NOW - 600), _request(NOW - 60, read=50_000, mid="msg_2")]
+        self.assertEqual(ccwho.cache_state(main)["at"], NOW - 60)           # control
+
+    def test_after_a_compaction_the_context_is_what_it_kept(self):
+        boundary = json.dumps({"type": "system", "subtype": "compact_boundary",
+                               "timestamp": _iso(NOW - 300),
+                               "compactMetadata": {"trigger": "auto", "preTokens": 640_002,
+                                                   "postTokens": 31_000}})
+        got = ccwho.cache_state([_request(NOW - 3300), boundary])
+        self.assertEqual(got["ctx"], 31_000)
+        self.assertIsNone(got["ttl"])       # its cache is the old context's
+        later = ccwho.cache_state([_request(NOW - 3300), boundary,
+                                   _request(NOW - 60, read=0, write=33_000, mid="msg_2")])
+        self.assertEqual(later["ctx"], 33_002)                             # control
+
+    def test_the_recap_while_you_are_away_renews_the_cache(self):
+        # Claude Code writes it with a request on the main thread's cache, a few
+        # minutes after the turn: measured, the cache then lives an hour from it
+        tail = [_request(NOW - 61 * 60), _away(NOW - 58 * 60)]
+        self.assertEqual(ccwho.cache_mark(ccwho.cache_state(tail), "stopped", now=NOW),
+                         ("640k ⧗2m", True))
+        self.assertEqual(ccwho.cache_mark(ccwho.cache_state(tail[:1]), "stopped", now=NOW),
+                         ("640k cold", False))                              # control
+        before = [_away(NOW - 30 * 60), _request(NOW - 20 * 60)]
+        self.assertEqual(ccwho.cache_state(before)["at"], NOW - 20 * 60)
+        # nor one stamped before the request it follows: the hour never goes back
+        older = [_request(NOW - 600), _away(NOW - 1200)]
+        self.assertEqual(ccwho.cache_state(older)["at"], NOW - 600)
+        # after a compaction no cache holds what it kept: a recap renews nothing
+        boundary = json.dumps({"type": "system", "subtype": "compact_boundary",
+                               "timestamp": _iso(NOW - 600),
+                               "compactMetadata": {"postTokens": 250_000}})
+        kept = ccwho.cache_state([_request(NOW - 900), boundary, _away(NOW - 300)])
+        self.assertEqual((kept["at"], kept["ttl"]), (NOW - 900, None))
+
+    def test_a_damaged_record_breaks_nothing(self):
+        def boundary(meta):
+            return json.dumps({"type": "system", "subtype": "compact_boundary",
+                               "timestamp": _iso(NOW - 300), "compactMetadata": meta})
+        for meta in ("x", ["x"], {}, {"postTokens": "x"}, None):
+            with self.subTest(meta=meta):
+                tail = [_request(NOW - 600), boundary(meta)]
+                self.assertEqual(ccwho.cache_state(tail)["ctx"], 640_002)
+                self.assertIsInstance(ccwho.build_row(TestBuildRow.SESSION, [], tail,
+                                                      mtime=0, now=NOW), dict)
+        # a tail that starts after a request, at its compaction
+        self.assertIsNone(ccwho.cache_state([boundary({"postTokens": 31_000})]))
+        later = ccwho.cache_state([boundary({"postTokens": 31_000}), _request(NOW - 60)])
+        self.assertEqual(later["ctx"], 640_002)                            # control
+        # a count that is not a number counts for nothing
+        rec = json.loads(_request(NOW - 60))
+        rec["message"]["usage"]["cache_read_input_tokens"] = "600000"
+        self.assertEqual(ccwho.cache_state([json.dumps(rec)])["ctx"], 40_002)
+
+    def test_no_request_no_state(self):
+        self.assertIsNone(ccwho.cache_state([json.dumps({"type": "user", "timestamp": _iso(NOW)})]))
+
+
+class TestCacheMark(unittest.TestCase):
+    """The mark a large session gets: its size, and while it waits, the minutes
+    its cache has left."""
+
+    def mark(self, ctx=640_000, left=19 * 60 + 30, ttl=3600, attention="stopped"):
+        state = {"ctx": ctx, "at": NOW + left - (ttl or 0), "ttl": ttl}
+        return ccwho.cache_mark(state, attention, now=NOW)
+
+    def test_a_small_session_has_no_mark(self):
+        self.assertEqual(self.mark(ctx=199_999), ("", False))
+        self.assertEqual(self.mark(ctx=200_000), ("200k ⧗19m", False))     # control
+        self.assertEqual(ccwho.cache_mark(None, "stopped", now=NOW), ("", False))
+
+    def test_a_waiting_session_counts_down(self):
+        for attention in ("stopped", "review", "asks", "blocked", "running", "parked"):
+            with self.subTest(attention=attention):
+                self.assertEqual(self.mark(attention=attention), ("640k ⧗19m", False))
+
+    def test_a_busy_session_says_its_size_only(self):
+        self.assertEqual(self.mark(attention="busy"), ("640k", False))
+        self.assertEqual(self.mark(attention="busy", left=-60), ("640k", False))
+
+    def test_under_fifteen_minutes_a_large_one_warns(self):
+        self.assertEqual(self.mark(left=15 * 60), ("640k ⧗15m", False))
+        self.assertEqual(self.mark(left=15 * 60 - 1), ("640k ⧗14m", True))
+        self.assertEqual(self.mark(left=30), ("640k ⧗<1m", True))
+        self.assertEqual(self.mark(ctx=399_999, left=60), ("399k ⧗1m", False))
+        self.assertEqual(self.mark(ctx=400_000, left=60), ("400k ⧗1m", True))  # control
+
+    def test_after_the_cache_expired_it_is_cold(self):
+        self.assertEqual(self.mark(left=0), ("640k cold", False))
+        self.assertEqual(self.mark(left=-86400), ("640k cold", False))
+
+    def test_no_known_cache_life_says_the_size_only(self):
+        self.assertEqual(self.mark(ttl=None), ("640k", False))
+
+    def test_a_full_window_reads_in_millions(self):
+        self.assertEqual(self.mark(ctx=1_000_000), ("1.0M ⧗19m", False))
+        self.assertEqual(self.mark(ctx=999_999), ("999k ⧗19m", False))     # control
+
+    def test_build_row_carries_the_mark(self):
+        session = dict(TestBuildRow.SESSION)
+        tail = [_request(NOW - 2400)]
+        row = ccwho.build_row(session, [], tail, mtime=0, now=NOW)
+        self.assertEqual((row["cache"], row["cache_warn"]), ("640k ⧗20m", False))
+        busy = ccwho.build_row(dict(session, status="busy"), [], tail, mtime=0, now=NOW)
+        self.assertEqual(busy["cache"], "640k")
+        late = ccwho.build_row(session, [], [_request(NOW - 3000)], mtime=0, now=NOW)
+        self.assertEqual((late["cache"], late["cache_warn"]), ("640k ⧗10m", True))
+        self.assertEqual(ccwho.build_row(session, [], [], mtime=0, now=NOW)["cache"], "")
+
+    def test_a_program_s_busy_session_says_its_size_only(self):
+        # a program's session is "program", busy or not: busy is the feed's word
+        session = dict(TestBuildRow.SESSION, entrypoint="sdk-cli")
+        tail = [_request(NOW - 2400)]
+        row = ccwho.build_row(dict(session, status="busy"), [], tail, mtime=0, now=NOW)
+        self.assertEqual((row["attention"], row["cache"]), ("program", "640k"))
+        idle = ccwho.build_row(session, [], tail, mtime=0, now=NOW)        # control
+        self.assertEqual((idle["attention"], idle["cache"]), ("program", "640k ⧗20m"))
+
+
+class TestCacheMarkOnTheRow(unittest.TestCase):
+    """Where the mark goes on a row of the live list and of the table."""
+
+    ROW = dict(sessionId="abcd1234", attention="stopped", name="liveapp-4e",
+               project="liveapp", tab_title="Fix the gate", tty="/dev/ttys071",
+               since="41m", doing="AskUserQuestion: which gate", status="idle", orphans=0,
+               title="", ports=[])
+
+    def test_the_live_list_says_it_after_the_meta_and_before_the_account(self):
+        row = dict(self.ROW, cache="640k ⧗19m", cache_warn=False)
+        first = ccwho.ui_row_cells(row, width=100, tag="acct2")[0]
+        roles = [role for _, role in first]
+        self.assertIn((" · 640k ⧗19m", "cache"), first)
+        self.assertLess(roles.index("meta"), roles.index("cache"))
+        self.assertLess(roles.index("cache"), roles.index("account"))
+        warn = ccwho.ui_row_cells(dict(row, cache_warn=True), width=100)[0]
+        self.assertIn((" · 640k ⧗19m", "cache_warn"), warn)
+
+    def test_a_row_with_no_mark_is_as_before(self):
+        plain = ccwho.ui_row_cells(self.ROW, width=100, tag="acct2")
+        self.assertEqual(ccwho.ui_row_cells(dict(self.ROW, cache="", cache_warn=False),
+                                            width=100, tag="acct2"), plain)
+
+    def test_the_title_gives_way_to_the_mark(self):
+        row = dict(self.ROW, cache="640k ⧗19m", cache_warn=False)
+        for width in (50, 60, 80):
+            with self.subTest(width=width):
+                first = ccwho.ui_row_cells(row, width=width)[0]
+                self.assertIn((" · 640k ⧗19m", "cache"), first)
+                self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), width)
+
+    def test_the_mark_is_whole_or_not_there(self):
+        row = dict(self.ROW, cache="640k ⧗19m", cache_warn=False, tab_title="", title="")
+        for width in range(20, 60):
+            with self.subTest(width=width):
+                first = ccwho.ui_row_cells(row, width=width)[0]
+                shown = [t for t, role in first if role == "cache"]
+                self.assertIn(shown, ([], [" · 640k ⧗19m"]), first)
+                self.assertLessEqual(sum(ccwho._cells(t) for t, _ in first), width)
+        # "· abcd  liveapp-4e · 41m · s071 · 640k ⧗19m", then the arrow: 48
+        self.assertIn((" · 640k ⧗19m", "cache"), ccwho.ui_row_cells(row, width=48)[0])
+        self.assertNotIn("cache", [r for _, r in ccwho.ui_row_cells(row, width=47)[0]])
+        self.assertIn(" · 41m · s071", ccwho.ui_row_lines(row, width=47)[0])  # control
+
+    def test_a_mark_that_does_not_fit_leaves_the_row_as_it_was_without_it(self):
+        # the title, the project in the meta and the account's form are chosen
+        # with the mark's room taken: where it then goes, the row is the row
+        # without it - not one that lost its title or its account for nothing
+        kinds = {"shown": 0, "dropped": 0}
+        for name in ("liveapp-4e", "update-landing-page-whatsapp-faq"):
+            for tag in ("", "ant:lukaso"):
+                for ports in ([], [3000]):
+                    for width in range(30, 91):
+                        row = dict(self.ROW, name=name, ports=ports)
+                        marked = ccwho.ui_row_cells(dict(row, cache="640k ⧗19m",
+                                                         cache_warn=False), width, tag=tag)
+                        plain = ccwho.ui_row_cells(dict(row, cache=""), width, tag=tag)
+                        roles = [r for _, r in marked[0]]
+                        with self.subTest(name=name, tag=tag, ports=ports, width=width):
+                            if "cache" in roles:
+                                kinds["shown"] += 1
+                            else:
+                                kinds["dropped"] += 1
+                                self.assertEqual(marked, plain)
+                            if "account" in [r for _, r in plain[0]]:
+                                self.assertIn("account", roles)
+        self.assertTrue(kinds["shown"] and kinds["dropped"], kinds)        # control
+        # the case the review found: at 45 cells the title stays
+        row = dict(self.ROW, cache="640k ⧗19m", cache_warn=False)
+        self.assertIn("Fix the", ccwho.ui_row_lines(row, width=45)[0])
+
+    def test_a_narrow_table_has_no_cache_column(self):
+        # the doing column keeps 8 cells or the mark is not there: at 77 it has
+        # 18, and the mark's column takes 11
+        rows = [dict(self.ROW, cache="640k ⧗19m", cache_warn=False)]
+        self.assertNotIn("640k", ccwho.render(rows, {}, color=False, width=77))
+        self.assertIn("640k ⧗19m", ccwho.render(rows, {}, color=False, width=78))  # control
+
+    def test_the_table_says_it_after_since(self):
+        rows = [dict(self.ROW, cache="640k ⧗19m", cache_warn=False),
+                dict(self.ROW, sessionId="efgh5678", name="liveapp-06", cache="",
+                     cache_warn=False)]
+        lines = ccwho.render(rows, {}, color=False, width=150).splitlines()
+        big = next(line for line in lines if line.startswith("liveapp-4e"))
+        small = next(line for line in lines if line.startswith("liveapp-06"))
+        self.assertTrue(big.rstrip().endswith("41m  640k ⧗19m"), big)
+        self.assertTrue(small.rstrip().endswith("41m"), small)
+        self.assertLessEqual(max(ccwho._cells(line) for line in lines), 150)
+        warm = ccwho.render(rows, {}, color=True, width=150)
+        warn = ccwho.render([dict(rows[0], cache_warn=True)], {}, color=True, width=150)
+        self.assertNotIn("\033[33;1m640k", warm)
+        self.assertIn("\033[33;1m640k ⧗19m", warn)
+
+    def test_a_table_with_no_mark_is_as_before(self):
+        rows = [dict(self.ROW, cache="", cache_warn=False)]
+        self.assertEqual(ccwho.render(rows, {}, color=False, width=150),
+                         ccwho.render([self.ROW], {}, color=False, width=150))
+
+
 class TestRecordsAcceptBoth(unittest.TestCase):
     """Extractors must accept pre-parsed dicts, so a tail is parsed once per tick
     instead of once per extractor. They took 5.2 passes over every line."""

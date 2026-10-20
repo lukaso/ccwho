@@ -39,6 +39,8 @@ ROW_KEYS = {
                           # terminal), "" when no app ccwho knows does
     "park_note", "park_was",  # added 2026-10-08: parked in ccwho (attention
                           # "parked"): your note, and its state when not parked
+    "cache", "cache_warn",  # added 2026-10-18: a large session's size and its
+                          # cache's minutes ("640k ⧗19m"), and whether they run out
 }
 
 # Every key a manifest session entry has ever carried. Append only.

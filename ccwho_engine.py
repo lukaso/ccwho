@@ -311,6 +311,90 @@ def since(mtime, now=None):
     return f"{secs // 86400}d"
 
 
+# The prompt cache of a large session (issue #49). Each turn reads the whole
+# context from the cache; when the cache has expired, the next turn writes it
+# all again, and for a large session that one turn costs as much as many.
+CACHE_SHOWN = 200_000           # smaller sessions get no mark
+CACHE_WARN = 400_000            # and from here, the last minutes are a warning
+CACHE_WARN_LEFT = 15 * 60
+# The cache of the main thread lives an hour after its last request. Claude Code
+# asks for the five-minute cache while extra usage pays (2.1.302,
+# "isUsingOverage"), but measured (2026-10-18, a week of transcripts) those
+# sessions read their context back after pauses of up to an hour, and lost it
+# after more than an hour, as the hour writes do.
+CACHE_LIFE = 3600
+
+
+def _epoch(raw):
+    try:
+        return datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def cache_state(lines):
+    """The context the main thread's last request sent, when that request
+    started, and how long its cache lives (s) - or None with no request.
+
+    The context is the fresh input plus what the request wrote to the cache and
+    what it read from it. A request writes one record per content block: it
+    starts at the first. A subagent's request is another cache, and an error
+    record (zero usage) none. After a compaction the context is what it kept,
+    and no cache holds it yet: its life is None. The recap Claude Code writes
+    while you are away (away_summary) is a request on the main thread's cache
+    too: measured, the cache then lives an hour from it.
+    """
+    state, mid = None, object()
+    for d in as_records(lines):
+        if d.get("isSidechain"):
+            continue
+        if d.get("type") == "system" and d.get("subtype") == "away_summary":
+            at = _epoch(d.get("timestamp"))
+            if state is not None and state["ttl"] and at is not None and at > state["at"]:
+                state = dict(state, at=at)
+            continue
+        if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+            meta = d.get("compactMetadata")
+            kept = meta.get("postTokens") if isinstance(meta, dict) else None
+            if state is not None and isinstance(kept, int):
+                state, mid = {"ctx": kept, "at": state["at"], "ttl": None}, object()
+            continue
+        if d.get("type") != "assistant":
+            continue
+        msg = d.get("message") or {}
+        use = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        ctx = sum(use.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens",
+                                             "cache_read_input_tokens")
+                  if isinstance(use.get(k) or 0, int))
+        at = _epoch(d.get("timestamp"))
+        if not ctx or at is None:
+            continue
+        if msg.get("id") is not None and msg.get("id") == mid and state is not None:
+            at = state["at"]
+        mid = msg.get("id")
+        state = {"ctx": ctx, "at": at, "ttl": CACHE_LIFE}
+    return state
+
+
+def cache_mark(state, attention, now=None):
+    """(text, warn) for a row: "640k ⧗19m" while a large session waits, its size
+    alone while it is busy (each request renews the cache) or when its cache
+    life is unknown, "640k cold" once the cache expired. warn: a session of
+    CACHE_WARN or more with less than CACHE_WARN_LEFT left. ("", False) under
+    CACHE_SHOWN."""
+    if not state or not isinstance(state.get("ctx"), int) or state["ctx"] < CACHE_SHOWN:
+        return "", False
+    ctx = state["ctx"]
+    size = f"{ctx / 1_000_000:.1f}M" if ctx >= 1_000_000 else f"{ctx // 1000}k"
+    if attention == "busy" or not state.get("ttl") or state.get("at") is None:
+        return size, False
+    left = state["at"] + state["ttl"] - (time.time() if now is None else now)
+    if left <= 0:
+        return f"{size} cold", False
+    mins = f"{int(left // 60)}m" if left >= 60 else "<1m"
+    return f"{size} ⧗{mins}", ctx >= CACHE_WARN and left < CACHE_WARN_LEFT
+
+
 def _cmdline_orphans(ps_output, session_ids):
     """sessionId -> pids of PID-1 processes whose command line names it."""
     out = {sid: set() for sid in session_ids}
@@ -3362,6 +3446,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # Not busy and not asking: either it stopped, or it is waiting on work -
         # work that can never end is stuck, whatever the feed says between turns
         attention = "stuck" if dead_loops else ("running" if work else "stopped")
+    # busy before a program or a park names it otherwise: each request renews
+    # its cache, so its cache mark says its size only (cache_mark)
+    working = attention == "busy"
     ts = last_turn_ts(tail)
     # Anything that finished a turn you have not looked at since is worth
     # reviewing - that is most of what a session ever asks of you. Looking at it
@@ -3388,6 +3475,8 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     recs = as_records(head) + as_records(tail)
     r = brief.recap(recs)
     has_window = windowed
+    cache, cache_warn = cache_mark(cache_state(tail), "busy" if working else attention,
+                                  now=now)
     row = {
         "windowed": has_window,
         "kind": session.get("kind", ""),
@@ -3429,6 +3518,9 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # the session's work processes and their ports; collect() fills them in
         "procs": 0,
         "ports": [],
+        # the size of a large session, and while it waits, its cache's minutes
+        "cache": cache,
+        "cache_warn": cache_warn,
     }
     # the text comes from transcripts, the agents feed and tab titles, and goes to
     # a terminal and to agents: nothing in it may start an escape sequence
@@ -4056,7 +4148,7 @@ UI_UNKNOWN_MARK = "·"
 # What a part of a row IS, so the screen can decide how to draw it. The engine
 # never names a colour: a terminal's palette is not its business.
 UI_ROLES = ("mark", "id", "project", "name", "meta", "age", "recap", "pad", "action",
-            "detail", "park")
+            "detail", "park", "cache", "cache_warn")
 UI_KILL = "[kill stuck process…]"
 # On a question for you (▲): park it - kept, out of NEEDS YOU, with a note of why
 UI_PARK = "[park]"
@@ -4162,12 +4254,16 @@ def ui_row_cells(row, width=100, tag=""):
     # line's "ant:lukaso", owner 2026-10-01; the line drops its brand first too)
     tags = [t for t in (tag, tag.split(":", 1)[1] if ":" in tag else "") if t]
     account = [(f" · {tags[0]}", "account")] if tags else []
+    # a large session's size and its cache's minutes (cache_mark): after the
+    # meta, before the account, and the title gives way for it too
+    cache = ([(f" · {row['cache']}", "cache_warn" if row.get("cache_warn") else "cache")]
+             if row.get("cache") else [])
 
     def room_for_title(tail, gap=2):
         # after the name, two spaces before a title and one before the meta,
         # which brings its own; and the detail's room, with one cell before it
         return (width - _cells(glyph) - _cells(head) - gap - _cells(tail)
-                - sum(_cells(t) for t, _ in account) - _cells(UI_DETAIL[0]) - 1)
+                - sum(_cells(t) for t, _ in cache + account) - _cells(UI_DETAIL[0]) - 1)
     if project and room_for_title(f" · {project}" + tail) >= 20:
         tail = f" · {project}" + tail
     if len(tags) > 1:
@@ -4184,6 +4280,11 @@ def ui_row_cells(row, width=100, tag=""):
     shown = ((cut_codex_title(name, room) if row.get("kind") == "codex" else _cut(name, room))
              if room >= 8 else "")
     gap = 2 if shown else 1
+    if cache and room_for_title(tail, gap) < _cells(shown):
+        # whole or not at all, and before the account: then the row is the one it
+        # would be without it - its title, its project in the meta and the
+        # account's form were all chosen with the mark's room taken
+        return ui_row_cells(dict(row, cache=""), width, tag)
     if room_for_title(tail, gap) < _cells(shown):
         account = []            # whole or not at all: "· 1…" is no account
     # the ports after the account, in the room it leaves - or gives up
@@ -4197,7 +4298,7 @@ def ui_row_cells(row, width=100, tag=""):
         gap = 0                 # nothing follows the name: the arrow's cell will do
     first = [(glyph, "mark"), (f"{sid}  ", "id"),
              (handle + " " * gap, "project"),
-             (shown, "name"), (tail, "meta")] + account
+             (shown, "name"), (tail, "meta")] + cache + account
 
     # The age goes FIRST. At the end of a long recap it is the first thing
     # truncation eats, and a recap whose age you cannot see reads as the current
@@ -4500,6 +4601,12 @@ def render(rows, fleet=None, color=True, width=None, links=False):
     tag_w = min(max((_cells(t) + 2 for t in tags.values() if t), default=0), w_doing - 8)
     tag_w = tag_w if tag_w >= 3 else 0          # "  q": the smallest tag there is
     w_doing -= tag_w
+    # a large session's size and its cache's minutes (cache_mark), in a column
+    # after since, as wide as the widest - taken from the doing column too, and
+    # only where that column keeps room to be read: a mark is whole or not there
+    cache_w = max((_cells(r["cache"]) + 2 for r in rows if r.get("cache")), default=0)
+    cache_w = cache_w if w_doing - cache_w >= 8 else 0
+    w_doing -= cache_w
     # one column, one form: every tag with its brand, or none ("lukaso" over
     # "ant:d0a0" reads as two kinds of thing)
     branded = all(_cells(t) <= tag_w - 2 for t in tags.values() if t)
@@ -4538,6 +4645,10 @@ def render(rows, fleet=None, color=True, width=None, links=False):
                 f"{_paint(shown_doing, 'dim', color)}"
                 f"{' ' * max(0, w_d - len(shown_doing))}  "
                 f"{r['since']:>5}")
+        if cache_w:
+            mark = r.get("cache") or ""
+            line += "  " + (_paint(mark, "waiting" if r.get("cache_warn") else "dim", color)
+                            if mark else "") + " " * (cache_w - 2 - _cells(mark))
         if tag_w:
             tag = _fit_tag(tags.get(r.get("sessionId", ""), ""), tag_w - 2, branded)
             line += _paint("  " + tag + " " * (tag_w - 2 - _cells(tag)), "dim", color)

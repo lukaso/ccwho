@@ -68,6 +68,8 @@ ROLE_STYLE = {"mark": "",              # the state's own colour, from STATE_STYL
               "age": "bold",           # inside a dim line, the age stands out
               "recap": "dim",
               "account": "dim",        # which account the row spends (usage)
+              "cache": "dim",          # a large session's size, its cache's minutes
+              "cache_warn": "bold #e5a50a",    # amber: its cache expires soon
               "pad": ""}
 
 # The usage line's styles (ccwho_usage.STYLES), as ANSI colour names so the

@@ -187,7 +187,10 @@ message to, and a cut name is no address. The title says what it is about, and i
 is what gives way, down to nothing, before the name or the age does. A session with
 no name shows its project there. A renamed session's name no longer starts with
 its project, so the project follows in the dim part of the line, where there is
-room for it.
+room for it. A session of 200k or more says its size there too, and while it
+waits, the minutes its prompt cache has left (`640k ⧗19m`, amber when it runs out
+soon - see [a large session's cache](#a-large-sessions-cache)); the title gives way
+for it, and where even that is not enough, it goes whole.
 
 **Copying.** The list takes the mouse, so dragging over it selects nothing for
 iTerm2 (hold ⌥ while you drag for iTerm2's own selection). Instead, each value in
@@ -773,7 +776,40 @@ bar. Every `--json` names a session `sessionId`.
 | title | the tab's name (iTerm2 or Terminal.app); `~` + Claude Code's own `ai-title` when no tab gives one. A renamed session's project comes first |
 | doing | the last tool call, using Bash's human `description` when present |
 | since | time since the last real **turn**, from its `timestamp` - see below |
+| cache | a large session's context, and while it waits, the minutes its prompt cache has left: `640k ⧗19m` - see below |
 | account | the account it spends, with two or more of one brand on the usage line |
+
+### A large session's cache
+
+Each turn sends the whole context, and reads most of it from the prompt cache.
+The cache lives an hour after the main thread's last request - or after the recap
+Claude Code writes while you are away, which reads it too. While extra usage
+pays, Claude Code asks for the five-minute cache instead, but measured, those
+sessions too read their context back after pauses of up to an hour and lost it
+after more than an hour: so the mark counts an hour for every session. Once the
+cache has expired, the next turn writes the whole context again: for a large
+session, that one turn costs as much as many.
+The mark says which sessions that is, and how long until it happens:
+
+- **Only a session of 200k or more** gets a mark. A smaller one is not worth the room.
+- **`640k ⧗19m`**: its size, and the minutes its cache has left. In the live list it
+  is after the age and the tty, before the account; in `ccwho ls`, the column after
+  `since`.
+- **Amber** at 400k or more with less than 15 minutes left: answer it now, or
+  `/compact` it before it goes cold.
+- **`640k cold`**: the cache has expired. The next turn writes it all again, so a
+  `/compact` as the first thing costs about the same, and makes every turn after it
+  cheaper.
+- **The size alone** while it is busy: each request renews the cache. Also after a
+  compaction that kept 200k or more, until its next request: no cache holds what it
+  kept yet.
+- **After a compaction** (yours, or Claude Code's own) the size is what it kept, so
+  the mark goes smaller, or away.
+
+The size is the context of the main thread's last request - fresh input, plus what
+it wrote to the cache, plus what it read from it - from the usage Claude Code
+writes into the transcript. A subagent's requests are its own cache, and are not
+counted.
 
 ### What actually needs you
 

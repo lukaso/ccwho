@@ -1121,6 +1121,122 @@ class TestCacheMarkOnTheRow(unittest.TestCase):
                          ccwho.render([self.ROW], {}, color=False, width=150))
 
 
+class TestCacheAlerts(unittest.TestCase):
+    """A tool call that waits on you while a large cache runs out: said one time."""
+
+    ROW = {"sessionId": "s1", "attention": "blocked", "cache": "640k ⧗14m",
+           "cache_warn": True, "name": "liveapp-4e", "title": "Fix the gate",
+           "tab_title": "✳ Fix the gate (claude)"}
+    SAID = "NEEDS YOU: Fix the gate. Its 640k cache expires in 14m."
+    QUIET = NOW + ccwho.CACHE_WARN_LEFT             # until then, the same wait
+
+    def said(self, scans, warned=None, step=60):
+        """The texts said over scans `step` seconds apart, from NOW."""
+        texts, warned = [], dict(warned or {})
+        for i, rows in enumerate(scans):
+            alerts, warned = ccwho.cache_alerts(rows, warned, now=NOW + i * step)
+            texts += [text for _, text in alerts]
+        return texts
+
+    def test_a_tool_call_that_waits_is_said_one_time(self):
+        alerts, warned = ccwho.cache_alerts([self.ROW], {}, now=NOW)
+        self.assertEqual((alerts, warned), ([("s1", self.SAID)], {"s1": self.QUIET}))
+        later = dict(self.ROW, cache="640k ⧗13m")
+        self.assertEqual(ccwho.cache_alerts([later], warned, now=NOW + 60),
+                         ([], {"s1": self.QUIET}))
+
+    def test_only_a_tool_call_and_only_when_the_mark_is_amber(self):
+        for attention in ("asks", "review", "stopped", "busy", "running", "parked",
+                          "program", "stuck", "waiting"):
+            with self.subTest(attention=attention):
+                row = dict(self.ROW, attention=attention)
+                self.assertEqual(ccwho.cache_alerts([row], {}, now=NOW), ([], {}))
+        for cache in ("640k ⧗20m", "310k ⧗14m", "640k cold", "640k"):
+            with self.subTest(cache=cache):
+                row = dict(self.ROW, cache=cache, cache_warn=False)
+                self.assertEqual(ccwho.cache_alerts([row], {}, now=NOW), ([], {}))
+        self.assertEqual(self.said([[self.ROW]]), [self.SAID])               # control
+
+    def test_whatever_a_scan_between_shows_it_is_the_same_wait(self):
+        # parked and unparked, a transcript that could not be read, no row at
+        # all: within the amber's 15 minutes, one wait
+        for between in ([dict(self.ROW, attention="parked")],
+                        [dict(self.ROW, attention="stopped", cache="", cache_warn=False)],
+                        []):
+            with self.subTest(between=between):
+                self.assertEqual(self.said([[self.ROW], between, [self.ROW]]), [self.SAID])
+        # the same session twice in one scan
+        self.assertEqual(self.said([[self.ROW, dict(self.ROW, pid=2)]]), [self.SAID])
+        other = dict(self.ROW, sessionId="s2", title="Release queue")         # control
+        self.assertEqual(self.said([[self.ROW], [self.ROW, other]]),
+                         [self.SAID, self.SAID.replace("Fix the gate", "Release queue")])
+
+    def test_answered_what_it_asks_next_is_a_new_wait(self):
+        # a subagent's requests are not the main thread's, nor is the next of
+        # parallel tool calls: the cache runs on, and the next ask is a new wait
+        busy = dict(self.ROW, attention="busy", cache="640k", cache_warn=False)
+        again = dict(self.ROW, cache="640k ⧗8m")
+        self.assertEqual(self.said([[self.ROW], [busy], [again]]),
+                         [self.SAID, self.SAID.replace("14m", "8m")])
+        self.assertEqual(self.said([[self.ROW], [again]]), [self.SAID])     # control
+        # one session in two rows, one busy and one asking: it still asks
+        for scan in ([self.ROW, busy], [busy, self.ROW]):
+            with self.subTest(scan=scan):
+                self.assertEqual(self.said([scan, scan, scan]), [self.SAID])
+
+    def test_the_next_amber_is_a_new_wait(self):
+        # the amber lasts at most 15 minutes, and the same session's next one
+        # starts 45 minutes later at the earliest: an hour after a new request,
+        # less the 15
+        self.assertLess(ccwho.CACHE_WARN_LEFT, ccwho.CACHE_LIFE - ccwho.CACHE_WARN_LEFT)
+        quiet = {"s1": self.QUIET}
+        self.assertEqual(ccwho.cache_alerts([self.ROW], quiet, now=self.QUIET - 1)[0], [])
+        alerts, warned = ccwho.cache_alerts([self.ROW], quiet, now=self.QUIET)
+        self.assertEqual(alerts, [("s1", self.SAID)])
+        self.assertEqual(warned, {"s1": self.QUIET + ccwho.CACHE_WARN_LEFT})
+        # a time that has come is kept no longer
+        self.assertEqual(ccwho.cache_alerts([], {"s1": NOW, "s2": NOW + 1}, now=NOW)[1],
+                         {"s2": NOW + 1})
+
+    def test_it_names_the_session_by_its_title(self):
+        for row, label in ((self.ROW, "Fix the gate"),
+                           (dict(self.ROW, title=""), "✳ Fix the gate (claude)"),
+                           (dict(self.ROW, title="", tab_title=""), "liveapp-4e"),
+                           (dict(self.ROW, title="", tab_title="", name=""), "a session")):
+            with self.subTest(label=label):
+                self.assertEqual(self.said([[row]]), [self.SAID.replace("Fix the gate", label)])
+        self.assertEqual(self.said([[dict(self.ROW, cache="640k ⧗<1m")]]),
+                         ["NEEDS YOU: Fix the gate. Its 640k cache expires in less than "
+                          "a minute."])
+
+    def test_the_text_cannot_steer_what_it_goes_into(self):
+        # an escape sequence (BEL, ESC, ST end it), osascript's arguments (a
+        # leading - is an option) and iTerm2's OSC 9 ("4;" is a progress
+        # report): a title from the transcript starts none of them
+        row = dict(self.ROW, title="a\x07b\x1b]9;c\x9cd\ne\x7f" + "x" * 80)
+        said, = self.said([[row]])
+        self.assertFalse([c for c in said if not c.isprintable()], said)
+        self.assertTrue(said.startswith("NEEDS YOU: a b ]9;c d e"), said)
+        self.assertLessEqual(len(said.split(". Its ")[0]), len("NEEDS YOU: ") + 40)
+        self.assertIn("…", said)
+        for title in ("-eproperty p:1", "4;1;50"):
+            with self.subTest(title=title):
+                self.assertEqual(self.said([[dict(self.ROW, title=title)]]),
+                                 [self.SAID.replace("Fix the gate", title)])
+
+    def test_a_damaged_row_breaks_nothing(self):
+        for row in ({}, {"attention": "blocked", "cache_warn": True},
+                    dict(self.ROW, cache=None), dict(self.ROW, sessionId=None),
+                    dict(self.ROW, cache=""), dict(self.ROW, title=7)):
+            with self.subTest(row=row):
+                alerts, _ = ccwho.cache_alerts([row], {}, now=NOW)
+                self.assertIsInstance(alerts, list)
+        for row in (dict(self.ROW, sessionId=None), dict(self.ROW, cache=""),
+                    dict(self.ROW, cache=None)):
+            with self.subTest(row=row):
+                self.assertEqual(ccwho.cache_alerts([row], {}, now=NOW), ([], {}))
+
+
 class TestRecordsAcceptBoth(unittest.TestCase):
     """Extractors must accept pre-parsed dicts, so a tail is parsed once per tick
     instead of once per extractor. They took 5.2 passes over every line."""

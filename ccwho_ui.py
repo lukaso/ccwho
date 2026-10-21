@@ -116,6 +116,8 @@ PULSE_EVERY = 0.45             # the blink on a row that is being opened
 # fifteen changed four times a minute, and acting on every change is ~4% of a
 # core.
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
+ALERT_DEADLINE = 5.0           # osascript's notification: never without one
+ALERT_RETRY = 60.0             # a warning not sent: again, but not on every scan
 # The session index's first build reads every transcript: ~11 s. A read that has
 # not come back by this is asked again at the next `/` - a thread worker cannot
 # be stopped, and one that never returns must not stop every search after it.
@@ -1111,6 +1113,10 @@ class CcwhoUi(App):
         self.detail_mode = "brief"      # or "procs": what the detail pane shows
         self.status = "collecting..."
         self.started = self.shown = 0
+        # the sessions whose wait on you was said, its cache near its end
+        # (engine.cache_alerts): id -> when it may be said again, on
+        # self.clock. Kept here: a reload makes new engines
+        self.cache_warned = {}
         self.collecting = threading.Lock()     # one collect at a time: collect()
         self.again = False
         self.painted_width = 0
@@ -1323,7 +1329,46 @@ class CcwhoUi(App):
             if row.get("attention") == "review" and row.get("ts") \
                     and self.seen.get(row.get("sessionId")) == row.get("ts"):
                 row["attention"] = "stopped"
+        self.warn_caches(fleet.rows)
         return fleet
+
+    def warn_caches(self, rows):
+        """A question that waits while its large cache runs out: said outside
+        the list, one time for each wait (engine.cache_alerts)."""
+        try:
+            alerts, self.cache_warned = engine.cache_alerts(rows, self.cache_warned,
+                                                            now=self.clock())
+        except Exception:
+            return                  # a warning is never worth the list
+        for sid, text in alerts:
+            self.send_alert(sid, text)
+
+    @work(thread=True, group="alert")
+    def send_alert(self, sid, text):
+        """Off the UI thread: osascript is another program."""
+        try:
+            trouble = self.adapter.alert(text, write=self.to_screen)
+        except Exception as ex:
+            trouble = type(ex).__name__
+        if trouble:
+            self.call_from_thread(self.alert_failed, sid, trouble)
+
+    def alert_failed(self, sid, trouble):
+        """Said, and sent again in a minute: one osascript that did not answer
+        is not the whole wait. Not sooner: one that always fails would run on
+        every scan."""
+        self.cache_warned[sid] = self.clock() + ALERT_RETRY
+        self.said(f"could not send the cache warning: {trouble}")
+
+    def to_screen(self, text):
+        """Raw text for the terminal, from a worker thread: in the queue
+        Textual writes its frames from, as its own bell and clipboard do -
+        between two frames, never inside one."""
+        self.call_from_thread(self._driven, text)
+
+    def _driven(self, text):
+        if self._driver is not None:
+            self._driver.write(text)
 
     def keep_names(self, fleet):
         """A name saved here, on a scan that read the stored names before the
@@ -3536,6 +3581,33 @@ class Adapter:
         if done.returncode:
             return (done.stderr or "").strip() or f"pbcopy failed ({done.returncode})"
         return ""
+
+    def alert(self, text, write, env=None, deadline=ALERT_DEADLINE):
+        """A notification outside the list: "" when sent, else what went wrong.
+        In iTerm2 its own (OSC 9), written to the list's terminal; anywhere else
+        macOS's, from osascript - the text an argument, never in the script.
+        Only printable text: it goes into an escape sequence."""
+        text = "".join(c for c in text if c.isprintable())
+        env = os.environ if env is None else env
+        if env.get("TERM_PROGRAM") == engine.terms.ITERM2.term_program:
+            # "4;1;50" would be a progress report to iTerm2, not a notification
+            write(f"\x1b]9;{'ccwho: ' if text[:1].isdigit() else ''}{text}\x07")
+            return ""
+        try:
+            # --: a text that starts with - is no option - measured, "-ex"
+            # after the script is one more line of it
+            done = subprocess.run(["osascript", "-e", "on run argv",
+                                   "-e", 'display notification (item 1 of argv) with title "ccwho"',
+                                   "-e", "end run", "--", text],
+                                  # errors="replace": decoded after it ran
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=deadline)
+        except subprocess.TimeoutExpired:
+            return f"osascript did not answer in {deadline:g}s"
+        except OSError as ex:
+            return f"could not run osascript ({type(ex).__name__})"
+        # its code, never its text: osascript's message can quote paths
+        return f"osascript failed (exit {done.returncode})" if done.returncode else ""
 
     def keep_in_front(self):
         """The hotkey panel only: take back the focus iTerm2 gives it and then

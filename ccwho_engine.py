@@ -395,6 +395,48 @@ def cache_mark(state, attention, now=None):
     return f"{size} ⧗{mins}", ctx >= CACHE_WARN and left < CACHE_WARN_LEFT
 
 
+def cache_alerts(rows, warned, now=None):
+    """What to tell you when a tool call waits on you while a large cache runs
+    out: (alerts, warned). An alert is (session id, text); `warned` maps a
+    session id to the time it may be said again, on the caller's clock.
+
+    A row that waits on your answer (NEEDS YOU: a question, a permission) is
+    said when its mark turns amber: its turn is open, and Claude Code compacts
+    no open turn. Then not again for CACHE_WARN_LEFT. The amber lasts at most
+    that long, and the same session's next one starts 45 minutes later at the
+    earliest (an hour after a new request, less the 15). So whatever a scan in
+    between showed - parked, a transcript it could not read, no row at all -
+    a word in that time is the same wait. Busy ends it: you answered, and what
+    it asks next is a new wait - with no new request to renew the cache when
+    a subagent asks, or the next of parallel tool calls.
+
+    The text starts with words of its own: a title from the transcript must
+    not start what it goes into (a - is an option to osascript, "4;" a
+    progress report to iTerm2)."""
+    now = time.time() if now is None else now
+    warned = {sid: until for sid, until in warned.items() if until > now}
+
+    def ids(attention):
+        return {row.get("sessionId") for row in rows if row.get("attention") == attention}
+    for sid in ids("busy") - ids("blocked"):
+        warned.pop(sid, None)
+    alerts = []
+    for row in rows:
+        sid = row.get("sessionId")
+        if not isinstance(sid, str) or not sid or sid in warned:
+            continue
+        mark = row.get("cache") if isinstance(row.get("cache"), str) else ""
+        if row.get("attention") != "blocked" or not row.get("cache_warn") or not mark:
+            continue
+        warned[sid] = now + CACHE_WARN_LEFT
+        label = truncate(_printable(row.get("title") or row.get("tab_title")
+                                    or row.get("name")), 40) or "a session"
+        size, _, left = mark.partition(" ⧗")
+        left = "less than a minute" if left == "<1m" else left
+        alerts.append((sid, f"NEEDS YOU: {label}. Its {size} cache expires in {left}."))
+    return alerts, warned
+
+
 def _cmdline_orphans(ps_output, session_ids):
     """sessionId -> pids of PID-1 processes whose command line names it."""
     out = {sid: set() for sid in session_ids}

@@ -164,6 +164,13 @@ class FakeAdapter:
         self.attached, self.attached_rows = [], []
         self.kept_in_front = 0
         self.copied, self.copy_error = [], copy_error
+        self.alerted, self.alert_error = [], ""
+
+    def alert(self, text, write):
+        self.alerted.append(text)
+        if isinstance(self.alert_error, Exception):
+            raise self.alert_error
+        return self.alert_error
 
     def copy(self, text):
         self.copied.append(text)
@@ -6050,6 +6057,186 @@ class TestTheAdapterCopiesThroughPbcopy(unittest.TestCase):
         self.assertTrue(answer)
         answer, _ = self.run_copy(result=subprocess.CompletedProcess(["pbcopy"], 1, "", "boom"))
         self.assertIn("boom", answer)
+
+
+WAITS = row("cccc3333-0000-4000-8000-000000000003", "blocked", title="Fix the gate",
+            cache="640k ⧗14m", cache_warn=True)
+WARNED = "NEEDS YOU: Fix the gate. Its 640k cache expires in 14m."
+
+
+class TestAToolCallWhoseCacheRunsOut(UiTest):
+    """A large session that waits on your answer, its cache near its end: said
+    outside the list one time (engine.cache_alerts), through the adapter."""
+
+    def app_at(self, rows, adapter, now):
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            ui.Fleet(rows, True, "12:00:00")))
+        app.clock = lambda: now[0]
+        return app
+
+    async def test_it_is_said_one_time(self):
+        adapter, now = FakeAdapter(), [1000.0]
+        app = self.app_at([WAITS, BUSY], adapter, now)
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            self.assertEqual(adapter.alerted, [WARNED])
+            now[0] += 60
+            app.show(ui.Fleet([dict(WAITS, cache="640k ⧗13m"), BUSY], True, "12:01:00"))
+            await self.settled(pilot)
+            self.assertEqual(adapter.alerted, [WARNED])
+            other = dict(WAITS, sessionId="dddd4444-0000-4000-8000-000000000004",
+                         title="Release queue")                           # control
+            app.show(ui.Fleet([WAITS, other, BUSY], True, "12:01:10"))
+            await self.settled(pilot)
+            self.assertEqual(adapter.alerted,
+                             [WARNED, WARNED.replace("Fix the gate", "Release queue")])
+
+    async def test_no_amber_no_warning(self):
+        adapter = FakeAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            ui.Fleet([dict(WAITS, cache="640k ⧗20m", cache_warn=False), BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            self.assertEqual(adapter.alerted, [])
+
+    async def test_a_warning_that_fails_is_said_and_tried_again_in_a_minute(self):
+        # one osascript that did not answer is not the whole wait - and one that
+        # always fails does not run on every scan
+        for error, said in (("osascript failed (exit 1)", "osascript failed (exit 1)"),
+                            (OSError("gone"), "OSError")):
+            with self.subTest(error=error):
+                adapter, now = FakeAdapter(), [1000.0]
+                adapter.alert_error = error
+                app = self.app_at([WAITS, BUSY], adapter, now)
+                async with app.run_test() as pilot:
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.alerted, [WARNED])
+                    self.assertIn(f"could not send the cache warning: {said}", app.status)
+                    self.assertIn("Release queue", self.screen_text(app))
+                    now[0] += 30
+                    app.show(ui.Fleet([WAITS, BUSY], True, "12:00:30"))
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.alerted, [WARNED])
+                    now[0] += 31
+                    app.show(ui.Fleet([WAITS, BUSY], True, "12:01:01"))
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.alerted, [WARNED, WARNED])
+
+    async def test_iterm2_s_notification_goes_in_textual_s_queue(self):
+        # where Textual writes its frames, its bell and its clipboard: between
+        # two frames, never inside one
+        class Writes(FakeAdapter):
+            def alert(self, text, write):
+                self.alerted.append(text)
+                write(f"\x1b]9;{text}\x07")
+                return ""
+        adapter = Writes()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            ui.Fleet([BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            driven, out = [], mock.MagicMock()
+            with mock.patch.object(app._driver, "write", driven.append), \
+                    mock.patch.object(ui.sys, "__stdout__", out):
+                app.show(ui.Fleet([WAITS, BUSY], True, "12:00:05"))
+                await self.settled(pilot)
+            self.assertEqual(adapter.alerted, [WARNED])
+            self.assertIn(f"\x1b]9;{WARNED}\x07", driven)
+            self.assertFalse([c for c in out.write.call_args_list if "]9;" in str(c)])
+
+    async def test_a_scan_held_by_a_jump_is_said_when_it_lands(self):
+        adapter = GatedAdapter()
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            ui.Fleet([BUSY], True, "12:00:00")))
+        async with app.run_test() as pilot:
+            try:
+                await self.settled(pilot)
+                await pilot.click(list(app.query(ui.Row))[0])
+                await pilot.pause(0.1)
+                self.assertEqual(adapter.asked, [BUSY["sessionId"]])
+                app.show(ui.Fleet([WAITS, BUSY], True, "12:00:05"))
+                await self.settled(pilot)
+                self.assertEqual(adapter.alerted, [], "held: not on the screen yet")
+            finally:
+                adapter.gate.set()
+            await self.settled(pilot)
+            self.assertEqual(adapter.alerted, [WARNED])
+
+
+class TestTheAdapterSendsTheWarning(unittest.TestCase):
+    """In iTerm2, iTerm2's own notification (OSC 9); anywhere else, macOS's
+    through osascript. Nothing here reaches this machine: subprocess.run is
+    always the fake's, and the writer a list."""
+
+    def send(self, text="Fix the gate waits on you.", env=None, result=None, raises=None):
+        ran, written = [], []
+
+        def fake_run(cmd, **kw):
+            ran.append((cmd, kw))
+            if raises:
+                raise raises
+            return result or subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(ui.subprocess, "run", fake_run):
+            said = ui.Adapter().alert(text, write=written.append, env=env)
+        return said, ran, written
+
+    def test_in_iterm2_it_is_iterm2_s_own(self):
+        said, ran, written = self.send(env={"TERM_PROGRAM": "iTerm.app"})
+        self.assertEqual((said, ran), ("", []))
+        self.assertEqual(written, ["\x1b]9;Fix the gate waits on you.\x07"])
+
+    def test_anywhere_else_it_is_macos_s(self):
+        for env in ({"TERM_PROGRAM": "Apple_Terminal"}, {"TERM_PROGRAM": "tmux"}, {}):
+            with self.subTest(env=env):
+                said, ran, written = self.send(text='say "hi" & quit', env=env)
+                self.assertEqual((said, written), ("", []))
+                (cmd, kw), = ran
+                self.assertEqual(cmd[0], "osascript")
+                self.assertTrue(kw.get("timeout"))
+                # the text is an argument: a quote in it cannot end the script
+                self.assertEqual(cmd[-2:], ["--", 'say "hi" & quit'])
+                self.assertFalse([part for part in cmd[:-1] if "hi" in part])
+                self.assertIn("display notification", " ".join(cmd))
+
+    def test_a_leading_dash_is_no_option(self):
+        # measured: osascript reads "-ex waits" after the script as `-e x waits`,
+        # one more line of script - unless -- comes before it
+        _, ran, _ = self.send(text="-eproperty p:1 waits", env={})
+        cmd = ran[0][0]
+        self.assertEqual(cmd[-2:], ["--", "-eproperty p:1 waits"])
+        self.assertEqual(cmd.index("--"), len(cmd) - 2)
+
+    def test_a_number_is_no_progress_report(self):
+        # iTerm2 reads OSC 9 "4;1;50" as a progress report, not a notification
+        _, _, written = self.send(text="4;1;50 waits", env={"TERM_PROGRAM": "iTerm.app"})
+        self.assertNotRegex(written[0], r"^\x1b\]9;\d")
+        self.assertIn("4;1;50 waits", written[0])
+        _, _, plain = self.send(text="Fix the gate", env={"TERM_PROGRAM": "iTerm.app"})
+        self.assertEqual(plain, ["\x1b]9;Fix the gate\x07"])                # control
+
+    def test_where_the_list_runs_decides(self):
+        with mock.patch.dict(ui.os.environ, {"TERM_PROGRAM": "iTerm.app"}):
+            _, ran, written = self.send()
+        self.assertEqual((len(ran), len(written)), (0, 1))
+        with mock.patch.dict(ui.os.environ, {"TERM_PROGRAM": "Apple_Terminal"}):
+            _, ran, written = self.send()                                # control
+        self.assertEqual((len(ran), len(written)), (1, 0))
+
+    def test_the_text_cannot_steer_the_terminal(self):
+        _, _, written = self.send(text="a\x07b\x1b]9;c\x9cd", env={"TERM_PROGRAM": "iTerm.app"})
+        self.assertEqual(written, ["\x1b]9;ab]9;cd\x07"])
+        _, ran, _ = self.send(text="a\x07b\nc", env={})
+        self.assertEqual(ran[0][0][-1], "abc")
+
+    def test_a_failure_is_said_not_raised(self):
+        said, _, _ = self.send(env={}, raises=subprocess.TimeoutExpired("osascript", 5))
+        self.assertIn("did not answer", said)
+        said, _, _ = self.send(env={}, raises=OSError("no osascript"))
+        self.assertIn("could not run osascript", said)
+        said, _, _ = self.send(env={}, result=subprocess.CompletedProcess(
+            ["osascript"], 1, "", "execution error: /Users/x/secret (-1728)"))
+        self.assertIn("(exit 1)", said)
+        self.assertNotIn("/Users/x/secret", said)
 
 
 class TestWhatYouCanCopyLightsUp(UiTest):

@@ -811,6 +811,19 @@ The mark says which sessions that is, and how long until it happens:
 - **After a compaction** (yours, or Claude Code's own) the size is what it kept, so
   the mark goes smaller, or away.
 
+**A tool call that waits on you.** A session in the state NEEDS YOU (a question or a
+permission prompt waits on your answer) keeps its turn open, and Claude Code
+compacts no open turn. So when its mark turns amber, the live list also tells you
+outside the list: "NEEDS YOU: Fix the gate. Its 640k cache expires in 14m." An ASKED
+YOU or FINISHED row gets the amber only: its turn has ended. The list says it one
+time for each wait; a second list, or a list started again, says it again. When the
+list runs in iTerm2, it is iTerm2's notification: the profile must send
+notifications (Settings > Profiles > Terminal). In other terminals, it is a macOS
+notification from osascript, with the Script Editor icon; the first time, macOS can
+ask you to allow it. A warning that could not be sent is said in the list, and sent
+again a minute later. ccwho only tells you: it does not answer, cancel or compact
+the session. When no list runs, no warning comes.
+
 The size is the context of the main thread's last request - fresh input, plus what
 it wrote to the cache, plus what it read from it - from the usage Claude Code
 writes into the transcript. A subagent's requests are its own cache, and are not

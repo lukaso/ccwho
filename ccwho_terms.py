@@ -38,6 +38,12 @@ _AE_ERROR_AT = re.compile(r"(\d+):(\d+): execution error")
 # means nothing of the script was sent (ae_error_at).
 AE_PROBE = "count windows"
 
+# Claude Code's prompt box, as a pane's text shows it (empty_prompt)
+PROMPT_MARK, RULE_MARK = "\u276f", "\u2500"
+BOX_UNDER = 3                   # lines under the box: a blank or the status bar, the mode line
+BOX_LINES = 40                  # a draft this high is still seen as one
+_DEVICE = re.compile(r"/dev/ttys\d+")
+
 
 # ------------------------------------------------------------------ the apps
 
@@ -188,6 +194,81 @@ class ITerm2(App):
 
     # every launch script starts with AE_PROBE, which writes nothing
     head = 'tell application "iTerm2"\n  %s\n  activate\n' % AE_PROBE
+
+    @staticmethod
+    def _on_pane(device, body):
+        """A script that runs `body` (its own lines, on `s`) on the pane whose
+        tty is `device`, and answers "none" when no pane has it. `s` is
+        iTerm2's own answer to `whose tty is`, which names the pane by its id
+        ("session id ... of tab 1 of window id ...", measured 2026-10-22): a
+        loop item is a reference by index ("item 1 of every session of item 1
+        of every tab of ..."), and a jump that reorders the windows between two
+        events points it at another pane. By id, a pane that moved is an error,
+        never another pane. A tab it cannot even read is passed over."""
+        return ('tell application "iTerm2"\n'
+                '  repeat with w in windows\n'
+                '    repeat with t in tabs of w\n'
+                '      set found to {}\n'
+                '      try\n'
+                '        set found to (sessions of t whose tty is %s)\n'
+                '      end try\n'
+                '      if found is not {} then\n'
+                '        set s to item 1 of found\n%s'
+                '      end if\n'
+                '    end repeat\n'
+                '  end repeat\n'
+                'end tell\n'
+                'return "none"\n' % (applescript_str(device), body))
+
+    def screen_script(self, device):
+        """AppleScript for what the pane on `device` shows: "pane:" and its text."""
+        return self._on_pane(device, '          return "pane:" & (contents of s)\n')
+
+    # the box at the bottom of a screen, compared by code point (same): measured,
+    # AppleScript's own `is` takes a no-break space for a space, also when it
+    # considers white space. Handlers of their own: outside the tell, so what
+    # they do to the text is done here - inside it, "paragraphs of (contents of
+    # s)" was one event to iTerm2, and it failed (-1700, measured) - and a test
+    # runs them on a screen with no app to reach
+    BOX_HANDLERS = ('on boxAtBottom(screen, want)\n'
+                    '  set ps to paragraphs of screen\n'
+                    '  set n to count of ps\n'
+                    '  repeat while n > 0\n'
+                    '    if not blank(item n of ps) then exit repeat\n'
+                    '    set n to n - 1\n'
+                    '  end repeat\n'
+                    '  repeat with b from n to (n - %d) by -1\n'
+                    '    if b > 2 then\n'
+                    '      if same(item (b - 2) of ps, item 1 of want) and '
+                    'same(item (b - 1) of ps, item 2 of want) and '
+                    'same(item b of ps, item 3 of want) then return true\n'
+                    '    end if\n'
+                    '  end repeat\n'
+                    '  return false\n'
+                    'end boxAtBottom\n'
+                    'on same(a, b)\n'
+                    '  if (count of a) is not (count of b) then return false\n'
+                    '  if a is "" then return true\n'
+                    '  return (id of a) is (id of b)\n'
+                    'end same\n'
+                    'on blank(p)\n'
+                    '  repeat with c in (characters of p)\n'
+                    '    if (id of (contents of c)) is not in {32, 9, 160} then return false\n'
+                    '  end repeat\n'
+                    '  return true\n'
+                    'end blank\n' % BOX_UNDER)
+
+    def compact_script(self, device, box):
+        """AppleScript that types /compact into the pane on `device` while the
+        box at the bottom of its screen is still `box` (empty_prompt's three
+        lines): "typed" or "changed". The box is the screen's: each line a literal."""
+        want = "{%s}" % ", ".join(applescript_str(line) for line in box)
+        body = ('          if my boxAtBottom(contents of s, %s) then\n'
+                '            tell s to write text "/compact"\n'
+                '            return "typed"\n'
+                '          end if\n'
+                '          return "changed"\n' % want)
+        return self._on_pane(device, body) + self.BOX_HANDLERS
 
     def jump_args(self, device):
         return [os.path.join(HERE, "jump.applescript"), device]
@@ -487,6 +568,120 @@ def open_window(app, cmd, deadline):
     except OSError as ex:
         return f"could not reach {app.label} ({type(ex).__name__})"
     return f"could not open a window - {app.trouble(done.returncode, done.stderr)}" if done.returncode else ""
+
+
+# ------------------------------------------------- typing into a prompt
+#
+# Claude Code's prompt box in iTerm2, as `contents of` a session gives it
+# (2.1.307, measured 2026-10-22): a rule - with the session's name in it once
+# it has one -, the prompt line, a rule; under it a blank line or the status
+# bar, and the mode line. An empty prompt line is "❯" and a no-break space. A
+# draft, a new session's grey hint and a draft's second line all show as text
+# in the box: plain text cannot tell a hint from a draft, and neither is typed
+# into. A menu's "❯" is an option, one column in. A busy session's box is
+# empty too: that its turn has ended is the transcript's to say.
+
+def _is_rule(line, named=False):
+    """A rule of the box: the top one may hold the session's name."""
+    text = line.rstrip()
+    if named:
+        return text.startswith(RULE_MARK * 10) and text.endswith(RULE_MARK)
+    return len(text) >= 10 and set(text) == {RULE_MARK}
+
+
+def prompt_box(screen):
+    """The prompt box at the bottom of a Claude Code screen, rule to rule, its
+    prompt line first - or None when the bottom has none: a menu, a dialog, a
+    box further up."""
+    if not isinstance(screen, str):
+        return None
+    lines = screen.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for end in range(len(lines) - 1, max(1, len(lines) - 2 - BOX_UNDER), -1):
+        if _is_rule(lines[end]):
+            for top in range(end - 2, max(-1, end - 2 - BOX_LINES), -1):
+                if _is_rule(lines[top], named=True):
+                    return lines[top:end + 1] if lines[top + 1][:1] == PROMPT_MARK else None
+            return None
+    return None
+
+
+def empty_prompt(screen):
+    """The box at the bottom of a Claude Code screen whose prompt line is
+    empty, as its three lines - what must still be there when /compact is
+    typed - or None."""
+    box = prompt_box(screen)
+    return box if box is not None and len(box) == 3 and not box[1][1:].strip() else None
+
+
+# a try that typed nothing because no event went: it may be made again
+NOT_SENT = "not sent: "
+
+
+def _ask_trouble(app, why, timeout, typing=False):
+    """What a background ask that came back with no answer says: the gate's
+    words for it, never osascript's text - after NOT_SENT when the gate sent
+    no event at all."""
+    if why.get("asked") is False:
+        return NOT_SENT + _ask_trouble(app, dict(why, asked=None), timeout)
+    refused, error = why.get("refused"), why.get("error")
+    if refused == "not-running":
+        return f"{app.label} is not running"
+    if refused == "busy":
+        return f"{app.label} is busy with another question"
+    if refused in ("stuck", "waiting"):
+        return f"{app.label} does not answer"
+    # the second ask: a write that went in can come back after its deadline
+    may = " - it may have typed it" if typing else ""
+    if error == "timeout":
+        return f"{app.label} did not answer in {timeout:g}s{may}"
+    # the gate's codes are text, as osascript ended its message (ae_error_code)
+    if error == AE_TIMED_OUT:
+        return f"{app.label} did not answer ({error}){may}"
+    if isinstance(error, str) and re.fullmatch(r"-\d{1,6}", error):
+        return f"{app.label} refused ({error})"
+    return f"could not ask {app.label}"
+
+
+def type_compact(tty, timeout=5.0, wait=10.0, go=None):
+    """Type /compact into the prompt of the Claude Code session in the iTerm2
+    pane on `tty` - only into an empty one. One ask reads the pane's screen; a
+    second types, while the box at its bottom is still the one the first saw:
+    a key you press in between, and nothing is typed. Both through the gate:
+    ccwho types on its own, and nobody waits on it.
+
+    Says "typed", "draft" (text in its prompt), "no prompt" (no prompt box at
+    the bottom of its screen), "changed" (its screen changed between the two),
+    "gone" (no pane on that tty), "off" (`go()`, asked between the two, said
+    no: the setting was turned off), or what went wrong, in words a screen can
+    show."""
+    tty = tty if isinstance(tty, str) else ""
+    device = tty if tty.startswith("/dev/") else f"/dev/{tty}"
+    if not _DEVICE.fullmatch(device):
+        return "gone"
+    why = {}
+    seen = ITERM2.ask(["-e", ITERM2.screen_script(device)], timeout=timeout, wait=wait, why=why)
+    if seen is None:
+        return _ask_trouble(ITERM2, why, timeout)
+    if not seen.startswith("pane:"):
+        return "gone"
+    text = seen[len("pane:"):]
+    if prompt_box(text) is None:
+        return "no prompt"
+    box = empty_prompt(text)
+    if box is None:
+        return "draft"
+    if go is not None and not go():
+        return "off"
+    why = {}
+    done = ITERM2.ask(["-e", ITERM2.compact_script(device, box)], timeout=timeout, wait=wait,
+                      why=why)
+    if done is None:
+        return _ask_trouble(ITERM2, why, timeout, typing=True)
+    said = done.strip()
+    return {"typed": "typed", "changed": "changed", "none": "gone"}.get(
+        said, f"{ITERM2.label} said something else")
 
 
 def app_of(row):

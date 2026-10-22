@@ -169,7 +169,7 @@ ccwho                         # on a terminal
 | ← / Esc | back |
 | `/` | search every name a session has, plus what it is about - and `:3000` finds the session holding that port. Ended sessions it finds show after the running ones, under ENDED (not those a program started), found as `ccwho ls` finds them: type any part of the id a `claude --resume <id>` line printed. Enter on one reopens it in a new window, in its own folder. Half a second after the last key it also greps what was said in each session - your prompts and Claude's replies, not what tools printed or what Claude Code stores there (any case; every word in the same session; a word finds its forms too, `wake` finds woke, woken and waking) - and lists the sessions only that finds under MORE RESULTS, last: the closest first, each row showing the message that matched. The frame of the search box says whether that grep still runs (a spinner) or is done (✓ and how many more it found) |
 | `p` | every process agents started, grouped: each session and open Codex thread, left behind, Codex, not sure. The keys go to the first process: ↑ ↓ move, Esc or ← goes back |
-| `a` | every account on the usage line, to name one: who each is - its whole hash, email or Codex limit - and which open sessions spend it now. ↑ ↓ move; Enter, or a click, opens the name box for it. There Enter names the account, an empty name removes its name, Esc closes; then you are back in the accounts, on the one you named. A click on an account in the usage line opens its name box at once |
+| `a` | every account on the usage line, to name one: who each is - its whole hash, email or Codex limit - and which open sessions spend it now. ↑ ↓ move; Enter, or a click, opens the name box for it. There Enter names the account, an empty name removes its name, Esc closes; then you are back in the accounts, on the one you named. With two or more Claude accounts, `c` or a click on its line turns [Compact at limit](#compact-at-limit) on or off. A click on an account in the usage line opens its name box at once |
 | `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. In the box: `l` the stuck items, `p` its processes, `s` stop. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
 | `z` | park the session: you keep it, but not now. A box asks why (Enter parks, Esc parks nothing; the note may stay empty), and the row moves to a quiet PARKED group with your note as its second line. A click on `[park]` on a row with a question for you (▲) opens the same box; a finished turn (△) does not show it, as Enter or a click on it moves it to STOPPED; `z` still parks it. The highlight stays in the group the row left, on the next row (the one above when it was the last), so Enter goes on to the next session that needs you; with no other row there, or when the row stays where it is (under MORE RESULTS in a search), it stays on the parked row. The park ends when the session writes a new turn, when you go to it (Enter or a click that brings its window forward or gives it one, or Enter on an ended one, which reopens it), or with `z` on the parked row - then the row is as if it was never parked. Notes are kept in `parked.json` in `~/.ccwho` (or `$CCWHO_DIR`), so they outlive a restart, which text left unsent in a prompt box does not. A Codex thread parks too, once its turn has ended - a question, a finished turn or a stopped one; not while it says "waiting?", as its turn is still open. Enter on it says where it runs and brings nothing forward, so only its next turn or `z` ends the park. Not on a busy row (its next turn would end the park), a program's (a `codex exec` thread too) or an ended one |
@@ -828,6 +828,50 @@ The size is the context of the main thread's last request - fresh input, plus wh
 it wrote to the cache, plus what it read from it - from the usage Claude Code
 writes into the transcript. A subagent's requests are its own cache, and are not
 counted.
+
+### Compact at limit
+
+For two or more accounts. When one account comes near its limit, you move its
+sessions to another, and the cache does not move with a session: its first turn
+there writes the whole context again. A compaction first makes that turn small.
+Claude Code's own idle compaction skips every session near the limit, so with this
+setting on, the live list types `/compact` for you.
+
+- **The setting:** `a` opens the accounts, and under them is
+  `compact at limit: off · c or a click turns it on`. It is off at first, and
+  offered only while the usage line has two or more Claude accounts: with one, a
+  session near the limit waits for the reset, and its cache expires in that time.
+  It is saved with the names, in `~/.ccwho/accounts.json` (`"compact_at_limit": true`).
+- **Near the limit:** the account the session spends is at 90% or more of its 5
+  hours, or 80% or more of its week.
+- **Which sessions:** 400k or more, at the prompt - FINISHED, STOPPED or ASKED YOU,
+  or PARKED from one of them - with the cache still warm. Never NEEDS YOU, also
+  parked: a menu waits there, and `/compact` typed into it would answer it.
+- **When:** at the end of a turn the list saw. A turn that ended before that -
+  before the list started, or before the account came near its limit - 50 minutes
+  after its last request, 10 minutes before the cache expires. One try for each,
+  for each request.
+- **Only into an empty prompt.** The list reads the pane's screen first, and types
+  only when the prompt line is empty. With text there - a line you typed and did not
+  send, or a new session's grey hint - it types nothing, and says so: `did not
+  compact Fix the gate: its prompt is not empty`. With no prompt at the bottom of its
+  screen - a menu, a dialog - it says `no prompt on its screen`. A key you press
+  between the look and the typing stops it too.
+- **When iTerm2 was not asked:** ccwho asks iTerm2 one thing at a time, and pauses
+  30 seconds after an error. Then nothing was typed, and it tries again after the
+  pause.
+- **Not with Claude Code's vim mode:** its NORMAL mode shows the same empty prompt,
+  and there the letters typed are keys. With vim mode, leave Compact at limit off.
+- **Only in iTerm2:** it types with iTerm2's `write text`. A session in another
+  terminal is not compacted, and the list says so.
+- **What you see:** `compacting Fix the gate (640k): ant:work is at 92% of 5h`. The
+  transcript then has the `/compact`: no second one for that request, also from a
+  list started again.
+
+A compacted session keeps a summary, not every detail: in its first turns after it,
+it reads files again. Until you move it, or the window resets, a large session on
+that account works in a 400k window: each time it grows back to 400k, the end of its
+next turn compacts it again. When no list runs, nothing is compacted.
 
 ### What actually needs you
 

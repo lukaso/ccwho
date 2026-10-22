@@ -871,6 +871,27 @@ def _away(at):
                        "content": "You asked for the gate.", "timestamp": _iso(at)})
 
 
+def _typed(cmd="compact", args="", **extra):
+    """A local command typed at the prompt, as Claude Code 2.1.307 writes it
+    (measured 2026-10-22, a /compact typed by iTerm2's write text): its
+    caveat, its name, then its output - a system record."""
+    caveat = {"type": "user", "isMeta": True, "isSidechain": False, "userType": "external",
+              "message": {"role": "user", "content": (
+                  "<local-command-caveat>The command below was run directly in Claude Code,"
+                  " not sent to you as a request, and its output goes straight to the user."
+                  " It's recorded here as context for later messages.</local-command-caveat>")}}
+    name = {"type": "user", "isSidechain": False, "userType": "external",
+            "message": {"role": "user", "content": (
+                f"<command-name>/{cmd}</command-name>\n            <command-message>{cmd}"
+                f"</command-message>\n            <command-args>{args}</command-args>")}}
+    out = {"type": "system", "subtype": "local_command", "isMeta": False, "isSidechain": False,
+           "content": "<local-command-stdout>Not enough messages to compact.</local-command-stdout>",
+           "level": "info", "userType": "external"}
+    for rec in (caveat, name, out):
+        rec.update(extra)
+    return [json.dumps(rec) for rec in (caveat, name, out)]
+
+
 class TestCacheState(unittest.TestCase):
     """How big a session's context is, and until when its prompt cache lives -
     read off the last request the main thread made (issue #49)."""
@@ -959,6 +980,46 @@ class TestCacheState(unittest.TestCase):
 
     def test_no_request_no_state(self):
         self.assertIsNone(ccwho.cache_state([json.dumps({"type": "user", "timestamp": _iso(NOW)})]))
+
+
+class TestCacheStateSeesATypedCompact(unittest.TestCase):
+    """A /compact typed after the last request - by you or by Compact at
+    limit - is in the transcript: tried once, never again for that request,
+    also after the list starts again."""
+
+    def test_a_compact_typed_after_the_request(self):
+        got = ccwho.cache_state([_request(NOW - 600), *_typed()])
+        self.assertEqual(got, {"ctx": 640_002, "at": NOW - 600, "ttl": 3600, "typed": True})
+        self.assertNotIn("typed", ccwho.cache_state([_request(NOW - 600)]))   # control
+
+    def test_with_its_own_words_it_is_a_compact_too(self):
+        got = ccwho.cache_state([_request(NOW - 600), *_typed(args="keep the plan")])
+        self.assertTrue(got.get("typed"))
+
+    def test_another_command_is_none(self):
+        for cmd in ("model", "cost", "compact-notes", "compactor"):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("typed", ccwho.cache_state([_request(NOW - 600), *_typed(cmd)]))
+
+    def test_a_new_request_is_a_new_try(self):
+        got = ccwho.cache_state([_request(NOW - 900), *_typed(), _request(NOW - 60, mid="msg_2")])
+        self.assertEqual(got, {"ctx": 640_002, "at": NOW - 60, "ttl": 3600})
+
+    def test_a_subagent_s_record_is_not_the_main_thread_s(self):
+        got = ccwho.cache_state([_request(NOW - 600), *_typed(isSidechain=True)])
+        self.assertNotIn("typed", got)
+
+    def test_before_any_request_there_is_nothing_to_compact(self):
+        self.assertIsNone(ccwho.cache_state(_typed()))
+
+    def test_odd_records_do_not_raise(self):
+        odd = [json.dumps({"type": "user"}), json.dumps({"type": "user", "message": "x"}),
+               json.dumps({"type": "user", "message": {"content": 7}}),
+               json.dumps({"type": "user", "message": {"content": [{"type": "text", "text":
+                                                                    "<command-name>/compact"
+                                                                    "</command-name>"}]}})]
+        got = ccwho.cache_state([_request(NOW - 600), *odd])
+        self.assertTrue(got["typed"])           # the list form of a message too
 
 
 class TestCacheMark(unittest.TestCase):
@@ -1277,6 +1338,268 @@ class TestRecordsAcceptBoth(unittest.TestCase):
         recs = [{"type": "assistant", "message": {"content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}}]
         self.assertEqual(ccwho.waiting_kind(recs), "blocked")
+
+
+class TestCompactAtLimit(unittest.TestCase):
+    """Compact at limit (#49, parts 3 and 4): near its account's limit, a large
+    session at its prompt is compacted - at the end of a turn the list saw, or
+    10 minutes before its cache expires. One try for each, for each request."""
+
+    ROW = {"sessionId": "s1", "attention": "review", "ctx": 640_000, "cache_at": NOW - 120,
+           "compact_typed": False, "title": "Fix the gate",
+           "tab_title": "✳ Fix the gate (claude)", "name": "liveapp-4e",
+           "tty": "/dev/ttys071", "terminal": "iterm2"}
+    BUSY = dict(ROW, attention="busy")
+
+    @staticmethod
+    def usage(five=42, week=10, second="ant", sessions=None):
+        def acct(aid, five, week, brand="ant"):
+            return {"id": aid, "kind": "login", "brand": brand,
+                    "five_hour": {"state": "ok", "pct": five, "resets_at": NOW + 3600, "age": 5},
+                    "seven_day": {"state": "ok", "pct": week, "resets_at": NOW + 86400, "age": 5}}
+        rows = [acct("login:work", five, week)]
+        if second:
+            rows.append(acct("token:1a2b" if second == "ant" else "oai:codex", 5, 5, second))
+        return {"state": "ok", "accounts": rows,
+                "names": {"login:work": "work", "token:1a2b": "1a2b", "oai:codex": "codex"},
+                "sessions": {"s1": "login:work"} if sessions is None else sessions, "now": NOW}
+
+    def due(self, scans, usage=None, on=True, step=60, seen=None, start=NOW):
+        """What is due over scans `step` seconds apart: (session id, why). A scan
+        is its rows, or (rows, usage)."""
+        out = []
+        for i, scan in enumerate(scans):
+            rows, use = scan if isinstance(scan, tuple) else (scan, usage or self.usage())
+            got, seen = ccwho.compact_due(rows, use, on, seen, now=start + i * step)
+            out += [(row["sessionId"], why) for row, why in got]
+        return out
+
+    def test_a_turn_that_ends_near_the_limit(self):
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(five=92)),
+                         [("s1", "ant:work is at 92% of 5h")])
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(week=80)),
+                         [("s1", "ant:work is at 80% of the week")])
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(five=90)),
+                         [("s1", "ant:work is at 90% of 5h")])
+        for five, week in ((89, 79), (89.9, 79.9)):                     # control
+            with self.subTest(five=five, week=week):
+                self.assertEqual(self.due([[self.BUSY], [self.ROW]],
+                                          self.usage(five=five, week=week)), [])
+
+    def test_off_it_does_nothing(self):
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(five=92), on=False), [])
+
+    def test_only_with_two_claude_accounts(self):
+        # with one, the session waits for the reset, and its cache expires then
+        for second in (None, "oai"):
+            with self.subTest(second=second):
+                self.assertEqual(self.due([[self.BUSY], [self.ROW]],
+                                          self.usage(five=92, second=second)), [])
+
+    def test_only_a_large_session(self):
+        for ctx, due in ((399_999, False), (400_000, True), (None, False), ("640k", False)):
+            with self.subTest(ctx=ctx):
+                rows = [dict(self.ROW, ctx=ctx)]
+                self.assertEqual(bool(self.due([[dict(self.BUSY, ctx=ctx)], rows],
+                                               self.usage(five=92))), due)
+
+    def test_only_at_its_prompt(self):
+        # NEEDS YOU waits on a menu: a /compact typed there would answer it
+        for attention, due in (("review", True), ("stopped", True), ("asks", True),
+                               ("parked", False), ("blocked", False), ("busy", False),
+                               ("program", False), ("running", False), ("stuck", False),
+                               ("ended", False), (None, False)):
+            with self.subTest(attention=attention):
+                scans = [[self.BUSY], [dict(self.ROW, attention=attention)]]
+                self.assertEqual(bool(self.due(scans, self.usage(five=92))), due)
+
+    def test_a_parked_session_by_the_state_it_was_parked_in(self):
+        # z parks a question for you too (NEEDS YOU, ▲): its menu still waits
+        for was, due in (("review", True), ("stopped", True), ("asks", True),
+                         ("blocked", False), ("running", False), ("stuck", False),
+                         ("", False), (None, False)):
+            with self.subTest(park_was=was):
+                row = dict(self.ROW, attention="parked", park_was=was)
+                self.assertEqual(bool(self.due([[self.BUSY], [row]], self.usage(five=92))), due)
+                idle = dict(row, cache_at=NOW - 50 * 60)
+                self.assertEqual(bool(self.due([[idle]], self.usage(five=92))), due)
+
+    def test_a_question_answered_is_an_open_turn_too(self):
+        blocked = dict(self.ROW, attention="blocked")
+        self.assertEqual(self.due([[blocked], [self.ROW]], self.usage(five=92)),
+                         [("s1", "ant:work is at 92% of 5h")])
+
+    def test_a_turn_end_it_did_not_see_waits_for_ten_minutes_before_the_expiry(self):
+        # the list started after the turn ended, or the account came near its
+        # limit later: no turn end - 50 minutes after the last request
+        row = dict(self.ROW, cache_at=NOW - 48 * 60)
+        self.assertEqual(self.due([[row]] * 4, self.usage(five=92)),
+                         [("s1", "ant:work is at 92% of 5h")])
+        got, seen = ccwho.compact_due([row], self.usage(five=92), True, None,
+                                      now=NOW + 2 * 60 - 1)
+        self.assertEqual(got, [])                       # at 49:59, not yet
+        got, seen = ccwho.compact_due([row], self.usage(five=92), True, seen, now=NOW + 2 * 60)
+        self.assertEqual(len(got), 1)                   # at 50:00
+
+    def test_a_cold_cache_is_not_compacted(self):
+        # the compaction would write the whole context again: what it saves
+        row = dict(self.ROW, cache_at=NOW - 3600)
+        self.assertEqual(self.due([[dict(row, attention="busy")], [row]], self.usage(five=92)), [])
+        # an hour to the second: cold
+        self.assertEqual(self.due([[dict(row, attention="busy")], [row]], self.usage(five=92),
+                                  step=0), [])
+        warm = dict(self.ROW, cache_at=NOW - 3599)                          # control
+        self.assertEqual(len(self.due([[warm]], self.usage(five=92), step=0)), 1)
+
+    def test_one_try_at_the_end_and_one_before_the_expiry(self):
+        # the first found a draft in the prompt, say: one more try, 50 minutes
+        # after the request; no third
+        got, seen = ccwho.compact_due([self.BUSY], self.usage(five=92), True, None, now=NOW)
+        got, seen = ccwho.compact_due([self.ROW], self.usage(five=92), True, seen, now=NOW + 5)
+        self.assertEqual(len(got), 1)
+        for t in (NOW + 60, NOW + 47 * 60):
+            got, seen = ccwho.compact_due([self.ROW], self.usage(five=92), True, seen, now=t)
+            self.assertEqual(got, [], t)
+        at50 = self.ROW["cache_at"] + 50 * 60
+        got, seen = ccwho.compact_due([self.ROW], self.usage(five=92), True, seen, now=at50)
+        self.assertEqual(len(got), 1)
+        for t in (at50 + 1, at50 + 300):
+            got, seen = ccwho.compact_due([self.ROW], self.usage(five=92), True, seen, now=t)
+            self.assertEqual(got, [], t)
+
+    def test_a_try_that_sent_nothing_is_made_again(self):
+        # the gate paused after an error, or another ask was in flight: no
+        # event went to iTerm2, and the turn end is still news
+        use = self.usage(five=92)
+        got, seen = ccwho.compact_due([self.BUSY], use, True, None, now=NOW)
+        got, seen = ccwho.compact_due([self.ROW], use, True, seen, now=NOW + 5)
+        self.assertEqual(len(got), 1)
+        kept = seen
+        seen = ccwho.compact_unsent(seen, "s1")
+        got, seen = ccwho.compact_due([self.ROW], use, True, seen, now=NOW + 10)
+        self.assertEqual(len(got), 1)
+        got, seen = ccwho.compact_due([self.ROW], use, True, seen, now=NOW + 15)
+        self.assertEqual(got, [])                       # it went: one try
+        got, _ = ccwho.compact_due([self.ROW], use, True, kept, now=NOW + 10)
+        self.assertEqual(got, [])                                           # control
+        # the turn end is news for COMPACT_TURN_END: then the try before the expiry
+        late = ccwho.compact_unsent(kept, "s1")
+        got, late = ccwho.compact_due([self.ROW], use, True, late, now=NOW + 200)
+        self.assertEqual(got, [])
+        at50 = self.ROW["cache_at"] + 50 * 60
+        got, late = ccwho.compact_due([self.ROW], use, True, late, now=at50)
+        self.assertEqual(len(got), 1)
+        late = ccwho.compact_unsent(late, "s1")
+        got, late = ccwho.compact_due([self.ROW], use, True, late, now=at50 + 60)
+        self.assertEqual(len(got), 1)
+
+    def test_a_session_with_a_try_in_flight_is_not_due(self):
+        use = self.usage(five=92)
+        got, seen = ccwho.compact_due([self.BUSY], use, True, None, now=NOW)
+        got, seen = ccwho.compact_due([self.ROW], use, True, seen, now=NOW + 5, flying={"s1"})
+        self.assertEqual(got, [])
+        got, seen = ccwho.compact_due([self.ROW], use, True, seen, now=NOW + 10)
+        self.assertEqual(len(got), 1)                       # nothing was spent while it flew
+        # control: a try of another session under way
+        got, seen = ccwho.compact_due([self.BUSY], use, True, None, now=NOW)
+        got, _ = ccwho.compact_due([self.ROW], use, True, seen, now=NOW + 5, flying={"s2"})
+        self.assertEqual(len(got), 1)
+
+    def test_unsent_of_no_try_changes_nothing(self):
+        got, seen = ccwho.compact_due([self.BUSY], self.usage(five=92), True, None, now=NOW)
+        self.assertEqual(ccwho.compact_unsent(seen, "s2"), seen)
+        for odd in (None, {}, {"tried": 3}, {"tried": {"s1": "x"}}):
+            with self.subTest(odd=odd):
+                self.assertIsInstance(ccwho.compact_unsent(odd, "s1"), dict)
+
+    def test_a_compact_typed_is_not_typed_again(self):
+        typed = dict(self.ROW, compact_typed=True)
+        self.assertEqual(self.due([[self.BUSY], [typed]], self.usage(five=92)), [])
+        self.assertEqual(self.due([[dict(typed, cache_at=NOW - 50 * 60)]], self.usage(five=92)), [])
+
+    def test_after_a_compaction_there_is_no_cache_to_save(self):
+        # what it kept, and no request yet: cache_at is None
+        kept = dict(self.ROW, ctx=640_000, cache_at=None)
+        self.assertEqual(self.due([[dict(kept, attention="busy")], [kept]], self.usage(five=92)), [])
+
+    def test_a_new_request_is_a_new_turn_end(self):
+        later = dict(self.ROW, cache_at=NOW + 60)
+        self.assertEqual(self.due([[self.BUSY], [self.ROW], [dict(later, attention="busy")],
+                                   [later]], self.usage(five=92)),
+                         [("s1", "ant:work is at 92% of 5h")] * 2)
+
+    def test_a_reading_that_comes_after_the_turn_end(self):
+        # the statusLine records the limits after the reply: the scan that sees
+        # the turn end can still have the reading before it
+        low, high = self.usage(five=42), self.usage(five=92)
+        self.assertEqual(self.due([([self.BUSY], low), ([self.ROW], low), ([self.ROW], high)]),
+                         [("s1", "ant:work is at 92% of 5h")])
+        # minutes later, the turn end is no news: 50 minutes after the request
+        self.assertEqual(self.due([([self.BUSY], low), ([self.ROW], low), ([self.ROW], high)],
+                                  step=181), [])
+
+    def test_an_account_with_no_reading_or_past_its_reset(self):
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(five=92, sessions={})), [])
+        use = self.usage(five=92, week=95)
+        use["accounts"][0]["five_hour"] = {"state": "expired", "resets_at": NOW - 60, "age": 5}
+        use["accounts"][0]["seven_day"] = {"state": "expired", "resets_at": NOW - 60, "age": 5}
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], use), [])
+        self.assertEqual(len(self.due([[self.BUSY], [self.ROW]], self.usage(week=95))), 1)  # control
+
+    def test_the_5h_window_is_said_first(self):
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(five=95, week=85)),
+                         [("s1", "ant:work is at 95% of 5h")])
+
+    def test_the_account_is_said_in_the_line_s_words(self):
+        use = self.usage(five=92)
+        use["names"]["login:work"] = "client"
+        self.assertEqual(self.due([[self.BUSY], [self.ROW]], use),
+                         [("s1", "ant:client is at 92% of 5h")])
+
+    def test_two_sessions_each_once(self):
+        other = dict(self.ROW, sessionId="s2")
+        use = self.usage(five=92, sessions={"s1": "login:work", "s2": "login:work"})
+        self.assertEqual(self.due([[self.BUSY, dict(other, attention="busy")],
+                                   [self.ROW, other], [self.ROW, other]], use),
+                         [("s1", "ant:work is at 92% of 5h"), ("s2", "ant:work is at 92% of 5h")])
+
+    def test_what_it_keeps_stays_small(self):
+        got, seen = ccwho.compact_due([self.BUSY], self.usage(five=92), True, None, now=NOW)
+        got, seen = ccwho.compact_due([self.ROW], self.usage(five=92), True, seen, now=NOW + 5)
+        self.assertTrue(seen["tried"])
+        got, seen = ccwho.compact_due([], self.usage(five=92), True, seen, now=NOW + 3600)
+        self.assertEqual((seen["open"], seen["tried"]), ({}, {}))
+
+    def test_damaged_input_does_not_raise(self):
+        odd_rows = [{}, {"sessionId": None}, {"sessionId": 7, "attention": "review"},
+                    dict(self.ROW, cache_at="soon"), dict(self.ROW, ctx=True),
+                    dict(self.ROW, sessionId="")]
+        for use in (None, {}, {"state": "unknown"}, {"state": "ok", "accounts": None},
+                    {"state": "ok", "accounts": [None, {"id": "login:work"}], "sessions": []},
+                    self.usage(five="92")):
+            with self.subTest(use=use):
+                got, _ = ccwho.compact_due(odd_rows, use, True, {"open": [], "tried": 3}, now=NOW)
+                self.assertEqual(got, [])
+        self.assertEqual(len(self.due([[self.BUSY], [self.ROW]], self.usage(five=92))), 1)
+        # a share that is text is no share, also on a row that is due by all else
+        for odd in ("92", None, True, [92]):
+            with self.subTest(pct=odd):
+                self.assertEqual(self.due([[self.BUSY], [self.ROW]], self.usage(five=odd)), [])
+
+    def test_the_row_carries_what_the_rule_reads(self):
+        session = dict(TestBuildRow.SESSION)
+        row = ccwho.build_row(session, [], [_request(NOW - 2400)], mtime=0, now=NOW)
+        self.assertEqual((row["ctx"], row["cache_at"], row["compact_typed"]),
+                         (640_002, NOW - 2400, False))
+        typed = ccwho.build_row(session, [], [_request(NOW - 2400), *_typed()], mtime=0, now=NOW)
+        self.assertTrue(typed["compact_typed"])
+        boundary = json.dumps({"type": "system", "subtype": "compact_boundary",
+                               "timestamp": _iso(NOW - 300),
+                               "compactMetadata": {"trigger": "manual", "postTokens": 31_000}})
+        kept = ccwho.build_row(session, [], [_request(NOW - 2400), boundary], mtime=0, now=NOW)
+        self.assertEqual((kept["ctx"], kept["cache_at"]), (31_000, None))
+        none = ccwho.build_row(session, [], [], mtime=0, now=NOW)
+        self.assertEqual((none["ctx"], none["cache_at"], none["compact_typed"]), (None, None, False))
 
 
 class TestWindowCache(unittest.TestCase):

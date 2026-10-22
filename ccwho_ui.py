@@ -48,6 +48,7 @@ from textual.geometry import Region                                # noqa: E402
 from textual.widgets import Footer, Input, OptionList, Static      # noqa: E402
 from textual.widgets.option_list import Option                     # noqa: E402
 from rich.style import Style                                       # noqa: E402
+from rich.cells import cell_len                                    # noqa: E402
 from rich.text import Text                                         # noqa: E402
 
 import ccwho_engine as engine                                      # noqa: E402
@@ -118,6 +119,9 @@ PULSE_EVERY = 0.45             # the blink on a row that is being opened
 FOCUS_DEADLINE = 5.0           # iTerm2 is another program; it can hang
 ALERT_DEADLINE = 5.0           # osascript's notification: never without one
 ALERT_RETRY = 60.0             # a warning not sent: again, but not on every scan
+COMPACT_DEADLINE = 5.0         # each of the two asks that type /compact (terms.type_compact)
+COMPACT_WAIT = 10.0            # behind an ask in flight: ccwho types, nobody waits on it
+COMPACT_RETRY = 30.0           # a try that sent nothing: again after the gate's own pause
 # The session index's first build reads every transcript: ~11 s. A read that has
 # not come back by this is asked again at the next `/` - a thread worker cannot
 # be stopped, and one that never returns must not stop every search after it.
@@ -150,8 +154,10 @@ class Fleet:
     """One snapshot of the world, and the questions the screen asks of it."""
 
     def __init__(self, rows=(), source_ok=True, at="", error="", procs=None,
-                 secure="", usage=None, doctor=""):
+                 secure="", usage=None, doctor="", compact=False):
         self.source_ok, self.at, self.error = source_ok, at, error
+        # Compact at limit, as the scan read accounts.json (ccwho.compact_at_limit)
+        self.compact = compact is True
         # doctor's first fault, or "": the list is where a drift shows without
         # `ccwho doctor` (it was the watch's header, and the watch is gone)
         self.doctor = doctor
@@ -855,6 +861,9 @@ NO_ACCOUNTS = {"not_set_up": "no account to name - ccwho setup adds the usage li
                "off": "usage is off - ccwho setup --usage turns it on"}
 
 
+ACCOUNTS_NOTE = "Enter or a click names the account · Esc closes"
+
+
 class AccountsBox(AnswersOnce, ModalScreen):
     """Every account on the usage line, to name one (a user, 2026-10-11: "the
     fingerprint is not easy to remember"). Each has who it is - its name on the
@@ -875,6 +884,8 @@ class AccountsBox(AnswersOnce, ModalScreen):
     #accountsclose:hover { background: $accent; color: $text; }
     #accounts { height: auto; border: none; }
     .accountsnote { color: $text-muted; height: auto; }
+    #compactline { height: auto; margin: 1 0 0 0; }
+    #compactline:hover { background: $accent; }
     """
 
     # before the list's own keys (priority): its up and down go round from
@@ -883,11 +894,15 @@ class AccountsBox(AnswersOnce, ModalScreen):
         Binding("escape", "close", "close"),
         Binding("down,j", "down", "down", show=False, priority=True),
         Binding("up,k", "up", "up", show=False, priority=True),
+        Binding("c", "compact", "compact at limit", show=False),
     ]
 
-    def __init__(self, entries, start=None):
+    def __init__(self, entries, start=None, compact=None, set_compact=None):
+        """`compact`: Compact at limit's setting, None when it is not offered;
+        `set_compact(on)` saves it and answers the setting after it."""
         super().__init__()
         self.entries, self.start = list(entries), start
+        self.compact, self.set_compact = compact, set_compact
 
     def compose(self) -> ComposeResult:
         with Vertical(id="accountsbox"):
@@ -897,8 +912,23 @@ class AccountsBox(AnswersOnce, ModalScreen):
                 yield Static(" ✕ ", id="accountsclose", markup=False)
             yield OptionList(*[Option(self.lines(e), id=e["id"]) for e in self.entries],
                              id="accounts")
-            yield Static("Enter or a click names the account · Esc closes",
-                         classes="accountsnote", markup=False)
+            if self.compact is not None:
+                yield Static(self.compact_text(), id="compactline", markup=False)
+            yield Static(ACCOUNTS_NOTE, classes="accountsnote", markup=False)
+
+    def compact_text(self):
+        text = Text(f"compact at limit: {'on' if self.compact else 'off'}"
+                    f" · c or a click turns it {'off' if self.compact else 'on'}")
+        text.append("\n  /compact a session of 400k+ near its account's limit", style="dim")
+        return text
+
+    def action_compact(self):
+        """c, or a click on its line: Compact at limit the other way - the
+        list stays open, and its line says what was saved."""
+        if self.compact is None or self.set_compact is None:
+            return
+        self.compact = self.set_compact(not self.compact) is True
+        self.query_one("#compactline", Static).update(self.compact_text())
 
     @staticmethod
     def lines(entry):
@@ -909,17 +939,30 @@ class AccountsBox(AnswersOnce, ModalScreen):
     def on_mount(self):
         box = self.query_one("#accounts")
         self.fit()
+        self.call_after_refresh(self.fit)
         box.focus()
         ids = [e["id"] for e in self.entries]
         box.highlighted = ids.index(self.start) if self.start in ids else 0
 
     def on_resize(self, event):
         self.fit()
+        self.call_after_refresh(self.fit)
 
     def fit(self):
         """More accounts than fit: the list scrolls, and the top line and the
-        key line stay (the frame, those two lines and a row of the screen)."""
-        self.query_one("#accounts").styles.max_height = max(2, self.app.size.height - 6)
+        key line stay (the frame, the top line and a row of the screen, and
+        the key line's rows) - and the line of Compact at limit, when it is
+        there (its rows, and the row above them). A line wraps in a narrow
+        box: its rows as laid out, and before that as its text needs them."""
+        room = max(1, min(BOX_CELLS + BOX_FRAME, self.app.size.width) - 4)
+
+        def rows(widget, text):
+            laid = widget.outer_size.height
+            return laid or sum(max(1, -(-cell_len(line) // room)) for line in text.split("\n"))
+        under = rows(self.query_one(".accountsnote"), ACCOUNTS_NOTE)
+        if self.compact is not None:
+            under += 1 + rows(self.query_one("#compactline"), self.compact_text().plain)
+        self.query_one("#accounts").styles.max_height = max(2, self.app.size.height - 5 - under)
 
     @on(OptionList.OptionSelected, "#accounts")
     def chosen(self, event):
@@ -934,6 +977,9 @@ class AccountsBox(AnswersOnce, ModalScreen):
         widget = getattr(event, "widget", None)
         if widget is not None and widget.id == "accountsclose":
             self.answer(None)
+            return
+        if widget is not None and widget.id == "compactline":
+            self.action_compact()
             return
         while widget is not None and widget.id != "accountsbox":
             widget = widget.parent
@@ -1117,6 +1163,16 @@ class CcwhoUi(App):
         # (engine.cache_alerts): id -> when it may be said again, on
         # self.clock. Kept here: a reload makes new engines
         self.cache_warned = {}
+        # Compact at limit (engine.compact_due): what the rule keeps between
+        # scans, kept here for the same reason; the setting as saved here, and
+        # the scan it holds for (keep_compact); and the clock of the cache's
+        # hour - the transcript's, so the wall's
+        self.compact_seen = None
+        self.compact_here = None
+        self.wall = time.time
+        # the sessions with a try under way; those whose try sent nothing, and
+        # when (on self.clock) the next may go
+        self.compact_flying, self.compact_held = set(), {}
         self.collecting = threading.Lock()     # one collect at a time: collect()
         self.again = False
         self.painted_width = 0
@@ -1324,13 +1380,95 @@ class CcwhoUi(App):
         turn you saw stays seen. Every fleet that reaches the screen comes
         through here - the held one included."""
         fleet = self.keep_names(fleet)
+        self.keep_compact(fleet)
         for row in fleet.rows:
             self.keep_park(row)
             if row.get("attention") == "review" and row.get("ts") \
                     and self.seen.get(row.get("sessionId")) == row.get("ts"):
                 row["attention"] = "stopped"
         self.warn_caches(fleet.rows)
+        self.compact_sessions(fleet)
         return fleet
+
+    def keep_compact(self, fleet):
+        """Compact at limit as set here, on a scan that read accounts.json
+        before the save: turned off, a scan already under way must not type."""
+        if self.compact_here:
+            on, upto = self.compact_here
+            if 0 < getattr(fleet, "seq", 0) <= upto:
+                fleet.compact = on
+
+    def compact_sessions(self, fleet):
+        """Near its account's limit, /compact into a large session at its
+        prompt (engine.compact_due) - typed only into iTerm2's panes."""
+        now = self.clock()
+        self.compact_held = {sid: until for sid, until in self.compact_held.items() if until > now}
+        try:
+            due, self.compact_seen = engine.compact_due(
+                fleet.rows, fleet.usage, fleet.compact, self.compact_seen, now=self.wall(),
+                flying=self.compact_flying | set(self.compact_held))
+            due = [(row, why, engine.said_name(row)) for row, why in due]
+            iterm2 = engine.terms.ITERM2
+            due = [(row, why, name, engine.terms.app_of(row) is iterm2) for row, why, name in due]
+        except Exception:
+            return                  # a compaction is never worth the list
+        for row, why, name, typed_into in due:
+            if typed_into:
+                self.compact_flying.add(row.get("sessionId"))
+                self.send_compact(row, why, name)
+            else:
+                # after show() is done: it clears the status line it said this in
+                self.call_later(self.said,
+                                f"did not compact {name}: only a session in iTerm2 is typed into")
+
+    @work(thread=True, group="compact")
+    def send_compact(self, row, why, name):
+        """Off the UI thread: two asks of iTerm2."""
+        try:
+            # asked again before the typing: turned off since, nothing is typed
+            said = self.adapter.compact(row, go=lambda: self.fleet.compact is True)
+        except Exception as ex:
+            said = type(ex).__name__
+        self.call_from_thread(self.compacted, row, why, name, said)
+
+    def compacted(self, row, why, name, said):
+        said, sid = str(said), row.get("sessionId")
+        self.compact_flying.discard(sid)
+        try:
+            unsent = engine.terms.NOT_SENT
+            if said.startswith(unsent):
+                # nothing was typed: tried again once the gate's pause is over
+                said = said[len(unsent):]
+                self.compact_seen = engine.compact_unsent(self.compact_seen, sid)
+                self.compact_held[sid] = self.clock() + COMPACT_RETRY
+        except Exception:
+            pass                # an engine of before: the next try is the one before the expiry
+        size = str(row.get("cache") or "").partition(" ")[0]
+        self.said({"typed": f"compacting {name} ({size}): {why}",
+                   "draft": f"did not compact {name}: its prompt is not empty",
+                   "changed": f"did not compact {name}: its screen changed",
+                   "gone": f"did not compact {name}: its pane is gone",
+                   "no prompt": f"did not compact {name}: no prompt on its screen",
+                   "off": f"did not compact {name}: compact at limit was turned off"}.get(
+                       said, f"could not compact {name}: {said}"))
+
+    def set_compact(self, on):
+        """Compact at limit on or off, from the accounts list: saved
+        (ccwho.set_compact_at_limit), and what the list does from now on - also
+        on a scan already under way (keep_compact). Answers the setting after it."""
+        import ccwho as runner
+        try:
+            done = runner.set_compact_at_limit(on)
+        except Exception as ex:          # a click must never end the list
+            done = {"result": "failed", "why": type(ex).__name__}
+        if done.get("result") in ("set", "same"):
+            now = done.get("on") is True
+            self.compact_here = (now, self.started)
+            self.fleet.compact = now
+            self.said(f"compact at limit: {'on' if now else 'off'}")
+        else:
+            self.said(f"compact at limit: {done.get('why') or 'not saved'}")
+        return self.fleet.compact
 
     def warn_caches(self, rows):
         """A question that waits while its large cache runs out: said outside
@@ -2334,8 +2472,19 @@ class CcwhoUi(App):
         if start is None:
             row = self.selected_row() or {}
             start = (self.fleet.usage.get("sessions") or {}).get(row.get("sessionId"))
-        self.push_screen(AccountsBox(entries, start),
+        self.push_screen(AccountsBox(entries, start, self.compact_offer(), self.set_compact),
                          callback=lambda aid: aid and self.name_box(aid, back=True))
+
+    def compact_offer(self):
+        """Compact at limit as the accounts list offers it: the setting, or None
+        - not offered - with fewer than two Claude accounts on the line. With
+        one, a session near the limit waits for the reset, and its cache
+        expires in that time: a compaction does not help."""
+        snap = self.fleet.usage if isinstance(self.fleet.usage, dict) else {}
+        accounts = snap.get("accounts") if snap.get("state") == "ok" else None
+        claude = [a for a in accounts or () if isinstance(a, dict)
+                  and a.get("brand", "ant") == "ant"]
+        return self.fleet.compact if len(claude) >= 2 else None
 
     def name_box(self, aid, back=False):
         """The name box for one account. `back`: it was chosen in the accounts
@@ -3359,7 +3508,7 @@ class Collector:
         return Fleet(rows, status.get("source_ok", False),
                      time.strftime("%H:%M:%S"), trouble, procs=procs,
                      secure=self.secure_input(), usage=self.usage(rows, procs),
-                     doctor=self.doctor())
+                     doctor=self.doctor(), compact=self.compact_at_limit())
 
     def release(self, rows, seen_at, seen_mono=None):
         """The sessions on the list let go of their launch claims (ccwho's
@@ -3380,6 +3529,15 @@ class Collector:
             return runner.usage_snapshot(rows, codex_threads=runner.open_codex_threads(procs))
         except Exception:
             return {"state": "unknown"}
+
+    def compact_at_limit(self):
+        """Is Compact at limit on, read on this collecting thread as the names
+        are; off when it cannot be read. Never the reason the list goes down."""
+        try:
+            import ccwho as runner
+            return runner.compact_at_limit() is True
+        except Exception:
+            return False
 
     def doctor(self):
         """Doctor's first fault, or "" - its last answer in. Its checks are
@@ -3553,6 +3711,13 @@ class Collector:
 
 class Adapter:
     """The terminal apps, behind a door the tests can close."""
+
+    def compact(self, row, deadline=COMPACT_DEADLINE, go=None):
+        """/compact into the row's prompt, only when it is empty - and when
+        go(), asked before the typing, still says so (terms.type_compact):
+        what it says."""
+        return engine.terms.type_compact(row.get("tty"), timeout=deadline, wait=COMPACT_WAIT,
+                                         go=go)
 
     def attach(self, cmd, deadline=FOCUS_DEADLINE, row=None):
         """One new window running `claude attach <id>`, in the app the session

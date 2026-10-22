@@ -1781,5 +1781,274 @@ class W:
                                  "ownerz", "ownerz2", "nope3"]))
         self.assertEqual(got["checked"], 8 + 5 + 4 + 3 + 3)
 
+
+# The bottom of a Claude Code screen in iTerm2, as `contents of` a session
+# gave it (2.1.307, measured 2026-10-22): the prompt box is a rule, the
+# prompt line - "❯" and a no-break space - and a rule; under it, the status
+# bar and the mode line. The text is made up; the shapes are measured.
+RULE = "─" * 80
+MODE = "  ⏵⏵ auto mode on (shift+tab to cycle)"
+
+
+def screen(*box, under=("", MODE)):
+    return "\n".join(["⏺ All 234 tests pass.", "", "✻ Worked for 3m 12s", "", *box, *under,
+                      "", ""])
+
+
+EMPTY = screen(RULE, "❯\u00a0", RULE)
+EMPTY_BOX = [RULE, "❯\u00a0", RULE]
+
+
+class TestAnEmptyPromptIsWhatCanBeTypedInto(unittest.TestCase):
+    """Compact at limit types into a prompt only when nothing is in it: a line
+    typed and not sent would get "/compact" at its end, and go to Claude."""
+
+    def test_an_empty_prompt(self):
+        self.assertEqual(terms.empty_prompt(EMPTY), EMPTY_BOX)
+        # a status bar under it, and the rule with the session's name in it
+        top = "─" * 60 + " fix-the-gate ─"
+        bar = "  work 5h 42%↓/60% ↻15:30 · 7d 12%↓/30% ↻Thu21:00 "
+        self.assertEqual(terms.empty_prompt(screen(top, "❯\u00a0", RULE, under=(bar, MODE))),
+                         [top, "❯\u00a0", RULE])
+        self.assertEqual(terms.empty_prompt(EMPTY.replace("\n", "\r")), EMPTY_BOX)
+
+    def test_text_in_the_prompt(self):
+        # a draft, the hint of a new session, a draft that starts on its second
+        # line: plain text cannot tell a draft from a grey hint - neither is typed into
+        for box in ([RULE, "❯\u00a0hello there", RULE],
+                    [RULE, '❯\u00a0Try "how do I log an error?"', RULE],
+                    [RULE, "❯\u00a0", "  and then the gate", RULE],
+                    [RULE, "❯\u00a0/", RULE]):
+            with self.subTest(box=box):
+                self.assertIsNone(terms.empty_prompt(screen(*box)))
+
+    def test_a_menu_is_no_prompt(self):
+        # the trust question and a permission prompt: their "❯" is an option
+        trust = "\n".join([" Quick safety check: Is this a project you created or one you trust?",
+                           "", " ❯ No, exit", "   Yes, I trust this folder", "",
+                           " Enter to confirm · Esc to cancel"])
+        menu = screen(RULE, " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "",
+                      under=("Enter to select · ↑/↓ to navigate · Esc to cancel",))
+        for text in (trust, menu, screen(RULE, " ❯\u00a0", RULE)):
+            with self.subTest(text=text[-60:]):
+                self.assertIsNone(terms.empty_prompt(text))
+
+    def test_the_box_is_at_the_bottom(self):
+        # an empty box further up is an old screen: more under it than a
+        # status bar and the mode line
+        lines = ("", "  work 5h 42%", MODE, "⏺ more output")
+        self.assertIsNone(terms.empty_prompt(screen(RULE, "❯\u00a0", RULE, under=lines)))
+        self.assertEqual(terms.empty_prompt(screen(RULE, "❯\u00a0", RULE, under=lines[:3])),
+                         EMPTY_BOX)                                     # control
+        # a rule of a reply (a markdown line) is no box
+        self.assertIsNone(terms.empty_prompt(screen("❯\u00a0", RULE)))
+        self.assertIsNone(terms.empty_prompt(screen("─" * 9, "❯\u00a0", "─" * 9)))
+
+    def test_no_screen(self):
+        for text in ("", None, 7, "\n\n", RULE):
+            with self.subTest(text=text):
+                self.assertIsNone(terms.empty_prompt(text))
+
+
+class TestCompactIsTypedOnlyIntoTheScreenItSaw(unittest.TestCase):
+    """type_compact: one ask reads the pane's screen; a second types /compact,
+    only while the box at its bottom is still the one the first saw. Both
+    through the gate: ccwho types on its own, with nobody waiting on it."""
+
+    def setUp(self):
+        self.asked, self.answers = [], []
+
+        def ask(args, **k):
+            self.asked.append((args, k))
+            answer, why = self.answers.pop(0)
+            if "why" in k and why:
+                k["why"].update(why)
+            return answer
+        testkit.patch(self, engine.terms, "ask", ask)
+
+    def typed(self, *answers, tty="/dev/ttys071"):
+        self.answers = list(answers)
+        return terms.type_compact(tty, timeout=5.0, wait=10.0)
+
+    def test_an_empty_prompt_is_typed_into(self):
+        self.assertEqual(self.typed(("pane:" + EMPTY + "\n", None), ("typed\n", None)), "typed")
+        (look, k1), (act, k2) = self.asked
+        for k in (k1, k2):
+            self.assertIs(k["app"], terms.ITERM2)
+            self.assertEqual((k["timeout"], k["wait"]), (5.0, 10.0))
+        self.assertIn("contents of s", look[1])
+        self.assertNotIn("write text", look[1])
+        self.assertIn('write text "/compact"', act[1])
+        for line in EMPTY_BOX:
+            self.assertIn(terms.applescript_str(line), act[1])
+        for script in (look[1], act[1]):
+            self.assertIn('"/dev/ttys071"', script)
+
+    def test_a_prompt_with_text_is_not(self):
+        for box in ([RULE, "❯\u00a0hello there", RULE],
+                    [RULE, '❯\u00a0Try "how do I log an error?"', RULE],
+                    [RULE, "❯\u00a0", "  and then the gate", RULE],
+                    ["─" * 60 + " fix-the-gate ─", "❯\u00a0one", "  two", RULE]):
+            with self.subTest(box=box):
+                self.asked = []
+                self.assertEqual(self.typed(("pane:" + screen(*box), None)), "draft")
+                self.assertEqual(len(self.asked), 1)        # nothing typed
+
+    def test_a_screen_with_no_prompt_box(self):
+        # a menu, a dialog, a box further up: no prompt to type into - said so
+        trust = "\n".join([" Quick safety check: Is this a project you created or one you trust?",
+                           "", " ❯ No, exit", "   Yes, I trust this folder", "",
+                           " Enter to confirm · Esc to cancel"])
+        menu = screen(RULE, " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "",
+                      under=("Enter to select · ↑/↓ to navigate · Esc to cancel",))
+        old = screen(RULE, "❯\u00a0", RULE, under=("", "  work 5h", MODE, "⏺ more output"))
+        for text in (trust, menu, old, screen(RULE, " ❯\u00a0", RULE), ""):
+            with self.subTest(text=text[-50:]):
+                self.asked = []
+                self.assertEqual(self.typed(("pane:" + text, None)), "no prompt")
+                self.assertEqual(len(self.asked), 1)
+
+    def test_turned_off_after_the_look_nothing_is_typed(self):
+        self.answers = [("pane:" + EMPTY, None), ("typed", None)]
+        self.assertEqual(terms.type_compact("/dev/ttys071", timeout=5.0, wait=10.0,
+                                            go=lambda: False), "off")
+        self.assertEqual(len(self.asked), 1)
+        self.asked, self.answers = [], [("pane:" + EMPTY, None), ("typed", None)]
+        self.assertEqual(terms.type_compact("/dev/ttys071", timeout=5.0, wait=10.0,
+                                            go=lambda: True), "typed")     # control
+        self.assertEqual(len(self.asked), 2)
+
+    def test_a_screen_that_changed_or_a_pane_that_went(self):
+        self.assertEqual(self.typed(("pane:" + EMPTY, None), ("changed", None)), "changed")
+        self.assertEqual(self.typed(("none\n", None)), "gone")
+        self.assertEqual(self.typed(("pane:" + EMPTY, None), ("none", None)), "gone")
+
+    def test_a_tty_that_is_no_pane_s_is_never_asked(self):
+        for tty in ("", "/dev/ttys071\" & do shell script \"id", "/dev/console", "ttys", None):
+            with self.subTest(tty=tty):
+                self.asked = []
+                self.assertEqual(self.typed(tty=tty), "gone")
+                self.assertEqual(self.asked, [])
+        # a row's tty as ps gives it: the device it names           (control)
+        self.assertEqual(self.typed(("none", None), tty="ttys071"), "gone")
+        self.assertEqual(len(self.asked), 1)
+        self.assertIn('"/dev/ttys071"', self.asked[0][0][1])
+
+    def test_what_the_gate_says_when_it_did_not_ask(self):
+        # no event sent (the gate's "asked"): said so first - nothing was typed
+        cases = ((None, {"asked": False, "refused": "not-running"},
+                  "not sent: iTerm2 is not running"),
+                 (None, {"asked": False, "refused": "busy"},
+                  "not sent: iTerm2 is busy with another question"),
+                 (None, {"asked": False, "refused": "waiting", "error": "-1700"},
+                  "not sent: iTerm2 does not answer"),
+                 (None, {"asked": False, "refused": "stuck"}, "not sent: iTerm2 does not answer"),
+                 (None, {"asked": False, "refused": "io"}, "not sent: could not ask iTerm2"),
+                 (None, {"asked": True, "error": "timeout"}, "iTerm2 did not answer in 5s"),
+                 # the gate's codes are text, as osascript ended its message
+                 (None, {"error": terms.AE_NOT_PERMITTED}, "iTerm2 refused (-1743)"),
+                 (None, {"error": "-1700"}, "iTerm2 refused (-1700)"),
+                 (None, {"error": terms.AE_TIMED_OUT}, "iTerm2 did not answer (-1712)"),
+                 (None, {"error": "failed"}, "could not ask iTerm2"),
+                 (None, {"refused": "io"}, "could not ask iTerm2"))
+        for answer, why, said in cases:
+            with self.subTest(why=why):
+                self.assertEqual(self.typed((answer, why)), said)
+        # the second ask: a timeout may come after the typing went in
+        self.assertEqual(self.typed(("pane:" + EMPTY, None), (None, {"error": "timeout"})),
+                         "iTerm2 did not answer in 5s - it may have typed it")
+        self.assertEqual(self.typed(("pane:" + EMPTY, None), (None, {"error": terms.AE_TIMED_OUT})),
+                         "iTerm2 did not answer (-1712) - it may have typed it")
+        self.assertEqual(self.typed(("pane:" + EMPTY, None),
+                                    (None, {"asked": False, "refused": "busy"})),
+                         "not sent: iTerm2 is busy with another question")
+        self.assertEqual(self.typed(("pane:" + EMPTY, None), ("odd\n", None)),
+                         "iTerm2 said something else")
+
+    def test_the_pane_is_found_by_its_tty_and_kept_by_its_id(self):
+        # a loop item is a reference by index (measured, 2026-10-22: "item 1 of
+        # every session of item 1 of every tab of item 1 of every window"): a
+        # jump that reorders the windows between two events points it at another
+        # pane. `whose tty is` answers by id ("session id ... of tab 1 of window
+        # id ...", measured): moved, it fails - it never finds another pane
+        for script in (terms.ITERM2.screen_script("/dev/ttys071"),
+                       terms.ITERM2.compact_script("/dev/ttys071", EMPTY_BOX)):
+            self.assertIn('(sessions of t whose tty is "/dev/ttys071")', script)
+            self.assertIn("set s to item 1 of found\n", script)
+            self.assertNotIn("repeat with s in", script)
+            told = script[script.index("set s to item 1 of"):script.index("end tell")]
+            self.assertIn("contents of s", told)
+
+    def test_the_box_it_saw_cannot_steer_the_script(self):
+        # the top rule holds the session's name: a quote in it stays text
+        top = "─" * 60 + ' x" & (do shell script "id") & " ─'
+        box = screen(top, "❯\u00a0", RULE)
+        self.typed(("pane:" + box, None), ("typed", None))
+        act = self.asked[1][0][1]
+        self.assertIn(terms.applescript_str(top), act)
+        self.assertNotIn('(do shell script "id")', act)
+
+
+@unittest.skipUnless(__import__("shutil").which("osascript"), "macOS only")
+class TestTheBoxIsComparedByCodePoint(unittest.TestCase):
+    """compact_script's own check, run by osascript on screens: its handlers
+    alone - no tell, so no app is reached."""
+
+    def at_bottom(self, lines, box=EMPTY_BOX):
+        # the screen as one text, its lines joined as iTerm2 joins them
+        text = " & linefeed & ".join(terms.applescript_str(line) for line in lines) or '""'
+        script = terms.ITERM2.BOX_HANDLERS + "return boxAtBottom(%s, {%s})" % (
+            text, ", ".join(terms.applescript_str(line) for line in box))
+        done = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
+                              timeout=20)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip() == "true"
+
+    def test_the_box_it_saw_is_still_there(self):
+        self.assertTrue(self.at_bottom(EMPTY.splitlines()))
+        # under it blank lines, also of spaces: what a screen has
+        self.assertTrue(self.at_bottom(EMPTY.splitlines() + ["   ", "\u00a0", ""]))
+
+    def test_a_key_pressed_since(self):
+        for prompt in ("❯\u00a0h", "❯ ", "❯\u00a0\u00a0", "❯"):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(self.at_bottom(screen(RULE, prompt, RULE).splitlines()))
+
+    def test_a_rule_that_changed(self):
+        # the pane got narrower, or the session another name: not the box it saw
+        top = "─" * 60 + " fix-the-gate ─"
+        box = [top, "❯\u00a0", RULE]
+        self.assertTrue(self.at_bottom(screen(*box).splitlines(), box))
+        self.assertFalse(self.at_bottom(screen(top.upper(), "❯\u00a0", RULE).splitlines(), box))
+        self.assertFalse(self.at_bottom(screen(RULE[1:], "❯\u00a0", RULE[1:]).splitlines()))
+
+    def test_only_at_the_bottom(self):
+        under = ("", "  work 5h 42%", MODE, "⏺ more output")
+        self.assertFalse(self.at_bottom(screen(RULE, "❯\u00a0", RULE, under=under).splitlines()))
+        self.assertTrue(self.at_bottom(screen(RULE, "❯\u00a0", RULE,
+                                              under=under[:3]).splitlines()))   # control
+        self.assertFalse(self.at_bottom([]))
+        self.assertFalse(self.at_bottom(["❯\u00a0", RULE]))
+
+    def test_iterm2_is_asked_only_for_the_screen_and_the_typing(self):
+        # measured (2026-10-22, the end-to-end check): "paragraphs of
+        # (contents of s)" inside the tell is one event to iTerm2 - "every
+        # paragraph of contents of ..." - and it fails (-1700). Inside the tell:
+        # the pane's text and the typing, and nothing done to the text
+        script = terms.ITERM2.compact_script("/dev/ttys071", EMPTY_BOX)
+        told = script[script.index('tell application "iTerm2"'):script.index("end tell")]
+        for words in ("paragraphs of", "characters of", "count of", " id of "):
+            self.assertNotIn(words, told)
+        self.assertIn("contents of s", told)
+        handlers = script[script.index("end tell"):]
+        self.assertIn("paragraphs of", handlers)                            # control
+
+    def test_the_scripts_compile(self):
+        for script in (terms.ITERM2.screen_script("/dev/ttys071"),
+                       terms.ITERM2.compact_script("/dev/ttys071", EMPTY_BOX)):
+            done = testkit.compiles(self, terms.ITERM2, script)
+            self.assertEqual(done.returncode, 0, done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

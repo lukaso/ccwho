@@ -41,6 +41,9 @@ ROW_KEYS = {
                           # "parked"): your note, and its state when not parked
     "cache", "cache_warn",  # added 2026-10-18: a large session's size and its
                           # cache's minutes ("640k ⧗19m"), and whether they run out
+    "ctx", "cache_at", "compact_typed",  # added 2026-10-22: the context in tokens,
+                          # when its cache's hour started, and whether a /compact was
+                          # typed since (Compact at limit)
 }
 
 # Every key a manifest session entry has ever carried. Append only.

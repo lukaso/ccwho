@@ -342,11 +342,19 @@ def cache_state(lines):
     record (zero usage) none. After a compaction the context is what it kept,
     and no cache holds it yet: its life is None. The recap Claude Code writes
     while you are away (away_summary) is a request on the main thread's cache
-    too: measured, the cache then lives an hour from it.
+    too: measured, the cache then lives an hour from it. "typed": a /compact
+    was typed after that request (yours, or Compact at limit's: compact_due).
     """
     state, mid = None, object()
     for d in as_records(lines):
         if d.get("isSidechain"):
+            continue
+        if d.get("type") == "user":
+            msg = d.get("message")
+            text = _text_of(msg.get("content") if isinstance(msg, dict) else None).lstrip()
+            name = _COMMAND_NAME.match(text)
+            if state is not None and name and name.group(1) == "compact":
+                state = dict(state, typed=True)
             continue
         if d.get("type") == "system" and d.get("subtype") == "away_summary":
             at = _epoch(d.get("timestamp"))
@@ -395,6 +403,13 @@ def cache_mark(state, attention, now=None):
     return f"{size} ⧗{mins}", ctx >= CACHE_WARN and left < CACHE_WARN_LEFT
 
 
+def said_name(row):
+    """A session as a word outside its row names it: its title, else its
+    tab's, else its name."""
+    return truncate(_printable(row.get("title") or row.get("tab_title")
+                               or row.get("name")), 40) or "a session"
+
+
 def cache_alerts(rows, warned, now=None):
     """What to tell you when a tool call waits on you while a large cache runs
     out: (alerts, warned). An alert is (session id, text); `warned` maps a
@@ -429,12 +444,119 @@ def cache_alerts(rows, warned, now=None):
         if row.get("attention") != "blocked" or not row.get("cache_warn") or not mark:
             continue
         warned[sid] = now + CACHE_WARN_LEFT
-        label = truncate(_printable(row.get("title") or row.get("tab_title")
-                                    or row.get("name")), 40) or "a session"
+        label = said_name(row)
         size, _, left = mark.partition(" ⧗")
         left = "less than a minute" if left == "<1m" else left
         alerts.append((sid, f"NEEDS YOU: {label}. Its {size} cache expires in {left}."))
     return alerts, warned
+
+
+# Compact at limit (#49, parts 3 and 4): a user with two accounts moves the
+# sessions of one near its limit to the other, and the cache does not move
+# with a session - its first turn there writes the whole context again. A
+# compaction first makes that turn small. Claude Code's own idle compaction
+# skips every session near the limit, so the list types /compact.
+COMPACT_SIZE = CACHE_WARN
+COMPACT_5H, COMPACT_WEEK = 90, 80       # % used: either one is near the limit
+COMPACT_IDLE = 50 * 60                  # at its prompt this long: 10 minutes left
+COMPACT_TURN_END = 3 * 60               # seen open this recently: its turn just ended
+# its turn ended, and it waits at its prompt - parked too, by the state it was
+# parked in. Not NEEDS YOU, also parked (z parks a question for you): a menu
+# waits there, and a /compact typed into it would answer it
+COMPACT_AT_PROMPT = ("review", "stopped", "asks")
+_OPEN_TURN = ("busy", "blocked")
+
+
+def _number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _near_limit(acct):
+    """(% used, the window) that has an account near its limit, 5h first -
+    or None. A window past its reset is a new one: not near."""
+    for key, limit, words in (("five_hour", COMPACT_5H, "5h"),
+                              ("seven_day", COMPACT_WEEK, "the week")):
+        w = acct.get(key)
+        pct = w.get("pct") if isinstance(w, dict) and w.get("state") == "ok" else None
+        if _number(pct) and pct >= limit:
+            return pct, words
+    return None
+
+
+def compact_due(rows, usage, on, seen, now=None, flying=()):
+    """The sessions Compact at limit compacts now: (due, seen). `due` is
+    [(row, why)], `why` what makes it due ("ant:work is at 92% of 5h").
+    `seen` is kept by the caller between scans - a reload makes new engines:
+    "open", session id -> when its turn was last seen open; "tried", session
+    id -> (its last request, the tries made for that request, the last one).
+
+    Only with the setting on, and two or more Claude accounts on the usage
+    line: with one, a session near the limit waits for the reset, and its
+    cache expires in that time. A session is due when its account is at
+    COMPACT_5H% of 5h or COMPACT_WEEK% of the week, its context is
+    COMPACT_SIZE or more, it waits at its prompt with its cache still warm
+    (a cold one would write it all again), and no /compact was typed since
+    its last request. Then at the end of a turn the list saw - seen open in
+    the last COMPACT_TURN_END, as the limits are read after the reply - or
+    COMPACT_IDLE after its last request, 10 minutes before the cache expires.
+    One try for each, for each request: a try that found text in its prompt
+    is not made again on every scan. `flying`: the sessions with a try under
+    way - not due, and nothing spent for them, until it is back."""
+    now = time.time() if now is None else now
+    seen = seen if isinstance(seen, dict) else {}
+    opened, tried = seen.get("open"), seen.get("tried")
+    opened = {sid: t for sid, t in (opened.items() if isinstance(opened, dict) else ())
+              if _number(t) and now - t <= COMPACT_TURN_END}
+    tried = {sid: v for sid, v in (tried.items() if isinstance(tried, dict) else ())
+             if isinstance(v, tuple) and len(v) == 3 and _number(v[0])
+             and now - v[0] < CACHE_LIFE}
+    rows = [row for row in rows or () if isinstance(row, dict)]
+    for row in rows:
+        sid = row.get("sessionId")
+        if isinstance(sid, str) and sid and row.get("attention") in _OPEN_TURN:
+            opened[sid] = now
+    usage = usage if isinstance(usage, dict) else {}
+    accounts = usage.get("accounts") if usage.get("state") == "ok" else None
+    claude = {a["id"]: a for a in (accounts if isinstance(accounts, list) else ())
+              if isinstance(a, dict) and isinstance(a.get("id"), str)
+              and a.get("brand", "ant") == "ant"}
+    spends = usage.get("sessions") if isinstance(usage.get("sessions"), dict) else {}
+    names = usage.get("names") if isinstance(usage.get("names"), dict) else {}
+    due = []
+    for row in rows if on and len(claude) >= 2 else ():
+        sid, ctx, at = row.get("sessionId"), row.get("ctx"), row.get("cache_at")
+        state = row.get("park_was") if row.get("attention") == "parked" else row.get("attention")
+        if not isinstance(sid, str) or not sid or state not in COMPACT_AT_PROMPT or sid in flying:
+            continue
+        if not _number(ctx) or ctx < COMPACT_SIZE or not _number(at) or row.get("compact_typed"):
+            continue
+        idle = now - at
+        acct = claude.get(spends.get(sid))
+        near = _near_limit(acct) if acct and idle < CACHE_LIFE else None
+        kind = "end" if sid in opened else "idle" if idle >= COMPACT_IDLE else None
+        if near is None or kind is None:
+            continue
+        last, kinds, _ = tried.get(sid, (None, frozenset(), None))
+        kinds = kinds if last == at else frozenset()
+        if kind in kinds:
+            continue
+        tried[sid] = (at, kinds | {kind}, kind)
+        pct, words = near
+        name = names.get(acct["id"]) or acct["id"]
+        due.append((row, f"{acct.get('brand', 'ant')}:{name} is at {pct:g}% of {words}"))
+    return due, {"open": opened, "tried": tried}
+
+
+def compact_unsent(seen, sid):
+    """The last try for `sid` typed nothing - no event went to iTerm2
+    (terms.NOT_SENT): it is made again at a scan to come, while it is due.
+    Answers the `seen` to keep."""
+    seen = dict(seen) if isinstance(seen, dict) else {}
+    tried = dict(seen["tried"]) if isinstance(seen.get("tried"), dict) else {}
+    v = tried.get(sid)
+    if isinstance(v, tuple) and len(v) == 3 and isinstance(v[1], frozenset):
+        tried[sid] = (v[0], v[1] - {v[2]}, None)
+    return dict(seen, tried=tried)
 
 
 def _cmdline_orphans(ps_output, session_ids):
@@ -3517,8 +3639,8 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     recs = as_records(head) + as_records(tail)
     r = brief.recap(recs)
     has_window = windowed
-    cache, cache_warn = cache_mark(cache_state(tail), "busy" if working else attention,
-                                  now=now)
+    cached = cache_state(tail)
+    cache, cache_warn = cache_mark(cached, "busy" if working else attention, now=now)
     row = {
         "windowed": has_window,
         "kind": session.get("kind", ""),
@@ -3563,6 +3685,12 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # the size of a large session, and while it waits, its cache's minutes
         "cache": cache,
         "cache_warn": cache_warn,
+        # what Compact at limit reads (compact_due): the context, when its
+        # cache's hour started (None while no cache holds it), and whether a
+        # /compact was typed since
+        "ctx": cached["ctx"] if cached else None,
+        "cache_at": cached["at"] if cached and cached["ttl"] else None,
+        "compact_typed": bool(cached and cached.get("typed")),
     }
     # the text comes from transcripts, the agents feed and tab titles, and goes to
     # a terminal and to agents: nothing in it may start an escape sequence

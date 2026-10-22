@@ -165,6 +165,18 @@ class FakeAdapter:
         self.kept_in_front = 0
         self.copied, self.copy_error = [], copy_error
         self.alerted, self.alert_error = [], ""
+        self.compacted, self.compact_answer, self.compact_hold = [], "typed", None
+
+    def compact(self, row, deadline=5.0, go=None):
+        """As terms.type_compact: the look, then go() before the typing."""
+        self.compacted.append(row.get("sessionId"))
+        if self.compact_hold is not None:
+            self.compact_hold.wait(10)
+        if isinstance(self.compact_answer, Exception):
+            raise self.compact_answer
+        if self.compact_answer == "typed" and go is not None and not go():
+            return "off"
+        return self.compact_answer
 
     def alert(self, text, write):
         self.alerted.append(text)
@@ -4782,6 +4794,18 @@ class TestTheCollectorReadsUsage(unittest.TestCase):
         self.assertEqual(fleet.usage, {"state": "unknown"})
         self.assertEqual(len(fleet.rows), 1)
 
+    def test_the_fleet_carries_compact_at_limit(self):
+        # read on the collecting thread, as the names are; off when it cannot be
+        import ccwho as runner
+        import testkit
+        snap = lambda rows, codex_threads=(): {"state": "ok"}
+        for read, on in ((lambda: True, True), (lambda: False, False),
+                         (lambda: 1 / 0, False)):
+            with self.subTest(on=on):
+                testkit.patch(self, runner, "compact_at_limit", read)
+                self.assertIs(self.collect(snap).compact, on)
+        self.assertIs(ui.Fleet([LIVE], True, "12:00:00").compact, False)
+
 
 class TestCursorRepaintsUsageOnlyWhenTheAccountChanges(UiTest):
     async def test_same_account_no_update(self):
@@ -5392,7 +5416,8 @@ class TestAOpensTheAccountsList(NamesTest):
             frame = box.query_one("#accountsbox").region
             self.assertTrue(0 <= frame.y and frame.bottom <= 24, frame)
             self.assertLess(opts.size.height, 2 * 14)       # it scrolls
-            for part in ("#accountshead", "#accountsclose", ".accountsnote"):
+            # the line of Compact at limit too: 14 Claude accounts offer it
+            for part in ("#accountshead", "#accountsclose", ".accountsnote", "#compactline"):
                 r = box.query_one(part).region
                 self.assertTrue(r.height and frame.y < r.y < frame.bottom, (part, r))
             # the last account is reached with the keys
@@ -5423,6 +5448,366 @@ class TestAOpensTheAccountsList(NamesTest):
                     self.assertIn(last, drawn)        # on one line: not wrapped
                     if width == 40:         # cut to the cells the box has: no less
                         self.assertEqual(len(last), width - ui.BOX_FRAME)
+
+
+class TestCompactAtLimitInTheAccountsList(NamesTest):
+    """The setting Compact at limit (#49), on its own line under the accounts:
+    offered only with two or more Claude accounts - with one, a compaction
+    does not help. c, or a click on the line, turns it on or off."""
+
+    OFF = "compact at limit: off · c or a click turns it on"
+    ON = "compact at limit: on · c or a click turns it off"
+    WHAT = "  /compact a session of 400k+ near its account's limit"
+
+    def saves(self, *results):
+        """ccwho.set_compact_at_limit, replaced: what each save says, in order -
+        the last one again after that. Returns what it was asked."""
+        import ccwho as runner
+        import testkit
+        calls, left = [], list(results)
+
+        def save(on):
+            calls.append(on)
+            done = left.pop(0) if len(left) > 1 else left[0]
+            return done(on) if callable(done) else done
+        testkit.patch(self, runner, "set_compact_at_limit", save)
+        return calls
+
+    def line(self, box):
+        found = box.query("#compactline")
+        return str(found.first().content) if found else None
+
+    async def test_it_is_offered_with_two_claude_accounts(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            self.assertEqual(self.line(box), self.OFF + "\n" + self.WHAT)
+            # the accounts, and their keys, as they were
+            self.assertEqual([aid for aid, _ in self.lines_of(box)],
+                             [self.LOGIN, self.T1, self.T2])
+            self.assertIn("Enter or a click names the account · Esc closes", self.words(box))
+
+    async def test_with_one_claude_account_it_is_not(self):
+        import copy
+        one = self.snap()
+        one["accounts"] = one["accounts"][:1]
+        codex = copy.deepcopy(self.snap())
+        codex["accounts"] = [codex["accounts"][0], dict(codex["accounts"][1], brand="oai",
+                                                        id="oai:codex")]
+        for snap in (one, codex):
+            with self.subTest(accounts=[a["id"] for a in snap["accounts"]]):
+                calls = self.saves({"result": "set", "why": "", "on": True})
+                app = self.names_app(snap)
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app, "c")
+                    self.assertIsNone(self.line(box))
+                    self.assertEqual(calls, [])
+
+    async def test_c_turns_it_on_and_off(self):
+        calls = self.saves(lambda on: {"result": "set", "why": "", "on": on})
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "c")
+            self.assertEqual(calls, [True])
+            self.assertEqual(self.line(box), self.ON + "\n" + self.WHAT)
+            self.assertIs(app.screen, box)                  # the list stays open
+            self.assertIn("compact at limit: on", app.status)
+            await pilot.press("c")
+            await pilot.pause()
+            self.assertEqual(calls, [True, False])
+            self.assertEqual(self.line(box), self.OFF + "\n" + self.WHAT)
+            self.assertIn("compact at limit: off", app.status)
+
+    async def test_a_click_on_the_line(self):
+        calls = self.saves(lambda on: {"result": "set", "why": "", "on": on})
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            at = box.query_one("#compactline").region
+            self.click_at(app, at.x + 2, at.y)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(calls, [True])
+            self.assertIs(app.screen, box)
+
+    async def test_a_save_that_fails_says_why_and_keeps_the_setting(self):
+        calls = self.saves({"result": "busy", "why": "could not save: the names files are in use",
+                            "on": False})
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app, "c")
+            self.assertEqual(calls, [True])
+            self.assertEqual(self.line(box), self.OFF + "\n" + self.WHAT)
+            self.assertIn("compact at limit: could not save: the names files are in use",
+                          app.status)
+            self.assertIs(app.fleet.compact, False)
+
+    async def test_a_narrow_window_still_holds_the_box(self):
+        # the line wraps when the box is narrow: the list gives up the rows
+        import ccwho_usage as usage
+        rows = [{"id": f"token:{i:04x}aaaa", "kind": "token", "email": "", "brand": "ant",
+                 "label": "", "sessions": 1, "age": 5, "seven_day": None,
+                 "five_hour": {"state": "ok", "pct": 5, "resets_at": NOW + 7200, "age": 5}}
+                for i in range(1, 15)]
+        names = usage.short_names(rows, {})
+        snap = {"state": "ok", "accounts": usage.ordered(rows, names), "names": names,
+                "sessions": {}, "now": NOW, "labels": {}}
+        for width in (40, 50, 60, 80):
+            with self.subTest(width=width):
+                app = self.names_app(snap)
+                async with app.run_test(size=(width, 24)) as pilot:
+                    await pilot.pause()
+                    box = await self.open_box(pilot, app)
+                    await pilot.pause()
+                    frame = box.query_one("#accountsbox").region
+                    self.assertTrue(0 <= frame.y and frame.bottom <= 24, frame)
+                    for part in ("#compactline", ".accountsnote"):
+                        r = box.query_one(part).region
+                        self.assertTrue(r.height and frame.y < r.y and r.bottom < frame.bottom,
+                                        (part, r, frame))
+
+    async def test_it_shows_the_setting_the_scan_read(self):
+        fleet = ui.Fleet([LIVE, BUSY], True, "12:00:00", usage=self.snap(), compact=True)
+        app = self.app(collector=FakeCollector(fleet=fleet))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            self.assertEqual(self.line(box), self.ON + "\n" + self.WHAT)
+
+
+BIG_SID = "eeee5555-0000-4000-8000-000000000005"
+BIG = row(BIG_SID, "review", title="Fix the gate", tty="ttys071", terminal="iterm2",
+          cache="640k ⧗58m", cache_warn=False, ctx=640_000, cache_at=NOW - 120,
+          compact_typed=False)
+BIG_BUSY = dict(BIG, attention="busy", cache="640k")
+COMPACTING = "compacting Fix the gate (640k): ant:work is at 92% of 5h"
+
+
+def near_snap(pct=92, two=True):
+    """usage_snap, with BIG on the login account - work@example.com - at
+    `pct`% of its 5h."""
+    import ccwho_usage as usage
+    snap = usage_snap(two)
+    for acct in snap["accounts"]:
+        if acct["id"] == "login:a":
+            acct.update(email="work@example.com",
+                        five_hour=dict(acct["five_hour"], pct=pct))
+    snap["names"] = usage.short_names(snap["accounts"], {})
+    snap["accounts"] = usage.ordered(snap["accounts"], snap["names"])
+    snap["sessions"][BIG_SID] = "login:a"
+    return snap
+
+
+class TestCompactAtLimitTypesIntoTheSession(UiTest):
+    """Near its account's limit, a large session at its prompt gets /compact
+    typed (engine.compact_due, through the adapter), one time for each try, and
+    the list says what it did - or why it did not."""
+
+    def app_at(self, rows, adapter, snap=None, compact=True):
+        app = self.app(adapter=adapter, collector=FakeCollector(
+            ui.Fleet(rows, True, "12:00:00", usage=snap or near_snap(), compact=compact)))
+        now = [NOW]
+        app.wall = lambda: now[0]
+        return app, now
+
+    def scan(self, app, rows, snap=None, compact=True, seq=0):
+        fleet = ui.Fleet(rows, True, "12:00:05", usage=snap or near_snap(), compact=compact)
+        if seq:
+            fleet.seq = seq
+        app.show(fleet)
+
+    async def test_a_turn_that_ends_near_the_limit(self):
+        adapter = FakeAdapter()
+        app, now = self.app_at([BIG_BUSY, LIVE], adapter)
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [])
+            now[0] += 5
+            self.scan(app, [BIG, LIVE])
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [BIG_SID])
+            self.assertIn(COMPACTING, app.status)
+            now[0] += 5
+            self.scan(app, [BIG, LIVE])
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [BIG_SID])          # one try
+
+    async def test_off_or_with_one_claude_account_nothing_is_typed(self):
+        for snap, compact in ((near_snap(), False), (near_snap(two=False), True),
+                              (near_snap(pct=89), True)):
+            with self.subTest(compact=compact, accounts=len(snap["accounts"]),
+                              pct=snap["accounts"][0]["five_hour"]["pct"]):
+                adapter = FakeAdapter()
+                app, now = self.app_at([BIG_BUSY], adapter, snap, compact)
+                async with app.run_test() as pilot:
+                    await self.settled(pilot)
+                    now[0] += 5
+                    self.scan(app, [BIG], snap, compact)
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.compacted, [])
+
+    async def test_what_it_says_when_it_did_not_type(self):
+        for answer, said in (
+                ("draft", "did not compact Fix the gate: its prompt is not empty"),
+                ("changed", "did not compact Fix the gate: its screen changed"),
+                ("gone", "did not compact Fix the gate: its pane is gone"),
+                ("no prompt", "did not compact Fix the gate: no prompt on its screen"),
+                ("off", "did not compact Fix the gate: compact at limit was turned off"),
+                ("iTerm2 is busy with another question",
+                 "could not compact Fix the gate: iTerm2 is busy with another question"),
+                (OSError("boom"), "could not compact Fix the gate: OSError")):
+            with self.subTest(answer=answer):
+                adapter = FakeAdapter()
+                adapter.compact_answer = answer
+                app, now = self.app_at([BIG_BUSY], adapter)
+                async with app.run_test() as pilot:
+                    await self.settled(pilot)
+                    now[0] += 5
+                    self.scan(app, [BIG])
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.compacted, [BIG_SID])
+                    self.assertIn(said, app.status)
+
+    async def test_a_try_the_gate_sent_nothing_for_is_made_again(self):
+        # the gate paused after an error: again once its pause is over - not on
+        # every scan before that (COMPACT_RETRY, the gate's own pause)
+        for first, calls in (("not sent: iTerm2 does not answer", [BIG_SID, BIG_SID]),
+                             ("iTerm2 refused (-1700)", [BIG_SID])):              # control
+            with self.subTest(first=first):
+                adapter = FakeAdapter()
+                adapter.compact_answer = first
+                app, now = self.app_at([BIG_BUSY], adapter)
+                app.clock = lambda: now[0]
+                async with app.run_test() as pilot:
+                    await self.settled(pilot)
+                    now[0] += 5
+                    self.scan(app, [BIG])
+                    await self.settled(pilot)
+                    said = first.replace("not sent: ", "")
+                    self.assertIn("could not compact Fix the gate: " + said, app.status)
+                    adapter.compact_answer = "typed"
+                    now[0] += 5
+                    self.scan(app, [BIG])
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.compacted, [BIG_SID])  # held: the gate's pause
+                    now[0] += ui.COMPACT_RETRY
+                    self.scan(app, [BIG])
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.compacted, calls)
+
+    async def test_no_second_try_while_one_is_under_way(self):
+        import threading
+        adapter = FakeAdapter()
+        adapter.compact_hold = threading.Event()
+        app, now = self.app_at([BIG_BUSY], adapter)
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            now[0] += 5
+            self.scan(app, [BIG])
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [BIG_SID])
+            # a new request, and the turn end again: due by itself
+            again = dict(BIG, cache_at=NOW + 2)
+            self.scan(app, [dict(again, attention="busy")])
+            self.scan(app, [again])
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [BIG_SID])      # the first is under way
+            adapter.compact_hold.set()
+            await self.settled(pilot)
+            self.scan(app, [again])
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [BIG_SID, BIG_SID])            # control
+
+    async def test_turned_off_while_a_try_is_under_way(self):
+        import ccwho as runner
+        import testkit
+        import threading
+        testkit.patch(self, runner, "set_compact_at_limit",
+                      lambda on: {"result": "set", "why": "", "on": on})
+        for turned_off, said in ((True, "did not compact Fix the gate: compact at limit was"
+                                        " turned off"), (False, COMPACTING)):          # control
+            with self.subTest(turned_off=turned_off):
+                adapter = FakeAdapter()
+                adapter.compact_hold = threading.Event()
+                app, now = self.app_at([BIG_BUSY], adapter)
+                async with app.run_test() as pilot:
+                    await self.settled(pilot)
+                    now[0] += 5
+                    self.scan(app, [BIG])
+                    await self.settled(pilot)
+                    if turned_off:
+                        app.set_compact(False)
+                    adapter.compact_hold.set()
+                    await self.settled(pilot)
+                    self.assertIn(said, app.status)
+
+    async def test_a_session_in_another_terminal_is_not_typed_into(self):
+        adapter = FakeAdapter()
+        other = dict(BIG, terminal="terminal")
+        app, now = self.app_at([dict(other, attention="busy")], adapter)
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            now[0] += 5
+            self.scan(app, [other])
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [])
+            self.assertIn("did not compact Fix the gate: only a session in iTerm2 is typed into",
+                          app.status)
+
+    async def test_a_scan_that_read_it_on_before_it_was_turned_off(self):
+        # a scan in flight when you turned it off comes in with the old
+        # setting: it must not type
+        import ccwho as runner
+        import testkit
+        testkit.patch(self, runner, "set_compact_at_limit",
+                      lambda on: {"result": "set", "why": "", "on": on})
+        for turned_off, typed in ((True, []), (False, [BIG_SID])):              # control
+            with self.subTest(turned_off=turned_off):
+                adapter = FakeAdapter()
+                app, now = self.app_at([BIG_BUSY], adapter)
+                async with app.run_test() as pilot:
+                    await self.settled(pilot)
+                    now[0] += 5
+                    if turned_off:
+                        self.assertIs(app.set_compact(False), False)
+                    self.scan(app, [BIG], seq=app.started)
+                    await self.settled(pilot)
+                    self.assertEqual(adapter.compacted, typed)
+
+    async def test_a_scan_after_the_save_says_what_the_file_says(self):
+        import ccwho as runner
+        import testkit
+        testkit.patch(self, runner, "set_compact_at_limit",
+                      lambda on: {"result": "set", "why": "", "on": on})
+        adapter = FakeAdapter()
+        app, now = self.app_at([BIG_BUSY], adapter)
+        async with app.run_test() as pilot:
+            await self.settled(pilot)
+            app.set_compact(False)
+            upto = app.started
+            # turned on again elsewhere - `a` in a second list
+            self.scan(app, [BIG_BUSY], seq=upto + 1)
+            now[0] += 5
+            self.scan(app, [BIG], seq=upto + 2)
+            await self.settled(pilot)
+            self.assertEqual(adapter.compacted, [BIG_SID])
+
+
+class TestTheAdapterTypesCompact(unittest.TestCase):
+    def test_it_types_through_type_compact(self):
+        import testkit
+        seen = []
+        go = lambda: True
+        testkit.patch(self, ui.engine.terms, "type_compact",
+                      lambda tty, timeout, wait, go: seen.append((tty, timeout, wait, go))
+                      or "typed")
+        self.assertEqual(ui.Adapter().compact(BIG, go=go), "typed")
+        self.assertEqual(seen, [("ttys071", ui.COMPACT_DEADLINE, ui.COMPACT_WAIT, go)])
 
 
 class TestTheNameBox(NamesTest):

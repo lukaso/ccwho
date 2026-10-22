@@ -6816,6 +6816,77 @@ class TestNameAccount(unittest.TestCase):
         self.assertEqual(self.stored(), {self.T1: "work", self.T2: "home"})
 
 
+class TestCompactAtLimitIsKeptWithTheNames(unittest.TestCase):
+    """The setting Compact at limit (#49): in accounts.json beside the names,
+    written as a name is - one writer at a time, a file it cannot read never
+    touched - and never taken for a name."""
+
+    T1, T2 = TestNameAccount.T1, TestNameAccount.T2
+    setUp, reading, store, data, stored, rows = (
+        TestNameAccount.setUp, TestNameAccount.reading, TestNameAccount.store,
+        TestNameAccount.data, TestNameAccount.stored, TestNameAccount.rows)
+    hold_the_lock, no_room = TestNameAccount.hold_the_lock, TestNameAccount.no_room
+
+    def test_off_until_it_is_set(self):
+        self.assertFalse(runner.compact_at_limit())
+        self.assertEqual(runner.set_compact_at_limit(True),
+                         {"result": "set", "why": "", "on": True})
+        self.assertEqual(self.stored(), {"compact_at_limit": True})
+        self.assertTrue(runner.compact_at_limit())
+        self.assertEqual(runner.set_compact_at_limit(True)["result"], "same")
+        self.assertEqual(runner.set_compact_at_limit(False),
+                         {"result": "set", "why": "", "on": False})
+        self.assertEqual(self.stored(), {})
+        self.assertFalse(runner.compact_at_limit())
+
+    def test_the_names_stay_and_it_is_no_name(self):
+        self.store("accounts.json", {self.T1: "work"})
+        runner.set_compact_at_limit(True)
+        self.assertEqual(self.stored(), {self.T1: "work", "compact_at_limit": True})
+        self.assertEqual(runner.read_labels(), {self.T1: "work"})
+        self.assertEqual(runner.name_account(self.T2, "home", self.rows())["result"], "set")
+        self.assertEqual(self.stored(), {self.T1: "work", "compact_at_limit": True,
+                                         self.T2: "home"})
+        self.assertTrue(runner.compact_at_limit())
+
+    def test_only_true_is_on(self):
+        for value in ("yes", 1, [True], {"on": True}, None):
+            with self.subTest(value=value):
+                self.store("accounts.json", {self.T1: "work", "compact_at_limit": value})
+                self.assertFalse(runner.compact_at_limit())
+        self.store("accounts.json", {self.T1: "work", "compact_at_limit": True})   # control
+        self.assertTrue(runner.compact_at_limit())
+
+    def test_a_file_it_cannot_read_is_not_touched(self):
+        os.makedirs(self.dir, exist_ok=True)
+        for broken in (b"{nope", b"[1, 2]", b"7"):
+            with self.subTest(broken=broken):
+                with open(os.path.join(self.dir, "accounts.json"), "wb") as fh:
+                    fh.write(broken)
+                self.assertFalse(runner.compact_at_limit())
+                r = runner.set_compact_at_limit(True)
+                self.assertEqual((r["result"], r["on"]), ("unreadable", False))
+                self.assertTrue(r["why"].endswith("is not valid JSON - not touched"), r["why"])
+                self.assertEqual(self.data("accounts.json"), broken)
+
+    def test_one_writer_at_a_time(self):
+        let_go = self.hold_the_lock()
+        self.assertEqual(runner.set_compact_at_limit(True),
+                         {"result": "busy", "why": "could not save: the names files are in use",
+                          "on": False})
+        self.assertIsNone(self.stored())
+        let_go()
+        self.assertEqual(runner.set_compact_at_limit(True)["result"], "set")      # control
+
+    def test_a_save_that_fails_changes_nothing(self):
+        self.store("accounts.json", {self.T1: "work"})
+        self.no_room(runner.labels_path())
+        self.assertEqual(runner.set_compact_at_limit(True),
+                         {"result": "failed", "on": False,
+                          "why": "could not save: No space left on device - nothing changed"})
+        self.assertEqual(self.stored(), {self.T1: "work"})
+
+
 class TestUsageSetup(unittest.TestCase):
     """The first time ccwho writes another tool's file. Every guard is here:
     only where no statusLine is set, the diff shown, y/N asked, a backup kept,

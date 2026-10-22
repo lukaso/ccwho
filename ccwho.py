@@ -3378,6 +3378,55 @@ def name_account(aid, label, rows):
                              f" ({engine._tilde(names_lock_path())}) - nothing changed")
 
 
+# Compact at limit (#49): a setting, kept with the names in accounts.json and
+# written as they are - under the names lock, a file it cannot read never
+# touched. The list's accounts box sets it; a scan reads it.
+COMPACT_KEY = "compact_at_limit"
+
+
+def compact_at_limit():
+    """Is Compact at limit on: true in accounts.json, and nothing else is. A
+    file that cannot be read is off - forgiving, as a scan reads the names."""
+    try:
+        with open(labels_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
+        return False
+    return isinstance(data, dict) and data.get(COMPACT_KEY) is True
+
+
+def set_compact_at_limit(on):
+    """Turn Compact at limit on or off. Says what happened, never raises:
+    "result" is "set", "same" (nothing to write), "unreadable" (the stored
+    names: `why`), "busy" (the lock: `why`) or "failed" (the write: `why`);
+    "on" is the setting after it."""
+    on = bool(on)
+    out = {"result": "failed", "why": "", "on": compact_at_limit()}
+    try:
+        with _names_locked(NAMES_LOCK_SECONDS) as held:
+            if not held:
+                return dict(out, result="busy", why="could not save: the names files are in use")
+            labels, why = _stored_labels()
+            if labels is None:
+                return dict(out, result="unreadable", why=why)
+            if (labels.get(COMPACT_KEY) is True) == on:
+                return {"result": "same", "why": "", "on": on}
+            new = {k: v for k, v in labels.items() if k != COMPACT_KEY}
+            if on:
+                new[COMPACT_KEY] = True
+            try:
+                write_atomic(labels_path(), json.dumps(new, indent=2))
+            # as a name's save: never the temp file's name; RecursionError, a
+            # stored value nested too deep to write back
+            except (OSError, RecursionError) as ex:
+                return dict(out, why=f"could not save: {getattr(ex, 'strerror', None) or ex}"
+                                     " - nothing changed")
+            return {"result": "set", "why": "", "on": on}
+    except OSError as ex:               # the lock could not be had at all: its file, by name
+        return dict(out, why=f"could not save: {ex.strerror or ex}"
+                             f" ({engine._tilde(names_lock_path())}) - nothing changed")
+
+
 def accounts(argv):
     """Usage per account, from what the sessions' statusLines recorded."""
     now = time.time()

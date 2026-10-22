@@ -3809,10 +3809,79 @@ class Adapter:
         return engine.terms.focus(app, tty, deadline)
 
 
-def main():
-    app = CcwhoUi()
-    result = app.run()
-    return 42 if result == "restart" else 0       # the runner re-execs on 42
+CRASH_KEEP = 20     # crashes kept in crash.log: one on every start must not fill the disk
+
+
+def crash_log_path():
+    """Beside ccwho's other files: CCWHO_DIR, or ~/.ccwho."""
+    return os.path.join(os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho"),
+                        "crash.log")
+
+
+def note_crash(error, code, now=None):
+    """The error the list stopped on, at the end of crash.log - the newest
+    CRASH_KEEP are kept. Textual prints its traceback as the list ends, and
+    the hotkey window can close over it. Answers the path, or "" when it
+    could not be written: a note about a crash must never raise over it."""
+    import traceback
+    from textual.worker import WorkerFailed
+    # a worker's error reaches Textual wrapped in a WorkerFailed that is never
+    # raised: the frames are the error's own
+    if isinstance(error, WorkerFailed) and error.error is not None:
+        error = error.error
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    entry = [f"=== {when}  the list stopped (exit {code})\n"]
+    entry += (traceback.format_exception(error) if error is not None
+              else ["Textual kept no error\n"])
+    path = crash_log_path()
+    try:
+        import ccwho as runner
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                old = fh.read()
+        except FileNotFoundError:
+            old = ""
+        entries = []
+        for line in old.splitlines(keepends=True):
+            if line.startswith("=== ") or not entries:
+                entries.append([])
+            entries[-1].append(line)
+        entries = (entries + [entry])[-CRASH_KEEP:]
+        text = "".join("".join(e) for e in entries)
+        # half an emoji (a lone surrogate) is written as \ud83d, not lost with
+        # the rest: strict UTF-8 cannot write it
+        text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # private: a traceback can quote what a session said
+        runner.write_atomic(path, text, mode=0o600)
+    except Exception:
+        return ""
+    return path
+
+
+def tell_crash(error, code):
+    path = note_crash(error, code)
+    if path:
+        print(f"ccwho: the list stopped on an error - it is kept in {path}", file=sys.stderr)
+
+
+def main(app=None, headless=False):
+    app = CcwhoUi() if app is None else app
+    try:
+        result = app.run(headless=headless)
+    except Exception as ex:
+        tell_crash(ex, 1)           # and Python prints it, and exits 1
+        raise
+    if result == "restart":
+        return 42                   # the runner re-execs on 42
+    code = app.return_code
+    if code:
+        # Textual printed its traceback and ended. Not 0: the hotkey window
+        # takes 0 for q, and closes over the traceback. Textual keeps the
+        # first error for run_test to raise again
+        tell_crash(getattr(app, "_exception", None), code)
+        return code
+    return 0
 
 
 if __name__ == "__main__":

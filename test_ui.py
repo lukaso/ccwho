@@ -841,6 +841,118 @@ class TestRestart(UiTest):
                          "exit(message=...) is printed, not returned")
 
 
+class Stops(ui.CcwhoUi):
+    """A scan's rows that the screen cannot show: an error on the UI thread,
+    from the collect worker - as Textual reports it, a WorkerFailed."""
+    def show(self, fleet):
+        raise ValueError("a row of a shape nobody has seen")
+
+
+class Quits(ui.CcwhoUi):
+    def on_mount(self):
+        super().on_mount()
+        self.exit()
+
+
+class Restarts(ui.CcwhoUi):
+    def on_mount(self):
+        super().on_mount()
+        self.exit(result="restart")
+
+
+class TestAListThatStopsOnAnErrorSaysSo(unittest.TestCase):
+    """2026-10-22: the list stopped on an error in the hotkey window, and the
+    window closed with Textual's traceback on screen for a moment. main()
+    answered 0 for it, which `ccwho hotkey` takes for q: it held nothing
+    open. A crash is now a non-zero exit, and its traceback is kept in
+    crash.log beside ccwho's other files. Run for real, headless: the code
+    and the error are what Textual itself makes of a crash."""
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="ccwho-test-crash-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        env = mock.patch.dict(os.environ, {"CCWHO_DIR": self.dir})
+        env.start()
+        self.addCleanup(env.stop)
+        self.log = os.path.join(self.dir, "crash.log")
+
+    def run_main(self, app):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = ui.main(app=app, headless=True)
+        return rc, err.getvalue()
+
+    def logged(self):
+        with open(self.log, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_an_error_in_a_scan_is_a_non_zero_exit_and_is_kept(self):
+        rc, said = self.run_main(Stops(adapter=FakeAdapter(), collector=FakeCollector()))
+        self.assertEqual(rc, 1, "0 is q: the hotkey window closes with the error unread")
+        text = self.logged()
+        self.assertIn("ValueError: a row of a shape nobody has seen", text)
+        # the error's own traceback, not the WorkerFailed Textual wraps it in
+        # and never raises: that one has no frames
+        self.assertRegex(text, r'File ".*test_ui\.py", line \d+, in show')
+        self.assertIn(self.log, said, "the window says where the error is kept")
+        import os
+        import stat
+        self.assertEqual(stat.S_IMODE(os.stat(self.log).st_mode), 0o600,
+                         "a traceback can quote what a session said")
+
+    def test_q_is_still_0_and_keeps_nothing(self):      # control
+        import os
+        rc, said = self.run_main(Quits(adapter=FakeAdapter(), collector=FakeCollector()))
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertEqual(said, "")
+
+    def test_r_is_still_the_code_the_runner_re_execs_on(self):      # control
+        import os
+        rc, _ = self.run_main(Restarts(adapter=FakeAdapter(), collector=FakeCollector()))
+        self.assertEqual(rc, 42)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_an_error_out_of_run_itself_is_kept_and_raised(self):
+        class NoTerminal:
+            def run(self, headless=False):
+                raise OSError(6, "Device not configured")
+        with self.assertRaises(OSError):        # Python prints it, and exits 1
+            self.run_main(NoTerminal())
+        self.assertIn("OSError: [Errno 6] Device not configured", self.logged())
+
+    def test_a_log_that_cannot_be_written_never_hides_the_crash(self):
+        import os
+        blocked = os.path.join(self.dir, "a-file")
+        open(blocked, "w").close()
+        with mock.patch.dict(os.environ, {"CCWHO_DIR": blocked}):
+            rc, said = self.run_main(Stops(adapter=FakeAdapter(), collector=FakeCollector()))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("crash.log", said, "no file to point at")
+
+    def test_half_an_emoji_in_the_error_is_still_kept(self):
+        # a lone surrogate - a transcript's JSON can hold one, and the error
+        # that stops the list can quote it: strict UTF-8 cannot write it
+        error = ValueError("no row for cut emoji \ud83d")
+        self.assertEqual(ui.note_crash(error, 1), self.log)
+        self.assertIn("ValueError: no row for cut emoji \\ud83d\n", self.logged())
+
+    def test_the_log_keeps_only_the_newest(self):
+        for i in range(ui.CRASH_KEEP + 3):
+            ui.note_crash(ValueError(f"crash {i}"), code=1)
+        text = self.logged()
+        self.assertEqual(len([ln for ln in text.splitlines() if ln.startswith("=== ")]),
+                         ui.CRASH_KEEP)
+        self.assertIn(f"ValueError: crash {ui.CRASH_KEEP + 2}\n", text)
+        self.assertNotIn("ValueError: crash 2\n", text)
+        self.assertIn("ValueError: crash 3\n", text)
+
+
 class TestOneCollectionAtATime(UiTest):
     async def test_an_older_snapshot_cannot_overwrite_a_newer_one(self):
         app = self.app()

@@ -217,7 +217,10 @@ by default (`ccwho setup --hotkey option-w` to change it: `option-slash`, `optio
 iTerm2 had Accessibility when it registered the key; setup asks for it, and says
 when iTerm2 must be restarted for it to take. `q` closes the window, and the key
 opens the next one at the size it had: `q` writes its columns and rows into the
-hotkey profile, and setup keeps them.
+hotkey profile, and setup keeps them. If the list stops on an error, the window
+stays open until you press Return, and the error is also kept at the end of
+`crash.log` in `~/.ccwho` (or `$CCWHO_DIR`), readable only by you; the newest 20
+are kept.
 
 If the hotkey stops working after a crash, an app has probably left macOS Secure
 Input on, and then no global hotkey works. The live list (click iTerm2, or run

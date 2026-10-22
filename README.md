@@ -837,8 +837,9 @@ there writes the whole context again. A compaction first makes that turn small.
 Claude Code's own idle compaction skips every session near the limit, so with this
 setting on, the live list types `/compact` for you.
 
-- **The setting:** `a` opens the accounts, and under them is
-  `compact at limit: off · c or a click turns it on`. It is off at first, and
+- **The setting:** `a` opens the accounts. Under them and their key, a section
+  `settings` holds `compact at limit: off`; `c`, or a click on that line, turns it
+  on. It is one setting for all accounts. It is off at first, and
   offered only while the usage line has two or more Claude accounts: with one, a
   session near the limit waits for the reset, and its cache expires in that time.
   It is saved with the names, in `~/.ccwho/accounts.json` (`"compact_at_limit": true`).

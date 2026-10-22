@@ -5189,7 +5189,8 @@ class TestAOpensTheAccountsList(NamesTest):
                 (self.T2, ["ant:d0a0 · token d0a0fe42aa11bb22", "  no open session · last read 5s ago"])])
             words = self.words(box)
             self.assertIn("accounts", words)
-            self.assertIn("Enter or a click names the account · Esc closes", words)
+            self.assertIn("Enter or click to name the account", words)
+            self.assertIn("Esc closes", words)
 
     async def test_the_highlight_starts_on_the_account_of_the_selected_row(self):
         app = self.names_app()
@@ -5417,7 +5418,8 @@ class TestAOpensTheAccountsList(NamesTest):
             self.assertTrue(0 <= frame.y and frame.bottom <= 24, frame)
             self.assertLess(opts.size.height, 2 * 14)       # it scrolls
             # the line of Compact at limit too: 14 Claude accounts offer it
-            for part in ("#accountshead", "#accountsclose", ".accountsnote", "#compactline"):
+            for part in ("#accountshead", "#accountsclose", "#namenote", "#settings",
+                         "#compactline", "#compactkeys"):
                 r = box.query_one(part).region
                 self.assertTrue(r.height and frame.y < r.y < frame.bottom, (part, r))
             # the last account is reached with the keys
@@ -5451,13 +5453,17 @@ class TestAOpensTheAccountsList(NamesTest):
 
 
 class TestCompactAtLimitInTheAccountsList(NamesTest):
-    """The setting Compact at limit (#49), on its own line under the accounts:
-    offered only with two or more Claude accounts - with one, a compaction
-    does not help. c, or a click on the line, turns it on or off."""
+    """The setting Compact at limit (#49), in a section of its own under the
+    accounts and their key: a rule titled "settings" says that it is no
+    account's (a user, 2026-10-22: under the accounts, it read as one). Offered
+    only with two or more Claude accounts - with one, a compaction does not
+    help. c, or a click on its line, turns it on or off."""
 
-    OFF = "compact at limit: off · c or a click turns it on"
-    ON = "compact at limit: on · c or a click turns it off"
     WHAT = "  /compact a session of 400k+ near its account's limit"
+    LINE = {False: "compact at limit: off\n" + WHAT, True: "compact at limit: on\n" + WHAT}
+    KEYS = {False: "c or click to turn it on · Esc closes",
+            True: "c or click to turn it off · Esc closes"}
+    NAME = "Enter or click to name the account"
 
     def saves(self, *results):
         """ccwho.set_compact_at_limit, replaced: what each save says, in order -
@@ -5477,16 +5483,43 @@ class TestCompactAtLimitInTheAccountsList(NamesTest):
         found = box.query("#compactline")
         return str(found.first().content) if found else None
 
+    def keys(self, box):
+        found = box.query("#compactkeys")
+        return str(found.first().content) if found else None
+
+    def note(self, box):
+        return str(box.query_one("#namenote").content)
+
     async def test_it_is_offered_with_two_claude_accounts(self):
         app = self.names_app()
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             box = await self.open_box(pilot, app)
-            self.assertEqual(self.line(box), self.OFF + "\n" + self.WHAT)
-            # the accounts, and their keys, as they were
+            self.assertEqual(self.line(box), self.LINE[False])
+            self.assertEqual(self.keys(box), self.KEYS[False])
             self.assertEqual([aid for aid, _ in self.lines_of(box)],
                              [self.LOGIN, self.T1, self.T2])
-            self.assertIn("Enter or a click names the account · Esc closes", self.words(box))
+
+    async def test_the_account_s_key_is_under_the_accounts_and_the_setting_under_its_rule(self):
+        app = self.names_app()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            box = await self.open_box(pilot, app)
+            self.assertEqual(self.note(box), self.NAME)     # Esc is the last line's
+            parts = ("#accounts", "#namenote", "#settings", "#compactline", "#compactkeys")
+            tops = [box.query_one(p).region.y for p in parts]
+            self.assertEqual(tops, sorted(set(tops)), dict(zip(parts, tops)))
+            self.assertEqual(box.query_one("#accounts").region.bottom,
+                             box.query_one("#namenote").region.y)
+            # the rule as the screen draws it - a container draws no border of
+            # its own (render_line): the screen's compositor does
+            settings = box.query_one("#settings")
+            strips = app.screen._compositor.render_strips()
+            at = settings.region
+            rule = strips[at.y].text[at.x:at.right].strip()
+            self.assertRegex(rule, r"^─+ settings ─+$")
+            # its line is a row of its own: the rule above it, nothing beside it
+            self.assertEqual(box.query_one("#compactline").region.y, settings.region.y + 1)
 
     async def test_with_one_claude_account_it_is_not(self):
         import copy
@@ -5503,6 +5536,8 @@ class TestCompactAtLimitInTheAccountsList(NamesTest):
                     await pilot.pause()
                     box = await self.open_box(pilot, app, "c")
                     self.assertIsNone(self.line(box))
+                    self.assertFalse(box.query("#settings"))
+                    self.assertEqual(self.note(box), self.NAME + " · Esc closes")
                     self.assertEqual(calls, [])
 
     async def test_c_turns_it_on_and_off(self):
@@ -5512,13 +5547,13 @@ class TestCompactAtLimitInTheAccountsList(NamesTest):
             await pilot.pause()
             box = await self.open_box(pilot, app, "c")
             self.assertEqual(calls, [True])
-            self.assertEqual(self.line(box), self.ON + "\n" + self.WHAT)
+            self.assertEqual((self.line(box), self.keys(box)), (self.LINE[True], self.KEYS[True]))
             self.assertIs(app.screen, box)                  # the list stays open
             self.assertIn("compact at limit: on", app.status)
             await pilot.press("c")
             await pilot.pause()
             self.assertEqual(calls, [True, False])
-            self.assertEqual(self.line(box), self.OFF + "\n" + self.WHAT)
+            self.assertEqual((self.line(box), self.keys(box)), (self.LINE[False], self.KEYS[False]))
             self.assertIn("compact at limit: off", app.status)
 
     async def test_a_click_on_the_line(self):
@@ -5542,7 +5577,7 @@ class TestCompactAtLimitInTheAccountsList(NamesTest):
             await pilot.pause()
             box = await self.open_box(pilot, app, "c")
             self.assertEqual(calls, [True])
-            self.assertEqual(self.line(box), self.OFF + "\n" + self.WHAT)
+            self.assertEqual((self.line(box), self.keys(box)), (self.LINE[False], self.KEYS[False]))
             self.assertIn("compact at limit: could not save: the names files are in use",
                           app.status)
             self.assertIs(app.fleet.compact, False)
@@ -5566,7 +5601,7 @@ class TestCompactAtLimitInTheAccountsList(NamesTest):
                     await pilot.pause()
                     frame = box.query_one("#accountsbox").region
                     self.assertTrue(0 <= frame.y and frame.bottom <= 24, frame)
-                    for part in ("#compactline", ".accountsnote"):
+                    for part in ("#namenote", "#settings", "#compactline", "#compactkeys"):
                         r = box.query_one(part).region
                         self.assertTrue(r.height and frame.y < r.y and r.bottom < frame.bottom,
                                         (part, r, frame))
@@ -5577,7 +5612,7 @@ class TestCompactAtLimitInTheAccountsList(NamesTest):
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             box = await self.open_box(pilot, app)
-            self.assertEqual(self.line(box), self.ON + "\n" + self.WHAT)
+            self.assertEqual((self.line(box), self.keys(box)), (self.LINE[True], self.KEYS[True]))
 
 
 BIG_SID = "eeee5555-0000-4000-8000-000000000005"

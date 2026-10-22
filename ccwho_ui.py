@@ -861,7 +861,7 @@ NO_ACCOUNTS = {"not_set_up": "no account to name - ccwho setup adds the usage li
                "off": "usage is off - ccwho setup --usage turns it on"}
 
 
-ACCOUNTS_NOTE = "Enter or a click names the account · Esc closes"
+NAME_NOTE = "Enter or click to name the account"
 
 
 class AccountsBox(AnswersOnce, ModalScreen):
@@ -884,8 +884,11 @@ class AccountsBox(AnswersOnce, ModalScreen):
     #accountsclose:hover { background: $accent; color: $text; }
     #accounts { height: auto; border: none; }
     .accountsnote { color: $text-muted; height: auto; }
-    #compactline { height: auto; margin: 1 0 0 0; }
+    #settings { height: auto; border-top: solid $accent 50%; border-title-align: left;
+                border-title-color: $text-muted; }
+    #compactline { height: auto; }
     #compactline:hover { background: $accent; }
+    #compactkeys { color: $text-muted; height: auto; }
     """
 
     # before the list's own keys (priority): its up and down go round from
@@ -912,15 +915,27 @@ class AccountsBox(AnswersOnce, ModalScreen):
                 yield Static(" ✕ ", id="accountsclose", markup=False)
             yield OptionList(*[Option(self.lines(e), id=e["id"]) for e in self.entries],
                              id="accounts")
-            if self.compact is not None:
+            # the key of an account, under the accounts; what is no account's,
+            # in a section of its own (a user, 2026-10-22: under the accounts, the
+            # setting read as the highlighted account's). Esc, on the last line
+            if self.compact is None:
+                yield Static(NAME_NOTE + " · Esc closes", id="namenote", classes="accountsnote",
+                             markup=False)
+                return
+            yield Static(NAME_NOTE, id="namenote", classes="accountsnote", markup=False)
+            settings = Vertical(id="settings")
+            settings.border_title = " settings "    # drawn as it is: no room of its own
+            with settings:
                 yield Static(self.compact_text(), id="compactline", markup=False)
-            yield Static(ACCOUNTS_NOTE, classes="accountsnote", markup=False)
+                yield Static(self.compact_keys(), id="compactkeys", markup=False)
 
     def compact_text(self):
-        text = Text(f"compact at limit: {'on' if self.compact else 'off'}"
-                    f" · c or a click turns it {'off' if self.compact else 'on'}")
+        text = Text(f"compact at limit: {'on' if self.compact else 'off'}")
         text.append("\n  /compact a session of 400k+ near its account's limit", style="dim")
         return text
+
+    def compact_keys(self):
+        return f"c or click to turn it {'off' if self.compact else 'on'} · Esc closes"
 
     def action_compact(self):
         """c, or a click on its line: Compact at limit the other way - the
@@ -929,6 +944,7 @@ class AccountsBox(AnswersOnce, ModalScreen):
             return
         self.compact = self.set_compact(not self.compact) is True
         self.query_one("#compactline", Static).update(self.compact_text())
+        self.query_one("#compactkeys", Static).update(self.compact_keys())
 
     @staticmethod
     def lines(entry):
@@ -950,18 +966,19 @@ class AccountsBox(AnswersOnce, ModalScreen):
 
     def fit(self):
         """More accounts than fit: the list scrolls, and the top line and the
-        key line stay (the frame, the top line and a row of the screen, and
-        the key line's rows) - and the line of Compact at limit, when it is
-        there (its rows, and the row above them). A line wraps in a narrow
-        box: its rows as laid out, and before that as its text needs them."""
+        key lines stay (the frame, the top line and a row of the screen, and
+        the name key's rows) - and the settings, when they are there (their
+        rule, the line and its keys). A line wraps in a narrow box: its rows
+        as laid out, and before that as its text needs them."""
         room = max(1, min(BOX_CELLS + BOX_FRAME, self.app.size.width) - 4)
 
-        def rows(widget, text):
-            laid = widget.outer_size.height
-            return laid or sum(max(1, -(-cell_len(line) // room)) for line in text.split("\n"))
-        under = rows(self.query_one(".accountsnote"), ACCOUNTS_NOTE)
+        def need(text):
+            return sum(max(1, -(-cell_len(line) // room)) for line in text.split("\n"))
+        note = self.query_one("#namenote")
+        under = note.outer_size.height or need(str(note.content))
         if self.compact is not None:
-            under += 1 + rows(self.query_one("#compactline"), self.compact_text().plain)
+            under += self.query_one("#settings").outer_size.height or (
+                1 + need(self.compact_text().plain) + need(self.compact_keys()))
         self.query_one("#accounts").styles.max_height = max(2, self.app.size.height - 5 - under)
 
     @on(OptionList.OptionSelected, "#accounts")

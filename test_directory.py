@@ -908,5 +908,191 @@ class TestTheCommandsFollowTheRules(CommandCase):
                 self.assertIn(f"ccwho {cmd}", out)
 
 
+
+class TestSkillTextNamesRealCommands(unittest.TestCase):
+    """The skill text is a second list of commands: a renamed command must fail here."""
+
+    def test_each_ccwho_word_in_the_text_is_a_command(self):
+        import re
+        for name in runner.setup.SKILL_NAMES:
+            words = set(re.findall(r"/x/ccwho (\w+)", runner.setup.skill_text(name, "/x/ccwho")))
+            with self.subTest(name=name, words=sorted(words)):
+                self.assertTrue(words)
+                self.assertLessEqual(words, set(runner.COMMAND_TAKES))
+
+
+class TestSkillsSetup(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def path(self, name, root=None):
+        return os.path.join(root or self.root, "skills", name, "SKILL.md")
+
+    def run_it(self, roots=None, answer="y", **kw):
+        self.asked = []
+
+        def ask(prompt):
+            self.asked.append(prompt)
+            return answer
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = runner.skills_setup(roots if roots is not None else [self.root], ask=ask,
+                                     ccwho="/x/ccwho", **kw)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _read(self, name):
+        with open(self.path(name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def _write(self, name, text):
+        os.makedirs(os.path.dirname(self.path(name)), exist_ok=True)
+        with open(self.path(name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_yes_adds_both_skills(self):
+        rc, _, _ = self.run_it()
+        self.assertEqual(rc, 0)
+        for name in runner.setup.SKILL_NAMES:
+            self.assertEqual(self._read(name), runner.setup.skill_text(name, "/x/ccwho"))
+
+    def test_it_shows_them_before_it_asks(self):
+        _, out, _ = self.run_it()
+        self.assertIn("before you guess", out)
+        self.assertEqual(len(self.asked), 1)
+
+    def test_the_question_says_where_and_what_for(self):
+        self.run_it()
+        self.assertIn(self.root, self.asked[0])
+        self.assertIn("[y/N]", self.asked[0])
+
+    def test_no_writes_nothing(self):
+        rc, out, _ = self.run_it(answer="n")
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "skills")))
+        self.assertIn("not added", out)
+
+    def test_no_terminal_writes_nothing_and_says_how(self):
+        rc, out, _ = self.run_it(answer=None)
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "skills")))
+        self.assertIn("no terminal", out)
+        self.assertIn("ccwho setup", out)
+
+    def test_yes_flag_does_not_ask(self):
+        rc, _, _ = self.run_it(yes=True, answer="n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.asked, [])
+        self.assertTrue(os.path.exists(self.path("directory")))
+
+    def test_a_second_run_has_nothing_to_do(self):
+        self.run_it()
+        changed = []
+        rc, _, _ = self.run_it(changed=changed)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(changed, [])
+
+    def test_a_skill_it_did_not_write_is_left(self):
+        mine = "---\nname: directory\n---\nmy own\n"
+        self._write("directory", mine)
+        rc, out, _ = self.run_it(yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read("directory"), mine)
+        self.assertIn("left", out)
+        self.assertEqual(self._read("purpose"), runner.setup.skill_text("purpose", "/x/ccwho"))
+
+    def test_both_in_place_says_on(self):
+        self.run_it()
+        _, out, _ = self.run_it()
+        self.assertRegex(out, r"(?m)^ok .* on$")
+
+    def test_a_skill_left_alone_is_not_called_on(self):
+        self.run_it()
+        self._write("directory", "---\nname: directory\n---\nmy own\n")
+        _, out, _ = self.run_it()
+        self.assertNotRegex(out, r"(?m)^ok .* on$")
+
+    def test_a_failure_in_one_dir_does_not_hide_the_other(self):
+        other = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, other, True)
+        self.run_it(roots=[other])
+        os.makedirs(self.path("purpose"))
+        rc, out, _ = self.run_it(roots=[self.root, other], yes=True)
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, r"(?m)^ok .* on$")
+
+    def test_its_own_older_text_is_replaced_after_a_diff(self):
+        older = runner.setup.skill_text("purpose", "/moved/ccwho")
+        self._write("purpose", older)
+        rc, out, _ = self.run_it()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._read("purpose"), runner.setup.skill_text("purpose", "/x/ccwho"))
+        self.assertIn("-", out)
+        self.assertIn("/moved/ccwho", out)
+
+    def test_its_own_older_text_stays_at_no(self):
+        older = runner.setup.skill_text("purpose", "/moved/ccwho")
+        self._write("purpose", older)
+        self.run_it(answer="n")
+        self.assertEqual(self._read("purpose"), older)
+
+    def test_each_config_dir_is_asked_for(self):
+        other = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, other, True)
+        self.run_it(roots=[self.root, other])
+        self.assertEqual(len(self.asked), 2)
+        self.assertTrue(os.path.exists(self.path("purpose", other)))
+
+    def test_it_tells_what_it_wrote(self):
+        changed = []
+        self.run_it(changed=changed)
+        self.assertEqual(sorted(changed), sorted(self.path(n) for n in runner.setup.SKILL_NAMES))
+
+    def test_a_failed_write_says_why_and_goes_on(self):
+        other = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, other, True)
+        real = runner.write_atomic
+
+        def fail_first_root(path, text, mode=None):
+            if path.startswith(self.root):
+                raise OSError("disk full")
+            return real(path, text, mode)
+        with mock.patch.object(runner, "write_atomic", side_effect=fail_first_root):
+            rc, out, err = self.run_it(roots=[self.root, other], yes=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("disk full", out + err)
+        self.assertTrue(os.path.exists(self.path("purpose", other)))
+
+    def test_a_file_it_cannot_read_is_not_touched(self):
+        os.makedirs(self.path("purpose"))       # a folder where the file goes
+        rc, out, err = self.run_it(yes=True)
+        self.assertEqual(rc, 1)
+        self.assertIn("not checked", out + err)
+        self.assertTrue(os.path.isdir(self.path("purpose")))
+
+    def test_no_config_dirs_is_nothing_to_do(self):
+        self.assertEqual(self.run_it(roots=[])[0], 0)
+        self.assertEqual(self.asked, [])
+
+
+class TestDoctorReadsTheSkills(unittest.TestCase):
+    def test_states_for_each_config_dir_where_a_person_works(self):
+        root = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, root, True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.skills_setup([root], yes=True)
+        os.remove(os.path.join(root, "skills", "purpose", "SKILL.md"))
+        got = runner.skill_states(root)
+        self.assertEqual(got, {"directory": "current", "purpose": "missing"})
+
+    def test_a_file_it_cannot_read_counts_as_another(self):
+        root = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "skills", "purpose", "SKILL.md"))
+        self.assertEqual(runner.skill_states(root)["purpose"], "other")
+
+
 if __name__ == "__main__":
     unittest.main()

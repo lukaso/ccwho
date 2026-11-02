@@ -7212,6 +7212,17 @@ class TestUsageSetup(unittest.TestCase):
         self.assertIn("statusLine", self.read())
 
 
+class TestSetupOffersTheSkills(SetupHarness):
+    def test_setup_offers_them_for_the_interactive_dirs_only(self):
+        self.usage_dirs = (["/h/.claude"], ["/h/.la"])
+        seen = []
+        with mock.patch.object(runner, "usage_setup", return_value=0), \
+                mock.patch.object(runner, "skills_setup",
+                                  side_effect=lambda roots, **k: seen.append((roots, k)) or 0):
+            self.run_setup(["--yes", "--no-hotkey", "--no-list"])
+        self.assertEqual(seen, [(["/h/.claude"], {"yes": True, "changed": []})])
+
+
 class TestSetupOffersUsage(SetupHarness):
     def call(self, argv):
         seen = []
@@ -7336,6 +7347,15 @@ class TestDoctorGathersUsage(unittest.TestCase):
 
     def test_a_dir_with_nothing_and_no_interactive_session_is_not_reported(self):
         self.assertEqual(runner.usage_facts()["usage_roots"], [])
+
+    def test_the_skills_are_reported_for_a_dir_where_a_person_works(self):
+        with mock.patch.object(runner.setup, "interactive_roots", return_value=([self.root], [])):
+            got = runner.usage_facts()["skill_roots"]
+        self.assertEqual(got, [{"root": self.root,
+                                "states": {"directory": "missing", "purpose": "missing"}}])
+
+    def test_the_skills_are_not_reported_where_no_person_works(self):   # control
+        self.assertEqual(runner.usage_facts()["skill_roots"], [])
 
     def test_an_opted_out_dir_is_reported_as_such(self):
         with open(runner.opt_out_path(), "w") as fh:

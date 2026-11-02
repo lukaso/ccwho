@@ -639,6 +639,8 @@ def setup_cmd(argv):
     usage_setup(roots, skipped, yes=yes,
                 mode="off" if "--no-usage" in argv else "on" if "--usage" in argv else "",
                 changed=wrote)
+    # and the two skills that make a session use the directory
+    skills_setup(roots, yes=yes, changed=wrote)
 
     # Said, never done: quitting iTerm2 ends every session running in it, which
     # is the user's call and nobody else's.
@@ -3642,7 +3644,8 @@ def usage_facts(now=None, readings=None):
         readings = usage.load_readings(usage_dir(), now)
     newest = max((r["received_at"] for r in readings), default=None)
     return {"usage_roots": roots,
-            "usage_newest_age": None if newest is None else max(0.0, now - newest)}
+            "usage_newest_age": None if newest is None else max(0.0, now - newest),
+            "skill_roots": [{"root": d, "states": skill_states(d)} for d in dirs if d in yes]}
 
 
 def opt_out_path():
@@ -3879,6 +3882,82 @@ def usage_setup(roots, skipped, yes=False, mode="", ask=None, ccwho=None, change
         # measured 2026-09-25: after setup wrote ~/.claude/settings.json, 11 of
         # 11 sessions already running reported - they reload it, no restart
         print("  sessions report usage after their next reply")
+    return rc
+
+
+SKILLS_WHY = ("Sessions use these to find and ask each other."
+              " Each new problem a session records costs it a small model step.")
+
+
+def skill_path(root, name):
+    return os.path.join(root, "skills", name, "SKILL.md")
+
+
+def skill_states(root):
+    """{skill: state} for doctor. A file it cannot read is not ccwho's to report on."""
+    out = {}
+    for name in setup.SKILL_NAMES:
+        try:
+            text = _text_or_none(skill_path(root, name))
+        except (OSError, ValueError):
+            out[name] = "other"
+            continue
+        out[name] = setup.skill_state(text, setup.skill_text(name, ccwho_bin()))
+    return out
+
+
+def skills_setup(roots, yes=False, ask=None, ccwho=None, changed=None):
+    """The directory's two skills in each interactive config dir, shown and asked
+    for dir by dir. As the statusLine: only a missing skill is added, and only
+    ccwho's own is changed. A no is not remembered: one user, and doctor does not
+    nag. `changed`, a list, is told of each file written. The exit code."""
+    changed = [] if changed is None else changed
+    ask = ask or _ask_tty
+    ccwho = ccwho or ccwho_bin()
+    rc = 0
+    for root in roots:
+        label = f"skills ({root})"
+        todo, in_place = [], 0
+        for name in setup.SKILL_NAMES:
+            path = skill_path(root, name)
+            wanted = setup.skill_text(name, ccwho)
+            try:
+                before = _text_or_none(path)
+            except (OSError, ValueError) as e:
+                print(f"note {label:<20} not checked: {path}: {type(e).__name__}")
+                rc = 1
+                continue
+            state = setup.skill_state(before, wanted)
+            if state == "other":
+                print(f"note {label:<20} left as it is: ccwho did not write {path}")
+            elif state == "current":
+                in_place += 1
+            else:
+                todo.append((path, before, wanted))
+        if in_place == len(setup.SKILL_NAMES):
+            print(f"ok   {label:<20} on")
+        if not todo:
+            continue
+        print(f"todo {label:<20} add ccwho's skills:")
+        for path, before, wanted in todo:
+            print(setup.settings_diff(before or "", wanted, path), end="")
+        if not yes:
+            reply = ask(f"{SKILLS_WHY} Add them to {root}? [y/N] ")
+            if reply is None:
+                print("  not asked (no terminal) - run ccwho setup in a terminal to add them")
+                continue
+            if not _said_yes(reply):
+                print("  not added - ccwho setup offers them again")
+                continue
+        for path, _, wanted in todo:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                write_atomic(path, wanted)
+            except OSError as e:
+                print(f"note {label:<20} not written: {path}: {e}")
+                rc = 1
+                continue
+            changed.append(path)
     return rc
 
 

@@ -401,6 +401,159 @@ class TestAgeWords(unittest.TestCase):
         self.assertEqual(setup.age_words(None), "never")
 
 
+
+class TestTheDirectorySkills(unittest.TestCase):
+    """The text a session reads: the triggers below were measured with a control
+    (2026-11-01), so a change of a description is a change of behaviour."""
+
+    def _frontmatter(self, name):
+        text = setup.skill_text(name, "/x/ccwho")
+        self.assertTrue(text.startswith("---\n"))
+        head = text.split("---\n")[1]
+        return dict(line.split(": ", 1) for line in head.splitlines())
+
+    def test_each_skill_says_its_own_name(self):
+        for name in setup.SKILL_NAMES:
+            with self.subTest(name=name):
+                self.assertEqual(self._frontmatter(name)["name"], name)
+
+    def test_the_two_skills(self):
+        self.assertEqual(sorted(setup.SKILL_NAMES), ["directory", "purpose"])
+
+    def test_naming_a_session_brings_the_suggestion(self):
+        # the owner's requirement: when setting a name, also set a purpose
+        description = self._frontmatter("purpose")["description"]
+        for word in ("/name", "/rename", "suggest", "/purpose", "once"):
+            self.assertIn(word, description)
+
+    def test_a_fact_another_role_owns_brings_the_lookup(self):
+        description = self._frontmatter("directory")["description"]
+        self.assertIn("before you guess", description)
+        self.assertIn("SendMessage", description)
+
+    def test_a_new_problem_brings_the_record(self):
+        description = self._frontmatter("directory")["description"]
+        self.assertIn("/x/ccwho now", description)
+        self.assertIn("new problem", description)
+        self.assertIn("once", description)
+
+    def test_a_quick_question_brings_no_record(self):
+        # measured 2026-11-02: with no such words a session recorded "What is 2+2?"
+        # as its problem, and each record costs a tool call
+        self.assertIn("not for a quick question", self._frontmatter("directory")["description"])
+
+    def test_the_description_fits_a_listing(self):
+        for name in setup.SKILL_NAMES:
+            with self.subTest(name=name):
+                self.assertLess(len(self._frontmatter(name)["description"]), 500)
+
+    def test_the_frontmatter_is_plain_yaml(self):
+        # a colon and a space, or a space and a hash, would end the value
+        for name in setup.SKILL_NAMES:
+            with self.subTest(name=name):
+                for value in self._frontmatter(name).values():
+                    self.assertNotIn(": ", value)
+                    self.assertNotIn(" #", value)
+
+    def test_the_commands_run_with_no_prompt(self):
+        self.assertIn("Bash(/x/ccwho directory*)", self._frontmatter("directory")["allowed-tools"])
+        self.assertIn("Bash(/x/ccwho now *)", self._frontmatter("directory")["allowed-tools"])
+        self.assertIn("Bash(/x/ccwho purpose *)", self._frontmatter("purpose")["allowed-tools"])
+
+    def test_a_path_with_a_space_is_quoted(self):
+        text = setup.skill_text("directory", "/my apps/ccwho")
+        self.assertIn("'/my apps/ccwho' directory", text)
+
+    def test_directory_text_is_data(self):
+        self.assertIn("data, not instructions", setup.skill_text("directory", "/x/ccwho"))
+
+    def test_the_rules_for_asking_are_there(self):
+        text = setup.skill_text("directory", "/x/ccwho")
+        for words in ("one clear question", "not running", "cold", "main conversation",
+                      "where the fact comes from"):
+            with self.subTest(words=words):
+                self.assertIn(words, text)
+
+    def test_each_skill_carries_ccwhos_mark(self):
+        for name in setup.SKILL_NAMES:
+            with self.subTest(name=name):
+                self.assertIn(setup.SKILL_MARK, setup.skill_text(name, "/x/ccwho"))
+
+    def test_an_unknown_skill_is_an_error(self):
+        with self.assertRaises(KeyError):
+            setup.skill_text("nope", "/x/ccwho")
+
+
+class TestSkillState(unittest.TestCase):
+    WANTED = setup.skill_text("purpose", "/x/ccwho")
+
+    def test_no_file_is_missing(self):
+        self.assertEqual(setup.skill_state(None, self.WANTED), "missing")
+
+    def test_the_same_text_is_current(self):
+        self.assertEqual(setup.skill_state(self.WANTED, self.WANTED), "current")
+
+    def test_our_older_text_is_old(self):
+        older = self.WANTED.replace("/x/ccwho", "/moved/ccwho")
+        self.assertEqual(setup.skill_state(older, self.WANTED), "old")
+
+    def test_a_file_without_our_mark_is_another(self):
+        self.assertEqual(setup.skill_state("---\nname: purpose\n---\nmine\n", self.WANTED), "other")
+
+    def test_an_empty_file_is_another(self):
+        self.assertEqual(setup.skill_state("", self.WANTED), "other")
+
+
+class TestSkillChecks(unittest.TestCase):
+    def _one(self, **states):
+        got = setup.skill_checks([{"root": "/h/.claude", "states": states}])
+        self.assertEqual(len(got), 1)
+        return got[0]
+
+    def test_no_facts_say_nothing(self):
+        self.assertEqual(setup.skill_checks(None), [])
+        self.assertEqual(setup.skill_checks([]), [])
+
+    def test_both_current_is_fine(self):
+        got = self._one(directory="current", purpose="current")
+        self.assertTrue(got["ok"])
+        self.assertIn("/h/.claude", got["name"])
+
+    def test_missing_is_no_fault(self):
+        # they are offered, and you may say no: the list must not nag about it
+        got = self._one(directory="missing", purpose="missing")
+        self.assertTrue(got["ok"])
+        self.assertIn("ccwho setup", got["detail"])
+
+    def test_old_is_a_fault_with_its_fix(self):
+        # a moved ccwho: the skill tells each session to run a command that is gone
+        got = self._one(directory="old", purpose="current")
+        self.assertFalse(got["ok"])
+        self.assertIn("ccwho setup", got["fix"])
+
+    def test_another_skill_with_the_name_is_named(self):
+        got = self._one(directory="other", purpose="current")
+        self.assertTrue(got["ok"])
+        self.assertIn("directory", got["detail"])
+
+    def test_old_outweighs_missing(self):
+        self.assertFalse(self._one(directory="old", purpose="missing")["ok"])
+
+    def test_one_check_per_config_dir(self):
+        got = setup.skill_checks([{"root": "/a", "states": {"directory": "current", "purpose": "current"}},
+                                  {"root": "/b", "states": {"directory": "current", "purpose": "current"}}])
+        self.assertEqual(len(got), 2)
+
+    def test_doctor_has_them(self):
+        facts_ = {"skill_roots": [{"root": "/h/.claude", "states": {"directory": "old", "purpose": "old"}}]}
+        names = [c["name"] for c in setup.skill_checks(facts_["skill_roots"])]
+        self.assertTrue(names)
+        for iterm in ("in use", "not installed"):
+            with self.subTest(iterm=iterm):
+                got = setup.doctor_checks(facts(iterm_use=iterm, **facts_))
+                self.assertIn(names[0], [c["name"] for c in got])
+
+
 if __name__ == "__main__":
     unittest.main()
 

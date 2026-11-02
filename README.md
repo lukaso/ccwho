@@ -41,8 +41,8 @@ ccwho setup
 ```
 
 `ccwho setup` does the rest once, and says what it did: the `ccwho://` link
-handler, the autosave job, the usage statusLine in each config dir where you run
-claude (it shows the change and asks first), the iTerm2 hotkey window, and the Accessibility
+handler, the autosave job, the usage statusLine and the [directory's two skills](#sessions-that-ask-each-other)
+in each config dir where you run claude (it shows the change and asks first), the iTerm2 hotkey window, and the Accessibility
 permission the hotkey needs to reach you from another app (asked for when setup runs
 directly in an iTerm2 window, not in tmux: macOS gives it to the app setup runs in). It writes nothing on a
 machine that cannot work, and a second run changes nothing that is already right.
@@ -261,6 +261,69 @@ next turn or `z` again), or, for a `codex exec` thread, program under PROGRAMS.
 Enter says where it runs: ccwho cannot bring a Codex window forward. `x` kills its processes,
 after the usual box; end the thread in its app. `ccwho ls` and `--json` list Claude
 Code sessions only.
+
+## Sessions that ask each other
+
+One session can find another by its role and ask it, with no help from you. ccwho
+only says who is there. Claude Code's own `SendMessage` carries the message, to the
+session's name.
+
+```
+$ ccwho directory
+NAMED
+  coo  idle  532k cold  suppliers, staff, costs
+    now: Company details for the bank
+  crm  not running      customers, deals
+OTHER SESSIONS
+  app-1a  busy  640k ⧗19m  Root certificate check (12m)
+
+To ask one, use SendMessage with its name.
+```
+
+To make a role: type `/name coo` in that session, and then `/purpose suppliers, staff,
+costs`. After `/name`, the session's next reply suggests a purpose line.
+
+| Line | Who writes it | Kept by | When it goes |
+|---|---|---|---|
+| purpose | You, with `/purpose`, or `ccwho purpose --session coo "..."` from a terminal | The exact name | When you remove it with `""`. It stays over a resume, another account and `/clear` |
+| now | The session itself, with `ccwho now`, when a problem starts or changes | The session id | At `/clear`, which gives a new id. Files older than 30 days are removed |
+
+A session with no name of yours has a now line only, and its title shows until it
+writes one. `/purpose` there answers "Name it first".
+
+`ccwho setup` offers two skills, `directory` and `purpose`, for each config dir where
+you run claude. It shows them and asks. A no is not remembered, and `ccwho doctor` does not call it
+a fault. A skill of that name that ccwho did not write is left alone. The skills' descriptions
+are what make a session use all this: each session reads them in its skill list.
+A change of the wording changes how sessions behave, so measure it again, with
+`--disallowedTools=SendMessage,ListAgents`: a throwaway session sees your real sessions
+and will message them.
+
+What it costs:
+
+- Each record is one tool call in that session, and that call reads the session's whole
+  context from its cache.
+- A message starts a turn in the session that receives it, and that session's account pays.
+  So a row shows the size and cache state of a large session. Waking a large cold
+  session costs much more, and the skill tells sessions so.
+- `ccwho directory` takes about as long as `ccwho ls`: the same scan, so the state
+  and the titles are what the list shows.
+
+What it does not do:
+
+- `not running` shows only when both sources of sessions were read whole. If not, the row
+  says `unknown (session list incomplete)`. ccwho starts nothing. `ccwho open <name>` does not
+  find an ended session by its name ([#51](https://github.com/lukaso/ccwho/issues/51)).
+- A session whose account is at its limit may not answer, and nothing says so yet
+  ([#52](https://github.com/lukaso/ccwho/issues/52)).
+- `SendMessage` reaches the sessions of one config dir. A session in another one is listed,
+  and a send to it may fail. A session in another permission mode holds a message for your
+  approval. In default mode, Claude Code also asks you before a session first uses the skill.
+- A rename leaves the old purpose behind, as `not running`. `ccwho purpose --session old ""`
+  removes it.
+- A line is one printable line of 120 characters at most, and an agent can set only
+  its own. Other sessions read it as data, but a page that misled one session can
+  still put 120 characters in front of the others.
 
 ## Subscription usage
 
@@ -741,6 +804,9 @@ ccwho ls [words] [--all]  # the table, or every session matching (with options, 
 ccwho ls --needs-you    # only the Claude Code sessions the live list puts on top: NEEDS YOU and STUCK
 ccwho ls --json         # the rows, for a script, a status line or an agent
 ccwho show <session>    # what that session was working on
+ccwho directory [words]  # who is there to ask, and what each session is for
+ccwho purpose [--session NAME] [TEXT]  # what a named session is for
+ccwho now [TEXT]        # from inside a session: what it works on
 ccwho ps [--port N] [--helpers] [--full]  # what agents started, and their ports
 ccwho open <session>    # go to it: its window, a window for a background one, or reopen an ended one
 ccwho save              # record the live fleet (before a reboot)

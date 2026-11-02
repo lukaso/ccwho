@@ -3679,6 +3679,8 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # set only for a session found in another config dir: attach and resume
         # have to run there, or claude answers that it has no such session
         "configDir": session.get("configDir", ""),
+        # who named it: user, auto or derived. `user` makes it a role in the directory
+        "nameSource": session.get("nameSource", ""),
         # the session's work processes and their ports; collect() fills them in
         "procs": 0,
         "ports": [],
@@ -3706,7 +3708,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
 # every row field but the prose ones (recap, topic, first, ask)
 _ONE_LINE = ("kind", "entrypoint", "project", "status", "attention", "waitingFor", "name", "title",
              "doing", "since", "age", "tty", "tab_title", "recap_age", "sessionId", "cwd",
-             "configDir", "park_note", "park_was")
+             "configDir", "nameSource", "park_note", "park_was")
 
 
 def project_dirs(roots=None):

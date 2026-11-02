@@ -246,6 +246,11 @@ def live_session_files(entries, starts):
                if e.get(k) is not None}
         if "status" in row:
             row["status"] = _STATUS.get(row["status"], row["status"])
+        # who named it: only `user` makes it a role in the directory. Not a text
+        # field: an odd value costs this field, not a session that is really there
+        source = e.get("nameSource")
+        if isinstance(source, str) and source and not _CONTROL.search(source):
+            row["nameSource"] = source
         row["kind"] = _KIND.get(e.get("kind"), e.get("kind") or "interactive")
         if e.get("jobId"):
             row["id"] = e["jobId"]
@@ -318,12 +323,15 @@ def merge_sessions(agent_rows, file_rows):
     """The agents list, plus sessions only the files know about. A session in both
     keeps its agents row: that one is Claude Code's documented answer."""
     have = {r.get("sessionId") for r in agent_rows or []}
-    # except who started it: the agents list does not say, and a file does
-    started = {r.get("sessionId"): r["entrypoint"] for r in file_rows or []
-               if r.get("entrypoint")}
-    agents = [dict(r, entrypoint=started[r.get("sessionId")])
-              if not r.get("entrypoint") and r.get("sessionId") in started else r
-              for r in agent_rows or []]
+    # except who started it and who named it: the agents list does not say, and
+    # a file does
+    files = {r.get("sessionId"): r for r in file_rows or []}
+
+    def filled(row):
+        found = files.get(row.get("sessionId"), {})
+        return dict(row, **{k: found[k] for k in ("entrypoint", "nameSource")
+                            if found.get(k) and not row.get(k)})
+    agents = [filled(r) for r in agent_rows or []]
     return agents + [r for r in file_rows or [] if r.get("sessionId") not in have]
 
 

@@ -32,6 +32,7 @@ import uuid
 
 import ccwho_engine as engine
 import ccwho_index as index
+import ccwho_directory as directory
 import ccwho_setup as setup
 import ccwho_usage as usage
 
@@ -1013,6 +1014,120 @@ def ls(argv):
             print(f"  {engine.brief.short_id(r['sessionId']):<6} {r['project'][:12]:<12}"
                   f" {engine.truncate(r['title'] or r['topic'], 44):<44}"
                   f" ended {r['since']} ago")
+    return 0
+
+
+PURPOSE_USAGE = ('usage: ccwho purpose [TEXT]                what this named session is for\n'
+                 '       ccwho purpose --session NAME [TEXT]  the same, for a person (a role need not be running)\n'
+                 '       no TEXT prints it; "" removes it')
+NOW_USAGE = ('usage: ccwho now [TEXT]   what this session works on, for other sessions to read\n'
+             '       no TEXT prints it; "" removes it. It runs from inside a session.')
+DIRECTORY_USAGE = "usage: ccwho directory [words] [--json]   who is there to ask, and what each is for"
+
+
+def _save_line(cmd, kind, key, label, words):
+    """Print, set or remove one line of the directory: no words print it, and text
+    that comes to nothing removes it. The exit code."""
+    folder = directory_dir()
+    if not words:
+        got = directory.read_one(folder, kind, key)
+        print(f"{label}: {got['text']}" if got
+              else f"{label}: no {'purpose' if kind == 'purpose' else 'line'} yet")
+        return 0
+    wanted = " ".join(" ".join(words).split())
+    text = directory.clean(wanted)
+    path = directory.path_of(folder, kind, key)
+    try:
+        if not text:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+            print(f"{label}: removed")
+            return 0
+        os.makedirs(folder, exist_ok=True)
+        write_atomic(path, directory.entry_text(key, text, time.time()))
+    except OSError as e:
+        print(f"ccwho {cmd}: not saved: {e}", file=sys.stderr)
+        return 1
+    print(f"{label}: {text}")
+    if len(wanted) > directory.MAX_TEXT:
+        print(f"(cut to {directory.MAX_TEXT} characters)")
+    return 0
+
+
+def purpose_cli(argv):
+    """What a role is for, kept by the name you gave it. An agent sets its own
+    session only - as `ccwho kill` takes its own session's work only - and a person
+    says which. A derived name changes at the next resume, so it cannot hold one."""
+    words = list(argv)
+    session = _arg(argv, "--session", None)
+    if session is not None:
+        at = words.index("--session")
+        del words[at:at + 2]
+    mine = engine.agent_id(os.environ)
+    if mine is not None and session is not None:
+        print("ccwho purpose: from inside a session you set your own session only,"
+              " so no --session here", file=sys.stderr)
+        return 2
+    if mine is None and session is None:
+        print("ccwho purpose: say which session: --session NAME", file=sys.stderr)
+        print(PURPOSE_USAGE, file=sys.stderr)
+        return 2
+    try:
+        rows, _ = engine.live_file_sessions()
+    except Exception as e:          # noqa: BLE001 - whatever it was, nothing is written on a guess
+        print(f"ccwho purpose: could not read the session files: {type(e).__name__}", file=sys.stderr)
+        return 1
+    if mine is not None:
+        row = next((r for r in rows if r.get("sessionId") == mine), None)
+        if row is None:
+            print("ccwho purpose: this session is not in the session files", file=sys.stderr)
+            return 1
+        found, session = [row], row.get("name") or ""
+    else:
+        found = [r for r in rows if r.get("name") == session]
+    if found and not any(r.get("nameSource") == "user" for r in found):
+        print("ccwho purpose: this session has no name you gave it. Name it first: /name coo",
+              file=sys.stderr)
+        return 2
+    return _save_line("purpose", "purpose", session, session, words)
+
+
+def now_cli(argv):
+    """What this session works on, kept by its session id, so it goes at /clear. It
+    reads no rows: each session runs it at each new job."""
+    mine = engine.agent_id(os.environ)
+    if mine is None:
+        print("ccwho now: this runs from inside a session, for that session", file=sys.stderr)
+        return 2
+    rc = _save_line("now", "now", mine, "now", list(argv))
+    if rc == 0 and argv:
+        directory.prune_now(directory_dir(), time.time())
+    return rc
+
+
+def directory_cli(argv):
+    """Who is there to ask, and what each is for. The list's own scan, so state and
+    titles are what the list shows. A role not seen is called not running only
+    when both sources of sessions were read whole."""
+    words = [a for a in argv if not a.startswith("-")]
+    status = {}
+    try:
+        rows, _ = scan(cache={}, status=status, session_apps=False, samples=0)
+    except Exception as e:          # noqa: BLE001 - no rows must not read as nobody running
+        print(f"ccwho directory: could not read the sessions: {type(e).__name__}", file=sys.stderr)
+        return 1
+    complete = bool(status.get("source_ok")) and status.get("session_files_bad") == 0
+    got = directory.matching(directory.merge(rows, directory.read_all(directory_dir()),
+                                             engine.session_handle,
+                                             me=engine.agent_id(os.environ), complete=complete),
+                             words)
+    if words and not got["named"] and not got["others"]:
+        print(f"ccwho directory: no session matches {' '.join(words)!r}", file=sys.stderr)
+        return 1
+    if "--json" in argv:
+        print(json.dumps(got, indent=2))
+        return 0
+    print(directory.render(got))
     return 0
 
 
@@ -3049,6 +3164,10 @@ def ccwho_dir():
     return os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho")
 
 
+def directory_dir():
+    return os.path.join(ccwho_dir(), "directory")
+
+
 def usage_dir():
     return os.path.join(ccwho_dir(), "usage")
 
@@ -4475,6 +4594,9 @@ COMMAND_TAKES = {
     "usage": (("--json",), (), None,
               "usage: ccwho usage [--json]          subscription usage, per account\n"
               "       ccwho usage name <id> <label>  a display name for an account"),
+    "purpose": ((), ("--session",), None, PURPOSE_USAGE),
+    "now": ((), (), None, NOW_USAGE),
+    "directory": (("--json",), (), None, DIRECTORY_USAGE),
     "doctor": (("--json", "--no-color"), (), 0,
                "usage: ccwho doctor [--json] [--no-color]   is everything ccwho needs in place?"),
     "setup": (("--yes", "--no-hotkey", "--no-list", "--usage", "--no-usage"), ("--hotkey", "--proof"), 0,
@@ -4590,6 +4712,12 @@ def main(argv=None):
         return ls(argv[1:])
     if argv and argv[0] == "ps":
         return ps(argv[1:])
+    if argv and argv[0] == "purpose":
+        return purpose_cli(argv[1:])
+    if argv and argv[0] == "now":
+        return now_cli(argv[1:])
+    if argv and argv[0] == "directory":
+        return directory_cli(argv[1:])
     if argv and argv[0] == "statusline":
         return statusline(argv[1:])
     if argv and argv[0] == "usage":
@@ -4630,6 +4758,9 @@ def main(argv=None):
         print("       ccwho clean [--mine] [--dry-run] [--yes] [--force]      kill what ended sessions left - lists, then asks")
         print("       ccwho usage [--json]                       subscription usage, per account")
         print("       ccwho usage name <id> <label>              a display name for an account")
+        print("       ccwho directory [words] [--json]           who is there to ask, and what each is for")
+        print("       ccwho purpose [--session NAME] [TEXT]      what a named session is for")
+        print("       ccwho now [TEXT]                           from inside a session: what it works on")
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")
         print("       ccwho doctor [--json] [--no-color]         is everything ccwho needs in place?")
         print("       ccwho setup [--yes] [--hotkey KEY] [--no-hotkey] [--no-list]  install what ccwho needs, once")

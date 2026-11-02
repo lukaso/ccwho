@@ -323,6 +323,39 @@ class TestLiveSessionFiles(unittest.TestCase):
                                        self.STARTS)[0]
         self.assertEqual(row["entrypoint"], "sdk-cli")
 
+    def test_who_named_it_is_kept(self):
+        row = procs.live_session_files([entry(101, SID, nameSource="user")], self.STARTS)[0]
+        self.assertEqual(row["nameSource"], "user")
+
+    def test_an_odd_name_source_costs_that_field_only(self):
+        # the session is real and has an address: only "is it a role" is unknown
+        for odd in (7, ["user"], None, True, "bad\x1bname"):
+            with self.subTest(odd=odd):
+                row = procs.live_session_files([entry(101, SID, nameSource=odd)], self.STARTS)[0]
+                self.assertEqual(row["sessionId"], SID)
+                self.assertNotIn("nameSource", row)
+
+    def test_a_session_in_both_lists_keeps_who_named_it(self):
+        # measured 2026-11-01: the agents list has no nameSource, and it is the
+        # row that is kept - with no copy here no session would ever be a role
+        feed = [{"sessionId": SID, "name": "coo", "status": "idle"}]
+        files = [{"sessionId": SID, "name": "coo", "nameSource": "user"}]
+        self.assertEqual(procs.merge_sessions(feed, files)[0]["nameSource"], "user")
+
+    def test_a_session_in_both_lists_keeps_who_started_it_too(self):    # control
+        feed = [{"sessionId": SID, "name": "coo"}]
+        files = [{"sessionId": SID, "entrypoint": "cli", "nameSource": "user"}]
+        got = procs.merge_sessions(feed, files)[0]
+        self.assertEqual((got["entrypoint"], got["nameSource"]), ("cli", "user"))
+
+    def test_a_session_only_in_the_agents_list_has_no_name_source(self):
+        feed = [{"sessionId": SID, "name": "coo"}]
+        self.assertNotIn("nameSource", procs.merge_sessions(feed, [])[0])
+
+    def test_a_session_only_in_the_files_keeps_it(self):
+        files = [{"sessionId": SID, "name": "coo", "nameSource": "user"}]
+        self.assertEqual(procs.merge_sessions([], files)[0]["nameSource"], "user")
+
     def test_rows_come_out_in_the_agents_shape(self):
         bg = entry(101, SID, kind="bg", jobId="51fddd61")
         row = procs.live_session_files([bg], self.STARTS)[0]

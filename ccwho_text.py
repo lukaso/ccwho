@@ -58,3 +58,16 @@ def plain_text(text):
     output is common in a prompt, and neither the pane nor a paste wants it."""
     # and the controls the pane drops (BEL, backspace, VT, FF): a paste drops them too
     return re.sub(r"[\x1b\x07\x08\x0b\x0c]", "", ESCAPES.sub("", text))
+
+
+_AGE_UNITS = ((86400.0, "d"), (3600.0, "h"), (60.0, "m"))
+
+
+def age_words(secs):
+    """Seconds as ccwho spells ages elsewhere. None is "never", not blank."""
+    if secs is None:
+        return "never"
+    for size, unit in _AGE_UNITS:
+        if secs >= size:
+            return f"{int(secs // size)}{unit}"
+    return f"{int(secs)}s"

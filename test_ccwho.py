@@ -133,6 +133,8 @@ class MachinelessCollect(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="ccwho-test-verdicts-")
         self.addCleanup(shutil.rmtree, tmp, True)
         testkit.patch(self, ccwho, "verdicts_path", lambda: os.path.join(tmp, "readers.json"))
+        # and the directory's lines are the person's own
+        testkit.patch(self, ccwho, "directory_dir", lambda: os.path.join(tmp, "directory"))
 
     def tearDown(self):
         (ccwho.ps_snapshot, ccwho.tty_snapshot,
@@ -8091,6 +8093,49 @@ class TestASessionFileCaughtMidWriteIsReadAgain(unittest.TestCase):
         self.assertEqual(ccwho.read_session_files([self.dir]), ([], 1))
 
 
+class TestCollectGivesARoleItsPurpose(MachinelessCollect):
+    """A row built by collect() - not by hand - carries what the brief shows."""
+
+    ROLE, OTHER = "ffff7777-0000-4000-8000-000000000007", "ffff8888-0000-4000-8000-000000000008"
+
+    def setUp(self):
+        super().setUp()
+        testkit.patch(self, ccwho, "agents_json", lambda: "[]")
+        ccwho.live_file_sessions = lambda *a, **k: ([
+            {"pid": 77, "sessionId": self.ROLE, "cwd": "/Users/x/p", "kind": "interactive",
+             "status": "idle", "name": "coo", "nameSource": "user"},
+            {"pid": 88, "sessionId": self.OTHER, "cwd": "/Users/x/p", "kind": "interactive",
+             "status": "idle", "name": "coo", "nameSource": "derived"}], 0)
+
+    def save(self, name, text):
+        folder = ccwho.directory_dir()
+        os.makedirs(folder, exist_ok=True)
+        with open(ccwho.ccwho_directory.path_of(folder, "purpose", name), "w") as fh:
+            fh.write(ccwho.ccwho_directory.entry_text(name, text, 1793570000.0))
+
+    def purposes(self):
+        rows, _ = ccwho.collect(cache={})
+        return {r["sessionId"]: r["purpose"] for r in rows}
+
+    def test_a_role_has_the_line_of_its_name(self):
+        self.save("coo", "runs the company")
+        self.assertEqual(self.purposes()[self.ROLE], "runs the company")
+
+    def test_the_same_word_on_a_derived_name_has_none(self):
+        self.save("coo", "runs the company")
+        self.assertEqual(self.purposes()[self.OTHER], "")
+
+    def test_no_line_is_no_purpose(self):                               # control
+        self.assertEqual(self.purposes(), {self.ROLE: "", self.OTHER: ""})
+
+    def test_a_bad_file_costs_the_line_and_not_the_list(self):
+        folder = ccwho.directory_dir()
+        os.makedirs(folder, exist_ok=True)
+        with open(ccwho.ccwho_directory.path_of(folder, "purpose", "coo"), "w") as fh:
+            fh.write("{ not json")
+        self.assertEqual(self.purposes(), {self.ROLE: "", self.OTHER: ""})
+
+
 class TestTheConfigDirTravelsWithTheRow(MachinelessCollect):
     """configDir is only useful if it reaches the commands. A row built by
     collect() - not by hand - has to carry it to attach, save and restore."""
@@ -9519,10 +9564,11 @@ class TestTheBriefInParts(unittest.TestCase):
 
     def test_every_value_says_which_field_it_is(self):
         b = self.brief()
-        fields = [(f, v) for line in ccwho.brief_parts(b, {"project": "liveapp"}, fields=True)
+        whole = {"project": "liveapp", "purpose": "runs the company"}
+        fields = [(f, v) for line in ccwho.brief_parts(b, whole, fields=True)
                   for _, _, v, f in line if v or f]
         self.assertEqual([f for f, _ in fields],
-                         ["id", "project", "title", "recap", "goal", "you_said", "closing",
+                         ["id", "project", "title", "purpose", "recap", "goal", "you_said", "closing",
                           "tty", "pid", "name", "cwd", "session_id", "resume"])
         self.assertEqual(tuple(f for f, _ in fields), ccwho.BRIEF_FIELDS,
                          "the order a screen follows is the order they come in")
@@ -9530,7 +9576,26 @@ class TestTheBriefInParts(unittest.TestCase):
         # a value that is not there has no field either: no project, no "project"
         bare = [f for line in ccwho.brief_parts(b, {}, fields=True) for _, _, _, f in line if f]
         self.assertNotIn("project", bare)
+        self.assertNotIn("purpose", bare)
         self.assertIn("id", bare)                                           # control
+
+    def test_a_role_says_what_it_is_for_under_its_title(self):
+        lines = ccwho.render_brief(self.brief(), {"purpose": "runs the company"},
+                                   color=False).splitlines()
+        self.assertEqual(lines[lines.index("  Laptop crash") + 1], "  purpose   runs the company")
+
+    def test_with_no_title_the_purpose_is_under_the_first_line(self):
+        lines = ccwho.render_brief(self.brief(title=""), {"purpose": "runs the company"},
+                                   color=False).splitlines()
+        self.assertEqual(lines[1], "  purpose   runs the company")
+
+    def test_a_session_with_no_purpose_has_no_such_line(self):
+        for row in ({}, {"purpose": ""}):
+            with self.subTest(row=row):
+                self.assertNotIn("purpose", ccwho.render_brief(self.brief(), row, color=False))
+
+    def test_the_purpose_is_a_value_to_copy(self):
+        self.assertIn("runs the company", self.copies(self.brief(), {"purpose": "runs the company"}))
 
     def test_a_list_running_since_before_keeps_the_shape_it_reads(self):
         # the engine is hot-reloaded into a list that stays open for days; a

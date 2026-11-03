@@ -31,6 +31,7 @@ import uuid
 import xml.sax.saxutils
 
 import ccwho_engine as engine
+from ccwho_text import age_words
 
 # The launchd timer is 15 minutes. Two windows of grace before calling it stale:
 # StartInterval only fires while the Mac is awake, so one skipped window is normal.
@@ -39,18 +40,6 @@ AUTOSAVE_STALE_AFTER = 31 * 60
 # is missed, so the next run can be one window (and a little) away. A job that
 # has not run since the Mac woke is not stale before this.
 AUTOSAVE_WAKE_GRACE = 17 * 60
-
-_AGE_UNITS = ((86400.0, "d"), (3600.0, "h"), (60.0, "m"))
-
-
-def age_words(secs):
-    """Seconds as ccwho spells ages elsewhere. None is "never", not blank."""
-    if secs is None:
-        return "never"
-    for size, unit in _AGE_UNITS:
-        if secs >= size:
-            return f"{int(secs // size)}{unit}"
-    return f"{int(secs)}s"
 
 
 def doctor_checks(facts):

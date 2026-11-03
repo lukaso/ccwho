@@ -34,6 +34,7 @@ ROW_KEYS = {
                           # pid and tasks; a reader adds kind, program and root
     "entrypoint",         # added 2026-09-26: who started it - cli, or a program (sdk-*)
     "nameSource",         # added 2026-11-01: who named it - user, auto or derived
+    "purpose",            # added 2026-11-02: what a role is for, "" for any other session
     "parked",             # added 2026-09-26: ids of terminals that parked this job
                           # (ctrl+b) - they show it, and have no row of their own
     "terminal",           # added 2026-09-30: the app whose tab shows it (iterm2,

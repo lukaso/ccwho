@@ -20,8 +20,7 @@ import os
 import time
 
 import ccwho_procs as procs
-from ccwho_setup import age_words
-from ccwho_text import plain_text
+from ccwho_text import age_words, plain_text
 
 KINDS = ("purpose", "now")
 MAX_TEXT = 120              # text from one session lands in another's context
@@ -41,7 +40,7 @@ def clean(text):
 def path_of(folder, kind, key):
     """A hash of the exact key: a name can hold anything, and two spellings are two
     addresses, so nothing is folded."""
-    digest = hashlib.sha256(key.encode("utf-8", "surrogateescape")).hexdigest()
+    digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
     return os.path.join(folder, f"{kind}-{digest}.json")
 
 
@@ -106,6 +105,16 @@ def prune_now(folder, now):
 def _is_role(row):
     """Only a name you gave counts: a derived name changes at each resume."""
     return row.get("nameSource") == "user"
+
+
+def purpose_of(row, folder):
+    """What the row's session is for, as its brief says it. "" for a session that is
+    no role, or a role with no line. The scan reads this for each row."""
+    name = row.get("name")
+    if not _is_role(row) or not isinstance(name, str):
+        return ""
+    got = read_one(folder, "purpose", name)
+    return got["text"] if got else ""
 
 
 def _line(handle, state, purpose="", now_entry=None, now=0.0, row=None, you=False, shared=1):

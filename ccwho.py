@@ -408,7 +408,7 @@ def show(argv):
     if want_json:
         # a session is sessionId, as in every --json - also among its names
         # (aka); the brief itself keeps session_id, which render_brief reads
-        out = dict(b, sessionId=row.get("sessionId", ""))
+        out = dict(b, sessionId=row.get("sessionId", ""), purpose=row.get("purpose", ""))
         if isinstance(out.get("aka"), dict):
             out["aka"] = {("sessionId" if k == "session_id" else k): v
                           for k, v in out["aka"].items()}
@@ -1030,7 +1030,7 @@ DIRECTORY_USAGE = "usage: ccwho directory [words] [--json]   who is there to ask
 def _save_line(cmd, kind, key, label, words):
     """Print, set or remove one line of the directory: no words print it, and text
     that comes to nothing removes it. The exit code."""
-    folder = directory_dir()
+    folder = engine.directory_dir()
     if not words:
         got = directory.read_one(folder, kind, key)
         print(f"{label}: {got['text']}" if got
@@ -1103,7 +1103,7 @@ def now_cli(argv):
         return 2
     rc = _save_line("now", "now", mine, "now", list(argv))
     if rc == 0 and argv:
-        directory.prune_now(directory_dir(), time.time())
+        directory.prune_now(engine.directory_dir(), time.time())
     return rc
 
 
@@ -1119,7 +1119,7 @@ def directory_cli(argv):
         print(f"ccwho directory: could not read the sessions: {type(e).__name__}", file=sys.stderr)
         return 1
     complete = bool(status.get("source_ok")) and status.get("session_files_bad") == 0
-    got = directory.matching(directory.merge(rows, directory.read_all(directory_dir()),
+    got = directory.matching(directory.merge(rows, directory.read_all(engine.directory_dir()),
                                              engine.session_handle,
                                              me=engine.agent_id(os.environ), complete=complete),
                              words)
@@ -3164,10 +3164,6 @@ def prune_manifests(names, keep=KEEP_MANIFESTS):
 def ccwho_dir():
     """Under $HOME, never a temp dir: the whole point is to outlive the reboot."""
     return os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho")
-
-
-def directory_dir():
-    return os.path.join(ccwho_dir(), "directory")
 
 
 def usage_dir():

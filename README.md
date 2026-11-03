@@ -291,6 +291,9 @@ costs`. After `/name`, the session's next reply suggests a purpose line.
 A session with no name of yours has a now line only, and its title shows until it
 writes one. `/purpose` there answers "Name it first".
 
+The purpose line also shows in the brief of a running role: `ccwho show`, and the
+list's detail pane, where a click copies it.
+
 `ccwho setup` offers two skills, `directory` and `purpose`, for each config dir where
 you run claude. It shows them and asks. A no is not remembered, and `ccwho doctor` does not call it
 a fault. A skill of that name that ccwho did not write is left alone. The skills' descriptions

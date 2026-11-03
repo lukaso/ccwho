@@ -4,11 +4,14 @@ another session. Rules (ccwho_directory.py), then the commands (ccwho.py).
 Rows here are the shape engine.collect gives. No test reads the real sessions:
 scan and live_file_sessions are stand-ins, and CCWHO_DIR is a temp dir.
 """
+import ast
 import contextlib
 import io
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -452,6 +455,100 @@ class TestRender(unittest.TestCase):
         self.assertLess(max(len(x) for x in text.splitlines()), 200)
 
 
+class TestThePurposeOfARow(unittest.TestCase):
+    """What the brief of a running session says it is for: the scan reads this for
+    every row, so nothing in it may stop a scan."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="ccwho-dir-test-")
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        with open(directory.path_of(self.folder, "purpose", "coo"), "w") as fh:
+            fh.write(directory.entry_text("coo", "runs the company", NOW))
+
+    def of(self, name, source):
+        return directory.purpose_of(row(name, source), self.folder)
+
+    def test_a_role_has_the_line_of_its_name(self):
+        self.assertEqual(self.of("coo", "user"), "runs the company")
+
+    def test_the_same_word_on_a_name_you_did_not_give_has_none(self):
+        for source in ("derived", "auto", ""):
+            with self.subTest(source=source):
+                self.assertEqual(self.of("coo", source), "")
+
+    def test_a_role_with_no_line_has_none(self):
+        self.assertEqual(self.of("crm", "user"), "")
+
+    def test_a_name_that_is_not_text_has_none(self):
+        for name in (None, 7, ["coo"]):
+            with self.subTest(name=name):
+                self.assertEqual(self.of(name, "user"), "")
+
+    def test_a_name_no_file_can_hold_costs_nothing(self):
+        self.assertEqual(self.of("\ud800", "user"), "")
+
+
+class TestTheFolder(unittest.TestCase):
+    def test_it_is_beside_ccwhos_other_files(self):
+        with mock.patch.dict(os.environ, {"CCWHO_DIR": "/somewhere"}):
+            self.assertEqual(runner.engine.directory_dir(), "/somewhere/directory")
+
+    def test_with_no_setting_it_is_in_the_home_folder(self):
+        with mock.patch.dict(os.environ, {"HOME": "/home/x"}):
+            os.environ.pop("CCWHO_DIR", None)
+            self.assertEqual(runner.engine.directory_dir(), "/home/x/.ccwho/directory")
+
+
+class TestKillAndOpenNeverMatchAPurpose(unittest.TestCase):
+    """Text one session wrote about itself must not choose what `ccwho kill` or
+    `ccwho open` acts on."""
+
+    def test_a_word_of_the_purpose_finds_nothing(self):
+        r = row("coo", "user", purpose="runs the company")
+        self.assertEqual(runner.engine.match_rows([r], "company"), [])
+
+    def test_the_name_still_finds_it(self):                             # control
+        r = row("coo", "user", purpose="runs the company")
+        self.assertEqual(runner.engine.match_rows([r], "coo"), [r])
+
+
+class TestTheEngineReadsTheDirectory(unittest.TestCase):
+    """The engine reads the rules for each row, and is re-read into a list that has
+    been open for days. Each case is a new process: the order of imports is the
+    thing tested, and a reload here would swap modules under the other tests."""
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def fresh(self, code):
+        return subprocess.run([sys.executable, "-B", "-c", code], cwd=self.HERE,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_any_of_the_three_modules_can_be_imported_first(self):
+        for name in ("ccwho_engine", "ccwho_directory", "ccwho_setup"):
+            with self.subTest(name=name):
+                got = self.fresh(f"import {name}")
+                self.assertEqual((got.returncode, got.stderr), (0, ""))
+
+    def test_a_reload_reads_the_rules_again(self):
+        got = self.fresh("import sys, ccwho_engine as e\n"
+                         "old = sys.modules['ccwho_directory']\n"
+                         "e.reload_all(e)\n"
+                         "new = sys.modules['ccwho_directory']\n"
+                         "assert new is not old, 'not read again'\n"
+                         "assert e.ccwho_directory is new, 'the engine kept the old one'\n")
+        self.assertEqual((got.returncode, got.stderr), (0, ""))
+
+    def test_what_it_imports_is_read_again_before_it(self):
+        with open(os.path.join(self.HERE, "ccwho_directory.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        names = [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
+        names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
+        self.assertIn("ccwho_procs", names, "the scan found the wrong imports")   # control
+        order = list(runner.engine.RELOAD_FIRST)
+        before = order[:order.index("ccwho_directory")]
+        self.assertEqual([n for n in names if n.startswith("ccwho") and n not in before], [])
+
+
 @contextlib.contextmanager
 def as_agent(sid=SID_A):
     with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}):
@@ -482,7 +579,7 @@ class CommandCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"CCWHO_DIR": self.home})
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.folder = runner.directory_dir()
+        self.folder = runner.engine.directory_dir()
 
     def stored(self, kind, key):
         got = directory.read_one(self.folder, kind, key)

@@ -29,6 +29,7 @@ import sys
 import time
 
 import ccwho_brief as brief
+import ccwho_directory
 import ccwho_index
 import ccwho_text
 from ccwho_text import ANSI as _ANSI, cells as _cells, cut as _cut  # noqa: E402,F401
@@ -43,8 +44,8 @@ import ccwho_terms as terms
 # Dependencies first: ccwho_text before ccwho_usage (which imports it), procs
 # before brief (which imports procs).
 # ccwho_terms after ccwho_procs: it reads procs.ps_rows.
-RELOAD_FIRST = ("ccwho_text", "ccwho_procs", "ccwho_terms", "ccwho_brief", "ccwho_index",
-                "ccwho_usage")
+RELOAD_FIRST = ("ccwho_text", "ccwho_procs", "ccwho_directory", "ccwho_terms", "ccwho_brief",
+                "ccwho_index", "ccwho_usage")
 
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
@@ -3681,6 +3682,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "configDir": session.get("configDir", ""),
         # who named it: user, auto or derived. `user` makes it a role in the directory
         "nameSource": session.get("nameSource", ""),
+        "purpose": "",          # what that role is for, as its brief says it; collect fills it
         # the session's work processes and their ports; collect() fills them in
         "procs": 0,
         "ports": [],
@@ -3832,6 +3834,12 @@ def parks_path():
     """Beside ccwho's other files: CCWHO_DIR, or ~/.ccwho."""
     return os.path.join(os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho"),
                         "parked.json")
+
+
+def directory_dir():
+    """Beside ccwho's other files: CCWHO_DIR, or ~/.ccwho."""
+    return os.path.join(os.environ.get("CCWHO_DIR") or os.path.expanduser("~/.ccwho"),
+                        "directory")
 
 
 def load_parks(path=None):
@@ -4011,6 +4019,7 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
         rows[-1]["parked"] = sorted(t for t, job in parked.items() if job == sid)
         # unknown is null, not [] - a script must not read "holds nothing"
         rows[-1]["ports"] = summary["ports"] if ports is not None else None
+        rows[-1]["purpose"] = ccwho_directory.purpose_of(rows[-1], directory_dir())
     rows.sort(key=sort_key)
     if cache.pop("_verdicts_new", False):
         save_verdicts(cache)
@@ -4125,7 +4134,7 @@ _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
 
 
 # The fields a brief's values are, in the order brief_parts gives them.
-BRIEF_FIELDS = ("id", "project", "title", "recap", "goal", "you_said", "closing",
+BRIEF_FIELDS = ("id", "project", "title", "purpose", "recap", "goal", "you_said", "closing",
                 "tty", "pid", "name", "cwd", "session_id", "resume")
 
 
@@ -4158,6 +4167,9 @@ def brief_parts(b, row=None, fields=False):
     out.append(head)
     if b["title"]:
         out.append([("  ", "bold", None), (b["title"], "bold", b["title"], "title")])
+    if row.get("purpose"):
+        out.append([("  ", None, None), ("purpose", "dim", None), ("   ", None, None),
+                    (row["purpose"], None, row["purpose"], "purpose")])
     if b["recap"]:
         age = b["recap_age"] or "?"
         turns = b["turns_since_recap"]

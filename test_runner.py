@@ -3881,6 +3881,21 @@ class TestShowVerb(unittest.TestCase):
         self.assertEqual(got["aka"]["short_id"], "6c4c")
         self.assertIn("memory bloat", got["recap"])
 
+    def test_it_says_what_a_role_is_for(self):
+        self.rows[0]["purpose"] = "runs the company"
+        _, out = self._show("362")
+        self.assertIn("  purpose   runs the company\n", out)
+
+    def test_json_output_says_what_a_role_is_for(self):
+        self.rows[0]["purpose"] = "runs the company"
+        _, out = self._show("362", "--json")
+        self.assertEqual(json.loads(out)["purpose"], "runs the company")
+
+    def test_json_output_of_a_session_with_no_purpose_has_an_empty_one(self):   # control
+        self.rows[0].pop("purpose", None)
+        _, out = self._show("362", "--json")
+        self.assertEqual(json.loads(out)["purpose"], "")
+
 
 class TestDoctorVerb(unittest.TestCase):
     """`ccwho doctor` reports; it never repairs. Every line says what was checked

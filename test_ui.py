@@ -7088,6 +7088,15 @@ class TestTheKeysGoIntoTheDetail(UiTest):
             self.assertEqual(self.lit(app), [f"claude --resume {LIVE['sessionId']}"])
             self.assertEqual(app.selected, LIVE["sessionId"], "the session did not change")
 
+    async def test_a_role_says_what_it_is_for_and_the_keys_reach_it(self):
+        role = dict(LIVE, purpose="runs the company")
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([role, BUSY], True, "12:00:00")))
+        async with app.run_test(size=(300, 50)) as pilot:
+            await self.enter(pilot)
+            await pilot.press("down", "down", "down")       # id, project, title, purpose
+            await pilot.pause()
+            self.assertEqual(self.lit(app), ["runs the company"])
+
     async def test_enter_copies_the_value_and_does_not_jump(self):
         adapter = FakeAdapter()
         app = self.app(adapter=adapter)

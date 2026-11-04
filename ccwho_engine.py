@@ -1949,13 +1949,16 @@ def config_dirs_now(table=None):
 
 def live_file_sessions(table=None):
     """Live sessions from every config dir, as `claude agents --json` rows; and
-    how many session files could not be read (for `ccwho doctor`).
+    how many session files could not be read (for `ccwho doctor`), None if `ps` gave
+    no answer: a file counts only when its process is there, so no file can be told.
 
     `claude agents --json` only answers for the config dir it runs under, and
     pointed at another one it WRITES into it. So: each running claude process
     names its own CLAUDE_CONFIG_DIR, and each dir keeps a small file per session.
     """
     table = ps_table() if table is None else table
+    if not table:
+        return [], None
     dirs = config_dirs_now(table)
     entries, bad = read_session_files(dirs, default=os.path.expanduser("~/.claude"))
     return procs.live_session_files(entries, procs.claude_starts(table)), bad

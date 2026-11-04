@@ -316,6 +316,17 @@ def skill_text(name, ccwho):
     return _SKILLS[name].replace("@CCWHO@", shlex.quote(ccwho)).replace("@MARK@", SKILL_MARK)
 
 
+_SKILL_COMMAND = re.compile(r"^allowed-tools: Bash\((.+) (?:directory\*|purpose \*)\)", re.M)
+
+
+def skill_command(text):
+    """The ccwho that a skill file names, as skill_text wrote it, or None. ValueError
+    if the line was edited and no quote closes it."""
+    got = _SKILL_COMMAND.search(text or "")
+    words = shlex.split(got.group(1)) if got else []
+    return words[0] if words else None
+
+
 def skill_state(text, wanted):
     """missing, current, old (ccwho's, but not this text) or other (not ccwho's)."""
     if text is None:

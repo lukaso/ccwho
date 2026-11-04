@@ -374,14 +374,16 @@ def show(argv):
     rows, _ = scan(cache=cache)
     entry = {}
     if query:
-        # Not running is not gone: the transcript is still on disk, and so is the
-        # answer to "what was that one about".
-        hits, ended = matches(query, rows, everything="--all" in argv)
-        hits = hits + ended
-        found = index.search(fresh_index(), query, everything="--all" in argv)
-        by_id = {e.get("sessionId"): e for e in found}
+        # The exact name of a running session is that session: a word that others
+        # said, or a part of a title, does not make it a question.
+        hits = [r for r in rows if (r.get("name") or "").lower() == query.lower()]
+        if not hits:
+            # Not running is not gone: the transcript is still on disk, and so is the
+            # answer to "what was that one about".
+            hits, ended = matches(query, rows, everything="--all" in argv)
+            hits = hits + ended
         if hits:
-            entry = by_id.get(hits[0].get("sessionId"), {})
+            entry = fresh_index().get(hits[0].get("sessionId"), {})
     else:
         hits = rows
     if not hits:
@@ -1030,7 +1032,7 @@ DIRECTORY_USAGE = "usage: ccwho directory [words] [--json]   who is there to ask
 def _save_line(cmd, kind, key, label, words):
     """Print, set or remove one line of the directory: no words print it, and text
     that comes to nothing removes it. The exit code."""
-    folder = engine.directory_dir()
+    folder, label = engine.directory_dir(), directory.clean(label)
     if not words:
         got = directory.read_one(folder, kind, key)
         print(f"{label}: {got['text']}" if got
@@ -1119,12 +1121,12 @@ def directory_cli(argv):
         print(f"ccwho directory: could not read the sessions: {type(e).__name__}", file=sys.stderr)
         return 1
     complete = bool(status.get("source_ok")) and status.get("session_files_bad") == 0
-    got = directory.matching(directory.merge(rows, directory.read_all(engine.directory_dir()),
-                                             engine.session_handle,
-                                             me=engine.agent_id(os.environ), complete=complete),
-                             words)
+    everyone = directory.merge(rows, directory.read_all(engine.directory_dir()),
+                               engine.session_handle,
+                               me=engine.agent_id(os.environ), complete=complete)
+    got = directory.matching(everyone, words)
     if words and not got["named"] and not got["others"]:
-        print(f"ccwho directory: no session matches {' '.join(words)!r}", file=sys.stderr)
+        print(f"ccwho directory: {directory.no_match(everyone, words)}", file=sys.stderr)
         return 1
     if "--json" in argv:
         print(json.dumps(got, indent=2))
@@ -3895,11 +3897,18 @@ def skill_states(root):
     for name in setup.SKILL_NAMES:
         try:
             text = _text_or_none(skill_path(root, name))
+            out[name] = setup.skill_state(text, setup.skill_text(name, _ccwho_for(text)))
         except (OSError, ValueError):
             out[name] = "other"
-            continue
-        out[name] = setup.skill_state(text, setup.skill_text(name, ccwho_bin()))
     return out
+
+
+def _ccwho_for(skill):
+    """The ccwho a skill file should name: the one it names, if that is this same
+    program, else ccwho_bin(). A list that the hotkey opened has no `ccwho` on its
+    PATH, so ccwho_bin() there is another spelling of the file that setup wrote."""
+    named = setup.skill_command(skill)
+    return named if named and os.path.realpath(named) == os.path.realpath(__file__) else ccwho_bin()
 
 
 def skills_setup(roots, yes=False, ask=None, ccwho=None, changed=None):

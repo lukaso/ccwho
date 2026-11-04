@@ -455,7 +455,7 @@ class TestTheDirectorySkills(unittest.TestCase):
                     self.assertNotIn(": ", value)
                     self.assertNotIn(" #", value)
 
-    def test_the_commands_run_with_no_prompt(self):
+    def test_the_allowed_tools_name_the_commands(self):
         self.assertIn("Bash(/x/ccwho directory*)", self._frontmatter("directory")["allowed-tools"])
         self.assertIn("Bash(/x/ccwho now *)", self._frontmatter("directory")["allowed-tools"])
         self.assertIn("Bash(/x/ccwho purpose *)", self._frontmatter("purpose")["allowed-tools"])

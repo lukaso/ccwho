@@ -8136,6 +8136,86 @@ class TestCollectGivesARoleItsPurpose(MachinelessCollect):
         self.assertEqual(self.purposes(), {self.ROLE: "", self.OTHER: ""})
 
 
+class TestTheDirectoryFromARealScan(MachinelessCollect):
+    """`ccwho directory` through collect(), with the real read of the session files.
+    A stand-in for the status cannot see these: a file row that goes missing, and a
+    feed row that has no nameSource."""
+
+    SID = "ffff9999-0000-4000-8000-000000000009"
+    START = "Tue Nov  3 10:00:00 2026"
+    FEED_ROW = {"pid": 77, "sessionId": SID, "cwd": "/Users/x/p", "kind": "interactive",
+                "status": "idle", "name": "coo"}
+
+    def setUp(self):
+        super().setUp()
+        from unittest import mock
+        self.file_row = dict(self.FEED_ROW, nameSource="user", procStart=self.START,
+                             startedAt=1793570000000, version="2.1.0")
+        self.feed = [self.FEED_ROW]
+        ccwho.live_file_sessions = REAL["live_file_sessions"]
+        ccwho.ps_table = lambda: {77: (self.START, "claude")}
+        testkit.patch(self, ccwho, "agents_json", lambda: json.dumps(self.feed))
+        testkit.patch(self, ccwho, "config_dirs_now", lambda table=None: [])
+        testkit.patch(self, ccwho, "read_session_files",
+                      lambda dirs, default=None: ([dict(self.file_row)], 0))
+        home = tempfile.mkdtemp(prefix="ccwho-test-directory-")
+        self.addCleanup(shutil.rmtree, home, True)
+        patcher = mock.patch.dict(os.environ, {"CCWHO_DIR": home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        folder = ccwho.directory_dir()
+        os.makedirs(folder, exist_ok=True)
+        with open(ccwho.ccwho_directory.path_of(folder, "purpose", "coo"), "w") as fh:
+            fh.write(ccwho.ccwho_directory.entry_text("coo", "runs the company", 1793570000.0))
+
+    def listed(self):
+        import contextlib
+        import io
+        import ccwho as cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.directory_cli([]), 0)
+        return out.getvalue()
+
+    def role_line(self, text):
+        return next(x for x in text.splitlines() if x.strip().startswith("coo"))
+
+    def test_a_role_that_both_sources_show_is_running(self):            # control
+        text = self.listed()
+        self.assertIn("idle", self.role_line(text))
+        self.assertIn("runs the company", self.role_line(text))
+        self.assertNotIn(ccwho.ccwho_directory.INCOMPLETE, text)
+
+    def test_a_failed_ps_does_not_call_a_running_role_not_running(self):
+        ccwho.ps_table = lambda: {}
+        text = self.listed()
+        self.assertNotIn("not running", text)
+        self.assertIn("idle", self.role_line(text))
+        self.assertIn("runs the company", self.role_line(text))
+
+    def test_a_failed_ps_says_the_list_is_incomplete(self):
+        ccwho.ps_table = lambda: {}
+        self.assertIn(ccwho.ccwho_directory.INCOMPLETE, self.listed())
+
+    def test_a_failed_ps_does_not_say_not_running_of_a_role_only_its_file_shows(self):
+        # the feed answers for one config dir: a role in another is in the files only
+        ccwho.ps_table = lambda: {}
+        self.feed = []
+        text = self.listed()
+        self.assertNotIn("not running", text)
+        self.assertIn("unknown (session list incomplete)", text)
+
+    def test_a_file_with_another_start_time_does_not_hide_a_running_role(self):
+        self.file_row["procStart"] = "Mon Nov  2 09:00:00 2026"
+        text = self.listed()
+        self.assertNotIn("not running", text)
+        self.assertIn("idle", self.role_line(text))
+
+    def test_a_derived_name_with_that_word_leaves_the_role_not_running(self):   # control
+        self.file_row["nameSource"] = "derived"
+        self.assertIn("not running", self.listed())
+
+
 class TestTheConfigDirTravelsWithTheRow(MachinelessCollect):
     """configDir is only useful if it reaches the commands. A row built by
     collect() - not by hand - has to carry it to attach, save and restore."""

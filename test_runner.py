@@ -3896,6 +3896,104 @@ class TestShowVerb(unittest.TestCase):
         _, out = self._show("362", "--json")
         self.assertEqual(json.loads(out)["purpose"], "")
 
+    # "coo" as a real scan found it: a part of "coordinates" in an ended session, a
+    # word in another title. Neither of them is what `ccwho show coo` asks for.
+    ENDED = {"sessionId": "a2980000-0000-4000-8000-000000000000", "project": "liveapp",
+             "title": "Client feedback", "you_said": "Multiply coordinates by 2.15"}
+    OTHER = "99990000-0000-4000-8000-000000000000"
+
+    def _an_ended_session_said_it(self):
+        runner.fresh_index = lambda quiet=False: {self.ENDED["sessionId"]: self.ENDED}
+
+    def _another_runs(self, **also):
+        self.rows.append(dict(self.rows[0], sessionId=self.OTHER, name="ops-a1",
+                              nameSource="derived", title="Cool tools", tty="ttys099",
+                              pid=90267, **also))
+
+    def test_the_exact_name_gives_that_session_though_an_ended_one_said_the_word(self):
+        self.rows[0].update(name="coo", nameSource="user", purpose="runs the company")
+        self._an_ended_session_said_it()
+        rc, out = self._show("coo")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(self.SID, out)
+        self.assertIn("  purpose   runs the company\n", out)
+
+    def test_the_exact_name_gives_that_session_though_another_title_has_the_word(self):
+        self.rows[0].update(name="coo", nameSource="user")
+        self._another_runs()
+        rc, out = self._show("coo")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(self.SID, out)
+
+    def test_the_exact_name_gives_that_session_though_another_running_one_said_it(self):
+        self.rows[0].update(name="coo", nameSource="user")
+        self._another_runs(topic="")
+        self.rows[1]["title"] = "Something else"
+        runner.fresh_index = lambda quiet=False: {self.OTHER: dict(self.ENDED, sessionId=self.OTHER)}
+        rc, out = self._show("coo")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(self.SID, out)
+
+    def test_a_name_that_claude_code_made_is_a_name_too(self):
+        self.rows[0].update(name="liveapp-f0", nameSource="derived")
+        self._another_runs()
+        self.rows[1]["title"] = "Ask liveapp-f0"
+        rc, out = self._show("liveapp-f0")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(self.SID, out)
+
+    def test_the_name_is_read_in_any_case(self):
+        self._an_ended_session_said_it()
+        self.rows[0].update(name="coo", nameSource="user")
+        self.assertEqual(self._show("COO")[0], 0)
+        self.rows[0].update(name="COO")
+        self.assertEqual(self._show("coo")[0], 0)
+
+    def test_two_running_sessions_of_that_name_are_both_listed_and_nothing_else(self):
+        self.rows[0].update(name="coo", nameSource="user")
+        self._another_runs()
+        self.rows[1]["name"] = "coo"
+        self.rows.append(dict(self.rows[0], sessionId="77770000-0000-4000-8000-000000000000",
+                              name="ops-b2", title="Cool tools", tty="ttys098", pid=90268))
+        self._an_ended_session_said_it()
+        rc, out = self._show("coo")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("matches 2 sessions", out)
+        self.assertNotIn("7777", out)
+        self.assertNotIn("a298", out)
+
+    def test_part_of_a_name_is_still_a_search(self):                             # control
+        self.rows[0].update(name="coo-2", nameSource="user")
+        self._another_runs()
+        rc, out = self._show("coo")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("matches 2 sessions", out)
+
+    def test_a_word_that_is_no_name_still_finds_what_was_said(self):             # control
+        self._an_ended_session_said_it()
+        rc, out = self._show("coordinates")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(self.ENDED["sessionId"], out)
+
+    def test_a_session_found_by_its_name_keeps_the_recap_the_index_read(self):
+        # the index read the whole transcript; the brief reads a head and a tail. The
+        # index holds no name, and this transcript never says the word
+        self.rows[0].update(name="coo", nameSource="user")
+        runner.fresh_index = lambda quiet=False: {self.SID: {
+            "sessionId": self.SID, "you_said": "fix the gate", "recap": "Goal: from the middle.",
+            "recap_ts": "2026-09-17T10:18:00.000Z", "turns_since_recap": 3}}
+        _, out = self._show("coo")
+        self.assertIn("Goal: from the middle.", out)
+
+    def test_the_search_that_the_other_verbs_ask_still_reads_the_word(self):     # control
+        # only show has the rule: `matches` is what ls, kill and open ask
+        self.rows[0].update(name="coo", nameSource="user")
+        self._another_runs()
+        self._an_ended_session_said_it()
+        live, ended = runner.matches("coo", self.rows)
+        self.assertEqual({r["sessionId"] for r in live}, {self.SID, self.OTHER})
+        self.assertEqual([e["sessionId"] for e in ended], [self.ENDED["sessionId"]])
+
 
 class TestDoctorVerb(unittest.TestCase):
     """`ccwho doctor` reports; it never repairs. Every line says what was checked

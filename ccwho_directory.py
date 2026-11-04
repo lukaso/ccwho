@@ -15,11 +15,9 @@ whole and has one writer, so there is no lock.
 import collections
 import hashlib
 import json
-import math
 import os
 import time
 
-import ccwho_procs as procs
 from ccwho_text import age_words, plain_text
 
 KINDS = ("purpose", "now")
@@ -29,12 +27,16 @@ MAX_LINE = 190              # a model reads this list: its size is a cost on eac
 NOW_KEPT = 30 * 86400       # a purpose stays: a role can sleep for a year
 NOT_RUNNING = "not running"
 UNKNOWN = "unknown (session list incomplete)"
+INCOMPLETE = "The session list is incomplete: a session may be missing."
+MAX_TIME = 1e15             # NaN fails the test of this too, and a huge int has no float
 
 
 def clean(text):
-    """`text` as one printable line, MAX_TEXT at most. "" is no text."""
+    """`text` as one printable line, MAX_TEXT at most. "" is no text. What Python does
+    not call printable is `?`: a byte that is no UTF-8 stops each print of it, and a
+    format character is text that a model reads and a person does not see."""
     one_line = " ".join(plain_text(str(text)).split())
-    return procs.printable(one_line)[:MAX_TEXT].rstrip()
+    return "".join(c if c.isprintable() else "?" for c in one_line)[:MAX_TEXT].rstrip()
 
 
 def path_of(folder, kind, key):
@@ -60,7 +62,7 @@ def _entry(path):
     key, text, updated = data.get("key"), data.get("text"), data.get("updated")
     if not isinstance(key, str) or not isinstance(text, str):
         return None
-    if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not math.isfinite(updated):
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not abs(updated) < MAX_TIME:
         return None
     text = clean(text)
     return {"key": key, "text": text, "updated": updated} if text else None
@@ -134,12 +136,17 @@ def merge(rows, entries, handle_of, me=None, complete=True, now=None):
     be running, so it is never called not running."""
     now = time.time() if now is None else now
     purposes, now_lines = entries["purpose"], entries["now"]
-    live = collections.Counter(r.get("name") for r in rows if _is_role(r))
+
+    def role(r):
+        # a row from the feed alone does not say who named it. With a line kept under
+        # its name it is that role, running: its file did not match its process
+        return _is_role(r) or (not r.get("nameSource") and r.get("name") in purposes)
+    live = collections.Counter(r.get("name") for r in rows if role(r))
     named, others, reminder = [], [], None
     for r in rows:
         you = r.get("sessionId") == me
         now_entry = now_lines.get(r.get("sessionId"))
-        if _is_role(r):
+        if role(r):
             purpose = purposes.get(r.get("name"))
             named.append(_line(handle_of(r), r.get("status"), purpose["text"] if purpose else "",
                                now_entry, now, r, you, live[r.get("name")]))
@@ -178,12 +185,22 @@ def _dated(line):
     return f"{line['now']} ({line['now_age']})" if line["now"] else line["title"][:MAX_TITLE]
 
 
+def no_match(merged, words):
+    """What a search with no hit says. A word can be in no line when a session can
+    still help, so this never reads as nobody there. `merged`: before the search."""
+    text = f"no session matches {' '.join(words)!r}."
+    listed = len(merged["named"]) + len(merged["others"])
+    if listed:
+        text += f" The list has {listed}: run ccwho directory with no words to read it."
+    return text if merged["complete"] else f"{text} {INCOMPLETE}"
+
+
 def render(merged):
     """The directory as text, for a model to read and a person to check."""
     named, others = merged["named"], merged["others"]
     if not named and not others:
-        return "no sessions"
-    out = []
+        return "no sessions" if merged["complete"] else INCOMPLETE
+    out = [] if merged["complete"] else [INCOMPLETE]
     if named:
         out.append("NAMED")
         widths = _widths(named)

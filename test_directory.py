@@ -77,6 +77,15 @@ class TestClean(unittest.TestCase):
     def test_only_space_is_no_text(self):
         self.assertEqual(directory.clean(" \n\t "), "")
 
+    def test_what_cannot_be_seen_or_written_does_not_reach_the_reader(self):
+        # a byte that is no UTF-8 (\udcff) stops each print; the others are text a
+        # model reads and a person does not see
+        for bad in ("\udcff", "\u202e", "\u200b", "\U000e0041"):
+            with self.subTest(bad=ascii(bad)):
+                got = directory.clean(f"a{bad}b")
+                self.assertNotIn(bad, got)
+                self.assertTrue(got.isprintable(), ascii(got))
+
     def test_other_scripts_stay(self):                                  # control
         self.assertEqual(directory.clean("Zoë 日本語"), "Zoë 日本語")
 
@@ -131,6 +140,8 @@ class TestStore(unittest.TestCase):
                "time-a-string": '{"key": "x", "text": "t", "updated": "soon"}',
                "time-a-bool": '{"key": "x", "text": "t", "updated": true}',
                "time-nan": '{"key": "x", "text": "t", "updated": NaN}',
+               "time-infinite": '{"key": "x", "text": "t", "updated": Infinity}',
+               "time-huge": '{"key": "x", "text": "t", "updated": 1' + "0" * 400 + '}',
                "no-words": '{"key": "x", "text": "  ", "updated": 1}',
                "deep": "[" * 100000}
         for name, text in bad.items():
@@ -199,6 +210,24 @@ class TestPrune(unittest.TestCase):
 
 
 class TestMerge(unittest.TestCase):
+    def test_a_row_that_does_not_say_who_named_it_is_the_role_with_that_line(self):
+        # the feed has no nameSource: a file that did not match its process leaves
+        # only the feed's row, and that session is running
+        for source in ("", None):
+            with self.subTest(source=source):
+                got = merged([row("coo", source)], entries(purpose={"coo": ("suppliers", NOW)}))
+                self.assertEqual([(x["handle"], x["state"], x["purpose"]) for x in got["named"]],
+                                 [("coo", "idle", "suppliers")])
+                self.assertEqual(got["others"], [])
+
+    def test_a_name_ccwho_knows_is_not_yours_is_not_the_role_with_that_line(self):   # control
+        for source in ("derived", "auto"):
+            with self.subTest(source=source):
+                got = merged([row("coo", source)], entries(purpose={"coo": ("suppliers", NOW)}))
+                self.assertEqual([(x["handle"], x["state"]) for x in got["named"]],
+                                 [("coo", "not running")])
+                self.assertEqual(got["others"][0]["handle"], "coo")
+
     def test_a_name_you_gave_is_a_role(self):
         got = merged([row("coo", "user", cache="532k cold")],
                      entries(purpose={"coo": ("suppliers", NOW)}))
@@ -358,6 +387,20 @@ class TestMatching(unittest.TestCase):
 class TestRender(unittest.TestCase):
     def _text(self, rows, ent=None, **kw):
         return directory.render(merged(rows, ent, **kw))
+
+    def test_an_incomplete_list_with_nobody_never_says_no_sessions(self):
+        text = self._text([], complete=False)
+        self.assertNotIn("no sessions", text)
+        self.assertIn(directory.INCOMPLETE, text)
+
+    def test_an_incomplete_list_says_so_above_its_rows(self):
+        text = self._text([row("app-4e")], complete=False)
+        self.assertEqual(text.splitlines()[0], directory.INCOMPLETE)
+        self.assertIn("app-4e", text)
+
+    def test_a_complete_list_has_no_notice(self):                       # control
+        self.assertEqual(self._text([]), "no sessions")
+        self.assertNotIn(directory.INCOMPLETE, self._text([row("app-4e")]))
 
     def test_the_two_sections_in_order(self):
         text = self._text([row("coo", "user", sid=SID_A), row("app-4e", sid=SID_B)])
@@ -543,7 +586,7 @@ class TestTheEngineReadsTheDirectory(unittest.TestCase):
             tree = ast.parse(fh.read())
         names = [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
         names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
-        self.assertIn("ccwho_procs", names, "the scan found the wrong imports")   # control
+        self.assertIn("ccwho_text", names, "the scan found the wrong imports")    # control
         order = list(runner.engine.RELOAD_FIRST)
         before = order[:order.index("ccwho_directory")]
         self.assertEqual([n for n in names if n.startswith("ccwho") and n not in before], [])
@@ -570,6 +613,17 @@ def call(fn, *argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = fn(list(argv))
     return rc, out.getvalue(), err.getvalue()
+
+
+def call_strict(fn, *argv):
+    """As a real stdout: text that UTF-8 cannot write raises here. A StringIO takes
+    anything, so a test through call() is green on code that stops a real process."""
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="utf-8", errors="strict", write_through=True)
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = fn(list(argv))
+    return rc, raw.getvalue().decode("utf-8"), err.getvalue()
 
 
 class CommandCase(unittest.TestCase):
@@ -760,6 +814,13 @@ class TestPurposeCommand(CommandCase):
                 self.assertEqual(rc, 1)
                 self.assertIn("could not read the session files", err)
                 self.assertFalse(os.path.exists(self.folder))
+
+    def test_a_name_with_a_byte_that_is_no_utf8_does_not_stop_it(self):
+        self.live()
+        with as_person():
+            rc, out, _ = call_strict(runner.purpose_cli, "--session", "co\udcff", "the line")
+        self.assertEqual(rc, 0)
+        self.assertIn("the line", out)
 
 
 class TestNowCommand(CommandCase):
@@ -969,6 +1030,50 @@ class TestDirectoryCommand(CommandCase):
             rc, out, _ = call(runner.directory_cli)
         self.assertEqual(rc, 0)
         self.assertIn("app-4e", out)
+
+    def test_a_line_stored_with_a_byte_that_is_no_utf8_does_not_stop_it(self):
+        self._scan([row("coo", "user", sid=SID_A), row("app-4e", sid=SID_B)])
+        self._purpose("coo", "suppliers\udcff")
+        self._purpose("ops\udcff", "ended")
+        with as_person():
+            rc, out, _ = call_strict(runner.directory_cli)
+        self.assertEqual(rc, 0)
+        for part in ("coo", "suppliers", "app-4e", "ended"):
+            self.assertIn(part, out)
+
+    def test_an_incomplete_list_with_nobody_says_so_and_not_no_sessions(self):
+        self._scan([], source_ok=False)
+        with as_person():
+            rc, out, _ = call(runner.directory_cli)
+        self.assertEqual(rc, 0)
+        self.assertIn(directory.INCOMPLETE, out)
+        self.assertNotIn("no sessions", out)
+
+    def test_words_that_match_nothing_in_an_incomplete_list_say_it_is_incomplete(self):
+        self._scan([row("app-4e")], bad=1)
+        with as_person():
+            rc, _, err = call(runner.directory_cli, "crm")
+        self.assertEqual(rc, 1)
+        self.assertIn(directory.INCOMPLETE, err)
+
+    def test_words_that_match_nothing_say_how_to_read_the_whole_list(self):
+        # a purpose says "suppliers, staff, costs", and a session asks for "vat"
+        self._scan([row("coo", "user", sid=SID_A), row("app-4e", sid=SID_B)])
+        self._purpose("coo", "suppliers, staff, costs")
+        with as_person():
+            rc, _, err = call(runner.directory_cli, "vat")
+        self.assertEqual(rc, 1)
+        self.assertIn("'vat'", err)
+        self.assertIn("The list has 2", err)
+        self.assertIn("no words", err)
+        self.assertNotIn(directory.INCOMPLETE, err)
+
+    def test_words_with_nobody_there_do_not_offer_a_list(self):         # control
+        self._scan([])
+        with as_person():
+            _, _, err = call(runner.directory_cli, "vat")
+        self.assertIn("no session matches 'vat'", err)
+        self.assertNotIn("The list has", err)
 
 
 class TestTheCommandsFollowTheRules(CommandCase):
@@ -1189,6 +1294,81 @@ class TestDoctorReadsTheSkills(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         os.makedirs(os.path.join(root, "skills", "purpose", "SKILL.md"))
         self.assertEqual(runner.skill_states(root)["purpose"], "other")
+
+    # as `ps eww` shows it for a list that the hotkey opened: no ~/.local/bin, no brew
+    HOTKEY_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+    def _root(self):
+        root = tempfile.mkdtemp(prefix="ccwho-skills-test-")
+        self.addCleanup(shutil.rmtree, root, True)
+        return root
+
+    def _link(self, folder="bin"):
+        """`ccwho` in a folder, as an install makes it. The folder, for a PATH."""
+        where = os.path.join(self._root(), folder)
+        os.makedirs(where)
+        os.symlink(os.path.realpath(runner.__file__), os.path.join(where, "ccwho"))
+        return where
+
+    def _write(self, root, ccwho, also=""):
+        for name in runner.setup.SKILL_NAMES:
+            path = runner.skill_path(root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(runner.setup.skill_text(name, ccwho) + also)
+
+    def _states(self, root, path):
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            return set(runner.skill_states(root).values())
+
+    def test_a_skill_written_through_the_link_is_current_with_no_link_on_the_path(self):
+        root, where = self._root(), self._link()
+        with mock.patch.dict(os.environ, {"PATH": where}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.ccwho_bin(), os.path.join(where, "ccwho"))
+            runner.skills_setup([root], yes=True)
+        with mock.patch.dict(os.environ, {"PATH": self.HOTKEY_PATH}):
+            self.assertEqual(runner.ccwho_bin(), os.path.realpath(runner.__file__))
+            states = runner.skill_states(root)
+        self.assertEqual(set(states.values()), {"current"})
+        checks = runner.setup.skill_checks([{"root": root, "states": states}])
+        self.assertEqual(runner.setup.doctor_banner(checks), "")
+
+    def test_a_skill_written_with_the_file_is_current_with_the_link_on_the_path(self):
+        root = self._root()
+        self._write(root, os.path.realpath(runner.__file__))
+        self.assertEqual(self._states(root, self._link()), {"current"})
+
+    def test_a_folder_with_a_space_or_the_word_directory_is_read_whole(self):
+        for folder in ("my apps", "my directory"):
+            with self.subTest(folder=folder):
+                root, where = self._root(), self._link(folder)
+                self._write(root, os.path.join(where, "ccwho"))
+                self.assertEqual(self._states(root, self.HOTKEY_PATH), {"current"})
+
+    def test_a_skill_that_names_a_ccwho_that_has_moved_is_old_under_each_path(self):   # control
+        root = self._root()
+        self._write(root, "/gone/ccwho")
+        for path in (self._link(), self.HOTKEY_PATH):
+            with self.subTest(path=path):
+                self.assertEqual(self._states(root, path), {"old"})
+
+    def test_a_skill_of_this_ccwho_with_other_words_is_old_under_each_path(self):      # control
+        root, where = self._root(), self._link()
+        self._write(root, os.path.join(where, "ccwho"), also="more words\n")
+        for path in (where, self.HOTKEY_PATH):
+            with self.subTest(path=path):
+                self.assertEqual(self._states(root, path), {"old"})
+
+    def test_a_command_line_that_was_edited_does_not_stop_the_check(self):
+        for line in ("allowed-tools: Bash('/x directory*)", "allowed-tools: Bash(/x\0y directory*)",
+                     "allowed-tools: Bash(   directory*)"):
+            with self.subTest(line=line):
+                root = self._root()
+                path = runner.skill_path(root, "directory")
+                os.makedirs(os.path.dirname(path))
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(f"{line}\n{runner.setup.SKILL_MARK}\n")
+                self.assertIn(runner.skill_states(root)["directory"], ("old", "other"))
 
 
 if __name__ == "__main__":

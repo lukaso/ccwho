@@ -292,7 +292,8 @@ A session with no name of yours has a now line only, and its title shows until i
 writes one. `/purpose` there answers "Name it first".
 
 The purpose line also shows in the brief of a running role: `ccwho show`, and the
-list's detail pane, where a click copies it.
+list's detail pane, where a click copies it. `ccwho show coo` goes straight to the
+running session with that exact name. Any other word is a search.
 
 `ccwho setup` offers two skills, `directory` and `purpose`, for each config dir where
 you run claude. It shows them and asks. A no is not remembered, and `ccwho doctor` does not call it
@@ -315,7 +316,7 @@ What it costs:
 What it does not do:
 
 - `not running` shows only when both sources of sessions were read whole. If not, the row
-  says `unknown (session list incomplete)`. ccwho starts nothing. `ccwho open <name>` does not
+  says `unknown (session list incomplete)`, and the top of the list says that it is incomplete. ccwho starts nothing. `ccwho open <name>` does not
   find an ended session by its name ([#51](https://github.com/lukaso/ccwho/issues/51)).
 - A session whose account is at its limit may not answer, and nothing says so yet
   ([#52](https://github.com/lukaso/ccwho/issues/52)).

@@ -281,7 +281,8 @@ To ask one, use SendMessage with its name.
 ```
 
 To make a role: type `/name coo` in that session, and then `/purpose suppliers, staff,
-costs`. After `/name`, the session's next reply suggests a purpose line.
+costs`. After `/name`, the session's next reply suggests a purpose line. `/purpose` with
+no text prints the line, and suggests one if there is none.
 
 | Line | Who writes it | Kept by | When it goes |
 |---|---|---|---|

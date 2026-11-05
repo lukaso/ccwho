@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 
+import ccwho_directory as directory
 import ccwho_setup as setup
 import testkit
 
@@ -425,6 +426,41 @@ class TestTheDirectorySkills(unittest.TestCase):
         description = self._frontmatter("purpose")["description"]
         for word in ("/name", "/rename", "suggest", "/purpose", "once"):
             self.assertIn(word, description)
+
+    def _no_text_rule(self):
+        return next(line for line in setup.skill_text("purpose", "/x/ccwho").splitlines()
+                    if line.startswith("- With no text"))
+
+    def _asks_for(self, text):
+        got = re.search(r"at most (\d+) characters", text)
+        self.assertIsNotNone(got, text)
+        return int(got.group(1))
+
+    def test_a_suggestion_leaves_room_below_the_cut(self):
+        # measured 2026-11-05, opus, invented roles. Real sessions: 5 of 6 suggested lines
+        # over the limit, and 4 of 5 roles lost the end of their first line. Probe: with no
+        # number 16 of 20 lines were over. Asked for 120: 3 of 16 over, up to 126. Asked for
+        # 100: 0 of 24 over, up to 117. A model does not count, so it needs this margin.
+        for where, text in (("after a name", self._frontmatter("purpose")["description"]),
+                            ("with no text", self._no_text_rule())):
+            with self.subTest(where=where):
+                self.assertLessEqual(self._asks_for(text), directory.MAX_TEXT - 20)
+
+    def test_no_text_from_the_person_brings_a_suggestion_to_copy(self):
+        # the owner's way in: /purpose with no text, and then /purpose with the line
+        rule = self._no_text_rule()
+        for words in ("/x/ccwho purpose` to print the line", "`no purpose yet`", "suggest",
+                      "`/purpose <line>`"):
+            with self.subTest(words=words):
+                self.assertIn(words, rule)
+
+    def test_a_suggestion_says_what_the_session_owns(self):
+        self.assertIn("owns", self._no_text_rule())
+
+    def test_a_suggestion_is_not_saved(self):                           # control
+        text = setup.skill_text("purpose", "/x/ccwho")
+        self.assertIn("Set a purpose only when the person asks for it.", text)
+        self.assertNotIn("purpose \"<line>\"", self._no_text_rule())
 
     def test_a_fact_another_role_owns_brings_the_lookup(self):
         description = self._frontmatter("directory")["description"]

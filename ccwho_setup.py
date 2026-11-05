@@ -296,7 +296,7 @@ In the main conversation, not in a subagent, and only with a person present: whe
 """,
     "purpose": """---
 name: purpose
-description: Say what this named session is for in the ccwho directory, so other sessions can find it and ask it. When this session has just been given a name (the person typed /name or /rename), suggest one purpose line once, and tell the person to run /purpose with it.
+description: Say what this named session is for in the ccwho directory, so other sessions can find it and ask it. When this session has just been given a name (the person typed /name or /rename), suggest one purpose line of at most 100 characters (about 15 words) once, and tell the person to run /purpose with it.
 allowed-tools: Bash(@CCWHO@ purpose *)
 ---
 @MARK@
@@ -305,7 +305,7 @@ Run `@CCWHO@ purpose "<the person's text>"`, as one quoted argument on one line.
 
 - If it says "Name it first", tell the person to type `/name <role>`, and then to run /purpose again.
 - Set a purpose only when the person asks for it. Only /purpose changes it.
-- With no text from the person, run `@CCWHO@ purpose` to print the line.
+- With no text from the person, run `@CCWHO@ purpose` to print the line. If it says `no purpose yet`, suggest one of at most 100 characters (about 15 words), as a `/purpose <line>` command to copy. Say what this session owns, so that another session knows when to ask it.
 """,
 }
 SKILL_NAMES = tuple(_SKILLS)

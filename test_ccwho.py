@@ -76,16 +76,20 @@ def install_guards():
 
 _UNPIN = []
 REAL_VERDICTS_PATH = ccwho.verdicts_path
+REAL_ASKS_PATH = ccwho.asks_path
 
 
 def pin_verdicts():
-    """The stuck-reader verdicts file, in a temp dir for the module: collect()
-    writes it, and a test must never write the user's own (~/.cache/ccwho)."""
+    """The stuck-reader verdicts file and the asks that stand, in a temp dir for the
+    module: collect() writes them, and a test must never write the user's own
+    (~/.cache/ccwho)."""
     tmp = tempfile.mkdtemp(prefix="ccwho-test-verdicts-")
     ccwho.verdicts_path = lambda: os.path.join(tmp, "readers.json")
+    ccwho.asks_path = lambda: os.path.join(tmp, "asks.json")
 
     def undo():
         ccwho.verdicts_path = REAL_VERDICTS_PATH
+        ccwho.asks_path = REAL_ASKS_PATH
         shutil.rmtree(tmp, True)
     return undo
 
@@ -133,6 +137,7 @@ class MachinelessCollect(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="ccwho-test-verdicts-")
         self.addCleanup(shutil.rmtree, tmp, True)
         testkit.patch(self, ccwho, "verdicts_path", lambda: os.path.join(tmp, "readers.json"))
+        testkit.patch(self, ccwho, "asks_path", lambda: os.path.join(tmp, "asks.json"))
         # and the directory's lines are the person's own
         testkit.patch(self, ccwho, "directory_dir", lambda: os.path.join(tmp, "directory"))
 
@@ -142,6 +147,62 @@ class MachinelessCollect(unittest.TestCase):
          ccwho.stdin_sockets, ccwho.read_codex_threads) = self._saved
         for app in self._apps:
             app.__dict__.pop("titles", None)
+
+
+class TestAScanKeepsAnAskTheTailCannotSee(MachinelessCollect):
+    """collect() gives each row the ask that stands, and keeps it on disk."""
+
+    SID = "aaaaaaaa-0000-0000-0000-000000000000"
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp(prefix="ccwho-test-asks-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "t.jsonl")
+        with open(self.path, "w") as fh:
+            for record in ({"type": "permission-mode"},
+                           {"type": "assistant", "message": {"content": [
+                               {"type": "text", "text": "A or B?"}]}},
+                           {"type": "system", "subtype": "turn_duration"}):
+                fh.write(json.dumps(record) + "\n")
+            for _ in range(ccwho.TAIL_BYTES // 65536 + 2):
+                fh.write(json.dumps({"type": "api-request-blob", "blob": "x" * 65536}) + "\n")
+            for record in ({"type": "assistant", "message": {"content": [
+                               {"type": "text", "text": "A status line."}]}},
+                           {"type": "system", "subtype": "turn_duration"}):
+                fh.write(json.dumps(record) + "\n")
+        testkit.patch(self, ccwho, "transcript_path", lambda sid, roots=None: self.path)
+        testkit.patch(self, ccwho, "agents_json", lambda: json.dumps(
+            [{"sessionId": self.SID, "pid": 1, "cwd": "/x", "status": "idle"}]))
+
+    def test_the_row_says_the_ask(self):
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual((rows[0]["attention"], rows[0]["ask"]), ("asks", "A or B?"))
+
+    def test_what_it_found_is_on_disk(self):
+        ccwho.collect(cache={})
+        self.assertEqual(ccwho.load_asks(), {self.SID: {
+            "ask": "A or B?", "size": os.path.getsize(self.path)}})
+
+    def test_the_next_scan_does_not_read_back(self):
+        ccwho.collect(cache={})
+        reads = []
+        testkit.patch(self, ccwho, "_records_further_back", lambda *a: reads.append(a) or [])
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["ask"], "A or B?")
+        self.assertEqual(reads, [])
+
+    def test_a_scan_that_learned_nothing_writes_nothing(self):
+        ccwho.collect(cache={})
+        writes = []
+        testkit.patch(self, ccwho, "save_asks", lambda *a, **k: writes.append(a))
+        ccwho.collect(cache={})
+        self.assertEqual(writes, [])
+
+    def test_a_session_that_is_gone_leaves_the_file(self):
+        ccwho.save_asks({"gone": {"ask": "A?", "size": 1}})
+        ccwho.collect(cache={})
+        self.assertEqual(list(ccwho.load_asks()), [self.SID])
 
 
 class TestParseSessions(unittest.TestCase):
@@ -533,8 +594,9 @@ class TestAsksUser(unittest.TestCase):
     def test_the_word_question_alone_is_not_an_ask(self):
         self.assertFalse(ccwho.asks_user("Still open, not blocking: the spend labelling question."))
 
-    def test_only_the_closing_line_counts(self):
-        self.assertFalse(ccwho.asks_user("Should I do X?\n\nDone, all landed."))
+    def test_a_question_above_the_last_line_counts(self):
+        # measured: about 4 of 5 of these are real, and a false one costs a glance
+        self.assertTrue(ccwho.asks_user("Should I do X?\n\nDone, all landed."))
 
     def test_a_quoted_question_is_not_an_ask(self):
         # real closing lines: the question is one put to a reviewer, not to you
@@ -675,26 +737,6 @@ class TestAnAskPhraseAsksYou(unittest.TestCase):
     def test_any_phrase_that_asks_you_is_enough(self):           # control
         self.assertTrue(ccwho.asks_user("The logs tell me nothing, so tell me what you saw."))
         self.assertTrue(ccwho.asks_user("Tell me which; the logs tell me nothing."))
-
-
-class TestExtractAsk(unittest.TestCase):
-    def _msg(self, text):
-        return json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": text}]}})
-
-    def test_returns_the_closing_line(self):
-        got = ccwho.extract_ask([self._msg("Did work.\n\nWant me to build S2a?")])
-        self.assertEqual(got, "Want me to build S2a?")
-
-    def test_empty_when_not_asking(self):
-        self.assertEqual(ccwho.extract_ask([self._msg("All done.")]), "")
-
-    def test_uses_the_last_assistant_message(self):
-        lines = [self._msg("Want me to do X?"), self._msg("Never mind, finished.")]
-        self.assertEqual(ccwho.extract_ask(lines), "")
-
-    def test_no_messages(self):
-        self.assertEqual(ccwho.extract_ask([]), "")
 
 
 class TestAsksRanking(unittest.TestCase):
@@ -6716,7 +6758,8 @@ class TestAParkedRow(unittest.TestCase):
                            ("stdin_sockets", lambda pids: {}),
                            ("read_codex_threads",
                             lambda env=None, cache=None: [dict(t) for t in threads]),
-                           ("verdicts_path", lambda: os.path.join(tmp, "readers.json"))):
+                           ("verdicts_path", lambda: os.path.join(tmp, "readers.json")),
+                           ("asks_path", lambda: os.path.join(tmp, "asks.json"))):
             testkit.patch(self, ccwho, name, fake)
         for app in ccwho.terms.APPS:
             testkit.patch(self, app, "titles", lambda timeout=5.0, **k: {})

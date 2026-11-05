@@ -803,6 +803,12 @@ class TestTheEndOfATranscriptSaysTheState(unittest.TestCase):
         t = engine.codex_turn(self.path, cache={})
         self.assertEqual((t["turn"], t["ask"], t["ts"]), ("done", "Shall I land it?", 1790000000))
 
+    def test_a_question_above_the_last_line_asks(self):
+        transcript(self.path, ("task_started", {}),
+                   ("task_complete", {"completed_at": 5, "last_agent_message":
+                                      "Which one do you want?\n\nPlan: /x/p.md"}))
+        self.assertEqual(engine.codex_turn(self.path, cache={})["ask"], "Which one do you want?")
+
     def test_a_done_turn_that_does_not_ask(self):
         transcript(self.path, ("task_started", {}),
                    ("task_complete", {"completed_at": 5, "last_agent_message": "Done: all green."}))

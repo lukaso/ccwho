@@ -966,7 +966,7 @@ So `ccwho` derives the state instead:
 | state | how it is decided | label |
 |---|---|---|
 | blocked | an unanswered `tool_use` in the transcript | NEEDS YOU |
-| asks | the closing line of an **ended** turn is a question or a request - even while the harness says busy. Text in quotation marks does not count: a question put to someone else is not one put to you | ASKED YOU |
+| asks | an **ended** turn asked you, and you have not spoken since - even while the harness says busy. See [an ask stands until you speak](#an-ask-stands-until-you-speak) | ASKED YOU |
 | stuck | not asking you, not mid-turn, and a wait loop or stdin reader under it can never end | STUCK |
 | review | stopped, its turn ended, and you have not gone to it from the list since | FINISHED |
 | stopped | not busy, and **nothing running under it** | STOPPED |
@@ -978,6 +978,34 @@ So `ccwho` derives the state instead:
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.
 
+### An ask stands until you speak
+
+**A message asks you** when its last line is a question or a request, or says it
+waits for you ("still waiting for your choice", "until you answer", "your question
+is still open"), or when a line above it holds a question. A session often ends on a
+pointer, so the question is above it: `Plan: <path>`, `Commit: 58bf966`. Not counted:
+text in quotation marks, a blockquote, a table, code, and a "no" or an "if" before a
+wait ("Nothing needs your input yet"). Only a turn's last message counts: a question
+inside a turn is one the session goes on to answer.
+
+**The ask stays open until you type in the session**, also while a turn runs, or
+answer its question box. A turn that a peer, a finished task or a subagent started
+does not answer it, and neither do `/compact`, an interrupt or a `!` command at the
+empty prompt (one typed while a turn runs is saved as your message). Measured over 21 days, these machines start 78% of ended
+turns, and 179 asks were replaced by one. You then replied after 353 minutes (median),
+against 103 when the ask stayed on the last machine turn. So the row stays ASKED YOU
+and shows the newest ask, also while background work runs. A usage-limit line is an
+exception: it does not stay open after a later turn, as the session recovers by itself.
+
+So a false ask can stay: a session asks, then writes that nothing is needed after all.
+Type in the session, or `z` parks it. A park still ends on the session's next turn.
+
+A busy session's last 1 MiB holds about 7 ended turns. So what each scan finds is kept
+in `~/.cache/ccwho/asks.json`, with the size of the transcript at that look. The file
+is a cache: at a first look, or after a gap longer than the last 1 MiB can show, one
+read of the last 16 MiB gets the answer again. An ask older than that is not found.
+The file keeps only the ask of an ended turn: not a line of a turn that still runs.
+
 ### Busy, but the turn is over
 
 The harness says `busy` while any background task runs - even after the turn has
@@ -988,7 +1016,7 @@ over when `turn_duration` or `stop_hook_summary` follows the last message
 (measured over 300 transcripts: 2235 of 2251 ended turns carry one, and 0 of 44860
 steps inside a turn do). Then a question is ASKED YOU, whatever is running; a
 finished turn without one stays in BUSY as running - the task will wake it, so it
-is not news. The summary a compaction writes is no message of a turn: an idle
+is not news. An earlier ask you have not answered counts as that question. The summary a compaction writes is no message of a turn: an idle
 compaction writes one about 55 minutes after the turn ended, and a row sat in BUSY
 behind it over a stuck reader. Nor is a local command you run at the prompt
 (`/compact`, `/model`, `/cost`, `/clear`): Claude Code writes its caveat, its name and

@@ -84,6 +84,17 @@ _ASK_FILLER = {"please", "just", "also", "then", "now", "do", "feel", "free", "t
 # words that join it to a clause before it, whose subject it shares: "press ⌥/
 # and tell me"
 _ASK_LEAD = {"and", "or", "but", "so"}
+# A last line that says it waits for you, with no question mark. Bare "your go" is
+# not one: most of them are about later ("then I ask for your go"). A "no" or an
+# "if" in the clause before takes it back ("Nothing needs your input yet"), but not
+# before "until you": "Nothing is built until you answer" waits for you.
+# Measured 2026-11-05 over 21 days: 340 closings, and about 27 of 30 read were real.
+_ASK_WAITS = re.compile(r"(?<!\w)(?:waiting (?:for|on)|waits? (?:for|on)|needs?) your?(?!\w)")
+_ASK_DENIED = re.compile(r"\b(?:not|no|nothing|never|without|unless|if|may|might)\b|n't\b")
+_ASK_UNTIL = re.compile(r"(?<!\w)(?:(?:until|when) you (?:answer|reply|decide|approve|say|choose"
+                        r"|pick|confirm)"
+                        r"|(?:question|answer|choice|decision)s?\b[^.!?]*\b(?:is|are) still open)"
+                        r"(?!\w)")
 _UNKNOWN_RANK = 4
 
 
@@ -605,11 +616,15 @@ def live_ids(rows):
     return {sid for r in rows or [] for sid in answers_for(r) if sid}
 
 
+def _plain(line):
+    return re.sub(r"[*_`#>]", "", line).strip()
+
+
 def _closing_line(text):
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not lines:
         return ""
-    return re.sub(r"[*_`#>]", "", lines[-1]).strip()
+    return _plain(lines[-1])
 
 
 # A question in quotation marks is one the session reports - put to a reviewer,
@@ -620,19 +635,56 @@ def _closing_line(text):
 _QUOTED = re.compile(r'(?<!\d)"[^"]*"|“[^”]*”')
 
 
-def asks_user(text):
-    """Does this message hand the decision back to the human?
+_FENCED = re.compile(r"```.*?```", re.S)
+_INLINE_CODE = re.compile(r"`[^`]*`")
+# A sentence that ends in "?": never the "?" of a URL or of code like x ? y : z
+_A_QUESTION = re.compile(r"[^\s?]\?(?=[\s)\]]|\Z)")
 
-    The harness reports `idle` for a session that ended its turn with a question,
-    so status alone loses them. Only the closing line is considered: a question
-    earlier in a long report is usually one the message goes on to answer.
+
+def _question_above(text):
+    """The last line of the message that holds a question, or "". A draft in a
+    blockquote, a table, code and a quotation put questions to someone else.
+
+    A real question often sits above a pointer: "Plan: <path>", "Commit: 58bf966".
+    Measured 2026-11-05 over 21 days: 398 turns ended so, and about 16 of 20 read
+    were real questions to the person - one waited six hours behind a file path.
     """
-    closing = _QUOTED.sub(_quoted_word, _closing_line(text)).lower()
+    lines = [ln.strip() for ln in _FENCED.sub("", text or "").splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if line.startswith((">", "|")):
+            continue
+        spoken = _QUOTED.sub(_quoted_word, _plain(_INLINE_CODE.sub(" code ", line)))
+        if _A_QUESTION.search(spoken):
+            return _plain(line)
+    return ""
+
+
+def _closing_asks(closing):
+    """Does this last line hand the decision back to the person?"""
+    closing = _QUOTED.sub(_quoted_word, closing).lower()
     if not closing.strip():
         return False
-    return "?" in closing or any(
+    return ("?" in closing or bool(_ASK_UNTIL.search(closing)) or any(
         m.group() not in _ASK_ME or _you_are_asked(closing[:m.start()])
-        for m in _ASK_RE.finditer(closing))
+        for m in _ASK_RE.finditer(closing)) or any(
+        not _ASK_DENIED.search(_CLAUSE_END.split(closing[:m.start()])[-1])
+        for m in _ASK_WAITS.finditer(closing)))
+
+
+def ask_line(text):
+    """The line of this message that asks you: its last line when that asks,
+    else the last question above it. "" when it asks nothing.
+
+    The harness reports `idle` for a session that ended its turn with a question,
+    so status alone loses them.
+    """
+    closing = _closing_line(text)
+    return closing if _closing_asks(closing) else _question_above(text)
+
+
+def asks_user(text):
+    """Does this message hand the decision back to the human?"""
+    return bool(ask_line(text))
 
 
 def _quoted_word(m):
@@ -658,23 +710,92 @@ def _you_are_asked(before):
     return True                         # its clause starts with it
 
 
-def last_assistant_text(lines):
-    text = ""
-    for d in as_records(lines):
-        if d.get("type") != "assistant":
-            continue
-        content = d.get("message", {}).get("content")
-        if isinstance(content, list):
-            for b in content:
-                if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
-                    text = b["text"]
-    return text
+def _said_in(record):
+    """The last text of one assistant message, or ""."""
+    content = record.get("message", {}).get("content")
+    said = ""
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                said = b["text"]
+    return said
 
 
-def extract_ask(lines):
-    """The closing line, when it is a request. Empty when the session is not asking."""
-    text = last_assistant_text(lines)
-    return _closing_line(text) if asks_user(text) else ""
+def _a_person_said(record):
+    """Is this "user" record a person's words? Measured 2026-11-05 over 21 days:
+    each one has origin.kind "human". A peer, a finished task and the limit's
+    reset have another kind; a scheduled prompt, an idle notice and a skill's text
+    are isMeta. `/compact`, `!` and an interrupt have no origin: none answers you.
+    A transcript from before Claude Code wrote an origin has plain text only."""
+    origin = record.get("origin")
+    if isinstance(origin, dict):
+        return origin.get("kind") == "human"
+    if record.get("isMeta") or record.get("promptSource"):
+        return False
+    text = _text_of(record.get("message", {}).get("content")).lstrip()
+    return bool(text) and text[0] not in "/[" and brief.is_human_prompt(text)
+
+
+def _queued_by_a_person(record):
+    """Your message, typed while a turn ran: Claude Code writes it as an attachment
+    (2026-11-05: 350 in 60 transcripts, against 6 "queued" prompts). A peer's and a
+    finished task's have their own origin, or none."""
+    queued = record.get("attachment") if record.get("type") == "attachment" else None
+    return (isinstance(queued, dict) and queued.get("type") == "queued_command"
+            and (queued.get("origin") or {}).get("kind") == "human")
+
+
+def _box_ids(record):
+    """The ids of the question boxes (HUMAN_TOOLS) this assistant message opens."""
+    content = record.get("message", {}).get("content")
+    return {b.get("id") for b in (content if isinstance(content, list) else ())
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in HUMAN_TOOLS}
+
+
+def _answers_a_box(record, boxes):
+    """Your answer to a question box: its result, not an error (one you turned down)."""
+    content = record.get("message", {}).get("content")
+    return record.get("type") == "user" and any(
+        isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in boxes
+        and not b.get("is_error") for b in (content if isinstance(content, list) else ()))
+
+
+def _asks_of(lines):
+    """(did you speak, the ask of the newest ended turn since then, the newest
+    message, is that message an error)."""
+    records = as_records(lines)
+    turns = _turn_ids(records)
+    spoke, kept, text, error, boxes = False, "", "", False, set()
+    for d in records:
+        kind = d.get("type")
+        if kind == "assistant":
+            said = _said_in(d)
+            if said:
+                text, error = said, bool(d.get("isApiErrorMessage"))
+            boxes |= _box_ids(d)
+        elif kind == "system" and d.get("subtype") in _TURN_END:
+            if text and not error:
+                kept = ask_line(text) or kept
+        elif ((kind == "user" and id(d) in turns and _a_person_said(d))
+              or _queued_by_a_person(d) or _answers_a_box(d, boxes)):
+            spoke, kept, text, error = True, "", "", False
+    return spoke, kept, text, error
+
+
+def open_ask(lines):
+    """(did you speak here, the ask that stands, or "").
+
+    An ask stands until you speak: a turn that a peer, a task or a subagent started
+    does not answer it. Measured 2026-11-05 over 21 days: those start 78% of ended
+    turns, and 179 asks were replaced by one. You then replied after 353 minutes
+    (median), against 103 when the ask stayed on the last machine turn. Only a
+    turn's last message counts, as a question inside a turn is one it goes on to
+    answer. A usage-limit line reads as an ask for the "?" of its URL, and does not
+    stand after a later turn: the session recovers by itself.
+    """
+    spoke, kept, text, error = _asks_of(lines)
+    newest = ask_line(text)
+    return spoke, (kept or newest) if error else (newest or kept)
 
 
 # The tools that hand the decision to a person. A pending tool call on its own
@@ -1476,7 +1597,10 @@ def transcript_path(session_id, roots=None):
     return None
 
 
-def read_windows(session_id, tail_bytes=1024 * 1024, head_lines=400, cache=None):
+TAIL_BYTES = 1024 * 1024
+
+
+def read_windows(session_id, tail_bytes=TAIL_BYTES, head_lines=400, cache=None):
     """Head and tail of a transcript as PARSED records, plus its mtime.
 
     `cache` is owned by the runner (it survives hot reload) and keyed on
@@ -2182,7 +2306,7 @@ def _codex_step(state, line):
         text = p.get("last_agent_message")
         text = text if isinstance(text, str) else ""
         state.update(turn="done", ts=p.get("completed_at"), pending_tool=False,
-                     ask=_closing_line(text) if asks_user(text) else "")
+                     ask=ask_line(text))
     elif kind == "turn_aborted":
         # no completion time, as a new turn has none: a cold read stops here
         state.update(turn="aborted", ask="", ts=None, pending_tool=False)
@@ -3576,8 +3700,9 @@ def no_window_note(row):
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
               tab_title="", reviewed=None, windowed=None, dead_loops=(), terminal="",
-              parks=None):
+              parks=None, carried=""):
     """One display row from one session's data. Pure: no disk, no subprocess.
+    `carried`: the ask that stands, when the tail is too short to show it.
 
     collect() used to inline this, which hid the wiring - notably which clock
     `since` reads from - behind functions that only run against a live machine.
@@ -3587,7 +3712,8 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
             or extract_topic(head, strict=True)["last"] or first
             or extract_topic(tail)["last"])
     status = session.get("status", "?")
-    ask = extract_ask(tail)
+    spoke, ask = open_ask(tail)
+    ask = ask or ("" if spoke else carried)
     # A question it asked you outranks whatever the feed says, in both
     # directions: the transcript gains the question the moment it is asked, and
     # gains your answer the moment you give it.
@@ -3779,9 +3905,91 @@ def transcript_path_cached(session_id, cache=None):
     if cache is None:
         return transcript_path(session_id)
     paths = cache.setdefault("_paths", {})
-    if session_id not in paths:
-        paths[session_id] = transcript_path(session_id, roots=all_roots(cache))
-    return paths[session_id]
+    path = paths.get(session_id)
+    if path is None:
+        # none yet is not kept: a new session's transcript comes 12 to 67 s after
+        # its session file (review, 2026-11-05)
+        path = transcript_path(session_id, roots=all_roots(cache))
+        if path:
+            paths[session_id] = path
+    return path
+
+
+# The ask that stands, for each session: a busy session's 1 MiB tail holds about 7
+# ended turns, and about half of the asks that stand lie further back (2026-11-05).
+# The file is a cache: without it, one read further back gets the same answer.
+ASKS_DEEP = 16 * 1024 * 1024            # how far back one read goes
+ASKS_REACH = TAIL_BYTES // 2            # the tail surely shows this much of the end
+ASKS_STEP = 256 * 1024                  # the file is written when a session grew this much
+
+
+def asks_path():
+    return os.path.expanduser("~/.cache/ccwho/asks.json")
+
+
+def load_asks(path=None):
+    """Session id -> {"ask", "size"}: the size of its transcript at the look that
+    found that ask. Never raises: what cannot be read is read again from the
+    transcript."""
+    try:
+        with open(path or asks_path()) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return {sid: e for sid, e in (data.items() if isinstance(data, dict) else ())
+            if isinstance(e, dict) and isinstance(e.get("ask"), str)
+            and type(e.get("size")) is int}
+
+
+def save_asks(book, path=None):
+    path = path or asks_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(book, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass                            # the next scan reads it from the transcript
+
+
+def _records_further_back(path, size):
+    """The records of the last ASKS_DEEP bytes of a transcript."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - ASKS_DEEP))
+            data = fh.read(ASKS_DEEP)
+    except OSError:
+        return []
+    return as_records(data.decode("utf-8", "ignore").splitlines()[1:])
+
+
+def carried_ask(session_id, tail, book, cache=None):
+    """The ask of an ended turn that stands for this session, from its tail and
+    what `book` knows: never a line of a turn still running, nor a limit line - a
+    scan sees those, and the book would carry them on (review, 2026-11-05). The
+    tail answers when you spoke in it, when it holds the whole transcript, or when
+    it reaches back to the last look. Else, one read further back answers, and
+    `book` then saves the next look that read. `book` changes only when the ask
+    does, or when the session grew by ASKS_STEP."""
+    spoke, ask = _asks_of(tail)[:2]
+    path = transcript_path_cached(session_id, cache)
+    try:
+        size = os.path.getsize(path) if path else None
+    except OSError:
+        size = None
+    if size is None:
+        return ask
+    entry = book.get(session_id)
+    grew = size - entry["size"] if entry else None
+    if not spoke and size > TAIL_BYTES:
+        if grew is None or not 0 <= grew <= ASKS_REACH:
+            ask = _asks_of(_records_further_back(path, size))[1]
+        elif not ask:
+            ask = entry["ask"]
+    if grew is None or entry["ask"] != ask or not 0 <= grew < ASKS_STEP:
+        book[session_id] = {"ask": ask, "size": size}
+    return ask
 
 
 # What you have already looked at, and up to when. Keyed by session, valued by
@@ -3986,6 +4194,8 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
                           sessions_known=sessions_ok, own=os.getpid(), named=named)
     reviewed = load_reviewed()
     parks = load_parks()
+    asks_known = load_asks()
+    asks = dict(asks_known)
     rows = []
     parents, commands = parent_map(ps_out), command_map(ps_out)
     # the spare and the parked terminal still count above - as live claude
@@ -4015,6 +4225,7 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
                               reviewed=reviewed, parks=parks,
+                              carried=carried_ask(sid, tail, asks, cache=cache),
                               windowed=windowed(tty, shown, blind=blind),
                               terminal=app_of_tty.get(terms.short_tty_full(tty), "") if tty else "",
                               dead_loops=dead))
@@ -4026,6 +4237,10 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
     rows.sort(key=sort_key)
     if cache.pop("_verdicts_new", False):
         save_verdicts(cache)
+    live = {s.get("sessionId") for s, _tty in listed}
+    asks = {sid: entry for sid, entry in asks.items() if sid in live}
+    if asks != asks_known:
+        save_asks(asks)
     if status is not None:
         # The same value the cheap check computes, so finishing a scan never
         # leaves the check thinking the world moved. Taken BEFORE the Codex

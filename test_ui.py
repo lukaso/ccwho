@@ -11609,6 +11609,86 @@ class TestAParkEnds(ParkTest):
             self.assertEqual(self.unparks, [ASKING["sessionId"]])
             self.assertEqual(self.state(app), ["asks"], "a question you have not answered")
 
+    async def test_going_to_it_while_it_is_busy_ends_its_park(self):
+        # a park on a question holds over a peer's turn (#54): while that turn
+        # runs the row is busy, and going to it still ends the park (review)
+        sid = ASKING["sessionId"]
+        real = ui.engine.load_parks
+        ui.engine.load_parks = lambda path=None: {sid: {"ts": 1.0, "note": "later"}}
+        self.addCleanup(setattr, ui.engine, "load_parks", real)
+        app = self.app(collector=self.fleet(dict(ASKING, attention="busy", ask="")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [sid])
+
+    def disk_park(self, parks):
+        real = ui.engine.load_parks
+        ui.engine.load_parks = lambda path=None: parks
+        self.addCleanup(setattr, ui.engine, "load_parks", real)
+
+    async def go_while_a_scan_moves_it(self, start, moved):
+        """Enter on `start`; while its window opens, a scan shows it as `moved`."""
+        adapter = GatedAdapter()
+        c = self.fleet(start)
+        app = self.app(adapter=adapter, collector=c)
+        async with app.run_test(size=(120, 30)) as pilot:
+            try:
+                await pilot.pause()
+                await self.select(app, pilot)
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                c.fleet_value = ui.Fleet([dict(moved), dict(BUSY)], True, "12:00:05")
+                app.collect()
+                await pilot.pause(0.1)
+            finally:
+                adapter.gate.set()
+            await pilot.pause(0.1)
+            await pilot.pause()
+
+    async def test_a_turn_that_starts_while_its_window_opens_still_ends_the_park(self):
+        # review 2, 2026-11-09: the newer turn made the go return before the unpark
+        sid = ASKING["sessionId"]
+        self.disk_park({sid: {"ts": TS, "note": "later"}})
+        await self.go_while_a_scan_moves_it(parked(), dict(ASKING, attention="busy", ask="", ts=LATER))
+        self.assertEqual(self.unparks, [sid])
+
+    async def test_a_busy_row_that_moves_while_its_window_opens_still_ends_the_park(self):
+        sid = ASKING["sessionId"]
+        self.disk_park({sid: {"ts": 1.0, "note": "later"}})
+        busy = dict(ASKING, attention="busy", ask="")
+        await self.go_while_a_scan_moves_it(busy, dict(busy, ts=LATER))
+        self.assertEqual(self.unparks, [sid])
+
+    async def test_a_newer_turn_is_still_not_marked_seen(self):
+        sid = ASKING["sessionId"]
+        self.disk_park({sid: {"ts": TS, "note": "later"}})
+        await self.go_while_a_scan_moves_it(parked(was="review"),
+                                            dict(ASKING, attention="review", ask="", ts=LATER))
+        self.assertEqual((self.unparks, self.marks), ([sid], []))
+
+    async def test_a_moved_row_with_no_park_writes_nothing(self):        # control
+        self.disk_park({})
+        busy = dict(ASKING, attention="busy", ask="")
+        await self.go_while_a_scan_moves_it(busy, dict(busy, ts=LATER))
+        self.assertEqual(self.unparks, [])
+
+    async def test_going_to_a_busy_row_with_no_park_writes_nothing(self):   # control
+        real = ui.engine.load_parks
+        ui.engine.load_parks = lambda path=None: {}
+        self.addCleanup(setattr, ui.engine, "load_parks", real)
+        app = self.app(collector=self.fleet(dict(ASKING, attention="busy", ask="")))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await self.select(app, pilot)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(self.unparks, [])
+
     async def test_going_to_a_parked_finished_turn_leaves_it_stopped(self):
         # as if it was never parked: going to a finished turn is looking at it
         app = self.app(collector=self.fleet(parked(was="review")))

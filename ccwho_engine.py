@@ -290,22 +290,25 @@ def _turn_ids(records):
     return out
 
 
+def _epoch_of(record):
+    """Epoch seconds of a record's `timestamp` field, or None."""
+    raw = record.get("timestamp")
+    if not raw:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def last_turn_ts(lines):
     """Epoch seconds of the last real turn, from its `timestamp` field."""
     latest = None
     records = as_records(lines)
     turns = _turn_ids(records)
     for d in records:
-        if id(d) not in turns:
-            continue
-        raw = d.get("timestamp")
-        if not raw:
-            continue
-        try:
-            latest = datetime.datetime.fromisoformat(
-                str(raw).replace("Z", "+00:00")).timestamp()
-        except (ValueError, TypeError):
-            continue
+        if id(d) in turns and (ts := _epoch_of(d)) is not None:
+            latest = ts
     return latest
 
 
@@ -659,16 +662,22 @@ def _question_above(text):
     return ""
 
 
+def _waits_on_you(text):
+    """Does this lower-case text say it waits for you: "1195 still waits for
+    your choice", "until you answer", "the choice is still open"?"""
+    return bool(_ASK_UNTIL.search(text)) or any(
+        not _ASK_DENIED.search(_CLAUSE_END.split(text[:m.start()])[-1])
+        for m in _ASK_WAITS.finditer(text))
+
+
 def _closing_asks(closing):
     """Does this last line hand the decision back to the person?"""
     closing = _QUOTED.sub(_quoted_word, closing).lower()
     if not closing.strip():
         return False
-    return ("?" in closing or bool(_ASK_UNTIL.search(closing)) or any(
+    return ("?" in closing or _waits_on_you(closing) or any(
         m.group() not in _ASK_ME or _you_are_asked(closing[:m.start()])
-        for m in _ASK_RE.finditer(closing)) or any(
-        not _ASK_DENIED.search(_CLAUSE_END.split(closing[:m.start()])[-1])
-        for m in _ASK_WAITS.finditer(closing)))
+        for m in _ASK_RE.finditer(closing)))
 
 
 def ask_line(text):
@@ -679,7 +688,12 @@ def ask_line(text):
     so status alone loses them.
     """
     closing = _closing_line(text)
-    return closing if _closing_asks(closing) else _question_above(text)
+    if not _closing_asks(closing):
+        return _question_above(text)
+    # a question above a line that only reminds of an earlier one is the news:
+    # "New question for you: Is X SQE?" then "My earlier questions are still
+    # open." (review 5, 2026-11-09)
+    return (_question_above(text) or closing) if _reminds(closing) else closing
 
 
 def asks_user(text):
@@ -760,30 +774,92 @@ def _answers_a_box(record, boxes):
         and not b.get("is_error") for b in (content if isinstance(content, list) else ()))
 
 
+_SENTENCE_GAP = re.compile(r"(?<=[.!?:])\s+")
+# Shorter than this, what two asks share is a generic question ("Should I merge?",
+# "Tell me if you want it.") that a new ask can end with too. Measured 2026-11-09
+# over 21 days: 133 asks were said again in a new message; 2 shared less than
+# 25 characters, and one of them was a new offer.
+SAME_ASK_MIN = 25
+
+
+def _same_ask(old, new):
+    """Is `new` the ask `old` made again? Sessions say an open question again,
+    after news that changes each time: "<news>. The merge still waits for your
+    go." So: the two end in the same whole sentences, of SAME_ASK_MIN characters
+    or more, and those ask. "Is it A or B?" is not "A or B?" again, nor is
+    "Should I land B? I recommend yes." "Should I land A? I recommend yes." again."""
+    a, b = _SENTENCE_GAP.split(old), _SENTENCE_GAP.split(new)
+    n = 0
+    while n < min(len(a), len(b)) and a[-1 - n] == b[-1 - n]:
+        n += 1
+    shared = " ".join(a[-n:]) if n else ""
+    return len(shared) >= SAME_ASK_MIN and _closing_asks(shared)
+
+
+_STILL = re.compile(r"\bstill\b")
+_YOUR_CALL = re.compile(r"(?<!\w)your call(?!\w)")
+
+
+def _reminds(line):
+    """Does this ask line ask only by saying that an earlier ask still waits: "1195
+    still waits for your choice", "I am still waiting for your answer from my
+    last message", "the choice is still open"? No question mark, and "still" in
+    a sentence that waits for you or says "your call". So these are new: "That
+    leg waits for your eval run. Review round 6 is still running.", "Main is
+    still red; let me know if I should revert.", "Main is still red. Should I
+    revert?". Measured 2026-11-09 over 21 days (reviews 2 to 5): 204 lines had
+    "still" and no question mark; this keeps 189. About 10 of those came in a
+    message that also asked for something new: 3 as a question above the
+    line, which ask_line now takes, and some as a request made earlier in a
+    turn, which no rule here can see."""
+    spoken = _QUOTED.sub(_quoted_word, line)
+    return "?" not in spoken and any(
+        _STILL.search(s) and (_waits_on_you(s) or _YOUR_CALL.search(s))
+        for s in (part.lower() for part in _SENTENCE_GAP.split(spoken)))
+
+
+def _carry_on(old, old_ts, new, new_ts):
+    """The ask that stands once `new` (said at `new_ts`) follows `old` (open
+    since `old_ts`), as (words, time). A reminder keeps the ask it reminds of,
+    its words and its time; the same ask again keeps its time, in its newest
+    words; anything else is a new ask (issue #54)."""
+    if old and _reminds(new):
+        return old, old_ts
+    return new, old_ts if _same_ask(old, new) else new_ts
+
+
 def _asks_of(lines):
     """(did you speak, the ask of the newest ended turn since then, the newest
-    message, is that message an error)."""
+    message, is that message an error, when that ask was first made, when the
+    newest message was written). Times are epoch seconds, or None.
+
+    The same ask made again keeps the time it was first made: sessions say an
+    open question again ("1195 still waits for your choice"), and that is not a
+    new one (issue #54)."""
     records = as_records(lines)
     turns = _turn_ids(records)
     spoke, kept, text, error, boxes = False, "", "", False, set()
+    kept_ts = text_ts = None
     for d in records:
         kind = d.get("type")
         if kind == "assistant":
             said = _said_in(d)
             if said:
-                text, error = said, bool(d.get("isApiErrorMessage"))
+                text, error, text_ts = said, bool(d.get("isApiErrorMessage")), _epoch_of(d)
             boxes |= _box_ids(d)
         elif kind == "system" and d.get("subtype") in _TURN_END:
-            if text and not error:
-                kept = ask_line(text) or kept
+            asked = ask_line(text) if text and not error else ""
+            if asked:
+                kept, kept_ts = _carry_on(kept, kept_ts, asked, text_ts)
         elif ((kind == "user" and id(d) in turns and _a_person_said(d))
               or _queued_by_a_person(d) or _answers_a_box(d, boxes)):
-            spoke, kept, text, error = True, "", "", False
-    return spoke, kept, text, error
+            spoke, kept, text, error, kept_ts, text_ts = True, "", "", False, None, None
+    return spoke, kept, text, error, kept_ts, text_ts
 
 
-def open_ask(lines):
-    """(did you speak here, the ask that stands, or "").
+def standing_ask(lines):
+    """(did you speak here, the ask that stands or "", when it was first made,
+    is it the newest message's limit line).
 
     An ask stands until you speak: a turn that a peer, a task or a subagent started
     does not answer it. Measured 2026-11-05 over 21 days: those start 78% of ended
@@ -793,9 +869,16 @@ def open_ask(lines):
     answer. A usage-limit line reads as an ask for the "?" of its URL, and does not
     stand after a later turn: the session recovers by itself.
     """
-    spoke, kept, text, error = _asks_of(lines)
+    spoke, kept, text, error, kept_ts, text_ts = _asks_of(lines)
     newest = ask_line(text)
-    return spoke, (kept or newest) if error else (newest or kept)
+    if (error and kept) or not newest:
+        return spoke, kept, kept_ts, False
+    return (spoke, *_carry_on(kept, kept_ts, newest, text_ts), error)
+
+
+def open_ask(lines):
+    """(did you speak here, the ask that stands, or "")."""
+    return standing_ask(lines)[:2]
 
 
 # The tools that hand the decision to a person. A pending tool call on its own
@@ -3698,11 +3781,21 @@ def no_window_note(row):
     return f"{brief.short_id(sid)} has no window" + (f" - {terms.no_app(tty)}" if tty else "")
 
 
+def _park_holds(parked_at, ts):
+    """Is the row still where you parked it - its time not after the park's? A
+    new turn moves a row's time on. An ask's row is as old as the ask, so a park
+    holds until a new ask: also one the list made at the newest turn's time,
+    before rows took the ask's (issue #54)."""
+    return parked_at == ts or (type(parked_at) in (int, float)
+                               and type(ts) in (int, float) and parked_at >= ts)
+
+
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
               tab_title="", reviewed=None, windowed=None, dead_loops=(), terminal="",
-              parks=None, carried=""):
+              parks=None, carried="", carried_ts=None):
     """One display row from one session's data. Pure: no disk, no subprocess.
-    `carried`: the ask that stands, when the tail is too short to show it.
+    `carried`: the ask that stands, when the tail is too short to show it, and
+    `carried_ts` when it was first made (carried_ask).
 
     collect() used to inline this, which hid the wiring - notably which clock
     `since` reads from - behind functions that only run against a live machine.
@@ -3712,8 +3805,12 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
             or extract_topic(head, strict=True)["last"] or first
             or extract_topic(tail)["last"])
     status = session.get("status", "?")
-    spoke, ask = open_ask(tail)
-    ask = ask or ("" if spoke else carried)
+    spoke, ask, ask_ts, limit = standing_ask(tail)
+    if carried and not spoke:
+        # the book saw it first, and a limit line does not stand in for it
+        # (review, 2026-11-09)
+        ask, ask_ts = ((carried, carried_ts) if not ask or limit
+                       else _carry_on(carried, carried_ts, ask, ask_ts))
     # A question it asked you outranks whatever the feed says, in both
     # directions: the transcript gains the question the moment it is asked, and
     # gains your answer the moment you give it.
@@ -3758,11 +3855,15 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     ep = entrypoint_of(session, head, tail)
     if ep in ccwho_index.AGENT_ENTRYPOINTS and attention != "stuck":
         attention = "program"
+    if attention == "asks" and ask_ts is not None:
+        # an ask's row is as old as the ask, and a park on it holds until a new
+        # one: a peer's or a task's turn since does not end it (issue #54)
+        ts = ask_ts
     # You parked it at this turn: it waits for you to want it (load_parks). A
     # program's session is never yours to park - nothing in it waits on you.
     park = (parks or {}).get(session.get("sessionId", ""))
     park_note = park_was = ""
-    if ts and park and park.get("ts") == ts and attention != "program":
+    if ts and park and _park_holds(park["ts"], ts) and attention != "program":
         park_note, park_was, attention = park["note"], attention, "parked"
     # The recap comes off the windows this function was already given: the list's
     # second line is "what is this about", and the harness already answered it.
@@ -3936,9 +4037,11 @@ def load_asks(path=None):
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
+    # an entry with no "ts" is from before the time was kept (carried_ask)
     return {sid: e for sid, e in (data.items() if isinstance(data, dict) else ())
             if isinstance(e, dict) and isinstance(e.get("ask"), str)
-            and type(e.get("size")) is int}
+            and type(e.get("size")) is int
+            and (e.get("ts") is None or type(e["ts"]) in (int, float))}
 
 
 def save_asks(book, path=None):
@@ -3971,25 +4074,36 @@ def carried_ask(session_id, tail, book, cache=None):
     tail answers when you spoke in it, when it holds the whole transcript, or when
     it reaches back to the last look. Else, one read further back answers, and
     `book` then saves the next look that read. `book` changes only when the ask
-    does, or when the session grew by ASKS_STEP."""
-    spoke, ask = _asks_of(tail)[:2]
+    does, or when the session grew by ASKS_STEP.
+
+    Answers (the ask, when it was first made): the time stays over the same ask
+    made again, so a park on it holds (issue #54)."""
+    spoke, ask, _text, _error, ts = _asks_of(tail)[:5]
     path = transcript_path_cached(session_id, cache)
     try:
         size = os.path.getsize(path) if path else None
     except OSError:
         size = None
     if size is None:
-        return ask
+        return ask, ts
     entry = book.get(session_id)
     grew = size - entry["size"] if entry else None
+    # an entry from before the time was kept: one read back finds its time
+    old = entry is not None and "ts" not in entry
     if not spoke and size > TAIL_BYTES:
-        if grew is None or not 0 <= grew <= ASKS_REACH:
-            ask = _asks_of(_records_further_back(path, size))[1]
-        elif not ask:
-            ask = entry["ask"]
-    if grew is None or entry["ask"] != ask or not 0 <= grew < ASKS_STEP:
-        book[session_id] = {"ask": ask, "size": size}
-    return ask
+        if old or grew is None or not 0 <= grew <= ASKS_REACH:
+            deep_spoke, ask, _text, _error, ts = _asks_of(_records_further_back(path, size))[:5]
+            if old and 0 <= grew <= ASKS_REACH and not (deep_spoke or ask):
+                # further back than that read: it stands, its time not known
+                # (review, 2026-11-09)
+                ask = entry["ask"]
+        else:
+            # the tail reaches back to the last look, and you did not speak since
+            ask, ts = (_carry_on(entry["ask"], entry["ts"], ask, ts) if ask
+                       else (entry["ask"], entry["ts"]))
+    if old or grew is None or entry["ask"] != ask or not 0 <= grew < ASKS_STEP:
+        book[session_id] = {"ask": ask, "size": size, "ts": ts}
+    return ask, ts
 
 
 # What you have already looked at, and up to when. Keyed by session, valued by
@@ -4221,11 +4335,12 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
         dead = (find_dead_loops(s.get("pid"), ptable, cache=cache)
                 + find_dead_readers(s.get("pid"), ptable, unix=stdin_sockets, cache=cache,
                                     names=comms))
+        carried, carried_ts = carried_ask(sid, tail, asks, cache=cache)
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid")),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
                               reviewed=reviewed, parks=parks,
-                              carried=carried_ask(sid, tail, asks, cache=cache),
+                              carried=carried, carried_ts=carried_ts,
                               windowed=windowed(tty, shown, blind=blind),
                               terminal=app_of_tty.get(terms.short_tty_full(tty), "") if tty else "",
                               dead_loops=dead))

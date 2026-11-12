@@ -153,6 +153,7 @@ class TestAScanKeepsAnAskTheTailCannotSee(MachinelessCollect):
     """collect() gives each row the ask that stands, and keeps it on disk."""
 
     SID = "aaaaaaaa-0000-0000-0000-000000000000"
+    ASKED_AT = 1793880000.0         # 2026-11-05T12:00:00Z, the ask's own time
 
     def setUp(self):
         super().setUp()
@@ -161,14 +162,14 @@ class TestAScanKeepsAnAskTheTailCannotSee(MachinelessCollect):
         self.path = os.path.join(self.dir, "t.jsonl")
         with open(self.path, "w") as fh:
             for record in ({"type": "permission-mode"},
-                           {"type": "assistant", "message": {"content": [
-                               {"type": "text", "text": "A or B?"}]}},
+                           {"type": "assistant", "timestamp": "2026-11-05T12:00:00Z",
+                            "message": {"content": [{"type": "text", "text": "A or B?"}]}},
                            {"type": "system", "subtype": "turn_duration"}):
                 fh.write(json.dumps(record) + "\n")
             for _ in range(ccwho.TAIL_BYTES // 65536 + 2):
                 fh.write(json.dumps({"type": "api-request-blob", "blob": "x" * 65536}) + "\n")
-            for record in ({"type": "assistant", "message": {"content": [
-                               {"type": "text", "text": "A status line."}]}},
+            for record in ({"type": "assistant", "timestamp": "2026-11-08T21:55:00Z",
+                            "message": {"content": [{"type": "text", "text": "A status line."}]}},
                            {"type": "system", "subtype": "turn_duration"}):
                 fh.write(json.dumps(record) + "\n")
         testkit.patch(self, ccwho, "transcript_path", lambda sid, roots=None: self.path)
@@ -179,10 +180,15 @@ class TestAScanKeepsAnAskTheTailCannotSee(MachinelessCollect):
         rows, _ = ccwho.collect(cache={})
         self.assertEqual((rows[0]["attention"], rows[0]["ask"]), ("asks", "A or B?"))
 
+    def test_the_row_has_the_time_of_the_ask(self):
+        # issue #54: not the newest turn's, 3 days later
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["ts"], self.ASKED_AT)
+
     def test_what_it_found_is_on_disk(self):
         ccwho.collect(cache={})
         self.assertEqual(ccwho.load_asks(), {self.SID: {
-            "ask": "A or B?", "size": os.path.getsize(self.path)}})
+            "ask": "A or B?", "size": os.path.getsize(self.path), "ts": self.ASKED_AT}})
 
     def test_the_next_scan_does_not_read_back(self):
         ccwho.collect(cache={})
@@ -200,7 +206,7 @@ class TestAScanKeepsAnAskTheTailCannotSee(MachinelessCollect):
         self.assertEqual(writes, [])
 
     def test_a_session_that_is_gone_leaves_the_file(self):
-        ccwho.save_asks({"gone": {"ask": "A?", "size": 1}})
+        ccwho.save_asks({"gone": {"ask": "A?", "size": 1, "ts": None}})
         ccwho.collect(cache={})
         self.assertEqual(list(ccwho.load_asks()), [self.SID])
 

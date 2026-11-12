@@ -330,7 +330,18 @@ class TestParkACodexThread(ParkTest):
             await pilot.pause()
             text = self.box_text(app)
             self.assertIn(f"park {ASKING['sessionId'][:4]}", text)
-            self.assertIn("writes a new turn or you go to it", text)
+            # a peer's or a task's turn does not end a park on a question (#54)
+            self.assertIn("until it asks you something new or you go to it", text)
+
+    async def test_a_finished_turns_box_says_a_new_turn_ends_it(self):     # control
+        from test_ui import ASKING
+        finished = dict(ASKING, attention="review", ask="")
+        app = self.app(collector=FakeCollector(fleet=ui.Fleet([finished], True, "12:00:00")))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("z")
+            await pilot.pause()
+            self.assertIn("until it writes a new turn or you go to it", self.box_text(app))
 
     async def test_an_unpark_not_saved_names_it_by_its_rows_id(self):
         self.saves = False

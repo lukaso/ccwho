@@ -172,7 +172,7 @@ ccwho                         # on a terminal
 | `a` | every account on the usage line, to name one: who each is - its whole hash, email or Codex limit - and which open sessions spend it now. ↑ ↓ move; Enter, or a click, opens the name box for it. There Enter names the account, an empty name removes its name, Esc closes; then you are back in the accounts, on the one you named. With two or more Claude accounts, `c` or a click on its line turns [Compact at limit](#compact-at-limit) on or off. A click on an account in the usage line opens its name box at once |
 | `x` | on a process (after `p`, or in a Codex thread's brief): kill it and what runs under it. On the left-behind heading, or a click on the left-behind line: clean what ended sessions left. A box lists everything the kill takes first - see [ccwho kill](#ccwho-kill-and-ccwho-clean---you-see-the-list-then-you-decide). The footer says what `x` does on the current line |
 | `x` | on a session row: a box of what fits it - its stuck loop or reader first, with why, then all its processes, then a stop for a background session. In the box: `l` the stuck items, `p` its processes, `s` stop. On a row with a stuck loop or reader (a STUCK row, or one that also needs you), a click on `[kill stuck process…]` opens the kill box about the stuck items alone: what each is, why it can never end, that the session keeps running - `y` kills them, and what the kill did stays in the box |
-| `z` | park the session: you keep it, but not now. A box asks why (Enter parks, Esc parks nothing; the note may stay empty), and the row moves to a quiet PARKED group with your note as its second line. A click on `[park]` on a row with a question for you (▲) opens the same box; a finished turn (△) does not show it, as Enter or a click on it moves it to STOPPED; `z` still parks it. The highlight stays in the group the row left, on the next row (the one above when it was the last), so Enter goes on to the next session that needs you; with no other row there, or when the row stays where it is (under MORE RESULTS in a search), it stays on the parked row. The park ends when the session writes a new turn, when you go to it (Enter or a click that brings its window forward or gives it one, or Enter on an ended one, which reopens it), or with `z` on the parked row - then the row is as if it was never parked. Notes are kept in `parked.json` in `~/.ccwho` (or `$CCWHO_DIR`), so they outlive a restart, which text left unsent in a prompt box does not. A Codex thread parks too, once its turn has ended - a question, a finished turn or a stopped one; not while it says "waiting?", as its turn is still open. Enter on it says where it runs and brings nothing forward, so only its next turn or `z` ends the park. Not on a busy row (its next turn would end the park), a program's (a `codex exec` thread too) or an ended one |
+| `z` | park the session: you keep it, but not now. A box asks why (Enter parks, Esc parks nothing; the note may stay empty), and the row moves to a quiet PARKED group with your note as its second line. A click on `[park]` on a row with a question for you (▲) opens the same box; a finished turn (△) does not show it, as Enter or a click on it moves it to STOPPED; `z` still parks it. The highlight stays in the group the row left, on the next row (the one above when it was the last), so Enter goes on to the next session that needs you; with no other row there, or when the row stays where it is (under MORE RESULTS in a search), it stays on the parked row. The park ends when the session writes a new turn (on a question for you, when it asks you something new: a turn that a peer, a finished task or a subagent started does not end it), when you go to it (Enter or a click that brings its window forward or gives it one, or Enter on an ended one, which reopens it), or with `z` on the parked row - then the row is as if it was never parked. Notes are kept in `parked.json` in `~/.ccwho` (or `$CCWHO_DIR`), so they outlive a restart, which text left unsent in a prompt box does not. A Codex thread parks too, once its turn has ended - a question, a finished turn or a stopped one; not while it says "waiting?", as its turn is still open. Enter on it says where it runs and brings nothing forward, so only its next turn or `z` ends the park. Not on a busy row (its next turn would end the park), a program's (a `codex exec` thread too) or an ended one |
 | `o` | a menu of every save, newest first, with how many of its sessions run now and how many it would reopen; the last save before the restart is marked. Running sessions, and those Claude Desktop or a program ran, are left alone |
 | `r` | restart the list |
 | `q` | quit |
@@ -973,7 +973,7 @@ So `ccwho` derives the state instead:
 | busy | harness says busy, mid-turn | busy |
 | running | background work is in flight: not busy, or busy with the turn over | running |
 | program | a program started it (see [Started by a program](#started-by-a-program)), and it is not stuck | program |
-| parked | you parked it at its last turn (`z` in the live list), and it has had no turn since (a compaction or a local command is none). `--json` gives your note as `park_note`, and the state it has when not parked as `park_was` | PARKED |
+| parked | you parked it at its last turn (`z` in the live list), and it has had no turn since (a compaction or a local command is none). On a question for you: parked after that question was asked, and it has asked you nothing new since. `--json` gives your note as `park_note`, and the state it has when not parked as `park_was` | PARKED |
 
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.
@@ -997,11 +997,29 @@ against 103 when the ask stayed on the last machine turn. So the row stays ASKED
 and shows the newest ask, also while background work runs. A usage-limit line is an
 exception: it does not stay open after a later turn, as the session recovers by itself.
 
+The row's age is the ask's: an ask from 3 days ago stays `3d` after a peer's turn 5
+minutes ago. Sessions say an open question again, often after a sentence of news
+("Main is green. 1195 still waits for your choice."). Two lines that end in the same
+whole sentences, when those ask and are 25 characters or more, are the same ask: the
+row shows the newest words, with the time the ask was first made. "Is it A or B?"
+after "A or B?" is a new ask, and so is "Should I land B? I recommend yes." after
+"Should I land A? I recommend yes.". So is a short question in a new message ("Should
+I merge?"): in 21 days, 2 of 133 asks said again shared less, and one was new. A line
+that only says an earlier ask still waits ("I am still waiting for your answer from my
+last message", "The choice is still open"), with no question mark, keeps that ask:
+the row shows its words and its time. "Still" must be in a sentence that waits for
+you or says it is your call. So these are new asks: "Main is still red. Should I
+revert?", "Main is still red; let me know if I should revert.", and "That leg waits
+for your eval run. Review round 6 is still running." A question above such a line is
+the ask: "New question for you: Is X SQE?" then "My earlier questions are still open."
+
 So a false ask can stay: a session asks, then writes that nothing is needed after all.
-Type in the session, or `z` parks it. A park still ends on the session's next turn.
+Type in the session, or `z` parks it. The park holds until the session asks you
+something new: a peer's, a task's or a subagent's turn does not end it.
 
 A busy session's last 1 MiB holds about 7 ended turns. So what each scan finds is kept
-in `~/.cache/ccwho/asks.json`, with the size of the transcript at that look. The file
+in `~/.cache/ccwho/asks.json`, with the time of the ask and the size of the transcript
+at that look. The file
 is a cache: at a first look, or after a gap longer than the last 1 MiB can show, one
 read of the last 16 MiB gets the answer again. An ask older than that is not found.
 The file keeps only the ask of an ended turn: not a line of a turn that still runs.

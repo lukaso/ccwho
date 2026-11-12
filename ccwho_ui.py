@@ -2639,8 +2639,12 @@ class CcwhoUi(App):
         # a Codex row's own short id (its random end); a Claude session's prefix
         short = row.get("short") or engine.brief.short_id(row.get("sessionId", ""))
         title = "  ".join(t for t in (short, engine.session_handle(row)) if t)
-        # Enter on a Codex row goes nowhere: only a new turn ends its park
+        # Enter on a Codex row goes nowhere: only a new turn ends its park. A
+        # session's ask stands over a peer's or a task's turn, and so does its
+        # park (issue #54)
         until = ("it writes a new turn" if row.get("kind") == "codex"
+                 else "it asks you something new or you go to it"
+                 if row.get("attention") == "asks"
                  else "it writes a new turn or you go to it")
         self.push_screen(ParkBox(title, until),
                          callback=lambda note, row=row: self.parked_with(row, note))
@@ -3195,12 +3199,16 @@ class CcwhoUi(App):
         window was opening - is one you have not seen.
         """
         sid = row.get("sessionId", "")
+        if sid and (row.get("attention") == "parked" or (
+                row.get("attention") != "ended" and sid in engine.load_parks())):
+            # going to it ends the park: as if it was never parked (owner,
+            # 2026-10-08) - and then the look counts as for any row. Whatever
+            # turn it is on now: a park on a question holds over a peer's turn
+            # (issue #54), and a busy row's time moves with each record (review).
+            # An ended one's park ends when it is reopened (reopen_landed)
+            self.unpark_row(row)
         if not (sid and ts) or row.get("ts", "") != ts:
             return
-        if row.get("attention") == "parked":
-            # going to it ends the park: as if it was never parked (owner,
-            # 2026-10-08) - and then the look counts as for any row
-            self.unpark_row(row)
         if row.get("attention") != "review":
             return
         engine.mark_reviewed(sid, ts)

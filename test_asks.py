@@ -9,6 +9,7 @@ The record shapes here are copied from 21 days of real transcripts: a person's p
 has origin.kind "human"; `/compact` and an interrupt have no origin at all; a
 scheduled prompt is isMeta with no origin; a usage-limit line is isApiErrorMessage.
 """
+import datetime
 import json
 import os
 import shutil
@@ -19,6 +20,15 @@ import ccwho_engine as ccwho
 import testkit
 
 REAL_ASKS_PATH = getattr(ccwho, "asks_path", None)
+
+
+def at(when, *records):
+    """The records, as Claude Code writes them at `when` (ISO, UTC)."""
+    return [{**r, "timestamp": when} for r in records]
+
+
+def epoch(when):
+    return datetime.datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()
 
 
 def said(text, **extra):
@@ -389,12 +399,11 @@ class TestARowKeepsTheAsk(unittest.TestCase):
         woken = compacted + NOT_A_PERSON["a peer's message"]
         quiet = woken + [said("I told crm it is not tracked."), END]
         self.assertEqual(self.row("idle", quiet)["ask"], question)
-        # it says so again without a question mark: that line is the newest ask
+        # it says so again without a question mark: still the question it asked
         again = woken + [said("I am still waiting for your choice, A or B, from my last "
                               "message. Nothing is built until you answer."), END]
         row = self.row("idle", again)
-        self.assertEqual(row["attention"], "asks")
-        self.assertIn("still waiting for your choice", row["ask"])
+        self.assertEqual((row["attention"], row["ask"]), ("asks", question))
         self.assertNotEqual(self.row("idle", again + [human("B")])["attention"], "asks")
 
     def test_an_older_ask_comes_in_when_the_tail_has_none(self):
@@ -421,6 +430,334 @@ class TestARowKeepsTheAsk(unittest.TestCase):
         ts = ccwho.last_turn_ts(tail)
         row = self.row("idle", tail, parks={"a": {"ts": ts, "note": "later"}})
         self.assertEqual((row["attention"], row["park_was"]), ("parked", "asks"))
+
+
+T1, T2, T3 = "2026-11-05T12:00:00Z", "2026-11-08T21:55:00Z", "2026-11-08T22:10:00Z"
+NOW = epoch("2026-11-08T22:00:00Z")
+
+
+class TestAStandingAskKeepsItsTime(unittest.TestCase):
+    """Issue #54. A session asked 3 days ago, then a peer's message started a turn 5
+    minutes ago: the row said `ASKED YOU · 5m`. And a park took the newest turn's
+    time, so `z` on a false ask held only until the next machine turn - in the live
+    fleet, 10 minutes (2026-11-08: "no question", back as ASKED YOU)."""
+
+    ASKED = at(T1, said("A or B?"), END)
+    PEER = at(T2, *NOT_A_PERSON["a peer's message"], said("I told crm."), END)
+    TASK = NOT_A_PERSON["a finished task"]
+
+    def row(self, tail, parks=None, status="idle", **kw):
+        return ccwho.build_row({"sessionId": "a", "status": status, "pid": 1}, "", tail, None,
+                               now=NOW, parks=parks, **kw)
+
+    def parked_at(self, tail, note="no question"):
+        """`z` on the row this tail makes: the list parks it at the row's time."""
+        row = self.row(tail)
+        self.assertEqual(row["attention"], "asks")
+        return {"a": {"ts": row["ts"], "note": note}}
+
+    def test_the_row_has_the_age_of_the_ask(self):
+        row = self.row(self.ASKED + self.PEER)
+        self.assertEqual((row["attention"], row["ask"]), ("asks", "A or B?"))
+        self.assertEqual((row["ts"], row["since"]), (epoch(T1), "3d"))
+
+    def test_an_ask_in_the_newest_turn_has_that_turns_age(self):        # control
+        row = self.row(self.ASKED + at(T2, *self.TASK, said("Land it?"), END))
+        self.assertEqual((row["ask"], row["ts"], row["since"]), ("Land it?", epoch(T2), "5m"))
+
+    LONG = "Should I land issue 1195 before the release?"
+
+    def test_the_same_ask_again_keeps_the_first_time(self):
+        # sessions say an open question again ("1195 still waits for your choice")
+        tail = (at(T1, said(self.LONG), END) + self.PEER
+                + at(T3, *self.TASK, said("Done.\n\n" + self.LONG), END))
+        row = self.row(tail)
+        self.assertEqual((row["ask"], row["ts"]), (self.LONG, epoch(T1)))
+
+    REMINDER = "The sandbox post and the merge still wait for your go."
+    NEWS = "When the reviews come back, I fix what they find. "
+
+    def test_the_same_ask_after_a_sentence_of_news_keeps_the_first_time(self):
+        # 2026-11-08: a parked reminder came back as the end of a longer line
+        tail = (at(T1, said(self.REMINDER), END) + self.PEER
+                + at(T3, *self.TASK, said(self.NEWS + self.REMINDER), END))
+        row = self.row(tail)
+        self.assertEqual((row["ask"], row["ts"]), (self.REMINDER, epoch(T1)))
+
+    def test_the_same_ask_without_its_news_keeps_the_first_time(self):
+        tail = (at(T1, said(self.NEWS + self.REMINDER), END) + self.PEER
+                + at(T3, *self.TASK, said(self.REMINDER), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T1))
+
+    def test_the_same_ask_after_other_news_keeps_the_first_time(self):
+        # the news changes each time: "Main is green. 1195 still waits for your choice."
+        tail = (at(T1, said("Main is green. " + self.REMINDER), END) + self.PEER
+                + at(T3, *self.TASK, said(self.NEWS + self.REMINDER), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T1))
+
+    def test_a_question_that_only_ends_like_the_old_one_is_new(self):   # control
+        tail = self.ASKED + self.PEER + at(T3, *self.TASK, said("Is it A or B?"), END)
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    def test_the_same_question_and_its_reason_after_other_news_keep_the_first_time(self):
+        ask = "Should I land A? I recommend yes."
+        tail = (at(T1, said("Main is green. " + ask), END) + self.PEER
+                + at(T3, *self.TASK, said(self.NEWS + ask), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T1))
+
+    def test_a_number_is_no_sentence_gap(self):                         # control
+        # "2.0" is one word: "0? I recommend yes." is no ask the two share
+        tail = (at(T1, said("Ship version 2.0 to the beta testers today? I recommend yes, "
+                             "the tests pass."), END) + self.PEER
+                + at(T3, *self.TASK, said("Ship version 1.0 to the beta testers today? I recommend "
+                                          "yes, the tests pass."), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    def test_a_new_question_with_the_same_last_sentence_is_new(self):   # control
+        # what the two share does not ask: "I recommend yes." is no ask
+        tail = (at(T1, said("Should I land A? I recommend yes."), END) + self.PEER
+                + at(T3, *self.TASK, said("Should I land B? I recommend yes."), END))
+        row = self.row(tail)
+        self.assertEqual((row["ask"], row["ts"]), ("Should I land B? I recommend yes.", epoch(T3)))
+
+    def test_a_park_holds_when_the_ask_comes_back_after_news(self):
+        first = at(T1, said(self.REMINDER), END) + self.PEER
+        parks = self.parked_at(first)
+        tail = first + at(T3, *self.TASK, said(self.NEWS + self.REMINDER), END)
+        self.assertEqual(self.row(tail, parks)["attention"], "parked")
+
+    def test_the_book_goes_before_the_same_ask_after_news(self):
+        tail = at(T3, *self.TASK, said(self.NEWS + self.LONG), END)
+        row = self.row(tail, carried=self.LONG, carried_ts=epoch(T1))
+        self.assertEqual((row["ask"], row["ts"]), (self.NEWS + self.LONG, epoch(T1)))
+
+    def test_a_short_question_after_other_news_is_a_new_ask(self):
+        # review, 2026-11-09: "Should I merge?" about PR 12, then about PR 13. In 21
+        # days, 2 of 133 restated asks shared less than 25 characters: one was new
+        tail = (at(T1, said("PR 12 is ready. Should I merge?"), END) + self.PEER
+                + at(T3, *self.TASK, said("PR 13 is ready. Should I merge?"), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    QUESTION = "Should I start /plan-design-review now?"
+    REMINDS = "Status: the build is green.\n\nI am still waiting for your answer from my last message."
+
+    def test_a_reminder_keeps_the_ask_it_reminds_of(self):
+        # review 2, 2026-11-09: 146 asks in 21 days only said an earlier one still waits
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T3, *self.TASK, said(self.REMINDS), END))
+        row = self.row(tail)
+        self.assertEqual((row["attention"], row["ask"], row["ts"]), ("asks", self.QUESTION, epoch(T1)))
+
+    def test_a_park_holds_over_a_reminder(self):
+        first = at(T1, said(self.QUESTION), END) + self.PEER
+        parks = self.parked_at(first)
+        tail = first + at(T3, *self.TASK, said(self.REMINDS), END)
+        self.assertEqual(self.row(tail, parks)["attention"], "parked")
+
+    def test_the_question_again_after_a_reminder_keeps_its_time(self):
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T2, *self.TASK, said(self.REMINDS), END)
+                + at(T3, *self.TASK, said("Done.\n\n" + self.QUESTION), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T1))
+
+    def test_a_reminder_of_an_ask_from_the_book_keeps_it(self):
+        tail = self.PEER + at(T3, *self.TASK, said(self.REMINDS), END)
+        row = self.row(tail, carried=self.QUESTION, carried_ts=epoch(T1))
+        self.assertEqual((row["ask"], row["ts"]), (self.QUESTION, epoch(T1)))
+
+    def test_still_in_a_line_of_news_is_no_reminder(self):
+        # review 3, 2026-11-09, from a real session: the new request stayed hidden
+        # behind the park, 12 to 15 h after the ask
+        new = ("The full gate on 482562824 shows the same result: RED only on the "
+               "harness-eval trigger. That leg waits for your eval run; every other leg "
+               "passes. Review round 6 is still running.")
+        first = at(T1, said(self.QUESTION), END) + self.PEER
+        parks = self.parked_at(first)
+        row = self.row(first + at(T3, *self.TASK, said(new), END), parks)
+        self.assertEqual((row["attention"], row["ask"], row["ts"]), ("asks", new, epoch(T3)))
+
+    def test_a_question_with_still_in_it_is_new(self):                  # control
+        line = "Do you still want the sandbox post before the merge?"
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T3, *self.TASK, said(line), END))
+        row = self.row(tail)
+        self.assertEqual((row["ask"], row["ts"]), (line, epoch(T3)))
+
+    def test_still_in_a_sentence_that_asks_something_new_is_new(self):
+        # review 4, 2026-11-09: the real line came 86 h after the ask it hid
+        for line in ("If you want S2 released before the machine is quieter, tell me, and "
+                     "I will push with a higher limit; every test still has to pass.",
+                     "Main is still red; let me know if I should revert 1201.",
+                     "Let me know if you still want the sandbox post before the merge."):
+            with self.subTest(line):
+                tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                        + at(T3, *self.TASK, said(line), END))
+                row = self.row(tail)
+                self.assertEqual((row["ask"], row["ts"]), (line, epoch(T3)))
+
+    def test_a_question_above_a_reminder_is_the_ask(self):
+        # review 5, 2026-11-09: "New question for you: ..." then "My earlier
+        # questions are still open." - the row kept the old question
+        text = ("Intro.\n\n**New question for you:** Is the customer SQE?\n\n"
+                "My earlier questions are still open.")
+        self.assertEqual(ccwho.ask_line(text), "New question for you: Is the customer SQE?")
+        first = at(T1, said(self.QUESTION), END) + self.PEER
+        parks = self.parked_at(first)
+        row = self.row(first + at(T3, *self.TASK, said(text), END), parks)
+        self.assertEqual((row["attention"], row["ask"], row["ts"]),
+                         ("asks", "New question for you: Is the customer SQE?", epoch(T3)))
+
+    def test_a_reminder_below_news_is_still_a_reminder(self):           # control
+        text = "Main is green.\n\n1195 still waits for your choice."
+        self.assertEqual(ccwho.ask_line(text), "1195 still waits for your choice.")
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T3, *self.TASK, said(text), END))
+        self.assertEqual((self.row(tail)["ask"], self.row(tail)["ts"]), (self.QUESTION, epoch(T1)))
+
+    def test_a_new_question_beside_a_reminder_is_new(self):
+        line = "1195 still waits for your choice. Should I also land the hotfix?"
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T3, *self.TASK, said(line), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    def test_a_reminder_after_news_keeps_the_ask(self):                 # control
+        for line in ("1195 still waits for your choice.",
+                     "Main is green. 1195 still waits for your choice.",
+                     "Whether to land with /land is still your call.",
+                     "Still waiting on you: D1 and D2.",
+                     "The choice is still open."):
+            with self.subTest(line):
+                tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                        + at(T3, *self.TASK, said(line), END))
+                row = self.row(tail)
+                self.assertEqual((row["ask"], row["ts"]), (self.QUESTION, epoch(T1)))
+
+    def test_a_reminder_with_nothing_before_it_is_an_ask_of_its_own(self):  # control
+        row = self.row(self.PEER + at(T3, *self.TASK, said(self.REMINDS), END))
+        self.assertEqual((row["attention"], row["ts"]), ("asks", epoch(T3)))
+
+    def test_a_new_question_that_says_still_is_new(self):               # control
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T3, *self.TASK, said("Main is still red. Should I revert the last merge?"), END))
+        row = self.row(tail)
+        self.assertEqual((row["ask"], row["ts"]),
+                         ("Main is still red. Should I revert the last merge?", epoch(T3)))
+
+    def test_a_request_with_no_still_in_it_is_new(self):                # control
+        tail = (at(T1, said(self.QUESTION), END) + self.PEER
+                + at(T3, *self.TASK, said("Tell me which branch to land first."), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    def test_a_new_question_after_a_long_one_is_new(self):              # control
+        tail = (at(T1, said(self.LONG), END) + self.PEER
+                + at(T3, *self.TASK, said("Should I start the W0b rules now?"), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    def test_a_short_question_in_a_new_message_is_a_new_ask(self):
+        tail = (at(T1, said("The log rotates twice.\n\nWant me to fix it?"), END) + self.PEER
+                + at(T3, *self.TASK, said("The cache never expires.\n\nWant me to fix it?"), END))
+        self.assertEqual(self.row(tail)["ts"], epoch(T3))
+
+    def test_the_same_short_message_read_again_keeps_its_time(self):    # control
+        # a turn has two end records, and a silent turn reads the message again
+        tail = at(T1, said("A or B?"), END, STOP) + at(T3, *self.TASK, tool_use(), END)
+        self.assertEqual(self.row(tail)["ts"], epoch(T1))
+
+    def test_over_a_limit_line_it_keeps_its_time(self):
+        row = self.row(self.ASKED + at(T2, LIMIT, END))
+        self.assertEqual((row["ask"], row["ts"]), ("A or B?", epoch(T1)))
+
+    def test_an_ask_from_the_book_has_the_books_time(self):
+        row = self.row(self.PEER, carried="A or B?", carried_ts=epoch(T1))
+        self.assertEqual((row["attention"], row["ts"]), ("asks", epoch(T1)))
+
+    def test_the_book_goes_before_the_same_ask_in_the_tail(self):
+        tail = at(T3, *self.TASK, said(self.LONG), END)
+        row = self.row(tail, carried=self.LONG, carried_ts=epoch(T1))
+        self.assertEqual((row["ask"], row["ts"]), (self.LONG, epoch(T1)))
+
+    def test_a_limit_line_does_not_hide_an_ask_from_the_book(self):
+        # review, 2026-11-09: the limit line beat the book, and ended the park
+        parks = {"a": {"ts": epoch(T1), "note": "no question"}}
+        tail = self.PEER + at(T3, LIMIT, END)
+        row = self.row(tail, parks, carried="A or B?", carried_ts=epoch(T1))
+        self.assertEqual((row["attention"], row["ask"], row["park_was"]),
+                         ("parked", "A or B?", "asks"))
+
+    def test_a_programs_row_keeps_its_newest_turns_time(self):
+        # a program's prompt is no person: its first ask stands for ever (review)
+        row = ccwho.build_row({"sessionId": "a", "status": "idle", "pid": 1,
+                               "entrypoint": "sdk-cli"}, "", self.ASKED + self.PEER, None, now=NOW)
+        self.assertEqual((row["attention"], row["ts"]), ("program", epoch(T2)))
+
+    def test_a_book_entry_with_no_time_takes_the_newest_turns(self):    # control
+        row = self.row(self.PEER, carried="A or B?", carried_ts=None)
+        self.assertEqual((row["attention"], row["ts"]), ("asks", ccwho.last_turn_ts(self.PEER)))
+
+    def test_a_park_holds_over_a_machine_turn(self):
+        parks = self.parked_at(self.ASKED + self.PEER)
+        later = self.ASKED + self.PEER + at(T3, *self.TASK, said("Status."), END)
+        row = self.row(later, parks)
+        self.assertEqual((row["attention"], row["park_was"], row["park_note"]),
+                         ("parked", "asks", "no question"))
+
+    def test_a_park_holds_when_it_asks_the_same_again(self):
+        first = at(T1, said(self.LONG), END) + self.PEER
+        parks = self.parked_at(first)
+        again = first + at(T3, *self.TASK, said("Done.\n\n" + self.LONG), END)
+        self.assertEqual(self.row(again, parks)["attention"], "parked")
+
+    def test_a_park_made_before_this_fix_holds_too(self):
+        # the list parked at the newest turn's time: "no question", 2026-11-08
+        tail = self.ASKED + self.PEER
+        parks = {"a": {"ts": ccwho.last_turn_ts(tail), "note": "no question"}}
+        later = tail + at(T3, *self.TASK, said("Status."), END)
+        self.assertEqual(self.row(later, parks)["attention"], "parked")
+
+    def test_a_park_from_before_the_ask_does_not_park_it(self):         # control
+        done = at(T1, human("Go"), said("Done."), END)
+        parks = {"a": {"ts": self.row(done)["ts"], "note": "later"}}
+        asked = done + at(T2, *self.TASK, said("Land it?"), END)
+        self.assertEqual(self.row(asked, parks)["attention"], "asks")
+
+    def test_a_park_with_a_time_in_words_does_not_break_the_row(self):
+        parks = {"a": {"ts": T3, "note": "later"}}      # load_parks lets a string in
+        self.assertEqual(self.row(self.ASKED + self.PEER, parks)["attention"], "asks")
+
+    def test_a_park_holds_on_an_ask_from_the_book(self):
+        parks = {"a": {"ts": epoch(T1), "note": "no question"}}
+        later = self.PEER + at(T3, *self.TASK, said("Status."), END)
+        row = self.row(later, parks, carried="A or B?", carried_ts=epoch(T1))
+        self.assertEqual(row["attention"], "parked")
+
+    def test_a_new_ask_ends_the_park(self):                             # control
+        parks = self.parked_at(self.ASKED + self.PEER)
+        new = self.ASKED + self.PEER + at(T3, *self.TASK, said("Land it?"), END)
+        row = self.row(new, parks)
+        self.assertEqual((row["attention"], row["ask"], row["ts"]), ("asks", "Land it?", epoch(T3)))
+
+    def test_your_answer_ends_it(self):                                 # control
+        parks = self.parked_at(self.ASKED + self.PEER)
+        row = self.row(self.ASKED + self.PEER + at(T3, human("B"), said("Done."), END), parks)
+        self.assertNotIn(row["attention"], ("asks", "parked"))
+        self.assertEqual((row["ask"], row["ts"]), ("", epoch(T3)))
+
+    def test_mid_turn_it_is_busy_then_parked_again(self):
+        parks = self.parked_at(self.ASKED + self.PEER)
+        running = self.ASKED + self.PEER + at(T3, *self.TASK, tool_use())
+        row = self.row(running, parks, status="busy")
+        self.assertEqual((row["attention"], row["ts"]), ("busy", epoch(T3)))
+        ended = running + at(T3, user([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+                             said("Status."), END)
+        self.assertEqual(self.row(ended, parks)["attention"], "parked")
+
+    def test_a_park_on_a_finished_turn_still_ends_on_the_next_turn(self):  # control
+        done = at(T1, human("Go"), said("Done."), END)
+        row = self.row(done)
+        self.assertEqual(row["attention"], "review")
+        parks = {"a": {"ts": row["ts"], "note": "later"}}
+        self.assertEqual(self.row(done, parks)["attention"], "parked")
+        self.assertEqual(self.row(done + self.PEER, parks)["attention"], "review")
 
 
 class AskBook(unittest.TestCase):
@@ -461,6 +798,10 @@ class AskBook(unittest.TestCase):
         return ccwho.read_windows(self.SID)[1]
 
     def look(self, book):
+        return self.look_at(book)[0]
+
+    def look_at(self, book):
+        """(the ask that stands, the time of the turn that asked)."""
         return ccwho.carried_ask(self.SID, self.tail(), book)
 
 
@@ -561,7 +902,7 @@ class TestAnAskOlderThanTheTail(AskBook):
 
     def test_a_newer_ask_in_the_tail_goes_before_the_books(self):
         size = self.pad(ccwho.TAIL_BYTES + 1024)
-        book = {self.SID: {"ask": "An older ask?", "size": size}}
+        book = {self.SID: {"ask": "An older ask?", "size": size, "ts": None}}
         self.write(said("A newer ask?"), END)
         self.assertEqual(self.look(book), "A newer ask?")
         self.assertEqual(self.deep, [])
@@ -580,7 +921,7 @@ class TestAnAskOlderThanTheTail(AskBook):
     def test_a_transcript_shorter_than_at_the_last_look_is_read_again(self):
         self.asked_then_filled()
         size = os.path.getsize(self.path)
-        book = {self.SID: {"ask": "An old ask?", "size": size + 1}}
+        book = {self.SID: {"ask": "An old ask?", "size": size + 1, "ts": None}}
         self.assertEqual(self.look(book), "A or B?")
         self.assertEqual(len(self.deep), 1)
 
@@ -605,20 +946,20 @@ class TestAnAskOlderThanTheTail(AskBook):
         cache, there = {}, []
         testkit.patch(self, ccwho, "transcript_path",
                       lambda sid, roots=None: self.path if there else None)
-        self.assertEqual(ccwho.carried_ask(self.SID, [], {}, cache=cache), "")
+        self.assertEqual(ccwho.carried_ask(self.SID, [], {}, cache=cache), ("", None))
         there.append(True)                          # 12 to 67 s after the session file
         book = {}
         tail = ccwho.read_windows(self.SID)[1]
-        self.assertEqual(ccwho.carried_ask(self.SID, tail, book, cache=cache), "A or B?")
+        self.assertEqual(ccwho.carried_ask(self.SID, tail, book, cache=cache)[0], "A or B?")
         self.assertIn(self.SID, book)
 
     def test_no_transcript_is_no_ask(self):
         testkit.patch(self, ccwho, "transcript_path", lambda sid, roots=None: None)
-        self.assertEqual(ccwho.carried_ask(self.SID, [], {}), "")
+        self.assertEqual(ccwho.carried_ask(self.SID, [], {}), ("", None))
 
     def test_a_transcript_that_went_away_is_no_ask(self):
         os.remove(self.path)
-        self.assertEqual(ccwho.carried_ask(self.SID, [], {}), "")
+        self.assertEqual(ccwho.carried_ask(self.SID, [], {}), ("", None))
 
 
 class TestTheBookIsWrittenOnlyWhenItMust(AskBook):
@@ -646,7 +987,7 @@ class TestTheBookIsWrittenOnlyWhenItMust(AskBook):
         self.look(book)
         size = self.pad(ccwho.ASKS_STEP)
         self.look(book)
-        self.assertEqual(book[self.SID], {"ask": "A or B?", "size": size})
+        self.assertEqual(book[self.SID], {"ask": "A or B?", "size": size, "ts": None})
 
     def test_a_changed_ask_is_written_at_once(self):
         self.write(said("A or B?"), END)
@@ -654,7 +995,120 @@ class TestTheBookIsWrittenOnlyWhenItMust(AskBook):
         self.look(book)
         size = self.write(human("B"))
         self.look(book)
-        self.assertEqual(book[self.SID], {"ask": "", "size": size})
+        self.assertEqual(book[self.SID], {"ask": "", "size": size, "ts": None})
+
+
+class TestTheBookKeepsTheTimeOfTheAsk(AskBook):
+    """Issue #54: an ask older than the tail keeps the time of the turn that asked,
+    so its row shows how long it has waited and a park on it holds."""
+
+    def asked_then_filled(self):
+        self.write(*at(T1, said("A or B?"), END))
+        self.pad(ccwho.TAIL_BYTES + 1024)
+        self.write(*at(T2, *NOT_A_PERSON["a finished task"], said("Status."), END))
+
+    def test_the_first_look_reads_further_back_and_finds_its_time(self):
+        self.asked_then_filled()
+        book = {}
+        self.assertEqual(self.look_at(book), ("A or B?", epoch(T1)))
+        self.assertEqual(book[self.SID]["ts"], epoch(T1))
+
+    def test_the_next_look_keeps_it_with_no_read(self):
+        self.asked_then_filled()
+        book = {}
+        self.look(book)
+        self.write(*at(T3, said("Status."), END))
+        self.assertEqual(self.look_at(book), ("A or B?", epoch(T1)))
+        self.assertEqual(len(self.deep), 1)
+
+    def test_it_keeps_it_after_the_tail_moved_past_it(self):
+        self.write(*at(T1, said("A or B?"), END))
+        book = {}
+        self.assertEqual(self.look_at(book), ("A or B?", epoch(T1)))
+        for _ in range(20):
+            self.pad(ccwho.ASKS_STEP // 2)
+            self.write(*at(T2, said("Status."), END))
+            self.assertEqual(self.look_at(book), ("A or B?", epoch(T1)))
+        self.assertEqual(self.deep, [])
+
+    def test_the_same_ask_again_keeps_the_first_time(self):
+        ask = TestAStandingAskKeepsItsTime.LONG
+        self.write(*at(T1, said(ask), END))
+        book = {}
+        self.look(book)
+        for _ in range(6):                          # a look at each step, as the list does
+            self.pad(ccwho.TAIL_BYTES // 4)
+            self.look(book)
+        self.write(*at(T3, said("Done.\n\n" + ask), END))
+        self.assertEqual(self.look_at(book), (ask, epoch(T1)))
+
+    def test_the_same_ask_after_news_keeps_the_books_time(self):
+        ask = TestAStandingAskKeepsItsTime.LONG
+        self.write(*at(T1, said(ask), END))
+        book = {}
+        self.look(book)
+        for _ in range(6):                          # a look at each step, as the list does
+            self.pad(ccwho.TAIL_BYTES // 4)
+            self.look(book)
+        self.write(*at(T3, said("Status: green. " + ask), END))
+        self.assertEqual(self.look_at(book), ("Status: green. " + ask, epoch(T1)))
+
+    def test_a_reminder_keeps_the_books_ask(self):
+        ask = TestAStandingAskKeepsItsTime.QUESTION
+        self.write(*at(T1, said(ask), END))
+        book = {}
+        self.look(book)
+        for _ in range(6):                          # a look at each step, as the list does
+            self.pad(ccwho.TAIL_BYTES // 4)
+            self.look(book)
+        self.write(*at(T3, said(TestAStandingAskKeepsItsTime.REMINDS), END))
+        self.assertEqual(self.look_at(book), (ask, epoch(T1)))
+
+    def test_a_new_ask_has_its_own_time(self):                          # control
+        self.write(*at(T1, said("A or B?"), END))
+        book = {}
+        self.look(book)
+        self.write(*at(T3, said("Land it?"), END))
+        self.assertEqual(self.look_at(book), ("Land it?", epoch(T3)))
+        self.assertEqual(book[self.SID]["ts"], epoch(T3))
+
+    def test_after_you_spoke_the_same_words_are_a_new_ask(self):        # control
+        self.write(*at(T1, said("A or B?"), END))
+        book = {}
+        self.look(book)
+        self.write(*at(T3, human("Not yet."), said("A or B?"), END))
+        self.assertEqual(self.look_at(book), ("A or B?", epoch(T3)))
+
+    def old_entry(self):
+        """The book as the release before this one wrote it: no "ts"."""
+        with open(ccwho.asks_path(), "w") as fh:
+            json.dump({self.SID: {"ask": "A or B?", "size": os.path.getsize(self.path)}}, fh)
+        return ccwho.load_asks()
+
+    def test_an_old_entry_further_back_than_the_read_keeps_its_ask(self):
+        # review, 2026-11-09: dropping it lost an ask further back than ASKS_DEEP
+        self.asked_then_filled()
+        testkit.patch(self, ccwho, "ASKS_DEEP", ccwho.TAIL_BYTES + 512)    # cannot reach T1
+        book = self.old_entry()
+        self.assertEqual(self.look_at(book), ("A or B?", None))
+        self.assertEqual(self.look_at(book), ("A or B?", None))
+        self.assertEqual(len(self.deep), 1, "read back once, not at each look")
+        self.assertEqual(book[self.SID]["ts"], None)
+
+    def test_an_old_entry_you_answered_since_is_closed(self):          # control
+        self.write(*at(T1, said("A or B?"), END, human("B"), said("Done."), END))
+        self.pad(ccwho.TAIL_BYTES + 1024)
+        self.write(*at(T2, *NOT_A_PERSON["a finished task"], said("Status."), END))
+        book = self.old_entry()
+        self.assertEqual(self.look_at(book), ("", None))
+
+    def test_an_entry_from_before_times_were_kept_is_read_again(self):
+        self.asked_then_filled()
+        with open(ccwho.asks_path(), "w") as fh:     # as the release before this wrote it
+            json.dump({self.SID: {"ask": "A or B?", "size": os.path.getsize(self.path)}}, fh)
+        book = ccwho.load_asks()
+        self.assertEqual(self.look_at(book), ("A or B?", epoch(T1)))
+        self.assertEqual(len(self.deep), 1)
 
 
 class TestTheBookOnDisk(AskBook):
@@ -663,7 +1117,7 @@ class TestTheBookOnDisk(AskBook):
         self.assertEqual(REAL_ASKS_PATH(), os.path.expanduser("~/.cache/ccwho/asks.json"))
 
     def test_it_comes_back_as_it_went(self):
-        book = {self.SID: {"ask": "A or B?", "size": 12}}
+        book = {self.SID: {"ask": "A or B?", "size": 12, "ts": 1794175494.9}, "b": {"ask": "", "size": 3, "ts": None}}
         ccwho.save_asks(book)
         self.assertEqual(ccwho.load_asks(), book)
 
@@ -679,11 +1133,14 @@ class TestTheBookOnDisk(AskBook):
         self.assertEqual(ccwho.load_asks(), {})
 
     def test_bad_entries_are_left_out(self):
-        good = {"ask": "A?", "size": 3}
+        good = {"ask": "A?", "size": 3, "ts": 5.5}
         with open(ccwho.asks_path(), "w") as fh:
-            json.dump({"a": good, "b": {"ask": 1, "size": 3}, "c": {"ask": "A?", "size": "3"},
-                       "d": {"ask": "A?"}, "e": 7, "f": {"ask": "A?", "size": True}}, fh)
-        self.assertEqual(ccwho.load_asks(), {"a": good})
+            json.dump({"a": good, "b": {"ask": 1, "size": 3, "ts": 5}, "c": {"ask": "A?", "size": "3", "ts": 5},
+                       "d": {"ask": "A?", "ts": 5}, "e": 7, "f": {"ask": "A?", "size": True, "ts": 5},
+                       "g": {"ask": "A?", "size": 3, "ts": "5"}, "h": {"ask": "A?", "size": 3, "ts": True},
+                       "i": {"ask": "A?", "size": 3}}, fh)
+        # "i" is as the release before this one wrote it: it loads (review, 2026-11-09)
+        self.assertEqual(ccwho.load_asks(), {"a": good, "i": {"ask": "A?", "size": 3}})
 
     def test_a_write_that_fails_raises_nothing(self):
         blocker = os.path.join(self.dir, "a-file")
@@ -693,7 +1150,7 @@ class TestTheBookOnDisk(AskBook):
 
     def test_a_write_leaves_no_temp_file(self):
         before = set(os.listdir(self.dir))
-        ccwho.save_asks({self.SID: {"ask": "", "size": 1}})
+        ccwho.save_asks({self.SID: {"ask": "", "size": 1, "ts": None}})
         self.assertEqual(set(os.listdir(self.dir)) - before, {"asks.json"})
 
 

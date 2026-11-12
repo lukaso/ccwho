@@ -1583,32 +1583,418 @@ class TestOneClickGoesThere(UiTest):
             self.assertEqual(adapter.asked, [rows[1].row["sessionId"]])
 
 
-class TestARebuildIsOnePaint(UiTest):
-    """Tearing the list down and mounting it again shows the empty list for a
-    frame. Textual can hold the screen still until the whole rebuild is done."""
+def many(n, start=0, attention="stopped"):
+    """n sessions, each with a name that is on its line once."""
+    return [row(f"{i:04x}{i:04x}-0000-4000-8000-{i:012x}", attention, name=f"sess-{i:04x}",
+                title=f"Title {i:04x}", tab_title=f"✳ Title {i:04x} (claude)")
+            for i in range(start, start + n)]
 
-    async def test_the_rows_are_mounted_while_the_screen_is_held(self):
-        app = self.app()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            listing = app.query_one("#list")
-            held = []
-            real = listing.mount_all
-            # Textual calls batch_update itself in places, so watching THAT
-            # proves nothing. What matters is whether the screen is being held
-            # at the moment the rows go in.
-            listing.mount_all = lambda widgets: (
-                held.append(app._batch_count) or real(widgets))
-            # a real build: a session that was not there before. Re-ordering
-            # the rows that ARE there no longer goes through this path.
-            app.fleet = ui.Fleet([LIVE, BUSY, row("aaaa9999-0000-4000-8000-000000009999")],
-                                 True, "12:00:02")
-            app.painted_shape = None
+
+class TestARebuildIsOnePaint(UiTest):
+    """Reported 2026-11-12: the list flashes - not all the time, but often.
+
+    A session that starts or ends, and a search word that changes which rows
+    match, build the list again. The old rows went at once and the new ones
+    were drawn only when each had mounted, so the terminal got one frame of the
+    header over an empty list. A batch_update around the mount did not stop
+    it: the mount finishes after the batch ends.
+
+    Each test records every frame the terminal gets, as text, and asks of
+    each: are the rows there, and is the highlight on the row you were on?
+    """
+
+    def record(self, app):
+        """Every frame sent to the terminal, as lines: what the compositor holds
+        each time Textual paints. A held screen (batch_update) paints nothing,
+        so it records nothing. Textual's own names: pinned by textual<9."""
+        frames = []
+        real = app._display
+
+        def spy(screen, renderable):
+            real(screen, renderable)
+            if renderable is not None and not app._batch_count:
+                frames.append([s.text for s in screen._compositor.render_strips()])
+        app._display = spy
+        return frames
+
+    @staticmethod
+    def rows_in(frame):
+        """Session lines: "0006  sess-0006" - not the search box or the header
+        that say the word too."""
+        import re
+        return sum(bool(re.search(r"([0-9a-f]{4})  sess-\1", line)) for line in frame)
+
+    def assertNoFrameLosesTheList(self, frames, before, after, lit):
+        self.assertTrue(frames, "the change reached the screen")
+        least = min(before, after)
+        for n, frame in enumerate(frames):
+            text = "\n".join(line.rstrip() for line in frame)
+            self.assertGreaterEqual(self.rows_in(frame), least,
+                                    f"frame {n} of {len(frames)} lost rows:\n{text}")
+            if lit is None:
+                continue
+            self.assertTrue(any(line.startswith("█") and lit in line for line in frame),
+                            f"frame {n} of {len(frames)} lost the highlight on {lit}:\n{text}")
+
+    @staticmethod
+    def lit_in(frame, lit):
+        return any(line.startswith("█") and lit in line for line in frame)
+
+    async def changed(self, start, then, downs=6, search=None, scroll=None):
+        """The list of `start`, the highlight `downs` rows down - and with
+        `scroll`, the list scrolled to its end with the wheel; then a scan
+        brings `then` - or, with `search`, that word is typed in. Returns the
+        frames painted, the rows on screen before and after, and the name
+        under the highlight."""
+        collector = FakeCollector(fleet=ui.Fleet(start, True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self.settled(pilot)
+            for _ in range(downs):
+                await pilot.press("down")
+            if search is not None:
+                await pilot.press("slash")
+            if scroll:
+                app.query_one("#list").scroll_end(animate=False)
+            await self.settled(pilot)
+            lit = app.selected_row()["name"]
+            before = self.rows_in([s.text for s in app.screen._compositor.render_strips()])
+            frames = self.record(app)
+            if search is not None:
+                app.query_one("#search").value = search
+            else:
+                collector.fleet_value = ui.Fleet(then, True, "12:00:01")
+                app.collect()
+            await self.settled(pilot)
+            await self.settled(pilot)
+            after = self.rows_in(frames[-1]) if frames else 0
+            return frames, before, after, lit
+
+    async def test_a_session_that_starts_does_not_blank_the_list(self):
+        rows = many(12)
+        frames, before, after, lit = await self.changed(rows, rows + many(1, 100))
+        self.assertEqual(after, before + 1, "the new session is on screen")
+        self.assertNoFrameLosesTheList(frames, before, after, lit)
+
+    async def test_a_session_that_ends_does_not_blank_the_list(self):
+        rows = many(12)
+        frames, before, after, lit = await self.changed(rows, rows[:2] + rows[3:])
+        self.assertEqual(after, before - 1, "the ended session is gone")
+        self.assertNoFrameLosesTheList(frames, before, after, lit)
+
+    async def test_a_scrolled_list_does_not_blank_either(self):
+        rows = many(40)
+        frames, before, after, lit = await self.changed(rows, rows + many(1, 100),
+                                                        downs=30)
+        self.assertNoFrameLosesTheList(frames, before, after, lit)
+
+    async def test_a_search_word_does_not_blank_the_list(self):
+        rows = many(12)
+        frames, before, after, _ = await self.changed(rows, None, downs=0,
+                                                      search="sess-0000")
+        self.assertEqual(after, 1, "the search narrowed the list")
+        # while you type, the keys are in the box and no row is lit
+        self.assertNoFrameLosesTheList(frames, before, after, lit=None)
+
+    async def test_a_slow_mount_is_waited_for(self):
+        """On a busy machine the rows mount late: the screen waits for them,
+        not for a fixed moment that is long enough on a quiet one."""
+        class SlowRow(ui.Row):
+            async def on_mount(self):
+                await asyncio.sleep(0.15)
+        rows = many(12)
+        with mock.patch.object(ui, "Row", SlowRow):
+            frames, before, after, lit = await self.changed(rows, rows + many(1, 100))
+        self.assertEqual(after, before + 1, "the new session is on screen")
+        self.assertNoFrameLosesTheList(frames, before, after, lit)
+
+    async def test_a_mount_that_takes_too_long_does_not_stop_the_screen(self):
+        """The hold has a cap: a mount stuck for 2 s costs the empty frame,
+        not a list that paints nothing for 2 s."""
+        class StuckRow(ui.Row):
+            async def on_mount(self):
+                await asyncio.sleep(2.0)
+        rows = many(3)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        with mock.patch.object(ui, "Row", StuckRow):
+            app = self.app(collector=collector)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause(2.5)              # the first rows, mounted
+                collector.fleet_value = ui.Fleet(rows + many(1, 100), True, "12:00:01")
+                start = asyncio.get_running_loop().time()
+                app.collect()
+                held = False
+                while asyncio.get_running_loop().time() - start < 1.5:
+                    # not pilot.pause: it waits for the app to be idle, and
+                    # the stuck mount keeps it busy
+                    await asyncio.sleep(0.02)
+                    held = held or app._batch_count > 0
+                    if held and not app._batch_count:
+                        break
+                took = asyncio.get_running_loop().time() - start
+                self.assertTrue(held, "the rebuild held the screen")
+                self.assertEqual(app._batch_count, 0, f"still held after {took:.2f} s")
+                self.assertLess(took, ui.MOUNT_PATIENCE + 0.5)
+
+    # The highlight near the bottom of a list longer than the window, and
+    # sessions that come in above it (review 1, 2026-11-12): the row you are
+    # on went below the window and stayed there - Enter then went to a row
+    # you could not see. A start is a rebuild; a session that already ran and
+    # now needs you is a move (reordered): the same, by another path.
+
+    async def test_sessions_that_start_above_the_highlight_keep_it_in_view(self):
+        rows = many(40)
+        frames, before, after, lit = await self.changed(
+            rows, many(4, 100, "asks") + rows, downs=24)
+        self.assertTrue(frames)
+        self.assertGreaterEqual(min(self.rows_in(f) for f in frames), min(before, after))
+        self.assertTrue(self.lit_in(frames[-1], lit), "\n".join(frames[-1]))
+
+    async def test_sessions_that_move_above_the_highlight_keep_it_in_view(self):
+        rows = many(40)
+        moved = [dict(r, attention="asks") for r in rows[30:36]]
+        frames, before, after, lit = await self.changed(
+            rows, moved + rows[:30] + rows[36:], downs=24)
+        self.assertTrue(frames)
+        self.assertGreaterEqual(min(self.rows_in(f) for f in frames), min(before, after))
+        self.assertTrue(self.lit_in(frames[-1], lit), "\n".join(frames[-1]))
+
+    async def test_a_list_you_scrolled_away_stays_where_you_put_it(self):  # control
+        """The highlight on the first row, the list scrolled to its end with
+        the wheel: a scan does not take the view back to the highlight."""
+        rows = many(40)
+        frames, before, after, lit = await self.changed(
+            rows, many(4, 100, "asks") + rows, downs=0, scroll=True)
+        self.assertTrue(frames)
+        self.assertGreaterEqual(min(self.rows_in(f) for f in frames), min(before, after))
+        self.assertFalse(any(self.lit_in(f, lit) for f in frames),
+                         "the view stayed away from the highlight")
+
+    async def two_scans(self, gap, wheel_home=False):
+        """The highlight 24 rows down a list of 40, in view near the bottom;
+        a scan brings 4 sessions above it and another one a 5th, `gap` s
+        later - while the first one's rows still mount (0.1 s each). With
+        `wheel_home`, the list is first scrolled to its top with the wheel,
+        so the highlight is below the window."""
+        class SlowRow(ui.Row):
+            async def on_mount(self):
+                await asyncio.sleep(0.1)
+        rows = many(40)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        with mock.patch.object(ui, "Row", SlowRow):
+            app = self.app(collector=collector)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await self.settled(pilot)
+                for _ in range(24):
+                    await pilot.press("down")
+                await self.settled(pilot)
+                listing = app.query_one("#list")
+                if wheel_home:
+                    listing.scroll_home(animate=False)
+                    await self.settled(pilot)
+                lit, y0 = app.selected_row()["name"], listing.scroll_y
+                frames = self.record(app)
+                app.fleet = ui.Fleet(many(4, 100, "asks") + rows, True, "12:00:01")
+                app.rebuild()
+                await asyncio.sleep(gap)
+                app.fleet = ui.Fleet(many(5, 100, "asks") + rows, True, "12:00:02")
+                app.rebuild()
+                await self.settled(pilot)
+                await self.settled(pilot)
+                return frames, lit, y0, listing.scroll_y
+
+    async def test_two_scans_close_together_keep_the_highlight_in_view(self):
+        """Review 2: the second scan's rows came while the first one's screen
+        was held, so the scroll back ran before there was a layout to scroll
+        by - and the second scan read "not in view" off rows not yet placed."""
+        frames, lit, _, _ = await self.two_scans(0.03)
+        self.assertTrue(frames)
+        self.assertTrue(self.lit_in(frames[-1], lit), "\n".join(frames[-1]))
+
+    async def test_two_scans_close_together_leave_a_list_you_scrolled_away(self):  # control
+        frames, lit, y0, y1 = await self.two_scans(0.03, wheel_home=True)
+        self.assertTrue(frames)
+        self.assertFalse(any(self.lit_in(f, lit) for f in frames))
+        self.assertEqual(y0, y1, "the list stayed where the wheel put it")
+
+    async def scan_above(self, hook):
+        """The highlight 24 rows down a list of 40, in view near the bottom; a
+        scan brings 4 sessions above it. `hook(app, rows)` is called first."""
+        rows = many(40)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self.settled(pilot)
+            for _ in range(24):
+                await pilot.press("down")
+            await self.settled(pilot)
+            lit = app.selected_row()["name"]
+            hook(app, rows)
+            frames = self.record(app)
+            app.fleet = ui.Fleet(many(4, 100, "asks") + rows, True, "12:00:01")
             app.rebuild()
-            await pilot.pause()
-            self.assertTrue(held, "the rebuild mounts in one go")
-            self.assertGreater(held[0], 0,
-                               "a rebuild paints once, not row by row")
+            await self.settled(pilot)
+            await self.settled(pilot)
+            return frames, lit
+
+    async def test_a_scan_right_after_the_scroll_back_is_kept_too(self):
+        """A scan between the scroll back and the paint that lays it out: the
+        screen still has the row where it was pushed to, out of view."""
+        def hook(app, rows):
+            real, done = app.keep_in_view, []
+
+            def keep_then_scan():
+                asked = app.keep_asked and app.list_settled()
+                real()
+                if asked and not done:
+                    done.append(1)
+                    app.fleet = ui.Fleet(many(5, 100, "asks") + rows, True, "12:00:02")
+                    app.rebuild()
+            app.keep_in_view = keep_then_scan
+        frames, lit = await self.scan_above(hook)
+        self.assertTrue(self.lit_in(frames[-1], lit), "\n".join(frames[-1]))
+
+    async def test_a_hold_still_on_after_the_build_does_not_lose_the_scroll_back(self):
+        """Textual holds the screen for its own reasons too: the scroll back
+        waits for that hold to end, and for the layout after it."""
+        def hook(app, rows):
+            real = app.built
+
+            def built_then_hold(keep):
+                real(keep)
+                hold = app.batch_update()
+                hold.__enter__()
+                app.set_timer(0.05, lambda: hold.__exit__(None, None, None))
+            app.built = built_then_hold
+        frames, lit = await self.scan_above(hook)
+        self.assertTrue(self.lit_in(frames[-1], lit), "\n".join(frames[-1]))
+
+    async def box_scan(self, then, wheel_home=False):
+        """The highlight 24 rows down a list of 40; `z` opens the park box; a
+        scan brings `then(rows)`; Esc closes the box. With `wheel_home`, the
+        list was scrolled to its top first, the highlight below the window.
+        Returns the frames, the lit name, the list's scroll_y before and
+        after, and whether the row is in view at the end."""
+        rows = many(40)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self.settled(pilot)
+            for _ in range(24):
+                await pilot.press("down")
+            await self.settled(pilot)
+            listing = app.query_one("#list")
+            if wheel_home:
+                listing.scroll_home(animate=False)
+                await self.settled(pilot)
+            lit, y0 = app.selected_row()["name"], listing.scroll_y
+            app.action_park()
+            await self.settled(pilot)
+            self.assertIsInstance(app.screen, ui.ParkBox)
+            collector.fleet_value = ui.Fleet(then(rows), True, "12:00:01")
+            app.collect()
+            await self.settled(pilot)
+            await pilot.press("escape")
+            await self.settled(pilot)
+            await self.settled(pilot)
+            frames = self.record(app)
+            app.refresh()
+            await self.settled(pilot)
+            return (frames, lit, y0, listing.scroll_y,
+                    listing.can_view_entire(app.highlighted_widget()))
+
+    async def test_a_box_open_during_a_move_keeps_the_highlight_in_view(self):
+        """Review 3: with a box on top, the list's screen is not laid out, and
+        the scroll back ran against the old places - and was spent."""
+        frames, lit, _, _, seen = await self.box_scan(
+            lambda rows: [dict(r, attention="asks") for r in rows[30:36]]
+            + rows[:30] + rows[36:])
+        self.assertTrue(seen, "the row is in view once the box is closed")
+        self.assertTrue(frames and self.lit_in(frames[-1], lit))
+
+    async def test_a_box_open_during_a_start_keeps_the_highlight_in_view(self):
+        frames, lit, _, _, seen = await self.box_scan(
+            lambda rows: many(4, 100, "asks") + rows)
+        self.assertTrue(seen, "the row is in view once the box is closed")
+        self.assertTrue(frames and self.lit_in(frames[-1], lit))
+
+    async def test_a_box_open_during_a_scan_leaves_a_list_you_scrolled_away(self):  # control
+        frames, lit, y0, y1, seen = await self.box_scan(
+            lambda rows: many(4, 100, "asks") + rows, wheel_home=True)
+        self.assertFalse(seen)
+        self.assertEqual(y0, y1, "the list stayed where the wheel put it")
+
+    async def test_scans_under_a_box_wait_with_one_retry_not_one_each(self):
+        """Under a box the scroll back waits, retrying every KEEP_RETRY; each
+        scan asks again. One chain of retries, not one more per scan - rows
+        move about 9 times a minute, and a box can stay open for minutes."""
+        rows = many(40)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self.settled(pilot)
+            for _ in range(24):
+                await pilot.press("down")
+            await self.settled(pilot)
+            app.action_park()
+            await self.settled(pilot)
+            calls, real = [], app.keep_in_view
+            app.keep_in_view = lambda: (calls.append(1), real())[1]
+            for n in range(5):
+                order = rows[n + 1:] + rows[:n + 1]     # each scan moves rows
+                app.fleet = ui.Fleet(order, True, f"12:00:0{n + 1}")
+                app.rebuild()
+                await asyncio.sleep(0.02)
+            calls.clear()
+            await asyncio.sleep(0.5)
+            one_chain = 0.5 / ui.KEEP_RETRY
+            self.assertTrue(calls, "the scroll back still waits under the box")
+            self.assertLess(len(calls), 2 * one_chain, f"{len(calls)} tries in 0.5 s")
+
+    async def test_a_mount_past_the_cap_still_brings_the_highlight_back(self):
+        """Review 3: the hold ends at MOUNT_PATIENCE; the rows that mount
+        later had no place when the scroll back ran, and it was spent."""
+        class SlowRow(ui.Row):
+            async def on_mount(self):
+                await asyncio.sleep(ui.MOUNT_PATIENCE + 0.3)
+        rows = many(40)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        with mock.patch.object(ui, "Row", SlowRow):
+            app = self.app(collector=collector)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause(ui.MOUNT_PATIENCE + 0.6)
+                for _ in range(24):
+                    await pilot.press("down")
+                await self.settled(pilot)
+                lit = app.selected_row()["name"]
+                self.assertTrue(app.highlight_in_view())
+                app.fleet = ui.Fleet(many(4, 100, "asks") + rows, True, "12:00:01")
+                app.rebuild()
+                await asyncio.sleep(ui.MOUNT_PATIENCE + 0.6)   # past the mount
+                await self.settled(pilot)
+                listing = app.query_one("#list")
+                self.assertTrue(listing.can_view_entire(app.highlighted_widget()),
+                                f"{lit} below the window")
+
+    async def test_the_recorder_sees_an_empty_list(self):            # control
+        """The frames are real: a list that IS empty for a frame fails the
+        check that the tests above pass."""
+        rows = many(12)
+        collector = FakeCollector(fleet=ui.Fleet(rows, True, "12:00:00"))
+        app = self.app(collector=collector)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await self.settled(pilot)
+            frames = self.record(app)
+            listing = app.query_one("#list")
+            gone = list(listing.children)
+            await listing.remove_children()
+            await self.settled(pilot)
+            await listing.mount_all([ui.Row(r, 100) for r in rows])
+            await self.settled(pilot)
+            self.assertEqual(self.rows_in(frames[-1]), 12, "the rows came back")
+            self.assertTrue(gone)
+            with self.assertRaises(AssertionError):
+                self.assertNoFrameLosesTheList(frames, 12, 12, "sess-0000")
 
 
 class TestARowIsWrittenOnlyWhenItsWordsChange(UiTest):

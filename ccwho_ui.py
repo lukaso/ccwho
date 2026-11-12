@@ -28,6 +28,7 @@ problem this tool exists to solve.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import os
@@ -138,6 +139,11 @@ CONTENT_PATIENCE = 60.0
 # that moves is a list that has not hung (the owner, 2026-10-18).
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPIN = 0.1                     # seconds a turn
+# A rebuilt list is held off the screen until its rows have mounted
+# (paint_when_mounted) - never longer than this: a mount that does not finish
+# costs one empty frame, never a list that stops painting.
+MOUNT_PATIENCE = 0.5
+KEEP_RETRY = 0.02              # seconds: a scroll back that met an unsettled list tries again
 NOTHING_SAID = types.MappingProxyType({})   # one object: the cache compares by identity
 
 
@@ -1196,6 +1202,8 @@ class CcwhoUi(App):
         self.painted_shape = None
         self.hint_widget = None         # the Codex-only list's hint (place_hint)
         self.selected = ""      # by session id: widgets come and go, this does not
+        self.keep_asked = 0     # scans since the highlight was last kept in view
+        self.keep_waiting = False   # a keep_in_view retry waits: keep_again
         self.went_to = ""       # the session you went to in NEEDS YOU: going_to
         self.needs_order = []   # NEEDS YOU around it, the rows a search hides too
         self.acting = ""        # the session a window is being opened for
@@ -1830,15 +1838,19 @@ class CcwhoUi(App):
             self.paint_header(groups)
             self.repaint_detail()
             return
+        self.ask_to_keep()                  # before the rows move
         if self.reordered(listing, groups, width):
             self.painted_shape = shape
             self.paint_header(groups)
             self.repaint_detail()
+            # after the paint that lays the rows out where they now are
+            self.call_after_refresh(self.keep_in_view)
             return
         self.painted_shape = shape
         keep = self.selected_id()
         # One paint: mounting row by row shows the list half built, which is the
-        # flicker you see on a window that refreshes all day.
+        # flicker you see on a window that refreshes all day. And one paint
+        # AFTER the mount: see paint_when_mounted.
         with self.batch_update():
             listing.remove_children()
             fresh = []
@@ -1853,13 +1865,127 @@ class CcwhoUi(App):
                 fresh.append(Static(self.empty_text(), markup=False))
             elif self.hint_widget is not None:
                 fresh.append(self.hint_widget)
-            listing.mount_all(fresh)
+            mounted = listing.mount_all(fresh)
             self.paint_header(groups)
-        # Mounting is asynchronous: focusing a widget in the same breath as
-        # mounting it silently does nothing, and the cursor lands nowhere.
-        self.call_after_refresh(self.restore_selection, keep)
+            # Mounting is asynchronous: focusing a widget in the same breath as
+            # mounting it silently does nothing, and the cursor lands nowhere.
+            # The highlight goes back once the rows are there, before the paint
+            self.paint_when_mounted(mounted, lambda: self.built(keep))
+
+    def built(self, keep):
+        """The rebuilt rows are mounted: the highlight where it was, and an open
+        detail says what is under it. In view, if it was: once the paint has
+        laid the rows out (focus scrolls only to a row that has a place)."""
+        self.restore_selection(keep)
         if self.detail_open:
-            self.call_after_refresh(self.paint_detail)
+            self.paint_detail()
+        self.call_after_refresh(self.keep_in_view)
+
+    def highlighted_widget(self):
+        return next((w for w in self.rows_on_screen()
+                     if w.display and w.row.get("sessionId") == self.selected), None)
+
+    def highlight_in_view(self):
+        """Is the whole row you are on inside the list's window?"""
+        listing, widget = self.part("#list"), self.highlighted_widget()
+        try:
+            return bool(listing is not None and widget is not None
+                        and listing.can_view_entire(widget))
+        except Exception:           # not laid out yet: not seen
+            return False
+
+    def ask_to_keep(self):
+        """Before a scan moves the rows: was the row you are on in view? Read
+        off the screen only when it has settled. While a scroll back is still
+        to come (keep_asked), the rows on screen are not where they will be -
+        two scans closer together than a mount read "not in view" off rows
+        with no place yet (review 2) - and the answer is the one already given.
+        """
+        if self.keep_asked or self.highlight_in_view():
+            self.keep_asked += 1
+
+    def list_settled(self):
+        """Are the rows where the screen will draw them, so that a scroll can
+        be worked out from their places? Textual runs a call queued for after
+        the next refresh on the screen on top, and at once when that one has
+        nothing to paint - not after the list's layout. So not while:
+          - a batch_update holds the screen (review 2) - Textual's own count,
+            pinned by textual<9;
+          - a box is on top of the list (review 3): its screen is not the
+            one the call runs after, and the scroll waits for the box to
+            close - the wheel cannot move the list under a box;
+          - the row you are on still mounts, past MOUNT_PATIENCE (review 3).
+        """
+        if getattr(self, "_batch_count", 0):
+            return False
+        listing, widget = self.part("#list"), self.highlighted_widget()
+        if listing is None or listing.screen is not self.screen:
+            return False
+        return widget is None or widget.is_mounted
+
+    def keep_again(self):
+        """The one retry that waits: each scan under a box asks again, and a
+        chain of retries each was 5 chains after 5 scans."""
+        self.keep_waiting = False
+        self.call_after_refresh(self.keep_in_view)
+
+    def keep_in_view(self):
+        """Sessions that came in or moved above the row you are on pushed it
+        below the window, and it stayed there: Enter went to a row you could
+        not see (review 1, 2026-11-12). The list scrolls the least that shows
+        it again - only when it was in view before the scan (ask_to_keep): a
+        list you scrolled away from with the wheel stays where you put it.
+
+        Called after a paint: before one, the rows' places are the old ones.
+        So the row can be drawn out of view for a frame, then scrolled back -
+        where without this it stayed out of view.
+        """
+        if not self.keep_asked or self.keep_waiting:
+            return              # nothing asked, or one try already waits
+        if not self.list_settled():
+            self.keep_waiting = True
+            self.set_timer(KEEP_RETRY, self.keep_again)
+            return
+        listing, widget = self.part("#list"), self.highlighted_widget()
+        if listing is not None and widget is not None:
+            listing.scroll_to_widget(widget, animate=False, immediate=True)
+        self.call_after_refresh(self.kept, self.keep_asked)
+
+    def kept(self, asked):
+        """The scroll back is laid out: the screen can be read again - unless
+        a scan has asked since."""
+        if self.keep_asked == asked:
+            self.keep_asked = 0
+
+    def paint_when_mounted(self, mounted, then):
+        """Hold the screen until `mounted` - what a mount gave back - is done;
+        then call `then`, and paint once.
+
+        Textual draws a new widget only when its own task has mounted it, which
+        is after the batch_update around the mount has ended. Until then its
+        space is painted empty: for a rebuilt list, one frame of the header over
+        no rows. That was the flash each time a session started or ended, and
+        on each search key (2026-11-12). Called inside that batch_update, so no
+        frame gets between the two holds.
+
+        Never longer than MOUNT_PATIENCE: a mount that does not finish costs
+        that one frame, never a list that stops painting.
+        """
+        hold = self.batch_update()
+        hold.__enter__()
+
+        async def release():
+            try:
+                try:
+                    async with asyncio.timeout(MOUNT_PATIENCE):
+                        await mounted
+                except Exception:
+                    pass            # late, or it failed: paint what there is
+                then()              # not on a cancel: the list is closing
+            finally:
+                hold.__exit__(None, None, None)
+
+        self.run_worker(release(), group="paint")
 
     def going_to(self, row):
         """Enter or a click on a session in NEEDS YOU on screen: when it stops

@@ -10066,6 +10066,77 @@ class TestTerminalAppIsAskedForTabNamesOnlyForItsSessions(MachinelessCollect):
                          (301, "ttys042", ME, "claude")]))
 
 
+    def test_a_session_attached_by_name_in_its_tab(self):
+        # the measured shape: `claude attach linux-ci` typed in a tab
+        ccwho.agents_json = lambda: json.dumps(
+            [{"sessionId": "aaa", "pid": 301, "cwd": "/x", "status": "idle",
+              "name": "linux-ci", "kind": "background"}])
+        self.assert_shown_in_its_tab(self.collect(
+            TAB + [(301, 1, "claude bg-spare"), (402, 401, "claude attach linux-ci")],
+            TAB_PROCS + [(301, "ttys042", ME, "claude"), (402, "ttys050", ME, "claude")]))
+
+
+
+class TestAnAttachByNameIsTheWindow(unittest.TestCase):
+    """`claude attach <id|name>`: "Part of the session name works in place of
+    the id." A person types the name. Measured 2026-11-17: `claude attach
+    linux-ci` ran in an iTerm2 pane, the row said tty `-`, and Enter opened a
+    second window with another attach.
+
+    Measured on claude: `attach LINUX-CI` and `attach nux-c` open linux-ci, a
+    background session; `attach liveapp-` says "No session matching" though
+    interactive sessions have that name - attach knows background sessions only.
+    """
+
+    SID = "ab289ba2-0000-4000-8000-000000000001"
+    OTHER = "cd11ee22-0000-4000-8000-000000000002"
+    TITLES = {"ttys022": "a pane"}
+
+    def window(self, arg, sessions, sid=None):
+        return ccwho.owning_tty(5000, {}, {7000: "ttys022"}, self.TITLES,
+                                commands={7000: f"claude attach {arg}"},
+                                session_id=sid or self.SID, sessions=sessions)
+
+    def bg(self, sid, name):
+        return {"sessionId": sid, "name": name, "kind": "background"}
+
+    def test_its_name(self):
+        self.assertEqual(self.window("linux-ci", [self.bg(self.SID, "linux-ci")]), "ttys022")
+
+    def test_its_name_in_other_case(self):
+        self.assertEqual(self.window("LINUX-CI", [self.bg(self.SID, "linux-ci")]), "ttys022")
+
+    def test_a_part_of_its_name(self):
+        self.assertEqual(self.window("nux-c", [self.bg(self.SID, "linux-ci")]), "ttys022")
+
+    def test_a_name_with_a_space(self):
+        # `claude attach "my ci"`: ps shows the quotes gone
+        self.assertEqual(self.window("my ci", [self.bg(self.SID, "my ci")]), "ttys022")
+
+    def test_the_exact_name_of_another_is_not_it(self):                 # control
+        # "ci" is all of one name and part of the other: attach opens "ci"
+        both = [self.bg(self.SID, "linux-ci"), self.bg(self.OTHER, "ci")]
+        self.assertEqual(self.window("ci", both), "")
+        self.assertEqual(self.window("ci", both, sid=self.OTHER), "ttys022")
+
+    def test_a_part_two_names_share_is_neither(self):                   # control
+        # which one attach opens is not known: no window rather than a guess
+        both = [self.bg(self.SID, "linux-ci"), self.bg(self.OTHER, "linux-cd")]
+        self.assertEqual(self.window("linux-c", both), "")
+        self.assertEqual(self.window("linux-c", both, sid=self.OTHER), "")
+
+    def test_an_interactive_sessions_name_is_not_it(self):              # control
+        # attach knows background sessions only: "No session matching"
+        self.assertEqual(self.window("linux-ci", [
+            {"sessionId": self.SID, "name": "linux-ci", "kind": "interactive"}]), "")
+
+    def test_another_name_is_not_it(self):                              # control
+        self.assertEqual(self.window("coo", [self.bg(self.SID, "linux-ci")]), "")
+
+    def test_the_short_id_still_is(self):                               # control
+        self.assertEqual(self.window(self.SID[:8], [self.bg(self.SID, "linux-ci")]), "ttys022")
+
+
 class TestBackgroundAsksNeverPileUpInITerm2(unittest.TestCase):
     """The gate every background Apple Event to iTerm2 goes through.
 

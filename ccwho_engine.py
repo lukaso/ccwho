@@ -1847,12 +1847,35 @@ def attach_command(session_id, config_dir=None):
     return cmd
 
 
-def is_attach_to(command, session_id):
-    """Is this `claude attach` for this session, by its short id or its full one?"""
+def is_attach_to(command, session_id, sessions=None):
+    """Is this `claude attach` for this session, by its short id, its full one
+    or its name (attach_target)?"""
     if not session_id:
         return False
     ids = "|".join(re.escape(i) for i in {session_id, daemon_short(session_id)})
-    return re.search(r"\battach\s+(%s)(\s|$)" % ids, command or "") is not None
+    if re.search(r"\battach\s+(%s)(\s|$)" % ids, command or ""):
+        return True
+    return bool(sessions) and attach_target(command, sessions) == session_id
+
+
+def attach_target(command, sessions):
+    """The session a `claude attach <name>` shows, or "".
+
+    `claude attach <id|name>`: "Part of the session name works in place of the
+    id." Measured on claude: any case works, and only a background session is
+    found - `attach liveapp-` says "No session matching" while interactive
+    sessions have that name. All of a name wins over a part of another. A part
+    that two names share is no one's: which one attach opened is not known.
+    ps shows `claude attach "my ci"` without its quotes.
+    """
+    parts = (command or "").split()
+    if len(parts) < 3 or os.path.basename(parts[0]) != "claude" or parts[1] != "attach":
+        return ""
+    arg = " ".join(parts[2:]).casefold()
+    bg = [s for s in sessions or () if s.get("kind") == "background" and s.get("sessionId")]
+    found = ([s for s in bg if (s.get("name") or "").casefold() == arg]
+             or [s for s in bg if arg in (s.get("name") or "").casefold()])
+    return found[0]["sessionId"] if len(found) == 1 else ""
 
 
 def resolve_open(session_id, live_rows, entries, source_ok=True):
@@ -3661,8 +3684,8 @@ def is_viewer(command, session_id=""):
     return head == "claude"
 
 
-def attached_ttys(session_id, ttys, commands):
-    """The terminals running `claude attach <id>`, in ps order.
+def attached_ttys(session_id, ttys, commands, sessions=None):
+    """The terminals running `claude attach <id|name>`, in ps order.
 
     An attach can be anywhere - it is not an ancestor of the session it shows -
     so it is looked for by name rather than walked to.
@@ -3670,11 +3693,11 @@ def attached_ttys(session_id, ttys, commands):
     if not session_id:
         return []
     return [ttys[pid] for pid, cmd in (commands or {}).items()
-            if is_attach_to(cmd, session_id) and ttys.get(pid)]
+            if is_attach_to(cmd, session_id, sessions) and ttys.get(pid)]
 
 
 def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
-               session_id=""):
+               session_id="", sessions=None):
     """The terminal a session is DISPLAYED in, which is not always its own.
 
     Measured on a session running under the Claude Code daemon:
@@ -3694,10 +3717,13 @@ def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
     about windows and the session's own tty stands - never a guess dressed as
     an answer.
 
+    `sessions` are the running sessions: an attach by name is to the one
+    background session that name finds (attach_target).
+
     Of the terminals showing it, the first in a window: an attach before an
     ancestor, in ps order. With none in a window, the first there is.
     """
-    viewers = attached_ttys(session_id, ttys, commands)
+    viewers = attached_ttys(session_id, ttys, commands, sessions)
     seen = set()
     while pid and pid not in seen and depth > 0:
         seen.add(pid)
@@ -4318,7 +4344,7 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
     # not ttys[pid]: a session served by the daemon reports a background
     # process, and the window showing it belongs to an ancestor
     listed = [(s, owning_tty(s.get("pid"), parents, ttys, shown, commands=commands,
-                             session_id=s.get("sessionId", "")))
+                             session_id=s.get("sessionId", ""), sessions=sessions))
               for s in procs.shown_sessions(sessions)]
     # tab names: an app that asks for them only for its sessions (Terminal.app,
     # D7) is asked while one sits in its tabs - and never when the caller

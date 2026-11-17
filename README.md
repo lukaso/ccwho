@@ -233,7 +233,9 @@ not reported: iTerm2 holds Secure Input only while it is in front.
 A session started with `claude --bg`, or sent to the background from agent view,
 runs under the Claude Code daemon with no window at all. Enter on one opens a new
 window running `claude attach <short id>` - in the app the session was last in -
-and the row blinks while it opens.
+and the row blinks while it opens. When a pane already runs `claude attach` for it -
+by its id, its name in any case, or a part of its name that no other background
+session has - that pane is its window, and Enter goes there.
 It is never resumed: `claude --resume` on a running session starts a second process
 on one transcript.
 
@@ -246,6 +248,11 @@ To end one: `claude stop <short id>` (the conversation is kept, and `--resume` w
 after), or `claude rm <short id>` to delete it. `ccwho stop <id>`, or `x` then `s` in
 the list, does the same stop, and asks first. The session keeps the directory it
 was started in wherever you attach from; `--resume` uses the directory you are in.
+
+To take one out of the background - an ordinary session in a pane, not under the
+daemon: stop it, then `claude --resume <session id>` in that pane, in its directory.
+In an attached pane, ← goes back to agent view and Ctrl+Z to the shell; the session
+keeps running either way.
 
 ### Codex threads
 

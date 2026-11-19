@@ -3926,6 +3926,74 @@ class TestShowVerb(unittest.TestCase):
         self.assertEqual((got["account"], got["accountId"], got["provider"]),
                          (None, None, "anthropic"))
 
+    # `show` with no word is the caller's own session (D6): an agent learns its
+    # account, name and id in one command, with no row to guess among the rest.
+    PARKED = "7e7e0000-0000-4000-8000-000000000000"
+
+    def _as(self, sid=None, thread=None):
+        """Run as from inside that session (or Codex thread); neither: a shell."""
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for var, value in (("CLAUDE_CODE_SESSION_ID", sid), ("CODEX_THREAD_ID", thread)):
+            os.environ.pop(var, None)
+            if value:
+                os.environ[var] = value
+
+    def test_no_word_inside_a_session_gives_that_session(self):
+        self._another_runs()
+        self._spends({self.OTHER: "token:1a2b3c4d"})
+        self._as(self.OTHER)
+        rc, out = self._show("--json")
+        self.assertEqual(rc, 0, out)
+        got = json.loads(out)
+        self.assertEqual((got["sessionId"], got["account"]), (self.OTHER, "work"))
+        rc, out = self._show()
+        self.assertEqual(rc, 0, out)
+        self.assertIn(self.OTHER, out)
+        self.assertNotIn(self.SID, out)
+
+    def test_no_word_in_a_terminal_that_parked_its_job_gives_the_row_that_answers(self):
+        # the terminal has no row: the job it parked answers for it (answers_for),
+        # and a lookup in the rows alone would find nothing - or another's
+        self._another_runs()
+        self.rows[0]["parked"] = [self.PARKED]
+        self._as(self.PARKED)
+        rc, out = self._show("--json")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(out)["sessionId"], self.SID)
+
+    def test_no_word_takes_a_newer_recap_from_the_index_as_a_word_does(self):
+        self._another_runs()
+        runner.fresh_index = lambda quiet=False: {self.OTHER: {
+            "recap": "Goal: the index read the middle.", "recap_ts": "2026-09-17T10:00:00.000Z"}}
+        self._as(self.OTHER)
+        rc, out = self._show("--json")
+        self.assertEqual(json.loads(out)["recap"], "Goal: the index read the middle.")
+
+    def test_no_word_outside_a_session_says_to_name_one(self):
+        # one row running: it was shown, as if it were the caller's
+        self._as()
+        rc, out = self._show("--json")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "ccwho show: name a session (this is not a Claude Code"
+                              " session): ccwho show <session>\n")
+
+    def test_no_word_from_a_session_that_is_not_running_says_so(self):
+        # a Codex thread, or a session the scan did not see: never another's row
+        self._as(thread="019a0000-0000-7000-8000-000000000000")
+        rc, out = self._show("--json")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "ccwho show: this session (019a0000) is not among the running"
+                              " sessions - name one: ccwho ls\n")
+
+    def test_a_word_inside_a_session_is_still_that_word(self):      # control
+        self._another_runs()
+        self._as(self.OTHER)
+        rc, out = self._show("362", "--json")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(out)["sessionId"], self.SID)      # not the caller's
+
     def test_a_usage_failure_still_shows_the_session(self):
         def boom(rows, now=None, record=True, codex_threads=()):
             raise OSError("disk")
@@ -6522,6 +6590,43 @@ rows = r.usage.accounts(r.usage.load_readings(r.usage_dir(), now), now, {})
 print("ready", flush=True)
 print(r.name_account(aid, name, rows)["result"], flush=True)
 """
+
+
+class TestAccountOfTheClaudeRunningIt(unittest.TestCase):
+    """The scan's pid of each session's claude goes to the snapshot: a reading
+    from an earlier claude (a --resume, maybe on another account) names no
+    account in the table, `ls --json` or `show` - they read one snapshot."""
+
+    AID = "token:7980b01e4f3a2c1d"
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = mock.patch.dict(os.environ, {"CCWHO_DIR": os.path.join(tmp, "ccwho"),
+                                           runner.TEST_HOME_VAR: tmp})
+        env.start()
+        self.addCleanup(env.stop)
+        testkit.patch(self, runner, "usage_facts", lambda *a, **k: {"usage_roots": []})
+        self.now = time.time()
+        acct = {"kind": "token", "id": self.AID}
+        rec = {"v": 1, "session_id": "s1", "received_at": self.now, "measured_at": self.now,
+               "rate_limits": {"five_hour": {"used_percentage": 5,
+                                             "resets_at": self.now + 3600}},
+               "account": acct, "first_account": acct, "first_seen": self.now,
+               "login_at": None, "unsure": False, "claude_pid": 4100}
+        os.makedirs(runner.usage_dir())
+        with open(os.path.join(runner.usage_dir(), "s1.json"), "w") as fh:
+            json.dump(rec, fh)
+
+    def spends(self, row):
+        return runner.usage_snapshot([row], self.now, record=False)["sessions"].get("s1")
+
+    def test_a_reading_from_an_earlier_claude_names_no_account(self):
+        self.assertIsNone(self.spends({"sessionId": "s1", "pid": 5200}))
+
+    def test_the_claude_running_it_names_its_account(self):        # control
+        self.assertEqual(self.spends({"sessionId": "s1", "pid": 4100}), self.AID)
+        self.assertEqual(self.spends({"sessionId": "s1"}), self.AID)    # no pid: no evidence
 
 
 class TestNameAccount(unittest.TestCase):
@@ -10027,12 +10132,19 @@ class TestEveryCommandSpeaksTheSameWay(unittest.TestCase):
         self.assertEqual(rc, 4, err)
         self.assertIn("ccwho restore: cannot read", err)
 
+    def _show_from_inside(self):
+        """`show` with no word is the caller's own session: run as the row's."""
+        env = mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID})
+        env.start()
+        self.addCleanup(env.stop)
+
     def test_show_json_names_the_session_sessionId(self):
         # the real brief: its id is under "aka" (review 1 of the CLI revamp,
         # slice 3b - a stand-in brief with a top-level id passed from the start)
         testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
             [{"sessionId": self.SID, "title": "t", "project": "p", "tty": "", "pid": 1}], {}))
         testkit.patch(self, runner.engine, "read_windows", lambda sid, cache=None, **k: ([], [], 0))
+        self._show_from_inside()
         rc, out, err = self.main("show", "--json")
         self.assertEqual(rc, 0, err)
         got = json.loads(out)
@@ -10048,6 +10160,7 @@ class TestEveryCommandSpeaksTheSameWay(unittest.TestCase):
         testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
             [{"sessionId": self.SID, "title": "t", "project": "p", "tty": "", "pid": 1}], {}))
         testkit.patch(self, runner.engine, "read_windows", lambda sid, cache=None, **k: ([], [], 0))
+        self._show_from_inside()
         rc, out, err = self.main("show", "--no-color")
         self.assertEqual(rc, 0, err)
         self.assertIn(self.SID, out)
@@ -10061,6 +10174,7 @@ class TestEveryCommandSpeaksTheSameWay(unittest.TestCase):
         seen = []
         testkit.patch(self, runner.engine, "render_brief",
                       lambda b, row, color=False: seen.append(color) or "")
+        self._show_from_inside()
         self.main("show", tty=True)
         self.main("show", "--no-color", tty=True)
         self.assertEqual(seen, [True, False])

@@ -878,17 +878,37 @@ def session_accounts(readings):
     return out
 
 
-def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
+def stale_sessions(readings, pids):
+    """The sessions whose reading is from an earlier claude than the one that
+    runs them now (`pids`: session id -> the pid of its claude, from the scan).
+    A session resumed on another account is a new claude: until it replies, the
+    account its reading names is the earlier process's (outside voice 1). A pid
+    unknown on either side is no evidence."""
+    out = set()
+    for r in readings:
+        sid = r.get("session_id")
+        if r.get("retired_at") or not isinstance(sid, str):
+            continue
+        now_pid, read_pid = (pids or {}).get(sid), r.get("claude_pid")
+        if _pid(now_pid) and _pid(read_pid) and now_pid != read_pid:
+            out.add(sid)
+    return out
+
+
+def snapshot(readings, now, live_ids, facts, labels=None, codex=None, pids=None):
     """What the list needs about usage, built once per collect: every account
     with a reading kept (KEEP_SECONDS), a live session spending it or not
     (owner, 2026-10-03: "I switch between them" - it was the live ones only,
     E-D6). `codex`: the Codex rows, kept as long. `sessions`: the live ones,
-    and the open Codex threads - each spends the limit whose row names it."""
+    and the open Codex threads - each spends the limit whose row names it.
+    `pids`: session id -> its claude's pid now; a session whose reading is
+    from an earlier claude spends no account here, and is in `stale`."""
     labels = labels or {}
     rows = accounts(readings, now, labels)
     spent = session_accounts(readings)
     live_ids = set(live_ids or ())
-    sessions = {sid: aid for sid, aid in spent.items() if sid in live_ids}
+    stale = stale_sessions(readings, pids)
+    sessions = {sid: aid for sid, aid in spent.items() if sid in live_ids - stale}
     sessions.update((t, r["id"]) for r in codex or [] for t in r.get("threads") or ())
     shown = rows + list(codex or [])
     if set(sessions.values()) & {r["id"] for r in rows}:
@@ -914,7 +934,7 @@ def snapshot(readings, now, live_ids, facts, labels=None, codex=None):
     # `labels`: the stored names of the accounts shown - the list says that an
     # account can be named while a token account has none (usage_marked)
     return {"state": state, "accounts": ordered(shown, names), "names": names,
-            "sessions": sessions, "now": now,
+            "sessions": sessions, "stale": sorted(stale), "now": now,
             "labels": {r["id"]: labels[r["id"]] for r in shown
                        if isinstance(labels.get(r["id"]), str) and labels[r["id"]]}}
 

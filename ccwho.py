@@ -370,10 +370,24 @@ def show(argv):
     """
     want_json = "--json" in argv
     query = " ".join(a for a in argv if not a.startswith("-"))
+    me = None if query else engine.agent_id(os.environ)
+    if not query and me is None:
+        print("ccwho show: name a session (this is not a Claude Code session):"
+              " ccwho show <session>", file=sys.stderr)
+        return 2
     cache = {}
     rows, fleet = scan(cache=cache)
     entry = {}
-    if query:
+    if me is not None:
+        # the caller's own session (D6), from the sessions each row answers for:
+        # a terminal that parked its job has no row, and the job's row is its
+        hits = [r for r in rows if me in engine.answers_for(r)][:1]
+        if not hits:
+            print(f"ccwho show: this session ({me[:8]}) is not among the running sessions"
+                  " - name one: ccwho ls", file=sys.stderr)
+            return 1
+        entry = fresh_index().get(hits[0].get("sessionId"), {})
+    else:
         # The exact name of a running session is that session: a word that others
         # said, or a part of a title, does not make it a question.
         hits = [r for r in rows if (r.get("name") or "").lower() == query.lower()]
@@ -384,8 +398,6 @@ def show(argv):
             hits = hits + ended
         if hits:
             entry = fresh_index().get(hits[0].get("sessionId"), {})
-    else:
-        hits = rows
     if not hits:
         print(f"ccwho show: no session matches {query!r}", file=sys.stderr)
         return 1
@@ -3306,9 +3318,13 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
         except Exception:         # noqa: BLE001 - an odd rollout costs Codex's entry only
             codex = None
     labels = read_labels()
+    # each session's claude now: a reading from an earlier one names no account
+    # (a usage module from before stale_sessions takes no pids)
+    pids = {r.get("sessionId"): r.get("pid") for r in rows or [] if r.get("sessionId")}
     snap = u.snapshot(readings, now, engine.live_ids(rows),
                       lambda: usage_facts(now, readings), labels,
-                      **({"codex": codex} if codex else {}))
+                      **({"codex": codex} if codex else {}),
+                      **({"pids": pids} if hasattr(u, "stale_sessions") else {}))
     # only a snapshot over the whole fleet is recorded: a filtered `ls` leaves
     # the shared names and shown-log to the list
     if record:
@@ -4674,7 +4690,8 @@ CLEAN_USAGE = "usage: ccwho clean [--mine] [--dry-run] [--yes] [--force]"
 COMMAND_TAKES = {
     "ls": (LS_FLAGS, (), None, LS_USAGE),
     "show": (("--all", "--json", "--no-color"), (), None,
-             "usage: ccwho show <session> [--all] [--json] [--no-color]   what that session was working on"),
+             "usage: ccwho show [<session>] [--all] [--json] [--no-color]   what that session was working on;"
+             " no session: this one, from inside a session"),
     "open": ((), (), None, OPEN_USAGE),
     "restore": (("--open", "--check", "--list", "--no-color", "--no-links"), ("--from",), 0,
                 "usage: ccwho restore [--open | --check] [--from PATH] [--no-color] [--no-links]\n"
@@ -4843,7 +4860,8 @@ def main(argv=None):
         print("                                                  (--all: sessions a program started too;")
         print("                                                  --needs-you: the sessions the list puts on top;")
         print("                                                  Claude Code sessions only, no Codex thread)")
-        print("       ccwho show <session> [--all] [--json] [--no-color]  what that session was working on")
+        print("       ccwho show [<session>] [--all] [--json] [--no-color]  what that session was working on;")
+        print("                                                  no session: this one, from inside a session")
         print("       ccwho ps [--port N] [--helpers] [--json] [--full]  what agents started, and their ports")
         print("       ccwho kill <pid>|:<port>|<session> [--pid] [--dry-run] [--yes] [--force]  kill a tree, a port's holder or what a session started - lists, then asks")
         print("       ccwho stop <session> [--and-procs] [--dry-run] [--yes]  stop a background session (its conversation is kept) - asks")

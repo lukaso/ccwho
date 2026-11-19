@@ -1338,6 +1338,44 @@ class TestSnapshot(unittest.TestCase):
         s = usage.snapshot([b], NOW, live_ids={"s2"}, facts=lambda: self.fail("no facts"))
         self.assertEqual(s["state"], "ok")
 
+    # A session resumed with --resume, on another account, is a new claude: until
+    # it replies, its reading is the earlier process's, and so is the account
+    # (outside voice 1). The process running it now decides.
+    def _pid_reading(self, claude_pid):
+        return dict(reading("login:a", five=(5, FIVE_RESET), sid="s1"), claude_pid=claude_pid)
+
+    def test_a_reading_from_an_earlier_claude_names_no_account(self):
+        s = usage.snapshot([self._pid_reading(111)], NOW, live_ids={"s1"},
+                           facts=self.FACTS_OURS, pids={"s1": 222})
+        self.assertEqual(s["sessions"], {})
+        self.assertEqual(s["stale"], ["s1"])
+        self.assertEqual(usage.row_account(s, "s1")["account"], None)
+        self.assertEqual([r["id"] for r in s["accounts"]], ["login:a"])   # its numbers stay
+
+    def test_a_reading_from_the_claude_running_it_names_the_account(self):     # control
+        s = usage.snapshot([self._pid_reading(222)], NOW, live_ids={"s1"},
+                           facts=self.FACTS_OURS, pids={"s1": 222})
+        self.assertEqual((s["sessions"], s["stale"]), ({"s1": "login:a"}, []))
+
+    def test_an_unknown_process_on_either_side_is_no_evidence(self):
+        # a reading from before claude_pid, an unconfirmed claude, a row with no
+        # pid (a parked terminal), a scan that gave no pids: not stale
+        for claude_pid, pids in ((None, {"s1": 222}), (111, {"s1": None}), (111, {}),
+                                 (111, None), (True, {"s1": 1})):
+            s = usage.snapshot([self._pid_reading(claude_pid)], NOW, live_ids={"s1"},
+                               facts=self.FACTS_OURS, pids=pids)
+            self.assertEqual((s["sessions"], s["stale"]), ({"s1": "login:a"}, []),
+                             (claude_pid, pids))
+
+    def test_a_retired_reading_of_an_earlier_claude_is_not_the_session_now(self):
+        # the session moved on (retired): its kept reading names the earlier
+        # claude, and its own reading the one that runs it
+        old = dict(reading("login:b", five=(5, FIVE_RESET), sid="s1", email="b@x.com"),
+                   claude_pid=111, retired_at=NOW)
+        s = usage.snapshot([old, self._pid_reading(222)], NOW, live_ids={"s1"},
+                           facts=self.FACTS_OURS, pids={"s1": 222})
+        self.assertEqual((s["sessions"], s["stale"]), ({"s1": "login:a"}, []))
+
     def test_empty_state_precedence(self):
         live = {"s1"}
         facts = lambda *states: {"usage_roots": [

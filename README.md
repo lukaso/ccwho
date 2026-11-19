@@ -384,8 +384,13 @@ For a script or an agent, `ccwho ls --json` and `ccwho show --json` give each se
 account: `account` (the name the usage line gives it), `accountId` (`login:<uuid>` or
 `token:<hash>`, the id `ccwho usage name` takes) and `provider` (`anthropic`: these
 commands list Claude Code sessions only). `ccwho show` prints it as `account   ant:work`,
-the words the table's tag and the usage line use. Before the session's first reading, with usage off, or for
-an ended session, `account` and `accountId` are `null`; an ended row in `ls --json` has
+the words the table's tag and the usage line use. An agent asks about its own session with
+`ccwho show --json` and no word: ccwho finds it from `CLAUDE_CODE_SESSION_ID`, also when it
+runs as the job its terminal parked. Outside a session, `show` with no word exits 2 and says
+to name one. Before the session's first reading, with usage off, or for
+an ended session, `account` and `accountId` are `null`, and so they are after a
+`--resume` until the session replies: its reading is from its earlier claude, maybe on
+another account (the table shows no tag for it then either); an ended row in `ls --json` has
 no account keys. Do not use
 `configDir` to find the account: `""` means only that the session runs in the default
 config dir (`CLAUDE_CONFIG_DIR` is not set). A session started with a token
@@ -827,7 +832,7 @@ ccwho                   # the live list (on a terminal)
 ccwho ls [words] [--all]  # the table, or every session matching (with options, or piped, `ccwho` is this)
 ccwho ls --needs-you    # only the Claude Code sessions the live list puts on top: NEEDS YOU and STUCK
 ccwho ls --json         # the rows, for a script, a status line or an agent
-ccwho show <session>    # what that session was working on
+ccwho show [<session>]  # what that session was working on; no word, from inside a session: its own
 ccwho directory [words]  # who is there to ask, and what each session is for
 ccwho purpose [--session NAME] [TEXT]  # what a named session is for
 ccwho now [TEXT]        # from inside a session: what it works on

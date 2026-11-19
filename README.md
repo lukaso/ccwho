@@ -380,6 +380,18 @@ draws the bar again. A
 `ccwho setup --no-usage` turns it off again: the line goes, Codex's entry with it, once no
 running session spends an account on it.
 
+For a script or an agent, `ccwho ls --json` and `ccwho show --json` give each session's
+account: `account` (the name the usage line gives it), `accountId` (`login:<uuid>` or
+`token:<hash>`, the id `ccwho usage name` takes) and `provider` (`anthropic`: these
+commands list Claude Code sessions only). `ccwho show` prints it as `account   ant:work`,
+the words the table's tag and the usage line use. Before the session's first reading, with usage off, or for
+an ended session, `account` and `accountId` are `null`; an ended row in `ls --json` has
+no account keys. Do not use
+`configDir` to find the account: `""` means only that the session runs in the default
+config dir (`CLAUDE_CONFIG_DIR` is not set). A session started with a token
+(`claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`) also runs there, and spends the token's
+account, not the login's.
+
 Codex has an entry too, after the Claude accounts, named by its limit:
 `oai:codex 7d 69%↑/60% ↻Sun08:00 (42m ago)`. It is kept two weeks after its last reading, the same
 as an account, a Codex thread open or not. ccwho reads it from Codex's own transcripts - the

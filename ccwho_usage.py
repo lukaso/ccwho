@@ -1152,7 +1152,33 @@ def row_tag(snap, session_id):
         return "?"
     name = snap.get("names", {}).get(aid, aid)
     # the usage line's own words for the account, brand and all
-    return f"{by_id[aid].get('brand', 'ant')}:{name}"
+    return account_tag(by_id[aid].get("brand", "ant"), name)
+
+
+PROVIDERS = {"ant": "anthropic", "oai": "openai"}
+
+
+def account_tag(brand, name):
+    """An account as text says it everywhere - the table's tag, the usage line,
+    `ccwho show`: "ant:work". `brand` may be a provider ("anthropic") too."""
+    brand = {v: k for k, v in PROVIDERS.items()}.get(brand, brand) or "ant"
+    return f"{brand}:{name}"
+
+
+def row_account(snap, session_id):
+    """The account a row spends, for a script: {account, accountId, provider}.
+    The usage line's name for it (one account is named too: a script cannot
+    see that the line has only one), its id, and who sells it. No reading, or
+    usage off or unknown: no account - and a Claude session, as for the tag."""
+    out = {"account": None, "accountId": None, "provider": "anthropic"}
+    if not isinstance(snap, dict) or snap.get("state") != "ok":
+        return out
+    aid = (snap.get("sessions") or {}).get(session_id)
+    row = next((r for r in snap.get("accounts") or [] if r.get("id") == aid), None)
+    if row is None:
+        return out
+    return {"account": (snap.get("names") or {}).get(aid, aid), "accountId": aid,
+            "provider": PROVIDERS.get(row.get("brand", "ant"), row.get("brand"))}
 
 
 def status_text(rec, now, labels=None, names=None):

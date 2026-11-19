@@ -9693,12 +9693,14 @@ class TestTheBriefInParts(unittest.TestCase):
 
     def test_every_value_says_which_field_it_is(self):
         b = self.brief()
-        whole = {"project": "liveapp", "purpose": "runs the company"}
+        whole = {"project": "liveapp", "purpose": "runs the company",
+                 "account": "work", "provider": "anthropic"}
         fields = [(f, v) for line in ccwho.brief_parts(b, whole, fields=True)
                   for _, _, v, f in line if v or f]
         self.assertEqual([f for f, _ in fields],
-                         ["id", "project", "title", "purpose", "recap", "goal", "you_said", "closing",
-                          "tty", "pid", "name", "cwd", "session_id", "resume"])
+                         ["id", "project", "title", "purpose", "account", "recap", "goal",
+                          "you_said", "closing", "tty", "pid", "name", "cwd", "session_id",
+                          "resume"])
         self.assertEqual(tuple(f for f, _ in fields), ccwho.BRIEF_FIELDS,
                          "the order a screen follows is the order they come in")
         self.assertTrue(all(v for _, v in fields), "a field is a value; a label has none")

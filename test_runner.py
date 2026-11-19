@@ -3896,6 +3896,46 @@ class TestShowVerb(unittest.TestCase):
         _, out = self._show("362", "--json")
         self.assertEqual(json.loads(out)["purpose"], "")
 
+    def _spends(self, sessions):
+        real = runner.usage_snapshot
+        self.addCleanup(setattr, runner, "usage_snapshot", real)
+        self.recorded = []
+
+        def fake(rows, now=None, record=True, codex_threads=()):
+            self.recorded.append(record)
+            return {"state": "ok", "names": {"token:1a2b3c4d": "work"},
+                    "accounts": [{"id": "token:1a2b3c4d", "kind": "token", "brand": "ant"}],
+                    "sessions": sessions}
+        runner.usage_snapshot = fake
+
+    def test_it_says_which_account_the_session_spends(self):
+        # as `ls --json` does: an agent asks show about one session
+        self._spends({self.SID: "token:1a2b3c4d"})
+        _, out = self._show("362")
+        self.assertIn("  account   ant:work\n", out)
+        got = json.loads(self._show("362", "--json")[1])
+        self.assertEqual((got["account"], got["accountId"], got["provider"]),
+                         ("work", "token:1a2b3c4d", "anthropic"))
+        self.assertEqual(set(self.recorded), {False})          # a lookup records nothing
+
+    def test_no_reading_is_no_account_line_and_null_in_json(self):    # control
+        self._spends({})
+        _, out = self._show("362")
+        self.assertNotIn("account", out)
+        got = json.loads(self._show("362", "--json")[1])
+        self.assertEqual((got["account"], got["accountId"], got["provider"]),
+                         (None, None, "anthropic"))
+
+    def test_a_usage_failure_still_shows_the_session(self):
+        def boom(rows, now=None, record=True, codex_threads=()):
+            raise OSError("disk")
+        real = runner.usage_snapshot
+        self.addCleanup(setattr, runner, "usage_snapshot", real)
+        runner.usage_snapshot = boom
+        rc, out = self._show("362")
+        self.assertEqual(rc, 0)
+        self.assertIn("memory bloat", out)
+
     # "coo" as a real scan found it: a part of "coordinates" in an ended session, a
     # word in another title. Neither of them is what `ccwho show coo` asks for.
     ENDED = {"sessionId": "a2980000-0000-4000-8000-000000000000", "project": "liveapp",
@@ -7542,6 +7582,65 @@ class TestUsageInTheTable(unittest.TestCase):
         finally:
             runner.fresh_index = real
         self.assertIn("usage  waiting", out.getvalue())
+
+
+class TestAccountInLsJson(unittest.TestCase):
+    """`ccwho ls --json` says which account each row spends, and its provider:
+    an agent running evals reads its own row for it. configDir cannot say it -
+    a setup-token session runs in the default dir, so its configDir is ""."""
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    OTHER = "5a3c02bd-2222-4333-8444-bcdefabcdef0"
+
+    def setUp(self):
+        rows = [dict(TestUsageInTheTable.ROWS[0], configDir=""),
+                dict(TestUsageInTheTable.ROWS[0], sessionId=self.OTHER, configDir="")]
+        self.real = (runner.engine.collect, runner.usage_snapshot)
+        runner.engine.collect = lambda cache=None, status=None: (list(rows), {})
+        self.calls = []
+        self.snap = {"state": "ok", "names": {"token:1a2b3c4d": "work"},
+                     "accounts": [{"id": "token:1a2b3c4d", "kind": "token", "brand": "ant"}],
+                     "sessions": {self.SID: "token:1a2b3c4d"}}
+
+        def fake(rows, now=None, record=True, codex_threads=()):
+            self.calls.append(record)
+            return self.snap
+        runner.usage_snapshot = fake
+
+    def tearDown(self):
+        runner.engine.collect, runner.usage_snapshot = self.real
+
+    def rows(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = runner.ls(["--json", *argv])
+        self.assertEqual(rc, 0)
+        return {r["sessionId"]: r for r in json.loads(out.getvalue())}
+
+    def test_each_row_names_its_account_and_provider(self):
+        got = self.rows()
+        self.assertEqual((got[self.SID]["account"], got[self.SID]["accountId"],
+                          got[self.SID]["provider"]), ("work", "token:1a2b3c4d", "anthropic"))
+        # control: a session with no reading has no account, and is still Claude
+        self.assertEqual((got[self.OTHER]["account"], got[self.OTHER]["accountId"],
+                          got[self.OTHER]["provider"]), (None, None, "anthropic"))
+
+    def test_needs_you_rows_too(self):
+        got = self.rows("--needs-you")
+        self.assertEqual(got[self.SID]["account"], "work")
+
+    def test_json_records_nothing(self):
+        # the shown-log and the names are the list's: a script reading rows is
+        # not a person seeing the line
+        self.rows()
+        self.assertEqual(self.calls, [False])
+
+    def test_a_usage_failure_keeps_the_rows(self):
+        def boom(rows, now=None, record=True, codex_threads=()):
+            raise OSError("disk")
+        runner.usage_snapshot = boom
+        got = self.rows()
+        self.assertEqual(got[self.SID]["account"], None)
+        self.assertEqual(got[self.SID]["provider"], "anthropic")
 
 
 class TestUsageSnapshotLogsWhatItShows(unittest.TestCase):

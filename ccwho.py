@@ -371,7 +371,7 @@ def show(argv):
     want_json = "--json" in argv
     query = " ".join(a for a in argv if not a.startswith("-"))
     cache = {}
-    rows, _ = scan(cache=cache)
+    rows, fleet = scan(cache=cache)
     entry = {}
     if query:
         # The exact name of a running session is that session: a word that others
@@ -395,7 +395,9 @@ def show(argv):
         for line in engine.pick_lines(hits):
             print(f"  {line}", file=sys.stderr)
         return 2
-    row = hits[0]
+    # the account it spends, as `ls --json` says it: a lookup records nothing
+    row = dict(hits[0], **usage.row_account(with_usage(rows, fleet, record=False)["usage"],
+                                            hits[0].get("sessionId", "")))
     head, tail, _mtime = engine.read_windows(row.get("sessionId", ""), cache=cache)
     b = engine.brief.build(head, tail, session=row,
                            now=engine.now_iso(), as_records=engine.as_records)
@@ -410,7 +412,8 @@ def show(argv):
     if want_json:
         # a session is sessionId, as in every --json - also among its names
         # (aka); the brief itself keeps session_id, which render_brief reads
-        out = dict(b, sessionId=row.get("sessionId", ""), purpose=row.get("purpose", ""))
+        out = dict(b, sessionId=row.get("sessionId", ""), purpose=row.get("purpose", ""),
+                   **{k: row[k] for k in ("account", "accountId", "provider")})
         if isinstance(out.get("aka"), dict):
             out["aka"] = {("sessionId" if k == "session_id" else k): v
                           for k, v in out["aka"].items()}
@@ -997,7 +1000,12 @@ def ls(argv):
     if needs_you:
         live, ended = engine.needs_you(live), []     # an ended session needs nothing of you
     if "--json" in argv:
-        print(json.dumps(list(live) + [dict(e, ended=True) for e in ended], indent=2))
+        # which account each row spends: configDir cannot say it - a
+        # setup-token session runs in the default dir, as "" (a script read
+        # that as the default account). Rows, not a person: records nothing
+        snap = with_usage(rows, fleet, record=False)["usage"]
+        live = [dict(r, **usage.row_account(snap, r.get("sessionId", ""))) for r in live]
+        print(json.dumps(live + [dict(e, ended=True) for e in ended], indent=2))
         return 0
     if needs_you and not live and (query or running):
         # not "no sessions found", nor "no session matches": an agent that

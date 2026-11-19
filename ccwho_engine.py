@@ -4493,8 +4493,8 @@ _LABEL = {"blocked": "NEEDS YOU", "waiting": "NEEDS YOU", "asks": "ASKED YOU",
 
 
 # The fields a brief's values are, in the order brief_parts gives them.
-BRIEF_FIELDS = ("id", "project", "title", "purpose", "recap", "goal", "you_said", "closing",
-                "tty", "pid", "name", "cwd", "session_id", "resume")
+BRIEF_FIELDS = ("id", "project", "title", "purpose", "account", "recap", "goal", "you_said",
+                "closing", "tty", "pid", "name", "cwd", "session_id", "resume")
 
 
 def brief_parts(b, row=None, fields=False):
@@ -4529,6 +4529,12 @@ def brief_parts(b, row=None, fields=False):
     if row.get("purpose"):
         out.append([("  ", None, None), ("purpose", "dim", None), ("   ", None, None),
                     (row["purpose"], None, row["purpose"], "purpose")])
+    if row.get("account"):
+        # `ccwho show` only: the list's rows carry the tag instead. The table's
+        # words for it ("ant:work", D11), which `ccwho usage name` also takes
+        said = ccwho_usage.account_tag(row.get("provider"), row["account"])
+        out.append([("  ", None, None), ("account", "dim", None), ("   ", None, None),
+                    (said, None, said, "account")])
     if b["recap"]:
         age = b["recap_age"] or "?"
         turns = b["turns_since_recap"]

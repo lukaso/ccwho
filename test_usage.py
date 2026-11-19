@@ -1560,6 +1560,51 @@ class TestRowTag(unittest.TestCase):
         self.assertEqual(usage.row_tag({"state": "unknown"}, "s1"), "")
 
 
+class TestRowAccount(unittest.TestCase):
+    """What `ccwho ls --json` says a row spends: an agent that runs an eval
+    reads it to know which account it is on. Unlike the tag, one account is
+    named too: a script cannot see that the line has only one."""
+    L = acct_row("login:a", email="lukaso@gmail.com", five=(1, None))
+    T = acct_row("token:1a2b3c4d", kind="token", five=(1, None))
+    NONE = {"account": None, "accountId": None, "provider": "anthropic"}
+
+    def test_one_account_is_named(self):
+        s = snap([self.L], sessions={"s1": "login:a"})
+        self.assertEqual(usage.row_account(s, "s1"),
+                         {"account": "lukaso", "accountId": "login:a", "provider": "anthropic"})
+
+    def test_a_token_account_by_its_stored_name(self):
+        s = snap([self.L, self.T], sessions={"s1": "login:a", "s2": "token:1a2b3c4d"},
+                 labels={"token:1a2b3c4d": "work"})
+        self.assertEqual(usage.row_account(s, "s2"),
+                         {"account": "work", "accountId": "token:1a2b3c4d",
+                          "provider": "anthropic"})
+        self.assertEqual(usage.row_account(s, "s1")["account"], "lukaso")       # control
+
+    def test_no_reading_is_no_account_but_still_claude(self):
+        s = snap([self.L, self.T], sessions={"s1": "login:a"})
+        self.assertEqual(usage.row_account(s, "s3"), self.NONE)
+
+    def test_usage_off_or_unknown_is_no_account(self):
+        for s in (None, {"state": "unknown"}, snap([], state="off"),
+                  snap([self.L], sessions={"s1": "login:a"}, state="waiting")):
+            self.assertEqual(usage.row_account(s, "s1"), self.NONE)
+
+    def test_a_codex_limit_is_openai(self):
+        o = dict(acct_row("codex:codex", kind="codex", week=(65, NOW + D7)), brand="oai",
+                 email="")
+        s = snap([self.L, o], sessions={"t1": "codex:codex", "s1": "login:a"})
+        self.assertEqual(usage.row_account(s, "t1")["provider"], "openai")
+        self.assertEqual(usage.row_account(s, "s1")["provider"], "anthropic")     # control
+
+    def test_text_names_an_account_as_the_table_does(self):
+        # one form everywhere text names an account (D11): the provider a
+        # record carries and the brand a usage row carries give the same words
+        self.assertEqual(usage.account_tag("anthropic", "work"), "ant:work")
+        self.assertEqual(usage.account_tag("openai", "codex"), "oai:codex")
+        self.assertEqual(usage.account_tag("ant", "work"), "ant:work")            # control
+
+
 class TestStatusBar(unittest.TestCase):
     def test_own_entry_in_ansi(self):
         rec = reading("login:a", five=(42, NOW + 0.4 * H5), week=(2, NOW + 0.7 * D7),

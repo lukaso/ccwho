@@ -100,6 +100,38 @@ class TestJsonRowShape(unittest.TestCase):
         json.loads(json.dumps(self.row))          # --json would die on anything else
 
 
+# Keys `ccwho ls --json` adds to every running row, next to ROW_KEYS. Append only.
+LS_KEYS = {
+    "account", "accountId", "provider",   # added 2026-11-17: the account the session
+                                          # spends, its id, and who sells it (null: unknown)
+}
+
+
+class TestLsJsonShape(unittest.TestCase):
+    """What `ccwho ls --json` prints, not only what build_row gives: a key the
+    command adds is as much a contract as a row key."""
+
+    def test_ls_json_rows_have_exactly_the_declared_keys(self):
+        import contextlib
+        import io
+        import ccwho as runner
+        row = ccwho.build_row(SESSION, HEAD, TAIL, mtime=1788203600, now=1788207200)
+        real = (runner.engine.collect, runner.usage_snapshot)
+        runner.engine.collect = lambda cache=None, status=None, **k: ([dict(row)], {})
+        runner.usage_snapshot = lambda rows, now=None, record=True, codex_threads=(): {
+            "state": "unknown"}
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(runner.ls(["--json"]), 0)
+        finally:
+            runner.engine.collect, runner.usage_snapshot = real
+        got = json.loads(out.getvalue())[0]
+        self.assertEqual(set(got) - ROW_KEYS, LS_KEYS,
+                         "a key ls adds is declared in LS_KEYS in the same commit")
+        self.assertEqual(ROW_KEYS - set(got), set(), "a consumer of --json reads these by name")
+
+
 class TestManifestShape(unittest.TestCase):
     def setUp(self):
         row = ccwho.build_row(SESSION, HEAD, TAIL, mtime=1788203600, now=1788207200)

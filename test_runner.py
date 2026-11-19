@@ -3534,13 +3534,13 @@ class TestTheSaveAsksNoSessionApp(unittest.TestCase):
             runner.save([])
         self.assertEqual(seen, [False])
 
-class TestOnlyScansThatShowStuckWorkSample(unittest.TestCase):
+class TestNoScanOfTheCliSamples(unittest.TestCase):
     """A sample of a possible stuck reader takes about 1.5 s and stops the
-    process at each look. Only a scan whose rows show stuck work may take one:
-    ls and show. save (the launchd job, every 15 minutes), open, restore,
-    stop's check (review 2) and ps - which prints no row's state (review 3) -
-    take none."""
-    SAMPLING = {"ls", "show"}
+    process at each look. No command of the CLI takes one (D18): ls and show
+    read the verdicts the live list saved, as save (the launchd job, every 15
+    minutes), open, restore, stop's check (review 2) and ps do. The live list
+    samples (its own collect)."""
+    SAMPLING = set()
 
     def test_the_save_takes_no_sample(self):
         seen = []
@@ -3553,7 +3553,7 @@ class TestOnlyScansThatShowStuckWorkSample(unittest.TestCase):
             runner.save([])
         self.assertEqual(seen, [0])
 
-    def test_every_scan_but_ls_and_show_takes_none(self):
+    def test_no_scan_of_the_cli_takes_one(self):
         import ast
         here = os.path.dirname(os.path.abspath(__file__))
         tree = ast.parse(open(os.path.join(here, "ccwho.py")).read())
@@ -3566,8 +3566,8 @@ class TestOnlyScansThatShowStuckWorkSample(unittest.TestCase):
                     calls.setdefault(fn.name, []).append(
                         getattr(kw.get("samples"), "value", "default") if "samples" in kw
                         else "default")
-        self.assertTrue(self.SAMPLING <= set(calls), calls)                       # control
-        self.assertTrue({"save", "open_session", "restore", "_live_rows", "ps"} <= set(calls), calls)
+        self.assertTrue({"ls", "show", "save", "open_session", "restore", "_live_rows", "ps"}
+                        <= set(calls), calls)                                     # control
         for fn, said in sorted(calls.items()):
             with self.subTest(fn=fn):
                 self.assertEqual(set(said), {"default"} if fn in self.SAMPLING else {0})
@@ -3823,6 +3823,10 @@ class TestShowVerb(unittest.TestCase):
         # laptop rather than the code
         self.real_index = runner.fresh_index
         runner.fresh_index = lambda quiet=False: {}
+        # the usage read too: the real one reads this machine's settings (a test
+        # that needs an account stands one in: _spends)
+        testkit.patch(self, runner, "usage_snapshot",
+                      lambda rows, now=None, record=True, codex_threads=(): {"state": "unknown"})
 
     def tearDown(self):
         runner.engine.collect = self.real_collect
@@ -3878,7 +3882,7 @@ class TestShowVerb(unittest.TestCase):
         rc, out = self._show("362", "--json")
         self.assertEqual(rc, 0)
         got = json.loads(out)
-        self.assertEqual(got["aka"]["short_id"], "6c4c")
+        self.assertEqual((got["sessionId"], got["tty"], got["pid"]), (self.SID, "ttys022", 90266))
         self.assertIn("memory bloat", got["recap"])
 
     def test_it_says_what_a_role_is_for(self):
@@ -4457,7 +4461,7 @@ class TestPlainCcwhoOpensTheUi(unittest.TestCase):
             returncode = 0
 
         runner.subprocess.run = lambda *a, **k: self.runs.append(a[0]) or Done()
-        runner.engine.collect = lambda cache=None, status=None: ([], 0)
+        runner.engine.collect = lambda cache=None, status=None, **k: ([], 0)
 
     def tearDown(self):
         runner.subprocess.run = self.real_run
@@ -6624,6 +6628,14 @@ class TestAccountOfTheClaudeRunningIt(unittest.TestCase):
     def test_a_reading_from_an_earlier_claude_names_no_account(self):
         self.assertIsNone(self.spends({"sessionId": "s1", "pid": 5200}))
 
+    def test_a_reading_that_cannot_be_read_is_named(self):
+        with open(os.path.join(runner.usage_dir(), "s2.json"), "w") as fh:
+            fh.write("{nope")
+        snap = runner.usage_snapshot([{"sessionId": "s1", "pid": 4100}, {"sessionId": "s2"}],
+                                     self.now, record=False)
+        self.assertEqual(snap["unreadable"], ["s2"])
+        self.assertEqual(runner.usage.account_error(snap, "s2")["code"], "unreadable")
+
     def test_the_claude_running_it_names_its_account(self):        # control
         self.assertEqual(self.spends({"sessionId": "s1", "pid": 4100}), self.AID)
         self.assertEqual(self.spends({"sessionId": "s1"}), self.AID)    # no pid: no evidence
@@ -7653,7 +7665,7 @@ class TestUsageInTheTable(unittest.TestCase):
 
     def setUp(self):
         self.real = (runner.engine.collect, runner.usage_snapshot)
-        runner.engine.collect = lambda cache=None, status=None: (list(self.ROWS), {})
+        runner.engine.collect = lambda cache=None, status=None, **k: (list(self.ROWS), {})
         self.snap = {"state": "waiting"}
         runner.usage_snapshot = lambda rows, now=None, record=True, codex_threads=(): self.snap
 
@@ -7700,7 +7712,7 @@ class TestAccountInLsJson(unittest.TestCase):
         rows = [dict(TestUsageInTheTable.ROWS[0], configDir=""),
                 dict(TestUsageInTheTable.ROWS[0], sessionId=self.OTHER, configDir="")]
         self.real = (runner.engine.collect, runner.usage_snapshot)
-        runner.engine.collect = lambda cache=None, status=None: (list(rows), {})
+        runner.engine.collect = lambda cache=None, status=None, **k: (list(rows), {})
         self.calls = []
         self.snap = {"state": "ok", "names": {"token:1a2b3c4d": "work"},
                      "accounts": [{"id": "token:1a2b3c4d", "kind": "token", "brand": "ant"}],
@@ -7746,6 +7758,139 @@ class TestAccountInLsJson(unittest.TestCase):
         got = self.rows()
         self.assertEqual(got[self.SID]["account"], None)
         self.assertEqual(got[self.SID]["provider"], "anthropic")
+
+
+class TestTheRecordSaysWhatIsMissing(unittest.TestCase):
+    """Every --json record says why a field is null (`errors`, D13), and a
+    listing with a hole in it says so: the rows it has, a line naming the
+    source that was not read, exit 4 (D14). Absence is decided only after a
+    whole read: an indexed session not seen on a partial scan may be running."""
+    SID = "4f2b91ac-1111-4222-8333-abcdefabcdef"
+    GONE = "77770000-0000-4000-8000-000000000000"
+    SOURCE = "`claude agents --json` could not be read whole"
+
+    def setUp(self):
+        self.status = {"source_ok": True, "session_files_bad": 0}
+        self.rows_ = [dict(TestUsageInTheTable.ROWS[0], pid=4100, name="gate-n")]
+
+        def collect(cache=None, status=None, **k):
+            if status is not None:
+                status.update(self.status)
+            return list(self.rows_), {}
+        testkit.patch(self, runner.engine, "collect", collect)
+        self.snap = {"state": "ok", "names": {"token:1a2b3c4d": "work"},
+                     "accounts": [{"id": "token:1a2b3c4d", "kind": "token", "brand": "ant"}],
+                     "sessions": {}, "stale": [], "unsure": [], "unreadable": []}
+        testkit.patch(self, runner, "usage_snapshot",
+                      lambda rows, now=None, record=True, codex_threads=(): self.snap)
+        ended = {"sessionId": self.GONE, "project": "liveapp", "title": "Gate",
+                 "you_said": "the gate", "last_ts": "2026-09-01T11:00:00Z"}
+        testkit.patch(self, runner, "fresh_index", lambda quiet=False: {self.GONE: ended})
+        testkit.patch(self, runner.index, "search",
+                      lambda idx, q, live_ids=(), everything=False: [ended])
+        testkit.patch(self, runner.engine, "read_windows", lambda sid, **kw: ([], [], 0))
+
+    def run_cmd(self, fn, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = fn(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def ls_json(self, *words):
+        rc, out, err = self.run_cmd(runner.ls, *words, "--json")
+        return rc, {r["sessionId"]: r for r in json.loads(out)}, err
+
+    def test_a_running_row_says_why_its_account_is_null(self):
+        _, got, _ = self.ls_json()
+        self.assertEqual(got[self.SID]["ended"], False)
+        self.assertEqual(got[self.SID]["errors"]["account"]["code"], "no-reading-yet")
+        self.snap["stale"] = [self.SID]
+        _, got, _ = self.ls_json()
+        self.assertEqual(got[self.SID]["errors"]["account"]["code"], "stale-process")
+
+    def test_a_known_account_has_no_error(self):                         # control
+        self.snap["sessions"] = {self.SID: "token:1a2b3c4d"}
+        _, got, _ = self.ls_json()
+        self.assertEqual((got[self.SID]["account"], got[self.SID]["errors"]), ("work", {}))
+
+    def test_an_ended_row_is_a_record_that_has_ended(self):
+        rc, got, err = self.ls_json("gate")
+        self.assertEqual((rc, err), (0, ""))
+        gone = got[self.GONE]
+        self.assertEqual((gone["ended"], gone["account"], gone["pid"]), (True, None, None))
+        self.assertEqual(gone["errors"]["account"]["code"], "ended")
+
+    def test_a_whole_read_exits_0_and_says_nothing(self):                # control
+        rc, got, err = self.ls_json()
+        self.assertEqual((rc, err), (0, ""))
+
+    def test_claude_agents_not_read_whole_is_exit_4_with_the_rows(self):
+        self.status["source_ok"] = False
+        rc, got, err = self.ls_json()
+        self.assertEqual(rc, 4)
+        self.assertIn(self.SID, got)                     # the rows it has
+        self.assertEqual(err, f"ccwho ls: {self.SOURCE} - the list may miss sessions; rerun\n")
+        rc, out, err = self.run_cmd(runner.ls, "--no-color")         # the table too
+        self.assertEqual(rc, 4)
+        self.assertIn(self.SOURCE, err)
+
+    def test_session_files_not_read_is_exit_4_too(self):
+        for bad, words in ((2, "2 session files could not be read"),
+                           (1, "1 session file could not be read"),
+                           (None, "the session files could not be read")):
+            self.status["session_files_bad"] = bad
+            rc, _, err = self.ls_json()
+            self.assertEqual((rc, err), (4, f"ccwho ls: {words} - the list may miss sessions;"
+                                            " rerun\n"), bad)
+
+    def test_both_sources_not_read_are_both_named(self):
+        self.status.update(source_ok=False, session_files_bad=2)
+        _, _, err = self.ls_json()
+        self.assertEqual(err, f"ccwho ls: {self.SOURCE}, and 2 session files could not be read"
+                              " - the list may miss sessions; rerun\n")
+
+    def test_on_a_partial_read_an_unseen_session_is_not_called_ended(self):
+        self.status["source_ok"] = False
+        rc, got, _ = self.ls_json("gate")
+        self.assertEqual(rc, 4)
+        self.assertEqual(got[self.GONE]["ended"], None)
+        self.assertEqual(got[self.GONE]["errors"]["ended"]["code"], "not-read-whole")
+
+    def test_show_finding_nothing_on_a_partial_read_could_not_tell(self):
+        self.status["source_ok"] = False
+        testkit.patch(self, runner.index, "search",
+                      lambda idx, q, live_ids=(), everything=False: [])
+        rc, _, err = self.run_cmd(runner.show, "nothing-like-this")
+        self.assertEqual(rc, 4)
+        self.assertEqual(err, "ccwho show: no session matches 'nothing-like-this' - "
+                              f"{self.SOURCE}, so it may be running; rerun\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.GONE}):
+            rc, _, err = self.run_cmd(runner.show)
+        self.assertEqual(rc, 4)
+        self.assertIn(self.SOURCE, err)
+        rc, _, err = self.run_cmd(runner.ls, "nothing-like-this", "--json")
+        self.assertEqual((rc, err), (4, "ccwho ls: no session matches 'nothing-like-this' - "
+                                        f"{self.SOURCE}, so it may be running; rerun\n"))
+        self.status["source_ok"] = True                                   # control
+        self.assertEqual(self.run_cmd(runner.show, "nothing-like-this")[0], 1)
+        self.assertEqual(self.run_cmd(runner.ls, "nothing-like-this")[0], 1)
+
+    def test_show_of_an_unseen_session_on_a_partial_read_is_not_called_ended(self):
+        self.status["source_ok"] = False
+        rc, out, _ = self.run_cmd(runner.show, "zzz", "--json")     # only the index has it
+        self.assertEqual(rc, 0, out)                     # found: shown
+        got = json.loads(out)
+        self.assertEqual((got["sessionId"], got["ended"]), (self.GONE, None))
+        self.status["source_ok"] = True                                   # control
+        self.assertEqual(json.loads(self.run_cmd(runner.show, "zzz", "--json")[1])["ended"],
+                         True)
+
+    def test_show_says_why_the_account_is_null(self):
+        rc, out, _ = self.run_cmd(runner.show, "gate-n", "--json")
+        self.assertEqual(rc, 0)
+        got = json.loads(out)
+        self.assertEqual((got["ended"], got["errors"]["account"]["code"]),
+                         (False, "no-reading-yet"))
 
 
 class TestUsageSnapshotLogsWhatItShows(unittest.TestCase):
@@ -8203,7 +8348,7 @@ class TestReviewRoundOneRunner(unittest.TestCase):
         rows = [dict(TestUsageInTheTable.ROWS[0], sessionId="s1", project="alpha"),
                 dict(TestUsageInTheTable.ROWS[0], sessionId="s2", project="beta")]
         real = (runner.engine.collect, runner.fresh_index, runner.usage_facts)
-        runner.engine.collect = lambda cache=None, status=None: (list(rows), {})
+        runner.engine.collect = lambda cache=None, status=None, **k: (list(rows), {})
         runner.fresh_index = lambda quiet=False: {}
         runner.usage_facts = lambda *a, **k: {"usage_roots": []}
         out = io.StringIO()
@@ -8237,7 +8382,7 @@ class TestFilteredLsLeavesTheSharedFilesAlone(TestReviewRoundOneRunner):
         rows = [dict(TestUsageInTheTable.ROWS[0], sessionId="s1", project="alpha"),
                 dict(TestUsageInTheTable.ROWS[0], sessionId="s2", project="beta")]
         real = (runner.engine.collect, runner.fresh_index, runner.usage_facts)
-        runner.engine.collect = lambda cache=None, status=None: (list(rows), {})
+        runner.engine.collect = lambda cache=None, status=None, **k: (list(rows), {})
         runner.fresh_index = lambda quiet=False: {}
         runner.usage_facts = lambda *a, **k: {"usage_roots": []}
         try:
@@ -9664,7 +9809,7 @@ class TestTheOneTable(unittest.TestCase):
 
     def setUp(self):
         self.addCleanup(setattr, runner.engine, "collect", runner.engine.collect)
-        runner.engine.collect = lambda cache=None, status=None: (
+        runner.engine.collect = lambda cache=None, status=None, **k: (
             (status or {}).update(source_ok=True) or ([dict(r) for r in self.ROWS], {}))
         self.addCleanup(setattr, runner, "usage_snapshot", runner.usage_snapshot)
         runner.usage_snapshot = (lambda rows, now=None, record=True, codex_threads=():
@@ -9784,7 +9929,7 @@ class TestTheOneTable(unittest.TestCase):
 
     def test_an_unknown_word_is_no_command_and_no_search(self):
         scans = []
-        runner.engine.collect = lambda cache=None, status=None: scans.append(1) or ([], {})
+        runner.engine.collect = lambda cache=None, status=None, **k: scans.append(1) or ([], {})
         for word in ("reap", "accounts", "liveapp"):
             with self.subTest(word=word):
                 rc, out, err = self.main([word])
@@ -10133,13 +10278,18 @@ class TestEveryCommandSpeaksTheSameWay(unittest.TestCase):
         self.assertIn("ccwho restore: cannot read", err)
 
     def _show_from_inside(self):
-        """`show` with no word is the caller's own session: run as the row's."""
+        """`show` with no word is the caller's own session: run as the row's.
+        The index and the usage read are stand-ins: the real ones read this
+        machine's transcripts and settings."""
         env = mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID})
         env.start()
         self.addCleanup(env.stop)
+        testkit.patch(self, runner, "fresh_index", lambda quiet=False: {})
+        testkit.patch(self, runner, "usage_snapshot",
+                      lambda rows, now=None, record=True, codex_threads=(): {"state": "unknown"})
 
     def test_show_json_names_the_session_sessionId(self):
-        # the real brief: its id is under "aka" (review 1 of the CLI revamp,
+        # the real brief: its id was under "aka" (review 1 of the CLI revamp,
         # slice 3b - a stand-in brief with a top-level id passed from the start)
         testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (
             [{"sessionId": self.SID, "title": "t", "project": "p", "tty": "", "pid": 1}], {}))
@@ -10154,7 +10304,8 @@ class TestEveryCommandSpeaksTheSameWay(unittest.TestCase):
                 return set(v) | {k for x in v.values() for k in keys(x)}
             return {k for x in v for k in keys(x)} if isinstance(v, list) else set()
         self.assertNotIn("session_id", keys(got))
-        self.assertEqual((got.get("sessionId"), got["aka"].get("sessionId")), (self.SID, self.SID))
+        self.assertEqual(got.get("sessionId"), self.SID)
+        self.assertNotIn("aka", got)                 # its names are core keys (plan A)
 
     def test_show_s_text_still_names_the_session(self):                    # control
         testkit.patch(self, runner, "scan", lambda cache=None, status=None, **k: (

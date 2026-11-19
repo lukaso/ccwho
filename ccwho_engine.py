@@ -2142,9 +2142,12 @@ def _read_session_file(path):
     return None
 
 
-def read_session_files(dirs, default=None):
+def read_session_files(dirs, default=None, live=None):
     """Every usable `<dir>/sessions/*.json`, each tagged with its `configDir`; and
-    how many could not be used.
+    how many could not be used. `live`: the pids of the claudes running now -
+    Claude Code names a file by its pid, so an unusable one counts only while
+    its claude runs: one a claude that ended left behind would make every
+    `ccwho ls` exit 4, and a rerun would never help.
 
     The dirs are named by other processes, so a scan must finish whatever is in
     them: only small regular files are read (see _read_small_file), glob
@@ -2159,7 +2162,9 @@ def read_session_files(dirs, default=None):
             except OSError:                 # a symlink (ELOOP), gone, unreadable
                 data = None
             if data is None or procs.entry_problem(data):
-                bad += 1
+                stem = os.path.basename(path)[:-len(".json")]
+                if live is None or (stem.isascii() and stem.isdigit() and int(stem) in live):
+                    bad += 1
                 continue
             # the default dir stays unnamed: its sessions run with
             # CLAUDE_CONFIG_DIR unset, and setting it can move the login
@@ -2190,7 +2195,8 @@ def live_file_sessions(table=None):
     if not table:
         return [], None
     dirs = config_dirs_now(table)
-    entries, bad = read_session_files(dirs, default=os.path.expanduser("~/.claude"))
+    entries, bad = read_session_files(dirs, default=os.path.expanduser("~/.claude"),
+                                      live=set(procs.claude_pids(table)))
     return procs.live_session_files(entries, procs.claude_starts(table)), bad
 
 
@@ -5011,6 +5017,44 @@ def ended_row(entry, now_iso):
             "turns_since_recap": entry.get("turns_since_recap") or 0,
             "orphans": 0, "work": 0, "ts": last, "since": brief.age_between(last, now_iso),
             "age": "", "waitingFor": ""}
+
+
+# The record of one session: every session object in every --json has these
+# keys (plan F, test_contract.SESSION_CORE). Text fields are "" when unknown;
+# the rest null. `errors` says why a field is null.
+SESSION_CORE_TEXT = ("sessionId", "name", "project", "cwd", "title", "attention",
+                     "status", "purpose", "tty", "since")
+SESSION_CORE = SESSION_CORE_TEXT + ("kind", "configDir", "account", "accountId",
+                                    "provider", "pid", "ended", "errors")
+RECORD_ERRORS = {
+    "ended": "it does not run now: an ended session spends no account",
+    "not-read-whole": "a source of sessions could not be read, so it may be running: rerun",
+}
+
+
+def session_record(row, snap, ended=False, sure=True):
+    """The row as a --json record: its keys, every core key (SESSION_CORE), the
+    account it spends from the usage snapshot `snap` (ccwho_usage.row_account),
+    and `errors`: why a field is null. `ended`: a session the index found and
+    no row shows. `sure`: the scan read every source of sessions - an unseen
+    session on a partial read may still run, so it is not called ended."""
+    rec = dict(row)
+    for key in SESSION_CORE_TEXT:
+        if not isinstance(rec.get(key), str):
+            rec[key] = ""
+    for key in ("kind", "configDir", "pid"):
+        rec.setdefault(key, None)
+    if not ended:
+        rec.update(ccwho_usage.row_account(snap, rec["sessionId"]), ended=False)
+        why = ccwho_usage.account_error(snap, rec["sessionId"])
+        rec["errors"] = {"account": why} if why else {}
+        return rec
+    code = "ended" if sure else "not-read-whole"
+    why = {"code": code, "fix": RECORD_ERRORS[code]}
+    rec.update(account=None, accountId=None, provider="anthropic", pid=None,
+               ended=True if sure else None,
+               errors={"account": why} if sure else {"ended": why, "account": why})
+    return rec
 
 
 def ui_found_running(idx, query, live_rows):

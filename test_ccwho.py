@@ -7721,6 +7721,19 @@ class TestLiveFileSessionsLooksWhereSessionsSayTheyAre(unittest.TestCase):
         rows, _ = REAL_LIVE_FILE_SESSIONS()
         self.assertEqual(rows, [])
 
+    def test_a_broken_file_counts_only_while_its_claude_runs(self):
+        # Claude Code names a session file by its pid: a broken one a claude that
+        # ended left behind would make every `ccwho ls` exit 4, and a rerun never
+        # helps. A running claude's (7) counts; 9 is not running; 8 is a shell
+        ccwho.read_procargs = lambda pid: {"CLAUDE_CONFIG_DIR": self.dir} if pid == 7 else {}
+        for name in ("9.json", "8.json", "notapid.json"):
+            with open(os.path.join(self.dir, "sessions", name), "w") as fh:
+                fh.write("{not json")
+        self.assertEqual(REAL_LIVE_FILE_SESSIONS()[1], 0)
+        with open(os.path.join(self.dir, "sessions", "7.json"), "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(REAL_LIVE_FILE_SESSIONS()[1], 1)                   # control
+
 
 SID_ISO = "dddd4444-0000-4000-8000-000000000004"
 
@@ -7820,6 +7833,13 @@ class TestSessionFilesAreReadCarefully(unittest.TestCase):
         self.write("7.json", json.dumps(self.GOOD))
         entries, _ = ccwho.read_session_files([self.dir])
         self.assertEqual(entries[0]["configDir"], self.dir)
+
+    def test_given_the_running_claudes_a_broken_file_of_another_pid_is_not_counted(self):
+        self.write("7.json", "{not json")
+        self.write("8.json", "{not json")
+        self.write("x.json", "{not json")
+        self.assertEqual(ccwho.read_session_files([self.dir], live={7}), ([], 1))
+        self.assertEqual(ccwho.read_session_files([self.dir]), ([], 3))     # control
 
     def test_no_sessions_dir_is_nothing_wrong(self):                  # control
         self.assertEqual(ccwho.read_session_files([tempfile.mkdtemp()]), ([], 0))
@@ -8206,7 +8226,7 @@ class TestTheDirectoryFromARealScan(MachinelessCollect):
         testkit.patch(self, ccwho, "agents_json", lambda: json.dumps(self.feed))
         testkit.patch(self, ccwho, "config_dirs_now", lambda table=None: [])
         testkit.patch(self, ccwho, "read_session_files",
-                      lambda dirs, default=None: ([dict(self.file_row)], 0))
+                      lambda dirs, default=None, **k: ([dict(self.file_row)], 0))
         home = tempfile.mkdtemp(prefix="ccwho-test-directory-")
         self.addCleanup(shutil.rmtree, home, True)
         patcher = mock.patch.dict(os.environ, {"CCWHO_DIR": home})

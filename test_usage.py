@@ -588,6 +588,21 @@ class TestLoadReadings(unittest.TestCase):
         self.put("good.json", reading("login:a", five=(5, FIVE_RESET)))
         self.assertEqual(len(usage.load_readings(self.dir, NOW)), 1)
 
+    def test_a_session_whose_reading_cannot_be_read_is_named(self):
+        # the cause is kept: `ls --json` says "unreadable", not "no reading yet"
+        # (outside voice 2). A file kept for an earlier account (retired) is not
+        # the session's reading now, and an old one is no reading at all
+        self.put("bad.json", "{nope")
+        self.put("list.json", "[]")
+        self.put("nolimits.json", dict(reading("login:a"), rate_limits=None))
+        self.put("kept.token-1.json", "{nope")
+        self.put("good.json", reading("login:a", five=(5, FIVE_RESET)))
+        self.put("old.json", reading("login:a", five=(5, FIVE_RESET),
+                                     received=NOW - 14 * 86400 - 60))
+        bad = set()
+        self.assertEqual(len(usage.load_readings(self.dir, NOW, bad=bad)), 1)
+        self.assertEqual(bad, {"bad", "list", "nolimits"})
+
     def test_older_than_two_weeks_is_ignored(self):
         # owner, 2026-10-03: an account is kept two weeks after its last
         # reading - past a weekly reset, and not forever
@@ -1596,6 +1611,63 @@ class TestRowTag(unittest.TestCase):
     def test_no_snapshot_no_tag(self):
         self.assertEqual(usage.row_tag(None, "s1"), "")
         self.assertEqual(usage.row_tag({"state": "unknown"}, "s1"), "")
+
+
+class TestAccountError(unittest.TestCase):
+    """Why a session's account is null, as `errors.account` in every --json
+    record (D13): a code an agent can branch on, and the next step."""
+    L = acct_row("login:a", five=(1, None))
+
+    def code(self, s, sid="s1"):
+        e = usage.account_error(s, sid)
+        if e is not None:
+            self.assertTrue(e["fix"], e)            # every code says what to do next
+            self.assertEqual(set(e), {"code", "fix"})
+        return e and e["code"]
+
+    def test_each_reason_has_its_code(self):
+        ok = dict(snap([self.L], sessions={"s2": "login:a"}), stale=[], unsure=[], unreadable=[])
+        self.assertEqual(self.code(dict(ok, sessions={"s1": "login:a"})), None)    # control
+        self.assertEqual(self.code(ok), "no-reading-yet")
+        self.assertEqual(self.code(dict(ok, stale=["s1"])), "stale-process")
+        self.assertEqual(self.code(dict(ok, unsure=["s1"])), "unsure")
+        self.assertEqual(self.code(dict(ok, unreadable=["s1"])), "unreadable")
+        self.assertEqual(self.code({"state": "waiting"}), "no-reading-yet")
+        self.assertEqual(self.code({"state": "off"}), "usage-off")
+        self.assertEqual(self.code({"state": "not_set_up"}), "usage-off")
+        self.assertEqual(self.code({"state": "unknown"}), "unreadable")
+        self.assertEqual(self.code(None), "unreadable")
+
+    def test_a_reason_is_not_lost_when_no_account_is_shown(self):
+        # the only reading is unsure, or cannot be read: no account is shown, so
+        # the state is "waiting" - and "it replies once" would not help
+        facts = {"usage_roots": [{"root": "/h/.claude", "state": "ours", "opted_out": False}]}
+        unsure = reading("login:a", five=(5, FIVE_RESET), sid="s2", unsure=True)
+        s = usage.snapshot([unsure], NOW, live_ids={"s2", "s3"}, facts=facts, bad={"s3"})
+        self.assertEqual(s["state"], "waiting")
+        self.assertEqual([self.code(s, sid) for sid in ("s2", "s3")], ["unsure", "unreadable"])
+        s = usage.snapshot([], NOW, live_ids={"s1"}, facts=facts)                # control
+        self.assertEqual((s["state"], self.code(s, "s1")), ("waiting", "no-reading-yet"))
+
+    def test_it_never_disagrees_with_row_account(self):
+        # a session that spends an account the snapshot has no entry for: row_account
+        # says null, so there is a reason
+        s = dict(snap([self.L], sessions={"s1": "login:gone"}), stale=[], unsure=[], unreadable=[])
+        self.assertEqual(usage.row_account(s, "s1")["account"], None)
+        self.assertEqual(self.code(s), "no-reading-yet")
+
+    def test_the_snapshot_keeps_why_a_live_session_has_no_account(self):
+        # unsure: the login changed under it; unreadable: its file (load_readings'
+        # `bad`); neither is "no reading yet". Only live sessions are named
+        facts = {"usage_roots": [{"root": "/h/.claude", "state": "ours", "opted_out": False}]}
+        sure = reading("login:a", five=(5, FIVE_RESET), sid="s1")
+        unsure = reading("login:a", five=(5, FIVE_RESET), sid="s2", unsure=True)
+        gone = reading("login:a", five=(5, FIVE_RESET), sid="s4", unsure=True)
+        s = usage.snapshot([sure, unsure, gone], NOW, live_ids={"s1", "s2", "s3"},
+                           facts=facts, bad={"s3", "s5"})
+        self.assertEqual((s["unsure"], s["unreadable"]), (["s2"], ["s3"]))
+        self.assertEqual([self.code(s, sid) for sid in ("s1", "s2", "s3")],
+                         [None, "unsure", "unreadable"])
 
 
 class TestRowAccount(unittest.TestCase):

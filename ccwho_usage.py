@@ -500,8 +500,11 @@ def codex_rows(home, now, cache=None, threads=(), every=False):
     return rows
 
 
-def load_readings(directory, now):
-    """Every usable reading on disk. Corrupt, foreign and stale files are skipped."""
+def load_readings(directory, now, bad=None):
+    """Every usable reading on disk. Corrupt, foreign and stale files are skipped.
+    `bad`: a set that gets the session id of each session's own reading (not a
+    retired one) that could not be used - its account is "unreadable", not
+    "no reading yet" (outside voice 2)."""
     try:
         names = os.listdir(directory)
     except OSError:
@@ -510,12 +513,15 @@ def load_readings(directory, now):
     for name in names:
         if not _READING.match(name):
             continue
+        own = name.count(".") == 1          # <sid>.json; <sid>.<account>.json is retired
         try:
             with open(os.path.join(directory, name)) as fh:
                 rec = json.load(fh)
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError, RecursionError):
+            rec = None
         if not isinstance(rec, dict) or not _number(rec.get("received_at")):
+            if own and bad is not None:
+                bad.add(name[:-len(".json")])
             continue
         if now - rec["received_at"] > KEEP_SECONDS:
             continue
@@ -523,6 +529,8 @@ def load_readings(directory, now):
         # window is dropped here, so nothing downstream - the list - can trip on it.
         limits = clean_limits(rec.get("rate_limits"), kept=True)
         if limits is None or not isinstance(rec.get("first_account"), dict):
+            if own and bad is not None:
+                bad.add(name[:-len(".json")])
             continue
         out.append(dict(rec, rate_limits=limits))
     return out
@@ -895,14 +903,17 @@ def stale_sessions(readings, pids):
     return out
 
 
-def snapshot(readings, now, live_ids, facts, labels=None, codex=None, pids=None):
+def snapshot(readings, now, live_ids, facts, labels=None, codex=None, pids=None, bad=None):
     """What the list needs about usage, built once per collect: every account
     with a reading kept (KEEP_SECONDS), a live session spending it or not
     (owner, 2026-10-03: "I switch between them" - it was the live ones only,
     E-D6). `codex`: the Codex rows, kept as long. `sessions`: the live ones,
     and the open Codex threads - each spends the limit whose row names it.
     `pids`: session id -> its claude's pid now; a session whose reading is
-    from an earlier claude spends no account here, and is in `stale`."""
+    from an earlier claude spends no account here, and is in `stale`. Why
+    another live session spends none is kept too: `unsure` (the login changed
+    under it, or its claude could not be read) and `unreadable` (`bad`: its
+    file, from load_readings) - account_error reads them."""
     labels = labels or {}
     rows = accounts(readings, now, labels)
     spent = session_accounts(readings)
@@ -935,6 +946,10 @@ def snapshot(readings, now, live_ids, facts, labels=None, codex=None, pids=None)
     # account can be named while a token account has none (usage_marked)
     return {"state": state, "accounts": ordered(shown, names), "names": names,
             "sessions": sessions, "stale": sorted(stale), "now": now,
+            "unsure": sorted({r["session_id"] for r in readings
+                              if r.get("unsure") and not r.get("retired_at")
+                              and isinstance(r.get("session_id"), str)} & live_ids),
+            "unreadable": sorted(set(bad or ()) & live_ids),
             "labels": {r["id"]: labels[r["id"]] for r in shown
                        if isinstance(labels.get(r["id"]), str) and labels[r["id"]]}}
 
@@ -1199,6 +1214,39 @@ def row_account(snap, session_id):
         return out
     return {"account": (snap.get("names") or {}).get(aid, aid), "accountId": aid,
             "provider": PROVIDERS.get(row.get("brand", "ant"), row.get("brand"))}
+
+
+# Why a session's account is null, and the next step: `errors.account` in each
+# --json record (D13). The README lists each code.
+ACCOUNT_ERRORS = {
+    "no-reading-yet": "the session has not replied since it started: it replies once, then ask again",
+    "stale-process": "the reading is from an earlier claude of this session (a --resume,"
+                     " maybe on another account): it replies once, then ask again",
+    "unsure": "the login changed under the session, or its claude could not be read:"
+              " ask the person which account it spends",
+    "unreadable": "its usage reading could not be read: report it, then rerun",
+    "usage-off": "ccwho reads no usage on this machine: ask the person (ccwho setup --usage)",
+}
+
+
+def account_error(snap, session_id):
+    """{"code", "fix"}: why this live session has no account, or None when it has one."""
+    def why(code):
+        return {"code": code, "fix": ACCOUNT_ERRORS[code]}
+    state = snap.get("state") if isinstance(snap, dict) else None
+    if state in ("off", "not_set_up"):
+        return why("usage-off")
+    if state not in ("ok", "waiting"):
+        return why("unreadable")             # the snapshot itself could not be made
+    if row_account(snap, session_id)["accountId"] is not None:
+        return None                         # as row_account says: they never disagree
+    # before "waiting": a session whose only reading is unsure or broken shows
+    # no account, so the state is "waiting" - and a reply would not help
+    for key, code in (("stale", "stale-process"), ("unsure", "unsure"),
+                      ("unreadable", "unreadable")):
+        if session_id in (snap.get(key) or ()):
+            return why(code)
+    return why("no-reading-yet")
 
 
 def status_text(rec, now, labels=None, names=None):

@@ -361,6 +361,19 @@ def _focus(row):
     return 1
 
 
+def not_read_whole(status):
+    """What a scan could not read, in words - "" when it read every source of
+    sessions. A listing with a hole still prints what it has, says this, and
+    exits 4 (D14). A key the scan did not set is no hole (a stand-in collect)."""
+    holes = [] if status.get("source_ok", True) else ["`claude agents --json` could not be read whole"]
+    bad = status.get("session_files_bad", 0)
+    if bad is None:
+        holes.append("the session files could not be read")
+    elif bad:
+        holes.append(f"{bad} session file{'s' if bad != 1 else ''} could not be read")
+    return ", and ".join(holes)
+
+
 def show(argv):
     """What was this session working on? The answer without opening it.
 
@@ -375,14 +388,19 @@ def show(argv):
         print("ccwho show: name a session (this is not a Claude Code session):"
               " ccwho show <session>", file=sys.stderr)
         return 2
-    cache = {}
-    rows, fleet = scan(cache=cache)
+    cache, status = {}, {}
+    rows, fleet = scan(cache=cache, status=status, samples=0)     # saved verdicts (D18)
+    hole = not_read_whole(status)
     entry = {}
     if me is not None:
         # the caller's own session (D6), from the sessions each row answers for:
         # a terminal that parked its job has no row, and the job's row is its
         hits = [r for r in rows if me in engine.answers_for(r)][:1]
         if not hits:
+            if hole:
+                print(f"ccwho show: this session ({me[:8]}) is not among the running sessions"
+                      f" - {hole}, so it may be running; rerun", file=sys.stderr)
+                return 4
             print(f"ccwho show: this session ({me[:8]}) is not among the running sessions"
                   " - name one: ccwho ls", file=sys.stderr)
             return 1
@@ -399,6 +417,10 @@ def show(argv):
         if hits:
             entry = fresh_index().get(hits[0].get("sessionId"), {})
     if not hits:
+        if hole:
+            print(f"ccwho show: no session matches {query!r} - {hole}, so it may be running;"
+                  " rerun", file=sys.stderr)
+            return 4
         print(f"ccwho show: no session matches {query!r}", file=sys.stderr)
         return 1
     if len(hits) > 1:
@@ -408,8 +430,8 @@ def show(argv):
             print(f"  {line}", file=sys.stderr)
         return 2
     # the account it spends, as `ls --json` says it: a lookup records nothing
-    row = dict(hits[0], **usage.row_account(with_usage(rows, fleet, record=False)["usage"],
-                                            hits[0].get("sessionId", "")))
+    snap = with_usage(rows, fleet, record=False)["usage"]
+    row = dict(hits[0], **usage.row_account(snap, hits[0].get("sessionId", "")))
     head, tail, _mtime = engine.read_windows(row.get("sessionId", ""), cache=cache)
     b = engine.brief.build(head, tail, session=row,
                            now=engine.now_iso(), as_records=engine.as_records)
@@ -422,13 +444,12 @@ def show(argv):
         b["recap_age"] = engine.brief.age_between(b["recap_ts"], engine.now_iso())
         b["turns_since_recap"] = entry.get("turns_since_recap", 0)
     if want_json:
-        # a session is sessionId, as in every --json - also among its names
-        # (aka); the brief itself keeps session_id, which render_brief reads
-        out = dict(b, sessionId=row.get("sessionId", ""), purpose=row.get("purpose", ""),
-                   **{k: row[k] for k in ("account", "accountId", "provider")})
-        if isinstance(out.get("aka"), dict):
-            out["aka"] = {("sessionId" if k == "session_id" else k): v
-                          for k, v in out["aka"].items()}
+        # the session's record, as in `ls --json` (its title the table's), and
+        # the brief around it; `aka` goes: its names are core keys
+        rec = engine.session_record(hits[0], snap, ended=hits[0].get("attention") == "ended",
+                                    sure=not hole)
+        out = dict({k: v for k, v in b.items() if k != "aka"},
+                   **{k: rec[k] for k in engine.SESSION_CORE})
         print(json.dumps(out, indent=2))
         return 0
     print(engine.render_brief(b, row, color=sys.stdout.isatty()
@@ -1000,12 +1021,18 @@ def ls(argv):
     # links on a terminal unless refused: one that cannot render OSC 8 shows
     # the label anyway, so the downside is nil
     links = sys.stdout.isatty() and "--no-links" not in argv
-    rows, fleet = scan(cache={})
+    status = {}
+    rows, fleet = scan(cache={}, status=status, samples=0)     # saved verdicts (D18)
+    hole = not_read_whole(status)
     needs_you = "--needs-you" in argv
     # words first, over every row: the index tells a running session from an
     # ended one by the rows it is given
     live, ended = matches(query, rows, everything="--all" in argv) if query else (rows, [])
     if query and not live and not ended:
+        if hole:
+            print(f"ccwho ls: no session matches {query!r} - {hole}, so it may be running;"
+                  " rerun", file=sys.stderr)
+            return 4
         print(f"ccwho ls: no session matches {query!r}", file=sys.stderr)
         return 1
     running = len(live)
@@ -1016,16 +1043,17 @@ def ls(argv):
         # setup-token session runs in the default dir, as "" (a script read
         # that as the default account). Rows, not a person: records nothing
         snap = with_usage(rows, fleet, record=False)["usage"]
-        live = [dict(r, **usage.row_account(snap, r.get("sessionId", ""))) for r in live]
-        print(json.dumps(live + [dict(e, ended=True) for e in ended], indent=2))
-        return 0
+        print(json.dumps([engine.session_record(r, snap) for r in live]
+                         + [engine.session_record(e, snap, ended=True, sure=not hole)
+                            for e in ended], indent=2))
+        return _ls_hole(hole)
     if needs_you and not live and (query or running):
         # not "no sessions found", nor "no session matches": an agent that
         # polls this would read that nothing runs
         # and "Claude Code": a Codex thread can be asking in the list
         print(f"no {'matching ' if query else ''}Claude Code session needs you"
               f" ({running} running)")
-        return 0
+        return _ls_hole(hole)
     if live or not query:
         # the fleet too: without it the table lost its ports, its usage and its
         # account tags. A part of the table (words, --needs-you) records no usage
@@ -1038,7 +1066,15 @@ def ls(argv):
             print(f"  {engine.brief.short_id(r['sessionId']):<6} {r['project'][:12]:<12}"
                   f" {engine.truncate(r['title'] or r['topic'], 44):<44}"
                   f" ended {r['since']} ago")
-    return 0
+    return _ls_hole(hole)
+
+
+def _ls_hole(hole):
+    """ls's exit: 4 and a line naming the source when the scan had a hole (D14)."""
+    if not hole:
+        return 0
+    print(f"ccwho ls: {hole} - the list may miss sessions; rerun", file=sys.stderr)
+    return 4
 
 
 PURPOSE_USAGE = ('usage: ccwho purpose [TEXT]                what this named session is for\n'
@@ -3309,7 +3345,10 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     # the runner once, and after its reload (or a failed one) sys.modules is
     # what holds the module to use
     u = sys.modules.get("ccwho_usage", usage)
-    readings = u.load_readings(usage_dir(), now)
+    # the sessions whose own reading could not be read: "unreadable", not "no reading yet"
+    bad = set()
+    readings = (u.load_readings(usage_dir(), now, bad=bad) if hasattr(u, "account_error")
+                else u.load_readings(usage_dir(), now))
     codex = None
     if hasattr(u, "codex_rows"):
         try:
@@ -3324,7 +3363,8 @@ def usage_snapshot(rows, now=None, record=True, codex_threads=()):
     snap = u.snapshot(readings, now, engine.live_ids(rows),
                       lambda: usage_facts(now, readings), labels,
                       **({"codex": codex} if codex else {}),
-                      **({"pids": pids} if hasattr(u, "stale_sessions") else {}))
+                      **({"pids": pids} if hasattr(u, "stale_sessions") else {}),
+                      **({"bad": bad} if hasattr(u, "account_error") else {}))
     # only a snapshot over the whole fleet is recorded: a filtered `ls` leaves
     # the shared names and shown-log to the list
     if record:

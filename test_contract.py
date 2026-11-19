@@ -104,12 +104,53 @@ class TestJsonRowShape(unittest.TestCase):
 LS_KEYS = {
     "account", "accountId", "provider",   # added 2026-11-17: the account the session
                                           # spends, its id, and who sells it (null: unknown)
+    "ended", "errors",                    # added 2026-11-19: false on a running row; why a
+                                          # null field is null ({"account": {code, fix}})
 }
+
+# The record of one session: every session object in every --json has these
+# keys, always (null when unknown), with these types (plan F). A command adds
+# its own keys around them.
+STR, OPT_STR, OPT_INT = (str,), (str, type(None)), (int, type(None))
+SESSION_CORE = {
+    "sessionId": STR, "name": STR, "project": STR, "cwd": STR, "title": STR,
+    "attention": STR, "status": STR, "purpose": STR, "kind": OPT_STR,
+    "configDir": OPT_STR, "account": OPT_STR, "accountId": OPT_STR, "provider": STR,
+    "tty": STR, "pid": OPT_INT, "since": STR, "ended": (bool, type(None)),
+    "errors": (dict,),
+}
+
+
+def assert_record(case, rec, where):
+    """`rec` is a session record: the core keys, each of its type."""
+    case.assertEqual(set(SESSION_CORE) - set(rec), set(), f"{where}: a core key is missing")
+    for key, types in SESSION_CORE.items():
+        case.assertIsInstance(rec[key], types, f"{where}: {key} = {rec[key]!r}")
+        if bool not in types:                       # a bool is an int to isinstance
+            case.assertNotIsInstance(rec[key], bool, f"{where}: {key}")
+    for field, why in rec["errors"].items():
+        case.assertIn(field, SESSION_CORE, f"{where}: errors names a core key")
+        case.assertEqual(set(why), {"code", "fix"}, f"{where}: errors.{field}")
+
+
+def own_ccwho_dir(case):
+    """A ccwho dir of the test's own: a scan lets go of launch claims in it."""
+    import shutil
+    import tempfile
+    from unittest import mock
+    tmp = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, tmp, True)
+    env = mock.patch.dict(os.environ, {"CCWHO_DIR": tmp})
+    env.start()
+    case.addCleanup(env.stop)
 
 
 class TestLsJsonShape(unittest.TestCase):
     """What `ccwho ls --json` prints, not only what build_row gives: a key the
     command adds is as much a contract as a row key."""
+
+    def setUp(self):
+        own_ccwho_dir(self)
 
     def test_ls_json_rows_have_exactly_the_declared_keys(self):
         import contextlib
@@ -130,6 +171,68 @@ class TestLsJsonShape(unittest.TestCase):
         self.assertEqual(set(got) - ROW_KEYS, LS_KEYS,
                          "a key ls adds is declared in LS_KEYS in the same commit")
         self.assertEqual(ROW_KEYS - set(got), set(), "a consumer of --json reads these by name")
+
+
+class TestEveryCommandGivesTheRecord(unittest.TestCase):
+    """`ls --json` (running and ended rows) and `show --json`: each session is
+    one record, the same keys of the same types (plan F)."""
+
+    def setUp(self):
+        import ccwho as runner
+        self.runner = runner
+        own_ccwho_dir(self)
+        row = ccwho.build_row(SESSION, HEAD, TAIL, mtime=1788203600, now=1788207200)
+        ended = {"sessionId": "77770000-0000-4000-8000-000000000000", "project": "liveapp",
+                 "title": "Gate", "you_said": "fix the gate", "last_ts": "2026-09-01T11:00:00Z"}
+        saved = (runner.engine.collect, runner.usage_snapshot, runner.fresh_index,
+                 runner.engine.read_windows)
+        self.addCleanup(lambda: (setattr(runner.engine, "collect", saved[0]),
+                                 setattr(runner, "usage_snapshot", saved[1]),
+                                 setattr(runner, "fresh_index", saved[2]),
+                                 setattr(runner.engine, "read_windows", saved[3])))
+
+        def collect(cache=None, status=None, **k):
+            if status is not None:
+                status.update(source_ok=True, session_files_bad=0)
+            return [dict(row)], {}
+        runner.engine.collect = collect
+        runner.usage_snapshot = lambda rows, now=None, record=True, codex_threads=(): {
+            "state": "unknown"}
+        runner.fresh_index = lambda quiet=False: {ended["sessionId"]: ended}
+        runner.engine.read_windows = lambda sid, **kw: (HEAD, TAIL, 1788203600)
+        live = {"sessionId": SESSION["sessionId"]}
+        self.search = lambda idx, q, live_ids=(), everything=False: [live, ended]
+
+    def run_cmd(self, fn, argv):
+        import contextlib
+        import io
+        out = io.StringIO()
+        real = self.runner.index.search
+        self.runner.index.search = self.search
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                rc = fn(argv)
+        finally:
+            self.runner.index.search = real
+        self.assertEqual(rc, 0)
+        return json.loads(out.getvalue())
+
+    def test_ls_running_and_ended_rows_are_records(self):
+        got = self.run_cmd(self.runner.ls, ["gate", "--json"])
+        self.assertEqual([r["ended"] for r in got], [False, True])
+        for r in got:
+            assert_record(self, r, f"ls {r['sessionId']}")
+
+    def test_a_text_key_that_is_null_in_the_row_is_empty_in_the_record(self):
+        rec = ccwho.session_record({"sessionId": "x", "title": None, "cwd": None},
+                                   {"state": "unknown"}, ended=True)
+        assert_record(self, rec, "a row with nulls")
+        self.assertEqual((rec["title"], rec["cwd"]), ("", ""))
+
+    def test_show_is_a_record(self):
+        got = self.run_cmd(self.runner.show, ["liveapp-4e", "--json"])
+        assert_record(self, got, "show")
+        self.assertNotIn("aka", got, "its contents are core keys")
 
 
 class TestManifestShape(unittest.TestCase):

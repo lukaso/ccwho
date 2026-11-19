@@ -387,11 +387,35 @@ commands list Claude Code sessions only). `ccwho show` prints it as `account   a
 the words the table's tag and the usage line use. An agent asks about its own session with
 `ccwho show --json` and no word: ccwho finds it from `CLAUDE_CODE_SESSION_ID`, also when it
 runs as the job its terminal parked. Outside a session, `show` with no word exits 2 and says
-to name one. Before the session's first reading, with usage off, or for
-an ended session, `account` and `accountId` are `null`, and so they are after a
-`--resume` until the session replies: its reading is from its earlier claude, maybe on
-another account (the table shows no tag for it then either); an ended row in `ls --json` has
-no account keys. Do not use
+to name one.
+
+Each session in `ls --json` and `show --json` is one record with the same keys:
+`sessionId`, `name`, `project`, `cwd`, `title`, `attention`, `status`, `purpose`, `kind`,
+`configDir`, `account`, `accountId`, `provider`, `tty`, `pid`, `since`, `ended` and `errors`
+(`show` adds the brief: `recap`, `goal`, `you_said`, `progress`, `closing`). `ended` is
+`false` for a running session, `true` for one the index found that no longer runs, and
+`null` when ccwho could not read every source of sessions and so cannot say. `errors`
+says why a field is `null`: `{"account": {"code": "...", "fix": "..."}}`, and `{}` when
+nothing is missing. The codes for `account`:
+
+- `no-reading-yet`: the session has not replied since it started. It replies once; then ask again.
+- `stale-process`: the reading is from an earlier claude of this session, as after a
+  `--resume`, maybe on another account (the table shows no tag for it then either). It
+  replies once; then ask again.
+- `unsure`: the login changed under the session, or its claude could not be read. Ask
+  the person which account it spends.
+- `unreadable`: its usage reading could not be read. Report it, then rerun.
+- `usage-off`: ccwho reads no usage on this machine. Ask the person (`ccwho setup --usage`).
+- `ended`: the session does not run, so it spends no account.
+- `not-read-whole`: a source of sessions could not be read, so a session that is not
+  seen may still be running (also under `errors.ended`). Rerun.
+
+When `claude agents --json` or a session file could not be read, `ls` still prints the
+sessions it has, writes one line that names what it could not read to stderr, and exits
+4 ("could not tell"). `ls <word>` and `show` exit 4, not 1, when they find nothing then.
+`show --json` has no `aka` any more: its names are the keys above.
+
+Do not use
 `configDir` to find the account: `""` means only that the session runs in the default
 config dir (`CLAUDE_CONFIG_DIR` is not set). A session started with a token
 (`claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`) also runs there, and spends the token's
@@ -1128,17 +1152,16 @@ being downloaded - uses little CPU either. Not found: a program with more than o
 thread (node, Go, Java, a python that started a thread), as every thread must be in
 that `read`. A sample takes about 1.5 s and stops the process for about a
 millisecond at each look. A scan takes at most two, all sessions together; the rest
-wait for the next scan. Only a scan that shows stuck work samples: the list,
-`ccwho ls` and `show`; never `ps`, `save`, `open` or `restore`. A sample's verdict
+wait for the next scan. Only the live list samples; `ccwho ls` and `show` show the
+verdicts it saved, and `ps`, `save`, `open` and `restore` take none either. So without
+the list running, `ccwho ls` does not find a new stuck reader. A sample's verdict
 is asked again after five minutes (some reads do return: `read -t`, an alarm), and a
 sample or an lsof that fails keeps the last one. That fd 0 is the claude's socket is
-kept for the life of the process, and proven again before each new sample. Two
-`ccwho ls` started at the same moment may each sample the same process. A kill samples again each process
+kept for the life of the process, and proven again before each new sample. A kill samples again each process
 it was asked about, and what it sees becomes the list's newest verdict. The
 verdicts are kept in `~/.cache/ccwho/readers.json`, under a hash of each process
 (its claude, pid, start and command - no command text), so `ccwho ls`, a new
-process every time, does not sample again what the list or an earlier `ccwho ls`
-already did. A program whose
+process every time, shows what the list already found. A program whose
 name is not a short plain word is called `a program`. Never one under an MCP server (Claude Code
 does write to that socket) or under an agent - but for a stuck codex under codex's
 own processes (its npm wrapper). Its kill box stops the reader's whole

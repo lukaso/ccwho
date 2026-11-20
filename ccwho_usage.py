@@ -1226,6 +1226,8 @@ ACCOUNT_ERRORS = {
               " ask the person which account it spends",
     "unreadable": "its usage reading could not be read: report it, then rerun",
     "usage-off": "ccwho reads no usage on this machine: ask the person (ccwho setup --usage)",
+    "codex-unknown": "Codex's usage names a limit, not an account: ask the person which"
+                     " ChatGPT login this thread spends",
 }
 
 

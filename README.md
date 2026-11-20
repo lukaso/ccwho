@@ -382,8 +382,8 @@ running session spends an account on it.
 
 For a script or an agent, `ccwho ls --json` and `ccwho show --json` give each session's
 account: `account` (the name the usage line gives it), `accountId` (`login:<uuid>` or
-`token:<hash>`, the id `ccwho usage name` takes) and `provider` (`anthropic`: these
-commands list Claude Code sessions only). `ccwho show` prints it as `account   ant:work`,
+`token:<hash>`, the id `ccwho usage name` takes) and `provider` (`anthropic`, or
+`openai` for a Codex thread). `ccwho show` prints it as `account   ant:work`,
 the words the table's tag and the usage line use. An agent asks about its own session with
 `ccwho show --json` and no word: ccwho finds it from `CLAUDE_CODE_SESSION_ID`, also when it
 runs as the job its terminal parked. Outside a session, `show` with no word exits 2 and says
@@ -396,7 +396,17 @@ Each session in `ls --json` and `show --json` is one record with the same keys:
 `false` for a running session, `true` for one the index found that no longer runs, and
 `null` when ccwho could not read every source of sessions and so cannot say. `errors`
 says why a field is `null`: `{"account": {"code": "...", "fix": "..."}}`, and `{}` when
-nothing is missing. The codes for `account`:
+nothing is missing.
+
+An open Codex thread is a record in `ls --json` too, after the running Claude Code
+sessions and before the ended ones:
+`kind` is `codex`, `provider` is `openai`, `pid` is the process that holds the thread,
+and it adds `where` (where the thread runs: VS Code, the codex CLI, the ChatGPT app) and
+`pids` (its processes). `ls --needs-you`, the table and `show` list Claude Code sessions
+only. A thread is never a session to `open`, `stop`, `kill` or `save`: they find no
+session by its id or its title, and a save never holds it.
+
+The codes for `account`:
 
 - `no-reading-yet`: the session has not replied since it started. It replies once; then ask again.
 - `stale-process`: the reading is from an earlier claude of this session, as after a
@@ -406,11 +416,14 @@ nothing is missing. The codes for `account`:
   the person which account it spends.
 - `unreadable`: its usage reading could not be read. Report it, then rerun.
 - `usage-off`: ccwho reads no usage on this machine. Ask the person (`ccwho setup --usage`).
+- `codex-unknown`: a Codex thread. Codex's usage names a limit, not an account, so ccwho
+  cannot tell which ChatGPT login the thread spends. Ask the person.
 - `ended`: the session does not run, so it spends no account.
 - `not-read-whole`: a source of sessions could not be read, so a session that is not
   seen may still be running (also under `errors.ended`). Rerun.
 
-When `claude agents --json` or a session file could not be read, `ls` still prints the
+When `claude agents --json`, a session file or (for `ls --json`) the open Codex threads
+could not be read, `ls` still prints the
 sessions it has, writes one line that names what it could not read to stderr, and exits
 4 ("could not tell"). `ls <word>` and `show` exit 4, not 1, when they find nothing then.
 `show --json` has no `aka` any more: its names are the keys above.
@@ -428,6 +441,16 @@ as an account, a Codex thread open or not. ccwho reads it from Codex's own trans
 never parses what was said. A selected Codex row makes the entry of its limit bright: the
 limit of the last 5-hour or 7-day reading in its transcript. `ccwho usage` lists it, and
 `ccwho usage name oai:codex <label>` names it.
+
+`ccwho usage --json` names each account as the session records do: `account`,
+`accountId` and `provider`, with `id` (what `ccwho usage name` takes), `kind`, `email`,
+`age`, `five_hour` and `seven_day`. `sessions` lists the running sessions that spend it
+now, each as `{"sessionId": ..., "name": ...}` - the same map `ls --json` reads; `null`
+when that is not known (usage is off or could not be read, or for Codex the open threads) - and
+`seen` counts the sessions it was seen in over the last two weeks. A Codex limit is no
+account: its `accountId` is `null`, and its `sessions` are the open threads whose
+transcript names the limit. When the running sessions or the open Codex threads could
+not all be read, it says so on stderr and exits 4.
 
 ## Finding an old session
 
@@ -539,6 +562,10 @@ ccwho ps --helpers          # ...including helpers (MCP servers and the like)
 ccwho ps --json             # for scripts, and for agents told to clean up
 ccwho ps --full             # the whole command line, not the short form
 ```
+
+In `ps --json` each process keeps its own keys - its `pid` is the process's, not the
+session's - and names its session as a reference, `"session": {"sessionId": ...,
+"name": ...}`, or `null` when no session is known.
 
 The live list and the table (`ccwho ls`) say it in one dim line
 each, never louder than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
@@ -882,7 +909,8 @@ hands a link it understands to `open`; the lines that follow start `ccwho open:`
 colour - `ls`, `show`, `restore` and `doctor` - and each takes `--no-color`; colour
 is also off when `NO_COLOR` is set, or when the output is not a terminal.
 `ccwho statusline` always prints colour: Claude Code shows its line in its status
-bar. Every `--json` names a session `sessionId`.
+bar. Every `--json` names a session by `sessionId` (`ps --json` and `usage --json` in
+a `{"sessionId", "name"}` reference).
 
 | Exit | Means |
 |---|---|

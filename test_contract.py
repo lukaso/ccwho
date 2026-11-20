@@ -235,6 +235,219 @@ class TestEveryCommandGivesTheRecord(unittest.TestCase):
         self.assertNotIn("aka", got, "its contents are core keys")
 
 
+# Keys a Codex thread's record has beside ROW_KEYS and LS_KEYS. Append only.
+CODEX_KEYS = {
+    "where", "pids",      # added 2026-11-19: where its thread runs, in words (the
+                          # codex CLI, VS Code, the ChatGPT app); its processes' pids
+}
+
+CODEX_ID = "019a0000-1111-7222-8333-444455556666"
+
+
+def codex_thread(**over):
+    """An open Codex thread as collect()'s fleet carries it (engine.codex_fleet)."""
+    return dict({"thread": CODEX_ID, "cwd": "/Users/x/projects/parser",
+                 "name": "fix the parser", "turn": "done", "ts": 5.0,
+                 "mtime": 1788207000, "host_pid": 7777, "source": "cli",
+                 "procs": 1, "ports": [], "pids": [7778]}, **over)
+
+
+class _CommandCase(unittest.TestCase):
+    """A command run on a fake scan: one Claude session and one Codex thread."""
+
+    def setUp(self):
+        import ccwho as runner
+        self.runner = runner
+        own_ccwho_dir(self)
+        self.row = ccwho.build_row(SESSION, HEAD, TAIL, mtime=1788203600, now=1788207200)
+        self.fleet = {"codex_threads": [codex_thread()]}
+        self.source_ok = True
+        saved = (runner.engine.collect, runner.usage_snapshot, runner.fresh_index)
+        self.addCleanup(lambda: (setattr(runner.engine, "collect", saved[0]),
+                                 setattr(runner, "usage_snapshot", saved[1]),
+                                 setattr(runner, "fresh_index", saved[2])))
+
+        def collect(cache=None, status=None, **k):
+            if status is not None:
+                status.update(source_ok=self.source_ok, session_files_bad=0)
+            return [dict(self.row)], dict(self.fleet)
+        runner.engine.collect = collect
+        self.snap = {"state": "unknown"}
+        runner.usage_snapshot = lambda rows, now=None, record=True, codex_threads=(): self.snap
+        runner.fresh_index = lambda quiet=False: {}
+
+    def run_cmd(self, fn, argv, rc=0):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            got = fn(argv)
+        self.err = err.getvalue()
+        self.assertEqual(got, rc, self.err)
+        return json.loads(out.getvalue())
+
+
+class TestACodexThreadIsARecord(_CommandCase):
+    """D9: `ls --json` lists the open Codex threads as records of their own -
+    the account unknown and saying why, never a Codex limit id as an account."""
+
+    def codex(self, got):
+        return [r for r in got if r.get("kind") == "codex"]
+
+    def test_ls_json_lists_the_thread_as_a_record(self):
+        got = self.run_cmd(self.runner.ls, ["--json"])
+        self.assertEqual([r["sessionId"] for r in got], [SESSION["sessionId"], CODEX_ID])
+        rec = self.codex(got)[0]
+        assert_record(self, rec, "a Codex thread")
+        self.assertEqual(set(rec) - ROW_KEYS - LS_KEYS, CODEX_KEYS,
+                         "a key a Codex record adds is declared in CODEX_KEYS")
+        self.assertEqual((rec["account"], rec["accountId"], rec["provider"], rec["ended"]),
+                         (None, None, "openai", False))
+        self.assertEqual(rec["errors"]["account"]["code"], "codex-unknown")
+        self.assertEqual(rec["pid"], 7777, "the process that holds the thread")
+        self.assertEqual(rec["title"], "fix the parser")
+
+    def test_a_codex_limit_is_never_an_account_id(self):
+        # the usage snapshot names the thread's limit; the record does not take it
+        self.snap = {"state": "ok", "accounts": [{"id": "codex:codex", "brand": "oai"}],
+                     "names": {"codex:codex": "codex"}, "sessions": {CODEX_ID: "codex:codex"}}
+        rec = self.codex(self.run_cmd(self.runner.ls, ["--json"]))[0]
+        self.assertEqual((rec["account"], rec["accountId"]), (None, None))
+
+    def test_words_find_a_thread_as_they_find_a_session(self):
+        self.assertEqual([r["sessionId"] for r in
+                          self.run_cmd(self.runner.ls, ["parser", "--json"])], [CODEX_ID])
+        self.assertEqual(self.codex(self.run_cmd(self.runner.ls, ["liveapp", "--json"])), [])
+
+    def test_threads_that_could_not_be_read_exit_4_and_say_so(self):
+        self.fleet = {"codex_threads": None}
+        got = self.run_cmd(self.runner.ls, ["--json"], rc=4)
+        self.assertEqual([r["sessionId"] for r in got], [SESSION["sessionId"]])
+        self.assertIn("Codex threads could not be read", self.err)
+
+    def test_a_codex_read_failure_leaves_ended_sessions_ended(self):
+        # the threads say nothing of a Claude session: exit 4 for the threads,
+        # and an ended session the index found is still ended
+        self.fleet = {"codex_threads": None}
+        ended = {"sessionId": "77770000-0000-4000-8000-000000000000", "project": "liveapp",
+                 "title": "Gate", "you_said": "fix the gate",
+                 "last_ts": "2026-09-01T11:00:00Z"}
+        self.runner.fresh_index = lambda quiet=False: {ended["sessionId"]: ended}
+        real = self.runner.index.search
+        self.runner.index.search = lambda idx, q, live_ids=(), everything=False: [ended]
+        self.addCleanup(setattr, self.runner.index, "search", real)
+        got = self.run_cmd(self.runner.ls, ["gate", "--json"], rc=4)
+        rec = next(r for r in got if r["sessionId"] == ended["sessionId"])
+        self.assertIs(rec["ended"], True)
+        self.assertEqual(set(rec["errors"]), {"account"})
+        self.assertEqual(rec["errors"]["account"]["code"], "ended")
+        self.assertIn("Codex threads could not be read", self.err)
+
+    def test_the_text_table_is_unchanged(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.runner.ls(["--no-color"]), 0)
+        self.assertNotIn("parser", out.getvalue(), "slice 5 brings the text")
+
+
+def _proc(pid, session, **over):
+    return dict({"pid": pid, "ports": [], "command": f"node {pid}.js", "session": session},
+                **over)
+
+
+class TestPsJsonNamesTheSessionByReference(_CommandCase):
+    """`ps --json`: each process keeps its own keys and its own pid; its session
+    is a reference {sessionId, name} - never the session's keys flattened in
+    (a process's pid is not the session's)."""
+
+    def test_each_process_has_a_session_reference(self):
+        self.fleet = dict(self.fleet, procs_ok=True, ports_ok=True,
+                          by_session={SESSION["sessionId"]: [_proc(501, SESSION["sessionId"])]},
+                          codex=[_proc(7778, CODEX_ID)],
+                          left_behind=[_proc(601, "dead0000-0000-4000-8000-000000000000")],
+                          unsure=[_proc(701, None, why="an app")])
+        got = {p["pid"]: p for p in self.run_cmd(self.runner.ps, ["--json"])}
+        self.assertEqual(got[501]["session"], {"sessionId": SESSION["sessionId"],
+                                               "name": "liveapp-4e"})
+        self.assertEqual(got[7778]["session"], {"sessionId": CODEX_ID, "name": ""})
+        self.assertEqual(got[601]["session"],
+                         {"sessionId": "dead0000-0000-4000-8000-000000000000", "name": ""})
+        self.assertIsNone(got[701]["session"])
+        for p in got.values():
+            self.assertNotIn("sessionId", p, "the session is a reference")
+
+
+class TestUsageJsonSpeaksAsTheRecords(_CommandCase):
+    """`usage --json`: each account as a record names it - account, accountId,
+    provider - and `sessions` are the live sessions that spend it now (the map
+    `ls` reads), as references; the count of every session seen is `seen` (E5)."""
+
+    def setUp(self):
+        super().setUp()
+        u = self.runner.usage
+        saved = (u.accounts, u.load_readings, u.codex_rows)
+        self.addCleanup(lambda: (setattr(u, "accounts", saved[0]),
+                                 setattr(u, "load_readings", saved[1]),
+                                 setattr(u, "codex_rows", saved[2])))
+        u.load_readings = lambda directory, now, bad=None: []
+        u.accounts = lambda readings, now, labels=None: [
+            {"id": "login:abc", "kind": "login", "email": "a@example.com", "brand": "ant",
+             "label": "a@example.com", "sessions": 3, "age": 5.0,
+             "five_hour": None, "seven_day": None}]
+        self.threads_asked = []
+
+        def codex_rows(home, now, cache=None, threads=(), every=False):
+            self.threads_asked.append(list(threads))
+            return [{"id": "codex:codex", "kind": "codex", "brand": "oai", "email": "",
+                     "label": "codex", "sessions": 9, "age": 1.0,
+                     "threads": [t for t in threads if t == CODEX_ID],
+                     "five_hour": None, "seven_day": None}]
+        u.codex_rows = codex_rows
+        self.snap = {"state": "ok", "accounts": [{"id": "login:abc", "brand": "ant"}],
+                     "names": {"login:abc": "work"},
+                     "sessions": {SESSION["sessionId"]: "login:abc"}}
+
+    def test_accounts_name_their_live_sessions(self):
+        got = {r["id"]: r for r in self.run_cmd(self.runner.accounts, ["--json"])}
+        ant = got["login:abc"]
+        self.assertEqual((ant["account"], ant["accountId"], ant["provider"]),
+                         ("work", "login:abc", "anthropic"), "as ls --json names it")
+        self.assertEqual(ant["sessions"], [{"sessionId": SESSION["sessionId"],
+                                            "name": "liveapp-4e"}])
+        self.assertEqual(ant["seen"], 3)
+        self.assertNotIn("label", ant)
+        self.assertNotIn("brand", ant)
+
+    def test_a_codex_limit_has_no_account_id_and_names_its_open_threads(self):
+        got = {r["id"]: r for r in self.run_cmd(self.runner.accounts, ["--json"])}
+        oai = got["codex:codex"]
+        self.assertEqual((oai["accountId"], oai["provider"]), (None, "openai"))
+        self.assertEqual(oai["sessions"], [{"sessionId": CODEX_ID, "name": ""}])
+        self.assertEqual(oai["seen"], 9)
+        self.assertNotIn("threads", oai)
+        self.assertIn([CODEX_ID], self.threads_asked)
+
+    def test_threads_that_could_not_be_read_are_unknown_not_none(self):
+        self.fleet = {"codex_threads": None}
+        got = {r["id"]: r for r in self.run_cmd(self.runner.accounts, ["--json"], rc=4)}
+        self.assertIsNone(got["codex:codex"]["sessions"], "null: not known")
+        self.assertEqual(len(got["login:abc"]["sessions"]), 1, "the Claude map still holds")
+        self.assertIn("ccwho usage: the Codex threads could not be read", self.err)
+
+    def test_a_usage_snapshot_that_failed_names_no_spenders(self):
+        self.snap = {"state": "unknown"}
+        got = {r["id"]: r for r in self.run_cmd(self.runner.accounts, ["--json"])}
+        self.assertIsNone(got["login:abc"]["sessions"], "null: not known, not none")
+        self.assertEqual(got["codex:codex"]["sessions"], [{"sessionId": CODEX_ID, "name": ""}])
+
+    def test_a_list_that_could_not_be_read_whole_exits_4(self):
+        self.source_ok = False
+        self.run_cmd(self.runner.accounts, ["--json"], rc=4)
+        self.assertIn("ccwho usage: `claude agents --json` could not be read whole", self.err)
+
+
 class TestManifestShape(unittest.TestCase):
     def setUp(self):
         row = ccwho.build_row(SESSION, HEAD, TAIL, mtime=1788203600, now=1788207200)

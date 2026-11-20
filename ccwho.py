@@ -1009,8 +1009,9 @@ def ls(argv):
     """The table - the only one: `ccwho` with options, or piped, is this. With
     words, the sessions that match - including ended ones. --needs-you: the
     sessions the live list puts on top (engine.needs_you; like the table, Claude
-    Code sessions only - no Codex thread). --json: the rows, for a script or an
-    agent; with words, the ended ones too, marked "ended"."""
+    Code sessions only - no Codex thread). --json: the rows as records
+    (engine.session_record), for a script or an agent, and the open Codex
+    threads after them; with words, the ended ones too, marked "ended"."""
     bad = [a for a in argv if a.startswith("-") and a not in LS_FLAGS]
     if bad:
         print(f"ccwho ls: unknown option(s): {' '.join(bad)}", file=sys.stderr)
@@ -1025,12 +1026,22 @@ def ls(argv):
     rows, fleet = scan(cache={}, status=status, samples=0)     # saved verdicts (D18)
     hole = not_read_whole(status)
     needs_you = "--needs-you" in argv
+    # the open Codex threads: records in --json (D9) - never rows, which save,
+    # open, stop and kill read (R1). --needs-you, as the table: Claude Code only
+    codex = engine.codex_rows(fleet) if "--json" in argv and not needs_you else []
+    # threads not read: exit 4 and say so - but `hole` stays Claude's own: an
+    # unseen Claude session is no less ended for it (sure=, below)
+    listed = ", and ".join(h for h in (
+        hole, "the Codex threads could not be read"
+        if "--json" in argv and not needs_you and codex_unread(fleet) else "") if h)
     # words first, over every row: the index tells a running session from an
     # ended one by the rows it is given
     live, ended = matches(query, rows, everything="--all" in argv) if query else (rows, [])
-    if query and not live and not ended:
-        if hole:
-            print(f"ccwho ls: no session matches {query!r} - {hole}, so it may be running;"
+    if query:
+        codex = engine.match_rows(codex, query)     # by the words a row is found by
+    if query and not live and not ended and not codex:
+        if listed:
+            print(f"ccwho ls: no session matches {query!r} - {listed}, so it may be running;"
                   " rerun", file=sys.stderr)
             return 4
         print(f"ccwho ls: no session matches {query!r}", file=sys.stderr)
@@ -1043,10 +1054,10 @@ def ls(argv):
         # setup-token session runs in the default dir, as "" (a script read
         # that as the default account). Rows, not a person: records nothing
         snap = with_usage(rows, fleet, record=False)["usage"]
-        print(json.dumps([engine.session_record(r, snap) for r in live]
+        print(json.dumps([engine.session_record(r, snap) for r in live + codex]
                          + [engine.session_record(e, snap, ended=True, sure=not hole)
                             for e in ended], indent=2))
-        return _ls_hole(hole)
+        return _ls_hole(listed)
     if needs_you and not live and (query or running):
         # not "no sessions found", nor "no session matches": an agent that
         # polls this would read that nothing runs
@@ -1069,11 +1080,17 @@ def ls(argv):
     return _ls_hole(hole)
 
 
-def _ls_hole(hole):
-    """ls's exit: 4 and a line naming the source when the scan had a hole (D14)."""
+def codex_unread(fleet):
+    """The scan looked for open Codex threads and could not read them."""
+    return isinstance(fleet, dict) and "codex_threads" in fleet and fleet["codex_threads"] is None
+
+
+def _ls_hole(hole, cmd="ls"):
+    """A listing's exit: 4 and a line naming the source when the scan had a
+    hole (D14) - `cmd`, the command that lists."""
     if not hole:
         return 0
-    print(f"ccwho ls: {hole} - the list may miss sessions; rerun", file=sys.stderr)
+    print(f"ccwho {cmd}: {hole} - the list may miss sessions; rerun", file=sys.stderr)
     return 4
 
 
@@ -2737,8 +2754,12 @@ def ps(argv):
         keep = ("pid", "ports", "command", "group", "who", "harness",
                 "orphan", "helper", "why") + (("command_full",) if full else ())
         # ports unknown is null, not [] - a script must not read "holds nothing";
-        # its session is sessionId, as in every --json
-        print(json.dumps([dict({k: p.get(k) for k in keep}, sessionId=p.get("session"),
+        # its session is a reference, {sessionId, name}: the process's own keys
+        # stay its own (its pid is not the session's), null for no session
+        names = {sid: r.get("name") or "" for r in rows for sid in engine.answers_for(r)}
+        ref = (lambda sid: {"sessionId": sid, "name": names.get(sid, "")}
+               if isinstance(sid, str) and sid else None)
+        print(json.dumps([dict({k: p.get(k) for k in keep}, session=ref(p.get("session")),
                                ports=p.get("ports") if known else None)
                           for p in listed], indent=2))
         return 0
@@ -3615,12 +3636,20 @@ def accounts(argv):
     now = time.time()
     labels = read_labels()
     rows = usage.accounts(usage.load_readings(usage_dir(), now), now, labels)
+    # --json names the sessions that spend each account now: a scan, first -
+    # its open threads tell which spend a Codex limit
+    listing = "--json" in argv and not (argv and argv[0] == "name")
+    status, live, fleet = {}, [], {}
+    if listing:
+        live, fleet = scan(cache={}, status=status, samples=0)
     # Codex's limits too, a thread open or not: this is the whole listing (D20).
-    # No `threads`: one-shot, it knows no thread open, and [] would say none spends it
+    # `threads` only after a scan: with no scan it knows no thread open, and []
+    # would say none spends it
     try:
-        rows += [dict({k: v for k, v in r.items() if k != "threads"},
+        rows += [dict({k: v for k, v in r.items() if k != "threads" or listing},
                       label=labels.get(r["id"]) or r["label"])
-                 for r in usage.codex_rows(engine.codex_home(), now, every=True)]
+                 for r in usage.codex_rows(engine.codex_home(), now, every=True,
+                                           threads=open_codex_threads(fleet))]
     except Exception:             # noqa: BLE001 - an odd rollout costs Codex's line only
         pass
     if argv and argv[0] == "name":
@@ -3649,8 +3678,7 @@ def accounts(argv):
               file=sys.stderr)
         return {"refused": 2, "unreadable": 4}.get(result, 1)
     if "--json" in argv:
-        print(json.dumps(rows, indent=2))
-        return 0
+        return _accounts_json(rows, labels, live, fleet, status)
     if not rows:
         print("no usage recorded yet. Sessions record it through `ccwho statusline`,"
               " after their first reply.")
@@ -3658,6 +3686,45 @@ def accounts(argv):
     for row in rows:
         print(usage.format_row(row, now))
     return 0
+
+
+def _accounts_json(rows, labels, live, fleet, status):
+    """`usage --json`: each account as a record names it - account, accountId,
+    provider - its windows, `sessions` the live sessions that spend it now (the
+    map `ls --json` reads), as references, and `seen` every session it was seen
+    in. A Codex limit is no account: accountId null; its sessions are the open
+    threads whose rollouts name it (E5). `live`, `fleet`, `status`: the scan."""
+    lost = codex_unread(fleet)
+    hole = ", and ".join(h for h in (
+        not_read_whole(status), "the Codex threads could not be read" if lost else "") if h)
+    snap = with_usage(live, fleet, record=False)["usage"]
+    # null, not []: who spends it is not known - [] would say nobody does
+    known = isinstance(snap, dict) and snap.get("state") == "ok"
+    names = {sid: r.get("name") or "" for r in live for sid in engine.answers_for(r)}
+    names.update({r["sessionId"]: "" for r in engine.codex_rows(fleet)})
+    spends = {}
+    for r in live:
+        aid = usage.row_account(snap, r.get("sessionId", ""))["accountId"]
+        if aid:
+            spends.setdefault(aid, []).append(r["sessionId"])
+    shown = usage.short_names(rows, labels)
+    out = []
+    for r in rows:
+        oai = r.get("kind") == "codex"
+        aid = r["id"]
+        sids = (None if lost else r.get("threads") or []) if oai else (
+            spends.get(aid, []) if known else None)
+        out.append({"id": aid,
+                    "account": (snap.get("names") or {}).get(aid) or shown.get(aid) or r["label"],
+                    "accountId": None if oai else aid,
+                    "provider": usage.PROVIDERS.get(r.get("brand", "ant"), r.get("brand")),
+                    "kind": r.get("kind"), "email": r.get("email", ""),
+                    "sessions": None if sids is None else
+                    [{"sessionId": sid, "name": names.get(sid, "")} for sid in sids],
+                    "seen": r.get("sessions"), "age": r.get("age"),
+                    "five_hour": r.get("five_hour"), "seven_day": r.get("seven_day")})
+    print(json.dumps(out, indent=2))
+    return _ls_hole(hole, "usage")
 
 
 def usage_roots():

@@ -6003,14 +6003,17 @@ class TestPsLists_WhatAgentsStarted(unittest.TestCase):
         _, out_all, _ = self.run_ps("--helpers")
         self.assertIn("some-mcp", out_all)
 
-    def test_json_names_the_session_sessionId(self):
-        # as every --json does (the CLI revamp, 2026-10-06), each its own
+    def test_json_names_the_session_by_reference(self):
+        # {sessionId, name}: the session's keys never flattened into the
+        # process's own (plan, ps --json) - and no sessionId of its own
         rc, out, err = self.run_ps("--json")
         self.assertEqual(rc, 0, err)
         rows = json.loads(out)
-        self.assertTrue(all("session" not in r for r in rows), rows[0])
-        self.assertEqual({r["pid"]: r["sessionId"] for r in rows if r["pid"] in (11, 20)},
-                         {11: SESSION, 20: "dddd"})
+        self.assertTrue(all("sessionId" not in r for r in rows), rows[0])
+        self.assertEqual({r["pid"]: r["session"]["sessionId"] for r in rows
+                          if r["pid"] in (11, 20)}, {11: SESSION, 20: "dddd"})
+        self.assertTrue(all(set(r["session"]) == {"sessionId", "name"}
+                            for r in rows if r["session"]), rows)
 
     def test_all_is_now_helpers_and_is_refused(self):
         # --all meant "with program sessions" in ls and "with helpers" here
@@ -6519,7 +6522,13 @@ class TestStatusline(unittest.TestCase):
     def test_accounts_json(self):
         self.run_with(self.payload())
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        # its scan and the snapshot it reads: not this machine's sessions, nor
+        # its settings.json
+        with contextlib.redirect_stdout(out), mock.patch.object(
+                runner.engine, "collect", lambda cache=None, status=None, **k: ([], {})), \
+                mock.patch.object(runner, "usage_snapshot",
+                                  lambda rows, now=None, record=True, codex_threads=(): {
+                                      "state": "unknown"}):
             runner.main(["usage", "--json"])
         rows = json.loads(out.getvalue())
         self.assertEqual(rows[0]["id"], "login:uuid-a")
@@ -7995,6 +8004,13 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
             os.environ[key] = value
             self.addCleanup(lambda k=key, o=old: os.environ.pop(k, None) if o is None
                             else os.environ.__setitem__(k, o))
+        # `usage --json` scans for the sessions that spend each account: no
+        # session, and the threads a test opens
+        self.open_threads = []
+        scan = mock.patch.object(runner.engine, "collect", lambda cache=None, status=None, **k: (
+            [], {"codex_threads": [{"thread": t} for t in self.open_threads]}))
+        scan.start()
+        self.addCleanup(scan.stop)
         t = time.localtime(self.now - 60)
         d = os.path.join(self.tmp, "codex", "sessions", time.strftime("%Y/%m/%d", t))
         os.makedirs(d)
@@ -8088,12 +8104,15 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
         os.utime(moved, (self.now - 15 * 86400, self.now - 15 * 86400))   # control
         self.assertNotIn("codex:codex", listed())
 
-    def test_the_listing_names_no_threads(self):
-        # one-shot, `ccwho usage` knows no thread open: an empty list there
-        # would say that none spends the limit
+    def test_the_listing_names_the_open_threads_that_spend_it(self):
+        # its scan knows which threads are open: those whose rollout names the
+        # limit spend it; `seen` counts the rollouts that carried it
         row = next(r for r in json.loads(self.accounts_json()) if r["id"] == "codex:codex")
         self.assertNotIn("threads", row)
-        self.assertEqual(row["sessions"], 1)                                # control
+        self.assertEqual((row["sessions"], row["seen"]), ([], 1))
+        self.open_threads = [self.THREAD]
+        row = next(r for r in json.loads(self.accounts_json()) if r["id"] == "codex:codex")
+        self.assertEqual(row["sessions"], [{"sessionId": self.THREAD, "name": ""}])
 
     def accounts_json(self):
         out = io.StringIO()
@@ -16115,3 +16134,107 @@ class TestAHiddenCtrlCWithNoProcessFound(unittest.TestCase):
         rec = runner._read_claim(self.SIDS[0])
         self.assertNotIn("send", rec)
         self.assertEqual(rec["app_pid"], [4242])
+
+
+CODEX_THREAD_ID = "019a0000-1111-7222-8333-444455556666"
+CODEX_FLEET = {"codex_threads": [{
+    "thread": CODEX_THREAD_ID, "cwd": "/Users/x/p/parser", "name": "fix the parser",
+    "turn": "done", "ts": 5.0, "mtime": 1788207000, "host_pid": 7777, "source": "cli",
+    "procs": 1, "ports": [], "pids": [7778]}]}
+
+
+class TestASaveNeverTakesACodexThread(unittest.TestCase):
+    """R1: an open Codex thread is in the fleet - the list shows it as a row -
+    and never in the rows a save writes, so a restore never resumes it."""
+
+    ROWS = TestSaveAndRestore.ROWS[:1]
+    setUp = TestSaveAndRestore.setUp
+    tearDown = TestSaveAndRestore.tearDown
+    _save = TestSaveAndRestore._save
+    _restore = TestSaveAndRestore._restore
+
+    def test_the_manifest_holds_the_claude_session_only(self):
+        fake = runner.engine.collect
+        runner.engine.collect = lambda cache=None, status=None, **k: (
+            fake(cache=cache, status=status, **k)[0], dict(CODEX_FLEET))
+        self.assertEqual(self._save()[0], 0)
+        saved = runner.newest_manifest()
+        self.assertEqual([s["sessionId"] for s in saved["sessions"]],
+                         [self.ROWS[0]["sessionId"]])
+        self.rows_now = []                      # the reboot
+        rc, out = self._restore()
+        self.assertEqual(rc, 0)
+        self.assertIn(f"claude --resume {self.ROWS[0]['sessionId']}", out)
+        self.assertNotIn(CODEX_THREAD_ID, out)
+
+
+class TestOpenStopKillNeverTakeACodexThread(unittest.TestCase):
+    """R1: open, stop and kill find a Claude session by a word; a Codex
+    thread's id or title is no session to them - nothing is focused, resumed,
+    stopped or killed, and nothing reaches the machine."""
+
+    ROW = {"sessionId": "4f2b91ac-1111-4222-8333-abcdefabcdef", "name": "liveapp-4e",
+           "cwd": "/Users/x/p/liveapp", "project": "liveapp", "title": "the gate",
+           "attention": "stopped", "status": "idle", "kind": "background", "tty": "",
+           "pid": 4242, "since": "1h"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        for patch in (mock.patch.dict(os.environ, {"CCWHO_DIR": self.tmp}),
+                      mock.patch.object(runner.engine, "collect", self.collect),
+                      mock.patch.object(runner, "fresh_index", lambda quiet=False: {}),
+                      # a transcript is looked for by id: none, and not on this machine
+                      mock.patch.object(runner.engine, "transcript_path",
+                                        lambda sid, roots=None: None),
+                      mock.patch.object(runner.subprocess, "run", self.machine),
+                      mock.patch.object(runner.subprocess, "Popen", self.machine)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.done = []
+
+    def collect(self, cache=None, status=None, **k):
+        if status is not None:
+            status.update(source_ok=True, session_files_bad=0)
+        return [dict(self.ROW)], dict(CODEX_FLEET)
+
+    def machine(self, *a, **k):
+        raise AssertionError(f"reached the machine: {a!r}")
+
+    def acted(self, *a, **k):
+        self.done.append(a)
+        raise AssertionError(f"acted on {a!r}")
+
+    def run_it(self, fn, *argv, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = fn(list(argv), **kw)
+        return rc, err.getvalue()
+
+    def test_open_takes_no_thread_by_its_id_or_its_title(self):
+        for word, says in ((CODEX_THREAD_ID, "is neither running nor in any saved manifest"),
+                           ("parser", "no session matches")):
+            rc, err = self.run_it(runner.open_session, word, from_index=True)
+            self.assertEqual(rc, 1, f"{word}: {err}")
+            self.assertIn(says, err)
+
+    def test_stop_takes_no_thread(self):
+        seams = {"env": {}, "stop": self.acted, "build": self.acted, "carry": self.acted,
+                 "ask": lambda prompt: True, "tty": lambda: True}
+        rc, err = self.run_it(runner.stop_cli, CODEX_THREAD_ID, "--yes", seams=seams)
+        self.assertEqual((rc, self.done), (1, []), err)
+        self.assertIn("no live session matches", err)
+
+    def test_kill_takes_no_thread(self):
+        seams = {"env": {}, "build": self.acted, "carry": self.acted,
+                 "ask": lambda prompt: True, "tty": lambda: True}
+        rc, err = self.run_it(runner.kill_cli, CODEX_THREAD_ID, "--yes", seams=seams)
+        self.assertEqual((rc, self.done), (1, []), err)
+        self.assertIn("no live session matches", err)
+
+    def test_the_session_beside_it_is_still_found(self):
+        # the control: the same seams take the Claude session
+        seams = {"env": {}, "build": self.acted, "carry": self.acted,
+                 "ask": lambda prompt: True, "tty": lambda: True}
+        self.run_it(runner.kill_cli, self.ROW["sessionId"], "--yes", seams=seams)
+        self.assertEqual(len(self.done), 1, "kill reached its plan for the Claude session")

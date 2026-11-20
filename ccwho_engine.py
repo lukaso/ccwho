@@ -5038,6 +5038,8 @@ def session_record(row, snap, ended=False, sure=True):
     and `errors`: why a field is null. `ended`: a session the index found and
     no row shows. `sure`: the scan read every source of sessions - an unseen
     session on a partial read may still run, so it is not called ended."""
+    if row.get("kind") == "codex" and not ended:
+        return codex_record(row)
     rec = dict(row)
     for key in SESSION_CORE_TEXT:
         if not isinstance(rec.get(key), str):
@@ -5054,6 +5056,28 @@ def session_record(row, snap, ended=False, sure=True):
     rec.update(account=None, accountId=None, provider="anthropic", pid=None,
                ended=True if sure else None,
                errors={"account": why} if sure else {"ended": why, "account": why})
+    return rec
+
+
+# a Codex row's own keys for the list: its record says them in core keys
+# (pid, cwd, title) or not at all
+CODEX_LIST_ONLY = ("short", "named", "folder", "mtime", "host_pid")
+
+
+def codex_record(row):
+    """An open Codex thread (codex_rows) as a --json record: the core keys, the
+    process that holds the thread as its pid, and no account - Codex's usage
+    names a limit, never an account, so a limit id is no accountId (D9)."""
+    rec = {k: v for k, v in row.items() if k not in CODEX_LIST_ONLY}
+    for key in SESSION_CORE_TEXT:
+        if not isinstance(rec.get(key), str):
+            rec[key] = ""
+    pid = row.get("host_pid")
+    code = "codex-unknown"
+    rec.update(kind="codex", configDir=None, account=None, accountId=None,
+               provider="openai", pid=pid if isinstance(pid, int) and not isinstance(pid, bool)
+               else None, ended=False,
+               errors={"account": {"code": code, "fix": ccwho_usage.ACCOUNT_ERRORS[code]}})
     return rec
 
 

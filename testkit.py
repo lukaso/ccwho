@@ -22,9 +22,20 @@ def pin_ccwho_dir(runner):
     real, tmp = runner.ccwho_dir, tempfile.mkdtemp(prefix="ccwho-test-")
     inherited = os.environ.pop("CCWHO_DIR", None)
     runner.ccwho_dir = lambda: os.environ.get("CCWHO_DIR") or tmp
+    # the directory's lines (purpose, now) too: the engine reads CCWHO_DIR
+    # itself, and `ls --json` read the user's own roles (2026-11-20)
+    eng = getattr(runner, "engine", None)
+    real_dir = getattr(eng, "directory_dir", None)
+    if real_dir is not None:
+        def pinned():
+            return os.path.join(runner.ccwho_dir(), "directory")
+        pinned.real = real_dir          # a test of the folder rule itself calls this
+        eng.directory_dir = pinned
 
     def undo():
         runner.ccwho_dir = real
+        if real_dir is not None:
+            eng.directory_dir = real_dir
         shutil.rmtree(tmp, True)
         if inherited is not None:
             os.environ["CCWHO_DIR"] = inherited

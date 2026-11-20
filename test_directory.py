@@ -532,14 +532,18 @@ class TestThePurposeOfARow(unittest.TestCase):
 
 
 class TestTheFolder(unittest.TestCase):
+    # the rule itself, not the module's pin of it (testkit.pin_ccwho_dir)
+    folder = staticmethod(lambda: getattr(runner.engine.directory_dir, "real",
+                                          runner.engine.directory_dir)())
+
     def test_it_is_beside_ccwhos_other_files(self):
         with mock.patch.dict(os.environ, {"CCWHO_DIR": "/somewhere"}):
-            self.assertEqual(runner.engine.directory_dir(), "/somewhere/directory")
+            self.assertEqual(self.folder(), "/somewhere/directory")
 
     def test_with_no_setting_it_is_in_the_home_folder(self):
         with mock.patch.dict(os.environ, {"HOME": "/home/x"}):
             os.environ.pop("CCWHO_DIR", None)
-            self.assertEqual(runner.engine.directory_dir(), "/home/x/.ccwho/directory")
+            self.assertEqual(self.folder(), "/home/x/.ccwho/directory")
 
 
 class TestKillAndOpenNeverMatchAPurpose(unittest.TestCase):
@@ -903,14 +907,16 @@ class TestNowCommand(CommandCase):
         self.assertGreaterEqual(got, before)
 
 
-class TestDirectoryCommand(CommandCase):
-    def _scan(self, rows, source_ok=True, bad=0):
+class TestLsNamed(CommandCase):
+    """`ccwho ls --named`: the directory's text view - named roles first, each
+    with its purpose, then the other sessions (D10). It was `ccwho directory`."""
+    def _scan(self, rows, source_ok=True, bad=0, fleet=None):
         self.asked = {}
 
         def fake(cache=None, status=None, **kw):
             self.asked = dict(kw, cache=cache)
             status["source_ok"], status["session_files_bad"] = source_ok, bad
-            return list(rows), {}
+            return list(rows), dict(fleet or {})
         patcher = mock.patch.object(runner, "scan", side_effect=fake)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -924,23 +930,22 @@ class TestDirectoryCommand(CommandCase):
         self._scan([row("coo", "user", sid=SID_A), row("app-4e", sid=SID_B)])
         self._purpose("coo", "suppliers")
         with as_person():
-            rc, out, _ = call(runner.directory_cli)
+            rc, out, _ = call(runner.ls, "--named")
         self.assertEqual(rc, 0)
         for part in ("NAMED", "coo", "suppliers", "OTHER SESSIONS", "app-4e"):
             self.assertIn(part, out)
 
-    def test_it_uses_the_list_scan_with_the_cheap_options(self):
+    def test_it_is_ls_s_own_scan(self):
         self._scan([])
         with as_person():
-            call(runner.directory_cli)
-        self.assertEqual((self.asked["session_apps"], self.asked["samples"], self.asked["cache"]),
-                         (False, 0, {}))
+            call(runner.ls, "--named")
+        self.assertEqual((self.asked["samples"], self.asked["cache"]), (0, {}))
 
     def test_a_failed_feed_never_says_not_running(self):
         self._scan([], source_ok=False)
         self._purpose("crm", "customers")
         with as_person():
-            _, out, _ = call(runner.directory_cli)
+            _, out, _ = call(runner.ls, "--named")
         self.assertNotIn("not running", out)
         self.assertIn("unknown (session list incomplete)", out)
 
@@ -948,42 +953,49 @@ class TestDirectoryCommand(CommandCase):
         self._scan([], bad=1)
         self._purpose("crm", "customers")
         with as_person():
-            _, out, _ = call(runner.directory_cli)
+            _, out, _ = call(runner.ls, "--named")
         self.assertNotIn("not running", out)
 
     def test_a_scan_of_the_files_that_crashed_never_says_not_running(self):
         self._scan([], bad=None)            # bad is None when the file scan crashed
         self._purpose("crm", "customers")
         with as_person():
-            _, out, _ = call(runner.directory_cli)
+            _, out, _ = call(runner.ls, "--named")
         self.assertNotIn("not running", out)
 
     def test_a_complete_list_says_not_running(self):                    # control
         self._scan([])
         self._purpose("crm", "customers")
         with as_person():
-            _, out, _ = call(runner.directory_cli)
+            _, out, _ = call(runner.ls, "--named")
         self.assertIn("not running", out)
 
     def test_other_rows_still_show_when_the_list_is_incomplete(self):
+        # and it exits 4, as every listing with a hole does (D14)
         self._scan([row("app-4e")], source_ok=False)
         with as_person():
-            rc, out, _ = call(runner.directory_cli)
-        self.assertEqual(rc, 0)
+            rc, out, err = call(runner.ls, "--named")
+        self.assertEqual(rc, 4)
         self.assertIn("app-4e", out)
+        self.assertIn("ccwho ls: `claude agents --json` could not be read whole", err)
 
-    def test_a_scan_that_raises_says_so(self):
-        with mock.patch.object(runner, "scan", side_effect=OSError("no")), as_person():
-            rc, out, err = call(runner.directory_cli)
-        self.assertEqual(rc, 1)
-        self.assertIn("could not read", err)
+    def test_a_role_parked_behind_another_row_is_running(self):
+        # its terminal parked a job (ctrl+b): the job's row stands for it
+        self._scan([row("app-4e", sid=SID_B)], fleet={"parked_sessions": [
+            {"sessionId": SID_C, "name": "crm", "nameSource": "user"}]})
+        self._purpose("crm", "customers")
+        with as_person():
+            _, out, _ = call(runner.ls, "--named")
+        line = next(x for x in out.splitlines() if x.strip().startswith("crm"))
+        self.assertIn("customers", line)
+        self.assertIn("running", line)
         self.assertNotIn("not running", out)
 
     def test_words_narrow_it(self):
         self._scan([row("coo", "user", sid=SID_A), row("app-4e", sid=SID_B)])
         self._purpose("coo", "suppliers")
         with as_person():
-            rc, out, _ = call(runner.directory_cli, "suppliers")
+            rc, out, _ = call(runner.ls, "--named", "suppliers")
         self.assertEqual(rc, 0)
         self.assertIn("coo", out)
         self.assertNotIn("app-4e", out)
@@ -991,33 +1003,54 @@ class TestDirectoryCommand(CommandCase):
     def test_words_that_match_nothing_say_so(self):
         self._scan([row("app-4e")])
         with as_person():
-            rc, _, err = call(runner.directory_cli, "nothing-like-this")
+            rc, _, err = call(runner.ls, "--named", "nothing-like-this")
         self.assertEqual(rc, 1)
         self.assertIn("nothing-like-this", err)
 
-    def test_json_has_the_same_data(self):
-        self._scan([row("coo", "user", sid=SID_A, cache="532k cold"), row("app-4e", sid=SID_B)])
-        self._purpose("coo", "suppliers")
+    def test_a_parked_role_stays_named_beside_a_row_of_that_derived_name(self):
+        self._scan([row("crm", "derived", sid=SID_B)], fleet={"parked_sessions": [
+            {"sessionId": SID_C, "name": "crm", "nameSource": "user"}]})
+        self._purpose("crm", "customers")
         with as_person():
-            rc, out, _ = call(runner.directory_cli, "--json")
-        self.assertEqual(rc, 0)
-        data = json.loads(out)
-        self.assertEqual(data["named"][0]["purpose"], "suppliers")
-        self.assertEqual(data["named"][0]["cache"], "532k cold")
-        self.assertEqual(data["others"][0]["handle"], "app-4e")
-        self.assertTrue(data["complete"])
+            _, out, _ = call(runner.ls, "--named")
+        self.assertIn(directory.PARKED_ROLE, out)
+        self.assertIn("customers", out)
+
+    def test_a_caller_in_a_parked_terminal_is_marked_on_the_job_s_row(self):
+        self._scan([row("app-4e", sid=SID_B, parked=[SID_C])])
+        with as_agent(SID_C):
+            _, out, _ = call(runner.ls, "--named")
+        self.assertIn("(you)", out)
+
+    def test_a_parked_role_that_asks_is_marked_once_on_its_own_line(self):
+        self._scan([row("app-4e", sid=SID_B, parked=[SID_C])], fleet={"parked_sessions": [
+            {"sessionId": SID_C, "name": "crm", "nameSource": "user"}]})
+        self._purpose("crm", "customers")
+        with as_agent(SID_C):
+            _, out, _ = call(runner.ls, "--named")
+        marked = [x for x in out.splitlines() if "(you)" in x]
+        self.assertEqual(len(marked), 1, out)
+        self.assertTrue(marked[0].strip().startswith("crm (you)"), out)
+
+    def test_flags_it_cannot_honour_are_refused(self):
+        self._scan([row("app-4e")])
+        for flag in ("--needs-you", "--all"):
+            with self.subTest(flag=flag), as_person():
+                rc, out, err = call(runner.ls, "--named", flag)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn(f"--named lists every session: it takes no {flag}", err)
 
     def test_own_row_is_marked_for_an_agent(self):
         self._scan([row("app-4e", sid=SID_A)])
         with as_agent(SID_A):
-            _, out, _ = call(runner.directory_cli)
+            _, out, _ = call(runner.ls, "--named")
         self.assertIn("(you)", out)
 
     def test_the_now_line_reaches_the_row(self):
         self._scan([row("app-4e", sid=SID_A, title="the title")])
         with as_agent(SID_A):
             call(runner.now_cli, "the problem")
-            _, out, _ = call(runner.directory_cli)
+            _, out, _ = call(runner.ls, "--named")
         self.assertIn("the problem", out)
         self.assertNotIn("the title", out)
 
@@ -1027,7 +1060,7 @@ class TestDirectoryCommand(CommandCase):
         with open(os.path.join(self.folder, "purpose-x.json"), "w") as fh:
             fh.write("{")
         with as_person():
-            rc, out, _ = call(runner.directory_cli)
+            rc, out, _ = call(runner.ls, "--named")
         self.assertEqual(rc, 0)
         self.assertIn("app-4e", out)
 
@@ -1036,7 +1069,7 @@ class TestDirectoryCommand(CommandCase):
         self._purpose("coo", "suppliers\udcff")
         self._purpose("ops\udcff", "ended")
         with as_person():
-            rc, out, _ = call_strict(runner.directory_cli)
+            rc, out, _ = call_strict(runner.ls, "--named")
         self.assertEqual(rc, 0)
         for part in ("coo", "suppliers", "app-4e", "ended"):
             self.assertIn(part, out)
@@ -1044,16 +1077,16 @@ class TestDirectoryCommand(CommandCase):
     def test_an_incomplete_list_with_nobody_says_so_and_not_no_sessions(self):
         self._scan([], source_ok=False)
         with as_person():
-            rc, out, _ = call(runner.directory_cli)
-        self.assertEqual(rc, 0)
+            rc, out, _ = call(runner.ls, "--named")
+        self.assertEqual(rc, 4)                         # could not tell (D14)
         self.assertIn(directory.INCOMPLETE, out)
         self.assertNotIn("no sessions", out)
 
     def test_words_that_match_nothing_in_an_incomplete_list_say_it_is_incomplete(self):
         self._scan([row("app-4e")], bad=1)
         with as_person():
-            rc, _, err = call(runner.directory_cli, "crm")
-        self.assertEqual(rc, 1)
+            rc, _, err = call(runner.ls, "--named", "crm")
+        self.assertEqual(rc, 4)                         # crm may be running (D14)
         self.assertIn(directory.INCOMPLETE, err)
 
     def test_words_that_match_nothing_say_how_to_read_the_whole_list(self):
@@ -1061,26 +1094,40 @@ class TestDirectoryCommand(CommandCase):
         self._scan([row("coo", "user", sid=SID_A), row("app-4e", sid=SID_B)])
         self._purpose("coo", "suppliers, staff, costs")
         with as_person():
-            rc, _, err = call(runner.directory_cli, "vat")
+            rc, _, err = call(runner.ls, "--named", "vat")
         self.assertEqual(rc, 1)
-        self.assertIn("'vat'", err)
+        self.assertIn("ccwho ls: no session matches 'vat'", err)
         self.assertIn("The list has 2", err)
-        self.assertIn("no words", err)
+        self.assertIn("run ccwho ls --named with no words", err)
         self.assertNotIn(directory.INCOMPLETE, err)
 
     def test_words_with_nobody_there_do_not_offer_a_list(self):         # control
         self._scan([])
         with as_person():
-            _, _, err = call(runner.directory_cli, "vat")
+            _, _, err = call(runner.ls, "--named", "vat")
         self.assertIn("no session matches 'vat'", err)
         self.assertNotIn("The list has", err)
+
+
+class TestTheDirectoryCommandIsGone(CommandCase):
+    """`ccwho directory` points to `ls --named` and exits 2: a session that
+    loaded the old skill text finds its way."""
+
+    def test_it_names_the_new_commands(self):
+        for argv in (("directory",), ("directory", "coo"), ("directory", "--json")):
+            with self.subTest(argv=argv), mock.patch.object(runner, "scan") as scan:
+                rc, out, err = call(runner.main, *argv)
+                self.assertEqual((rc, out), (2, ""))
+                self.assertIn("ccwho directory is gone: use `ccwho ls --named` (text) or"
+                              " `ccwho ls --json`", err)
+                scan.assert_not_called()
 
 
 class TestTheCommandsFollowTheRules(CommandCase):
     """COMMAND_TAKES: --help prints its usage and runs nothing; an unknown flag
     exits 2 and runs nothing."""
 
-    COMMANDS = ("purpose", "now", "directory")
+    COMMANDS = ("purpose", "now")
 
     def test_help_prints_usage(self):
         for cmd in self.COMMANDS:

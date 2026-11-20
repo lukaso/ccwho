@@ -106,6 +106,9 @@ LS_KEYS = {
                                           # spends, its id, and who sells it (null: unknown)
     "ended", "errors",                    # added 2026-11-19: false on a running row; why a
                                           # null field is null ({"account": {code, fix}})
+    "now", "you", "running",              # added 2026-11-20: its `ccwho now` line; true on
+                                          # the caller's own session; false for a named
+                                          # role with no session (null: not known)
 }
 
 # The record of one session: every session object in every --json has these
@@ -113,11 +116,12 @@ LS_KEYS = {
 # its own keys around them.
 STR, OPT_STR, OPT_INT = (str,), (str, type(None)), (int, type(None))
 SESSION_CORE = {
-    "sessionId": STR, "name": STR, "project": STR, "cwd": STR, "title": STR,
+    # sessionId null: a named role with no session (kind "role")
+    "sessionId": OPT_STR, "name": STR, "project": STR, "cwd": STR, "title": STR,
     "attention": STR, "status": STR, "purpose": STR, "kind": OPT_STR,
     "configDir": OPT_STR, "account": OPT_STR, "accountId": OPT_STR, "provider": STR,
     "tty": STR, "pid": OPT_INT, "since": STR, "ended": (bool, type(None)),
-    "errors": (dict,),
+    "errors": (dict,), "now": STR, "you": (bool,), "running": (bool, type(None)),
 }
 
 
@@ -446,6 +450,123 @@ class TestUsageJsonSpeaksAsTheRecords(_CommandCase):
         self.source_ok = False
         self.run_cmd(self.runner.accounts, ["--json"], rc=4)
         self.assertIn("ccwho usage: `claude agents --json` could not be read whole", self.err)
+
+
+class TestANamedRoleIsARecord(_CommandCase):
+    """D10: `ls --json` has the directory's data - each session's `now` line,
+    `you`, `running` - and a named role with no session is a record of its own."""
+
+    def setUp(self):
+        super().setUp()
+        import time
+        import ccwho_directory as directory
+        self.directory, self.time = directory, time
+        self.folder = self.runner.engine.directory_dir()
+        self.store("purpose", "coo", "suppliers, staff, costs")
+
+    def store(self, kind, key, text):
+        os.makedirs(self.folder, exist_ok=True)
+        with open(self.directory.path_of(self.folder, kind, key), "w") as fh:
+            fh.write(self.directory.entry_text(key, text, self.time.time()))
+
+    def roles(self, got):
+        return [r for r in got if r.get("kind") == "role"]
+
+    def test_the_core_here_is_the_engine_s(self):
+        # one list, two copies: a key the test drops is a key nothing checks
+        self.assertEqual(set(SESSION_CORE), set(ccwho.SESSION_CORE))
+
+    def test_a_role_with_no_session_is_a_record(self):
+        got = self.run_cmd(self.runner.ls, ["--json"])
+        role = self.roles(got)
+        self.assertEqual(len(role), 1, got)
+        rec = role[0]
+        assert_record(self, rec, "a role")
+        self.assertEqual((rec["sessionId"], rec["name"], rec["running"], rec["purpose"]),
+                         (None, "coo", False, "suppliers, staff, costs"))
+        self.assertEqual({k: v["code"] for k, v in rec["errors"].items()},
+                         {"sessionId": "not-running", "account": "not-running",
+                          "ended": "not-running"})
+        self.assertIsNone(rec["ended"], "no session: none that ended either")
+        for r in got:
+            assert_record(self, r, r["name"])
+        self.assertEqual([r["running"] for r in got if r["kind"] != "role"], [True, True])
+
+    def test_on_a_partial_read_a_role_may_be_running(self):
+        self.source_ok = False
+        rec = self.roles(self.run_cmd(self.runner.ls, ["--json"], rc=4))[0]
+        self.assertIsNone(rec["running"])
+        self.assertEqual(rec["errors"]["sessionId"]["code"], "not-read-whole")
+
+    def test_a_running_role_is_its_session_s_record(self):                 # control
+        self.row = dict(self.row, name="coo", nameSource="user",
+                        purpose="suppliers, staff, costs")      # as collect reads it
+        got = self.run_cmd(self.runner.ls, ["--json"])
+        self.assertEqual(self.roles(got), [])
+        self.assertEqual(got[0]["purpose"], "suppliers, staff, costs")
+
+    def test_a_role_parked_behind_another_row_is_running(self):
+        # its terminal parked a job (ctrl+b): the job's row stands for it in the
+        # table, and the role is a record of its own, running - found by its name
+        parked = "cccc0000-0000-4000-8000-000000000000"
+        self.fleet = dict(self.fleet, parked_sessions=[
+            {"sessionId": parked, "name": "coo", "nameSource": "user",
+             "kind": "interactive"}])
+        self.assertEqual(self.roles(self.run_cmd(self.runner.ls, ["--json"])), [])
+        got = self.run_cmd(self.runner.ls, ["coo", "--json"])
+        self.assertEqual([(r["name"], r["sessionId"], r["running"], r["ended"], r["kind"])
+                          for r in got], [("coo", parked, True, False, "interactive")])
+        assert_record(self, got[0], "a parked role")
+        self.assertEqual(got[0]["purpose"], "suppliers, staff, costs")
+
+    def test_words_find_a_role(self):
+        got = self.run_cmd(self.runner.ls, ["coo", "--json"])
+        self.assertEqual([r["name"] for r in got], ["coo"])
+        # and words that miss it leave it out
+        self.assertEqual(self.roles(self.run_cmd(self.runner.ls, ["liveapp", "--json"])), [])
+
+    def test_you_and_now(self):
+        from unittest import mock
+        self.store("now", SESSION["sessionId"], "the gate")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION["sessionId"]}):
+            got = {r["name"] or r["sessionId"]: r for r in self.run_cmd(self.runner.ls, ["--json"])}
+        mine = got["liveapp-4e"]
+        self.assertEqual((mine["you"], mine["now"]), (True, "the gate"))
+        self.assertEqual([r["you"] for k, r in got.items() if k != "liveapp-4e"], [False, False])
+
+    def parked_caller(self, role=True):
+        from unittest import mock
+        parked = "cccc0000-0000-4000-8000-000000000000"
+        self.row = dict(self.row, parked=[parked])
+        self.fleet = dict(self.fleet, parked_sessions=[
+            {"sessionId": parked, "name": "coo" if role else "app-7f",
+             "nameSource": "user" if role else "derived", "kind": "interactive"}])
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": parked}):
+            return [r for r in self.run_cmd(self.runner.ls, ["--json"]) if r["you"]]
+
+    def test_a_parked_role_that_asks_is_its_own_record_alone(self):
+        # its own record is the one it is: never also the job's row
+        self.assertEqual([r["name"] for r in self.parked_caller()], ["coo"])
+
+    def test_a_parked_caller_with_no_record_of_its_own_is_the_job_s_row(self):  # control
+        self.assertEqual([r["name"] for r in self.parked_caller(role=False)], ["liveapp-4e"])
+
+    def test_a_codex_thread_keeps_its_now_line(self):
+        # `ccwho now` takes a Codex thread's id too (agent_id)
+        self.store("now", CODEX_ID, "the parser")
+        got = self.run_cmd(self.runner.ls, ["--json"])
+        self.assertEqual(next(r for r in got if r["kind"] == "codex")["now"], "the parser")
+
+    def test_show_has_the_same_keys(self):
+        from unittest import mock
+        self.store("now", SESSION["sessionId"], "the gate")
+        real = self.runner.engine.read_windows
+        self.runner.engine.read_windows = lambda sid, **kw: (HEAD, TAIL, 1788203600)
+        self.addCleanup(setattr, self.runner.engine, "read_windows", real)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION["sessionId"]}):
+            rec = self.run_cmd(self.runner.show, ["--json"])
+        assert_record(self, rec, "show")
+        self.assertEqual((rec["you"], rec["now"], rec["running"]), (True, "the gate", True))
 
 
 class TestManifestShape(unittest.TestCase):

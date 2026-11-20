@@ -4426,6 +4426,11 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
                    sessions_ok=sessions_ok)
     fleet["unknown_ports"] = unknown_ports
     fleet["unknown_holders"] = unknown_holders
+    # the terminals that parked a job have no row, and still run as themselves:
+    # a role among them is running (ccwho_directory.running_names)
+    fleet["parked_sessions"] = [{"sessionId": x.get("sessionId"), "name": x.get("name"),
+                                 "nameSource": x.get("nameSource"), "kind": x.get("kind")}
+                                for x in sessions if x.get("sessionId") in parked]
     # Codex threads open now (Phase 3, D15): their own list, never session rows
     fleet["codex_threads"] = codex_fleet(read_codex_threads(cache=cache), att,
                                          ports_ok=ports is not None, reviewed=reviewed,
@@ -5025,36 +5030,42 @@ def ended_row(entry, now_iso):
 SESSION_CORE_TEXT = ("sessionId", "name", "project", "cwd", "title", "attention",
                      "status", "purpose", "tty", "since")
 SESSION_CORE = SESSION_CORE_TEXT + ("kind", "configDir", "account", "accountId",
-                                    "provider", "pid", "ended", "errors")
+                                    "provider", "pid", "ended", "errors", "now", "you",
+                                    "running")
 RECORD_ERRORS = {
     "ended": "it does not run now: an ended session spends no account",
+    "not-running": "no session has this role's name now, and ccwho starts none: tell the person",
     "not-read-whole": "a source of sessions could not be read, so it may be running: rerun",
 }
 
 
-def session_record(row, snap, ended=False, sure=True):
+def session_record(row, snap, ended=False, sure=True, now_lines=None, me=None):
     """The row as a --json record: its keys, every core key (SESSION_CORE), the
     account it spends from the usage snapshot `snap` (ccwho_usage.row_account),
     and `errors`: why a field is null. `ended`: a session the index found and
     no row shows. `sure`: the scan read every source of sessions - an unseen
-    session on a partial read may still run, so it is not called ended."""
+    session on a partial read may still run, so it is not called ended.
+    `now_lines`: the directory's `now` lines by session id (read_all); `me`:
+    the caller's own session id (agent_id), None for a person."""
     if row.get("kind") == "codex" and not ended:
-        return codex_record(row)
+        return codex_record(row, me=me, now_lines=now_lines)
     rec = dict(row)
     for key in SESSION_CORE_TEXT:
         if not isinstance(rec.get(key), str):
             rec[key] = ""
     for key in ("kind", "configDir", "pid"):
         rec.setdefault(key, None)
+    rec["now"] = _now_of(now_lines, rec["sessionId"])
+    rec["you"] = bool(me) and me in answers_for(row)
     if not ended:
-        rec.update(ccwho_usage.row_account(snap, rec["sessionId"]), ended=False)
+        rec.update(ccwho_usage.row_account(snap, rec["sessionId"]), ended=False, running=True)
         why = ccwho_usage.account_error(snap, rec["sessionId"])
         rec["errors"] = {"account": why} if why else {}
         return rec
     code = "ended" if sure else "not-read-whole"
     why = {"code": code, "fix": RECORD_ERRORS[code]}
     rec.update(account=None, accountId=None, provider="anthropic", pid=None,
-               ended=True if sure else None,
+               ended=True if sure else None, running=False if sure else None,
                errors={"account": why} if sure else {"ended": why, "account": why})
     return rec
 
@@ -5064,10 +5075,12 @@ def session_record(row, snap, ended=False, sure=True):
 CODEX_LIST_ONLY = ("short", "named", "folder", "mtime", "host_pid")
 
 
-def codex_record(row):
+def codex_record(row, me=None, now_lines=None):
     """An open Codex thread (codex_rows) as a --json record: the core keys, the
     process that holds the thread as its pid, and no account - Codex's usage
-    names a limit, never an account, so a limit id is no accountId (D9)."""
+    names a limit, never an account, so a limit id is no accountId (D9). `me`:
+    the caller's id - a Codex caller's is its thread (agent_id), and its
+    `ccwho now` line is kept by that id too (`now_lines`)."""
     rec = {k: v for k, v in row.items() if k not in CODEX_LIST_ONLY}
     for key in SESSION_CORE_TEXT:
         if not isinstance(rec.get(key), str):
@@ -5076,9 +5089,61 @@ def codex_record(row):
     code = "codex-unknown"
     rec.update(kind="codex", configDir=None, account=None, accountId=None,
                provider="openai", pid=pid if isinstance(pid, int) and not isinstance(pid, bool)
-               else None, ended=False,
+               else None, ended=False, now=_now_of(now_lines, row.get("sessionId")),
+               you=bool(me) and me == row.get("sessionId"),
+               running=True,
                errors={"account": {"code": code, "fix": ccwho_usage.ACCOUNT_ERRORS[code]}})
     return rec
+
+
+def _now_of(now_lines, sid):
+    """The `ccwho now` line kept by this session id, "" when none."""
+    line = (now_lines or {}).get(sid) if isinstance(sid, str) and sid else None
+    return line["text"] if isinstance(line, dict) and isinstance(line.get("text"), str) else ""
+
+
+def role_record(name, purpose, sure=True):
+    """A named role no session runs under now, as a --json record (D10): its name
+    and purpose, `running` false - null when a source of sessions was not read
+    whole, as it may run then - and no session: no id, no account, and none
+    that ended (`ended` null)."""
+    code = "not-running" if sure else "not-read-whole"
+    why = {"code": code, "fix": RECORD_ERRORS[code]}
+    rec = {key: "" for key in SESSION_CORE_TEXT}
+    rec.update(sessionId=None, name=name, purpose=purpose if isinstance(purpose, str) else "",
+               kind="role", configDir=None, account=None, accountId=None,
+               provider="anthropic", pid=None, ended=None, now="", you=False,
+               running=False if sure else None,
+               errors={"sessionId": why, "account": why, "ended": why})
+    return rec
+
+
+def parked_role_record(h, purpose, snap, now_lines=None, me=None):
+    """A role whose terminal parked a job (ctrl+b): it runs, and no row shows it -
+    the job's row stands for it in the table. Its own record, by its name."""
+    sid = h.get("sessionId") if isinstance(h.get("sessionId"), str) else None
+    rec = {key: "" for key in SESSION_CORE_TEXT}
+    rec.update(sessionId=sid, name=h["name"], purpose=purpose if isinstance(purpose, str) else "",
+               kind=h.get("kind") if isinstance(h.get("kind"), str) else None,
+               configDir=None, pid=None, ended=False, now=_now_of(now_lines, sid),
+               you=bool(me) and me == sid, running=True)
+    rec.update(ccwho_usage.row_account(snap, sid or ""))
+    why = ccwho_usage.account_error(snap, sid or "")
+    rec["errors"] = {"account": why} if why else {}
+    return rec
+
+
+def role_records(rows, fleet, entries, sure=True, snap=None, now_lines=None, me=None):
+    """A record for each role with a purpose and no row: role_record for one no
+    running session has, parked_role_record for one whose terminal parked a
+    job (fleet["parked_sessions"]) - it runs as itself."""
+    hidden = (fleet.get("parked_sessions") or []) if isinstance(fleet, dict) else []
+    purposes = (entries or {}).get("purpose") or {}
+    text = (lambda n: (purposes.get(n) or {}).get("text"))
+    return ([parked_role_record(h, text(h["name"]), snap, now_lines, me)
+             for h in ccwho_directory.parked_roles(rows, purposes, hidden)]
+            + [role_record(n, text(n), sure)
+               for n in ccwho_directory.idle_roles(rows, purposes, hidden)])
 
 
 def ui_found_running(idx, query, live_rows):

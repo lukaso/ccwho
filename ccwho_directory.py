@@ -26,6 +26,7 @@ MAX_TITLE = 80
 MAX_LINE = 190              # a model reads this list: its size is a cost on each lookup
 NOW_KEPT = 30 * 86400       # a purpose stays: a role can sleep for a year
 NOT_RUNNING = "not running"
+PARKED_ROLE = "running (its terminal shows a job)"
 UNKNOWN = "unknown (session list incomplete)"
 INCOMPLETE = "The session list is incomplete: a session may be missing."
 MAX_TIME = 1e15             # NaN fails the test of this too, and a huge int has no float
@@ -129,22 +130,59 @@ def _line(handle, state, purpose="", now_entry=None, now=0.0, row=None, you=Fals
             "you": you, "shared": shared}
 
 
-def merge(rows, entries, handle_of, me=None, complete=True, now=None):
+def _role(r, purposes):
+    # a row from the feed alone does not say who named it. With a line kept under
+    # its name it is that role, running: its file did not match its process
+    return _is_role(r) or (not r.get("nameSource") and r.get("name") in purposes)
+
+
+def running_names(rows, purposes, hidden=()):
+    """How many running sessions have each role's name: the rows', and those of
+    the sessions no row shows - a terminal that parked a job (ctrl+b) is the
+    job's row, and still runs as itself (collect's fleet["parked_sessions"])."""
+    return collections.Counter(r.get("name") for r in list(rows or ()) + list(hidden or ())
+                               if isinstance(r, dict) and _role(r, purposes))
+
+
+def parked_roles(rows, purposes, hidden=()):
+    """The sessions no row shows (`hidden`) that are roles no role row has the
+    name of: a terminal that parked a job (ctrl+b) runs as itself. One each name."""
+    shown = {r.get("name") for r in rows or () if _role(r, purposes)}
+    out = []
+    for h in hidden or ():
+        name = h.get("name") if isinstance(h, dict) else None
+        if isinstance(name, str) and name not in shown and _role(h, purposes):
+            shown.add(name)
+            out.append(h)
+    return out
+
+
+def idle_roles(rows, purposes, hidden=()):
+    """The role names with a purpose that no running session has, sorted."""
+    live = running_names(rows, purposes, hidden)
+    return sorted(n for n in purposes if n not in live)
+
+
+def merge(rows, entries, handle_of, me=None, complete=True, now=None, hidden=()):
     """The rows and the stored lines as {"named", "others", "complete", "reminder"}.
     `handle_of`: engine.session_handle (the engine imports this module). `me`: the
     caller's session id, None for a person. `complete` False: a role not seen may
-    be running, so it is never called not running."""
+    be running, so it is never called not running. `hidden`: the running
+    sessions no row shows (running_names)."""
     now = time.time() if now is None else now
     purposes, now_lines = entries["purpose"], entries["now"]
 
     def role(r):
-        # a row from the feed alone does not say who named it. With a line kept under
-        # its name it is that role, running: its file did not match its process
-        return _is_role(r) or (not r.get("nameSource") and r.get("name") in purposes)
-    live = collections.Counter(r.get("name") for r in rows if role(r))
+        return _role(r, purposes)
+    live = running_names(rows, purposes, hidden)
     named, others, reminder = [], [], None
+    parked = parked_roles(rows, purposes, hidden)
+    own = {h.get("sessionId") for h in parked}
     for r in rows:
-        you = r.get("sessionId") == me
+        # a terminal that parked a job is the job's row: its caller is there -
+        # unless it is a role with its own line (below), which is the caller alone
+        you = bool(me) and (r.get("sessionId") == me
+                            or (me in (r.get("parked") or []) and me not in own))
         now_entry = now_lines.get(r.get("sessionId"))
         if role(r):
             purpose = purposes.get(r.get("name"))
@@ -154,7 +192,14 @@ def merge(rows, entries, handle_of, me=None, complete=True, now=None):
                 reminder = clean(r.get("name"))
         else:
             others.append(_line(handle_of(r), r.get("status"), "", now_entry, now, r, you))
-    for name in sorted(n for n in purposes if n not in live):
+    # a role whose terminal parked a job (ctrl+b) has no row, and runs: by its name
+    for h in parked:
+        name = h["name"]
+        purpose = purposes.get(name)
+        named.append(_line(name, PARKED_ROLE, purpose["text"] if purpose else "",
+                           now_lines.get(h.get("sessionId")), now, None,
+                           h.get("sessionId") == me, live[name]))
+    for name in idle_roles(rows, purposes, hidden):
         named.append(_line(name, NOT_RUNNING if complete else UNKNOWN, purposes[name]["text"]))
     return {"named": named, "others": others, "complete": bool(complete), "reminder": reminder}
 
@@ -191,7 +236,7 @@ def no_match(merged, words):
     text = f"no session matches {' '.join(words)!r}."
     listed = len(merged["named"]) + len(merged["others"])
     if listed:
-        text += f" The list has {listed}: run ccwho directory with no words to read it."
+        text += f" The list has {listed}: run ccwho ls --named with no words to read it."
     return text if merged["complete"] else f"{text} {INCOMPLETE}"
 
 

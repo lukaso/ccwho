@@ -276,7 +276,7 @@ only says who is there. Claude Code's own `SendMessage` carries the message, to 
 session's name.
 
 ```
-$ ccwho directory
+$ ccwho ls --named
 NAMED
   coo  idle  532k cold  suppliers, staff, costs
     now: Company details for the bank
@@ -286,6 +286,16 @@ OTHER SESSIONS
 
 To ask one, use SendMessage with its name.
 ```
+
+`ccwho ls --named <words>` narrows it: every word in a line's name, purpose, now line or
+title. `ccwho ls --json` has the same data in each record: `purpose`, `now` (the session's
+now line), `you` (true on the caller's own session) and `running`. A role with a purpose
+and no session is a record of its own: `sessionId` null, `kind` `role`, `running` false,
+`ended` null, and `errors` code `not-running` (`running` null and `not-read-whole` when a
+source of sessions could not be read). A role whose terminal parked a job (ctrl+b) runs:
+its record has its own `sessionId` and `running` true, and `--named` shows it as
+`running (its terminal shows a job)`. `--named` takes no `--needs-you` or `--all`. `ccwho directory` is gone: it says to use these, and
+exits 2.
 
 To make a role: type `/name coo` in that session, and then `/purpose suppliers, staff,
 costs`. After `/name`, the session's next reply suggests a purpose line. `/purpose` with
@@ -318,13 +328,14 @@ What it costs:
 - A message starts a turn in the session that receives it, and that session's account pays.
   So a row shows the size and cache state of a large session. Waking a large cold
   session costs much more, and the skill tells sessions so.
-- `ccwho directory` takes about as long as `ccwho ls`: the same scan, so the state
-  and the titles are what the list shows.
+- `ccwho ls --named` is `ccwho ls`: the same scan, so the state and the titles are what
+  the list shows.
 
 What it does not do:
 
 - `not running` shows only when both sources of sessions were read whole. If not, the row
-  says `unknown (session list incomplete)`, and the top of the list says that it is incomplete. ccwho starts nothing. `ccwho open <name>` does not
+  says `unknown (session list incomplete)`, the top of the list says that it is
+  incomplete, and it exits 4. ccwho starts nothing. `ccwho open <name>` does not
   find an ended session by its name ([#51](https://github.com/lukaso/ccwho/issues/51)).
 - A session whose account is at its limit may not answer, and nothing says so yet
   ([#52](https://github.com/lukaso/ccwho/issues/52)).
@@ -391,10 +402,12 @@ to name one.
 
 Each session in `ls --json` and `show --json` is one record with the same keys:
 `sessionId`, `name`, `project`, `cwd`, `title`, `attention`, `status`, `purpose`, `kind`,
-`configDir`, `account`, `accountId`, `provider`, `tty`, `pid`, `since`, `ended` and `errors`
+`configDir`, `account`, `accountId`, `provider`, `tty`, `pid`, `since`, `ended`, `errors`,
+`now`, `you` and `running`
 (`show` adds the brief: `recap`, `goal`, `you_said`, `progress`, `closing`). `ended` is
 `false` for a running session, `true` for one the index found that no longer runs, and
-`null` when ccwho could not read every source of sessions and so cannot say. `errors`
+`null` when ccwho could not read every source of sessions and so cannot say, or for a
+named role with no session. `errors`
 says why a field is `null`: `{"account": {"code": "...", "fix": "..."}}`, and `{}` when
 nothing is missing.
 
@@ -419,6 +432,8 @@ The codes for `account`:
 - `codex-unknown`: a Codex thread. Codex's usage names a limit, not an account, so ccwho
   cannot tell which ChatGPT login the thread spends. Ask the person.
 - `ended`: the session does not run, so it spends no account.
+- `not-running` (also under `errors.sessionId`): a named role that no session runs under
+  now. ccwho starts nothing; tell the person.
 - `not-read-whole`: a source of sessions could not be read, so a session that is not
   seen may still be running (also under `errors.ended`). Rerun.
 
@@ -884,7 +899,7 @@ ccwho ls [words] [--all]  # the table, or every session matching (with options, 
 ccwho ls --needs-you    # only the Claude Code sessions the live list puts on top: NEEDS YOU and STUCK
 ccwho ls --json         # the rows, for a script, a status line or an agent
 ccwho show [<session>]  # what that session was working on; no word, from inside a session: its own
-ccwho directory [words]  # who is there to ask, and what each session is for
+ccwho ls --named [words]  # who is there to ask, and what each session is for
 ccwho purpose [--session NAME] [TEXT]  # what a named session is for
 ccwho now [TEXT]        # from inside a session: what it works on
 ccwho ps [--port N] [--helpers] [--full]  # what agents started, and their ports

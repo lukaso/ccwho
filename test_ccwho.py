@@ -5753,6 +5753,28 @@ class TestCollectShowsNoDaemonRows(MachinelessCollect):
         att = {"sessions": fleet["by_session"], "left_behind": [], "codex": []}
         self.assertEqual(ccwho._fleet(att, rows, True)["agent_ports"][0]["who"], "ccwho")
 
+    def test_the_fleet_names_the_parked_terminal_s_session(self):
+        # it has no row and runs as itself: a role among them is running
+        # (ccwho_directory.running_names), so its name and who named it travel
+        tmp = tempfile.mkdtemp(prefix="ccwho-test-parked-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name in ("reviewed_path", "parks_path"):          # this machine's notes
+            testkit.patch(self, ccwho, name, lambda n=name: os.path.join(tmp, n))
+        testkit.patch(self, ccwho.ccwho_index, "config_roots", lambda: [tmp])
+        real = ccwho.agents_json
+        ccwho.agents_json = lambda: json.dumps([
+            {"pid": 3, "id": "4e3efc1d", "sessionId": self.JOB, "cwd": "/x",
+             "kind": "background", "status": "idle"}])
+        ccwho.live_file_sessions = lambda *a, **k: ([dict(self.PARKED_ROW, name="coo",
+                                                          nameSource="user")], 0)
+        try:
+            fleet = ccwho.collect(cache={}, status={})[1]
+        finally:
+            ccwho.agents_json = real
+        self.assertEqual(fleet["parked_sessions"],
+                         [{"sessionId": self.PARKED, "name": "coo", "nameSource": "user",
+                           "kind": "interactive"}])
+
     def test_the_parked_terminal_counts_as_running(self):
         rows = self.collect([self.PARKED_ROW])
         self.assertEqual(ccwho.live_ids(rows), {self.JOB, self.PARKED})
@@ -8206,7 +8228,7 @@ class TestCollectGivesARoleItsPurpose(MachinelessCollect):
 
 
 class TestTheDirectoryFromARealScan(MachinelessCollect):
-    """`ccwho directory` through collect(), with the real read of the session files.
+    """`ccwho ls --named` through collect(), with the real read of the session files.
     A stand-in for the status cannot see these: a file row that goes missing, and a
     feed row that has no nameSource."""
 
@@ -8229,6 +8251,10 @@ class TestTheDirectoryFromARealScan(MachinelessCollect):
                       lambda dirs, default=None, **k: ([dict(self.file_row)], 0))
         home = tempfile.mkdtemp(prefix="ccwho-test-directory-")
         self.addCleanup(shutil.rmtree, home, True)
+        # what you looked at, the config roots and their transcripts: this
+        # machine's, so a temp folder's
+        testkit.patch(self, ccwho, "reviewed_path", lambda: os.path.join(home, "reviewed.json"))
+        testkit.patch(self, ccwho.ccwho_index, "config_roots", lambda: [home])
         patcher = mock.patch.dict(os.environ, {"CCWHO_DIR": home})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -8237,13 +8263,14 @@ class TestTheDirectoryFromARealScan(MachinelessCollect):
         with open(ccwho.ccwho_directory.path_of(folder, "purpose", "coo"), "w") as fh:
             fh.write(ccwho.ccwho_directory.entry_text("coo", "runs the company", 1793570000.0))
 
-    def listed(self):
+    def listed(self, rc=0):
         import contextlib
         import io
         import ccwho as cli
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(cli.directory_cli([]), 0)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            # 4 when the scan had a hole (D14): a failed ps
+            self.assertEqual(cli.ls(["--named"]), rc)
         return out.getvalue()
 
     def role_line(self, text):
@@ -8257,20 +8284,20 @@ class TestTheDirectoryFromARealScan(MachinelessCollect):
 
     def test_a_failed_ps_does_not_call_a_running_role_not_running(self):
         ccwho.ps_table = lambda: {}
-        text = self.listed()
+        text = self.listed(rc=4)
         self.assertNotIn("not running", text)
         self.assertIn("idle", self.role_line(text))
         self.assertIn("runs the company", self.role_line(text))
 
     def test_a_failed_ps_says_the_list_is_incomplete(self):
         ccwho.ps_table = lambda: {}
-        self.assertIn(ccwho.ccwho_directory.INCOMPLETE, self.listed())
+        self.assertIn(ccwho.ccwho_directory.INCOMPLETE, self.listed(rc=4))
 
     def test_a_failed_ps_does_not_say_not_running_of_a_role_only_its_file_shows(self):
         # the feed answers for one config dir: a role in another is in the files only
         ccwho.ps_table = lambda: {}
         self.feed = []
-        text = self.listed()
+        text = self.listed(rc=4)
         self.assertNotIn("not running", text)
         self.assertIn("unknown (session list incomplete)", text)
 

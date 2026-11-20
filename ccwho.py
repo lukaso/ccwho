@@ -447,7 +447,8 @@ def show(argv):
         # the session's record, as in `ls --json` (its title the table's), and
         # the brief around it; `aka` goes: its names are core keys
         rec = engine.session_record(hits[0], snap, ended=hits[0].get("attention") == "ended",
-                                    sure=not hole)
+                                    sure=not hole, now_lines=_stored_lines()["now"],
+                                    me=engine.agent_id(os.environ))
         out = dict({k: v for k, v in b.items() if k != "aka"},
                    **{k: rec[k] for k in engine.SESSION_CORE})
         print(json.dumps(out, indent=2))
@@ -1001,8 +1002,36 @@ def matches(query, rows, everything=False):
     return hits, ended
 
 
-LS_FLAGS = ("--all", "--needs-you", "--json", "--no-color", "--no-links")
-LS_USAGE = "usage: ccwho ls [words] [--all] [--needs-you] [--json] [--no-color] [--no-links]"
+LS_FLAGS = ("--all", "--needs-you", "--json", "--named", "--no-color", "--no-links")
+LS_USAGE = ("usage: ccwho ls [words] [--all] [--needs-you] [--json] [--named] [--no-color]"
+            " [--no-links]")
+
+
+def _stored_lines():
+    """The directory's lines - each role's purpose, each session's `now` - as
+    ccwho_directory.read_all gives them; none when they cannot be read."""
+    try:
+        return directory.read_all(engine.directory_dir())
+    except Exception:             # noqa: BLE001 - a listing never dies of its notes
+        return {"purpose": {}, "now": {}}
+
+
+def _ls_named(rows, fleet, status, words):
+    """`ccwho ls --named`: who is there to ask and what each is for - the named
+    roles first, each with its purpose, then the other sessions (it was
+    `ccwho directory`, D10). Every word in a line's name, purpose, now or title.
+    A role not seen is called not running only when the scan read every source."""
+    hole = not_read_whole(status)
+    everyone = directory.merge(rows, _stored_lines(), engine.session_handle,
+                               me=engine.agent_id(os.environ), complete=not hole,
+                               hidden=(fleet.get("parked_sessions") or [])
+                               if isinstance(fleet, dict) else [])
+    got = directory.matching(everyone, words)
+    if words and not got["named"] and not got["others"]:
+        print(f"ccwho ls: {directory.no_match(everyone, words)}", file=sys.stderr)
+        return 4 if hole else 1
+    print(directory.render(got))
+    return _ls_hole(hole)
 
 
 def ls(argv):
@@ -1018,17 +1047,34 @@ def ls(argv):
         print(LS_USAGE, file=sys.stderr)
         return 2
     query = " ".join(a for a in argv if not a.startswith("-"))
+    cannot = [f for f in ("--needs-you", "--all") if f in argv]
+    if "--named" in argv and "--json" not in argv and cannot:
+        print(f"ccwho ls: --named lists every session: it takes no {cannot[0]}", file=sys.stderr)
+        print(LS_USAGE, file=sys.stderr)
+        return 2
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ and "--no-color" not in argv
     # links on a terminal unless refused: one that cannot render OSC 8 shows
     # the label anyway, so the downside is nil
     links = sys.stdout.isatty() and "--no-links" not in argv
     status = {}
     rows, fleet = scan(cache={}, status=status, samples=0)     # saved verdicts (D18)
+    if "--named" in argv and "--json" not in argv:
+        return _ls_named(rows, fleet, status, [a for a in argv if not a.startswith("-")])
+    snap = with_usage(rows, fleet, record=False)["usage"] if "--json" in argv else None
     hole = not_read_whole(status)
     needs_you = "--needs-you" in argv
     # the open Codex threads: records in --json (D9) - never rows, which save,
     # open, stop and kill read (R1). --needs-you, as the table: Claude Code only
     codex = engine.codex_rows(fleet) if "--json" in argv and not needs_you else []
+    # the named roles no session runs under: records too (D10), as Codex's
+    stored = _stored_lines() if "--json" in argv else {"purpose": {}, "now": {}}
+    me = engine.agent_id(os.environ)
+    roles = (engine.role_records(rows, fleet, stored, sure=not hole, snap=snap,
+                                 now_lines=stored["now"], me=me)
+             if "--json" in argv and not needs_you else [])
+    # a caller with a record of its own (a role whose terminal parked a job)
+    # is that record alone - not also the job's row, which answers for it
+    row_me = None if me and any(r.get("sessionId") == me for r in roles) else me
     # threads not read: exit 4 and say so - but `hole` stays Claude's own: an
     # unseen Claude session is no less ended for it (sure=, below)
     listed = ", and ".join(h for h in (
@@ -1039,7 +1085,8 @@ def ls(argv):
     live, ended = matches(query, rows, everything="--all" in argv) if query else (rows, [])
     if query:
         codex = engine.match_rows(codex, query)     # by the words a row is found by
-    if query and not live and not ended and not codex:
+        roles = engine.match_rows(roles, query)
+    if query and not live and not ended and not codex and not roles:
         if listed:
             print(f"ccwho ls: no session matches {query!r} - {listed}, so it may be running;"
                   " rerun", file=sys.stderr)
@@ -1050,12 +1097,12 @@ def ls(argv):
     if needs_you:
         live, ended = engine.needs_you(live), []     # an ended session needs nothing of you
     if "--json" in argv:
-        # which account each row spends: configDir cannot say it - a
-        # setup-token session runs in the default dir, as "" (a script read
+        # which account each row spends (snap, above): configDir cannot say it
+        # - a setup-token session runs in the default dir, as "" (a script read
         # that as the default account). Rows, not a person: records nothing
-        snap = with_usage(rows, fleet, record=False)["usage"]
-        print(json.dumps([engine.session_record(r, snap) for r in live + codex]
-                         + [engine.session_record(e, snap, ended=True, sure=not hole)
+        mine = dict(now_lines=stored["now"], me=row_me)
+        print(json.dumps([engine.session_record(r, snap, **mine) for r in live + codex] + roles
+                         + [engine.session_record(e, snap, ended=True, sure=not hole, **mine)
                             for e in ended], indent=2))
         return _ls_hole(listed)
     if needs_you and not live and (query or running):
@@ -1099,7 +1146,7 @@ PURPOSE_USAGE = ('usage: ccwho purpose [TEXT]                what this named ses
                  '       no TEXT prints it; "" removes it')
 NOW_USAGE = ('usage: ccwho now [TEXT]   what this session works on, for other sessions to read\n'
              '       no TEXT prints it; "" removes it. It runs from inside a session.')
-DIRECTORY_USAGE = "usage: ccwho directory [words] [--json]   who is there to ask, and what each is for"
+DIRECTORY_USAGE = "usage: ccwho directory   gone: ccwho ls --named (text), ccwho ls --json"
 
 
 def _save_line(cmd, kind, key, label, words):
@@ -1182,30 +1229,16 @@ def now_cli(argv):
     return rc
 
 
+DIRECTORY_GONE = ("ccwho directory is gone: use `ccwho ls --named` (text) or `ccwho ls --json`"
+                  " - your own session's record: `ccwho show --json`")
+
+
 def directory_cli(argv):
-    """Who is there to ask, and what each is for. The list's own scan, so state and
-    titles are what the list shows. A role not seen is called not running only
-    when both sources of sessions were read whole."""
-    words = [a for a in argv if not a.startswith("-")]
-    status = {}
-    try:
-        rows, _ = scan(cache={}, status=status, session_apps=False, samples=0)
-    except Exception as e:          # noqa: BLE001 - no rows must not read as nobody running
-        print(f"ccwho directory: could not read the sessions: {type(e).__name__}", file=sys.stderr)
-        return 1
-    complete = bool(status.get("source_ok")) and status.get("session_files_bad") == 0
-    everyone = directory.merge(rows, directory.read_all(engine.directory_dir()),
-                               engine.session_handle,
-                               me=engine.agent_id(os.environ), complete=complete)
-    got = directory.matching(everyone, words)
-    if words and not got["named"] and not got["others"]:
-        print(f"ccwho directory: {directory.no_match(everyone, words)}", file=sys.stderr)
-        return 1
-    if "--json" in argv:
-        print(json.dumps(got, indent=2))
-        return 0
-    print(directory.render(got))
-    return 0
+    """`ccwho directory` was the list of who is there to ask: `ls --named` and
+    `ls --json` have it now (D10). A session that loaded the old skill text is
+    told where it went - exit 2, and no scan."""
+    print(DIRECTORY_GONE, file=sys.stderr)
+    return 2
 
 
 def doctor(argv):
@@ -4812,7 +4845,8 @@ COMMAND_TAKES = {
               "       ccwho usage name <id> <label>  a display name for an account"),
     "purpose": ((), ("--session",), None, PURPOSE_USAGE),
     "now": ((), (), None, NOW_USAGE),
-    "directory": (("--json",), (), None, DIRECTORY_USAGE),
+    # gone (D10): it takes what its usage names, and says where it went
+    "directory": (("--json", "--named"), (), None, DIRECTORY_USAGE),
     "doctor": (("--json", "--no-color"), (), 0,
                "usage: ccwho doctor [--json] [--no-color]   is everything ccwho needs in place?"),
     "setup": (("--yes", "--no-hotkey", "--no-list", "--usage", "--no-usage"), ("--hotkey", "--proof"), 0,
@@ -4962,11 +4996,12 @@ def main(argv=None):
         print("       ccwho restore [--open] [--from PATH] [--no-color] [--no-links]  list it back / reopen them")
         print("       ccwho restore --check                      would it restore? (run BEFORE you reboot)")
         print("       ccwho restore --list                       every saved manifest, and what it holds")
-        print("       ccwho ls [words] [--all] [--needs-you] [--json] [--no-color] [--no-links]  the table, or every session matching;")
+        print("       ccwho ls [words] [--all] [--needs-you] [--json] [--named] [--no-color] [--no-links]  the table, or every session matching;")
         print("                                                  `ccwho` with options, or piped, is this")
         print("                                                  (--all: sessions a program started too;")
         print("                                                  --needs-you: the sessions the list puts on top;")
-        print("                                                  Claude Code sessions only, no Codex thread)")
+        print("                                                  Claude Code sessions only, no Codex thread;")
+        print("                                                  --named: who is there to ask, and what each is for)")
         print("       ccwho show [<session>] [--all] [--json] [--no-color]  what that session was working on;")
         print("                                                  no session: this one, from inside a session")
         print("       ccwho ps [--port N] [--helpers] [--json] [--full]  what agents started, and their ports")
@@ -4975,7 +5010,7 @@ def main(argv=None):
         print("       ccwho clean [--mine] [--dry-run] [--yes] [--force]      kill what ended sessions left - lists, then asks")
         print("       ccwho usage [--json]                       subscription usage, per account")
         print("       ccwho usage name <id> <label>              a display name for an account")
-        print("       ccwho directory [words] [--json]           who is there to ask, and what each is for")
+        print("       ccwho directory                            gone: ccwho ls --named (text), ccwho ls --json")
         print("       ccwho purpose [--session NAME] [TEXT]      what a named session is for")
         print("       ccwho now [TEXT]                           from inside a session: what it works on")
         print("       ccwho statusline                           Claude Code's statusLine command (records usage)")

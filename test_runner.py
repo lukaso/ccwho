@@ -6516,8 +6516,17 @@ class TestStatusline(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = runner.main(["usage"])
         self.assertEqual(rc, 0)
-        self.assertIn("a@example.com", out.getvalue())
         self.assertIn("7d", out.getvalue())
+
+    def test_accounts_name_each_account_as_the_usage_line_does(self):
+        # slice 5 (D11): "ant:a", the words of `ls`'s usage line, its tags and
+        # `ls --json`'s account - not the login's email, which named it nowhere else
+        self.run_with(self.payload())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            runner.main(["usage"])
+        self.assertTrue(out.getvalue().startswith("ant:a  "), out.getvalue())
+        self.assertNotIn("a@example.com", out.getvalue())
 
     def test_accounts_json(self):
         self.run_with(self.payload())
@@ -6546,7 +6555,22 @@ class TestStatusline(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(runner.main(["usage", "name", "login:uuid", "work"]), 0)
             runner.main(["usage"])
-        self.assertIn("work", out.getvalue())
+        self.assertIn("\nant:work  ", out.getvalue())
+
+    def test_accounts_name_takes_the_name_the_listing_prints(self):
+        # `ccwho usage` says "ant:a": `usage name` takes that, with its brand or
+        # without - it said "no account matches" to the words it had just printed
+        for said in ("ant:a", "a"):
+            with self.subTest(said=said):
+                self.run_with(self.payload())
+                with contextlib.redirect_stdout(io.StringIO()):
+                    runner.main(["usage", "name", "login:uuid", ""])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(["usage", "name", said, "work"]), 0)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    runner.main(["usage"])
+                self.assertTrue(out.getvalue().startswith("ant:work  "), out.getvalue())
 
     def test_accounts_name_refuses_a_label_with_a_colon(self):
         # "work:home" would read as the brand "work" where the brand is dropped
@@ -8058,7 +8082,7 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(runner.main(["usage"]), 0)
-        line = next(l for l in out.getvalue().splitlines() if l.startswith("codex"))
+        line = next(l for l in out.getvalue().splitlines() if l.startswith("oai:codex  "))
         self.assertIn("7d 65%", line)
         self.assertIn("1 session", line)                  # the rollouts that said so
         out = io.StringIO()
@@ -8071,7 +8095,7 @@ class TestCodexUsageInTheSnapshot(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             runner.main(["usage"])
-        self.assertTrue(any(l.startswith("chatgpt ") for l in out.getvalue().splitlines()),
+        self.assertTrue(any(l.startswith("oai:chatgpt  ") for l in out.getvalue().splitlines()),
                         out.getvalue())
 
     def test_a_codex_read_that_fails_costs_only_codex(self):

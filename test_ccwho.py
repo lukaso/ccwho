@@ -5746,12 +5746,12 @@ class TestCollectShowsNoDaemonRows(MachinelessCollect):
 
     def test_what_the_parked_terminal_started_names_the_job(self):
         rows = self.collect([self.PARKED_ROW])
-        rows[0].update(project="ccwho", title="TUI copy-paste")
+        rows[0].update(project="ccwho", title="TUI copy-paste", name="ccwho-b5")
         fleet = {"by_session": {self.PARKED: [{"pid": 9, "helper": False, "ports": [3000]}]}}
         listed = ccwho.ps_listing(rows, fleet)
-        self.assertEqual(listed[0]["who"], "ccwho · TUI copy-paste")
+        self.assertEqual(listed[0]["who"], "ccwho-b5 · TUI copy-paste")
         att = {"sessions": fleet["by_session"], "left_behind": [], "codex": []}
-        self.assertEqual(ccwho._fleet(att, rows, True)["agent_ports"][0]["who"], "ccwho")
+        self.assertEqual(ccwho._fleet(att, rows, True)["agent_ports"][0]["who"], "ccwho-b5")
 
     def test_the_fleet_names_the_parked_terminal_s_session(self):
         # it has no row and runs as itself: a role among them is running
@@ -8910,6 +8910,62 @@ class TestTheTableNamesEachSession(unittest.TestCase):
         self.assertEqual(lines[0].index("s039"), lines[1].index("s039"))
 
 
+class TestTheTextSaysWhatTheJsonSays(unittest.TestCase):
+    """Slice 5 (D10, D11): every text names a session by its name, as `ls
+    --json` and SendMessage do, and a role's purpose shows where the session is
+    listed - `ls` and `ps` printed the project and a tab title ("liveapp ·
+    COO (claude)"), and the reader had to match that to `coo`."""
+
+    ROLE = {"project": "ops", "status": "idle", "attention": "stopped", "name": "coo",
+            "title": "Session 51fd", "tab_title": "", "doing": "", "since": "1m",
+            "tty": "ttys039", "orphans": 0, "sessionId": LIVE,
+            "purpose": "Runs the company: filings and money"}
+
+    def table_line(self, row):
+        out = ccwho.render([row], {}, color=False, width=200)
+        return next(l for l in out.splitlines() if "s039" in l)
+
+    def who(self, row):
+        fleet = {"by_session": {LIVE: [{"pid": 9, "helper": False, "ports": [3000]}]}}
+        return ccwho.ps_listing([row], fleet)[0]["who"]
+
+    def test_a_role_row_in_ls_says_its_purpose(self):
+        line = self.table_line(self.ROLE)
+        self.assertIn("Runs the company", line)
+        self.assertNotIn("Session 51fd", line)
+
+    def test_a_row_with_no_purpose_says_its_title(self):                # control
+        self.assertIn("Session 51fd", self.table_line(dict(self.ROLE, purpose="")))
+
+    def test_ps_names_the_session_and_its_purpose(self):
+        self.assertEqual(self.who(self.ROLE), "coo · Runs the company: filings and money")
+
+    def test_ps_says_the_purpose_over_the_tab_title(self):
+        # the live list's rows have tab titles: its process screen said
+        # "coo · COO (claude)"
+        self.assertEqual(self.who(dict(self.ROLE, tab_title="COO (claude)")),
+                         "coo · Runs the company: filings and money")
+
+    def test_ps_says_the_title_when_there_is_no_purpose(self):          # control
+        self.assertEqual(self.who(dict(self.ROLE, purpose="")), "coo · Session 51fd")
+
+    def test_ps_says_a_name_once(self):
+        # no title, or a tab that shows the name: "coo · coo" says nothing twice
+        for title in ("", "coo"):
+            with self.subTest(title=title):
+                self.assertEqual(self.who(dict(self.ROLE, purpose="", title=title)), "coo")
+
+    def test_ps_with_no_name_says_the_project(self):                    # control
+        self.assertEqual(self.who(dict(self.ROLE, purpose="", name="")), "ops · Session 51fd")
+
+    def test_the_ports_line_names_the_session(self):
+        att = {"sessions": {LIVE: [{"pid": 9, "helper": False, "ports": [3000]}]},
+               "left_behind": [], "codex": []}
+        held = ccwho._fleet(att, [self.ROLE], True)["agent_ports"]
+        self.assertEqual(held, [{"port": 3000, "pid": 9, "who": "coo"}])
+        self.assertIn(":3000 coo", ccwho.ports_line({"agent_ports": held}, 100))
+
+
 class TestAPickListNamesEachSession(unittest.TestCase):
     """`ccwho show x` and `ccwho open x` list the sessions x matched. Each line
     says the name that matched, or nobody can see why a row is on the list."""
@@ -9116,7 +9172,7 @@ class TestTheListSaysWhatAgentsHold(unittest.TestCase):
     def test_the_process_screen_has_a_heading_per_group(self):
         text = ccwho.render_ps_screen(ccwho.ps_listing([self.ROW], self.FLEET), self.FLEET,
                                       width=100)
-        for heading in ("app · fix nav", "LEFT BEHIND", "CODEX", "NOT SURE"):
+        for heading in ("n · fix nav", "LEFT BEHIND", "CODEX", "NOT SURE"):
             self.assertIn(heading, text)
         self.assertIn(":3000", text)
         self.assertIn("vite --port 3000", text)

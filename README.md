@@ -310,7 +310,8 @@ A session with no name of yours has a now line only, and its title shows until i
 writes one. `/purpose` there answers "Name it first".
 
 The purpose line also shows in the brief of a running role: `ccwho show`, and the
-list's detail pane, where a click copies it. `ccwho show coo` goes straight to the
+list's detail pane, where a click copies it. `ccwho ls` shows it in the role's title
+column, and `ccwho ps` after the role's name (`coo · Runs the company`). `ccwho show coo` goes straight to the
 running session with that exact name. Any other word is a search.
 
 `ccwho setup` offers two skills, `directory` and `purpose`, for each config dir where
@@ -381,7 +382,8 @@ pass the token to the statusLine, so `ccwho statusline` reads it from its claude
 process's environment and keeps only the hash. A session reports after its next
 reply - including sessions that were already running when setup added the line
 (measured: they reload the settings). `ccwho usage` lists every account seen in the last
-two weeks; `ccwho usage name <id> <label>` gives one a name. A name is at most 16 characters
+two weeks, by the name the usage line gives it (`ant:work`, `oai:codex`), and
+`ccwho usage name` takes that name too; `ccwho usage name <id> <label>` gives one a name. A name is at most 16 characters
 wide and holds no `:`. A name that another account on the line has is refused, and so is
 another account's hash or email name; `ccwho usage name <id> ""` removes it. `ccwho ls`
 says the name at once, the live list at its next scan (at once when you named it there,
@@ -578,12 +580,14 @@ ccwho ps --json             # for scripts, and for agents told to clean up
 ccwho ps --full             # the whole command line, not the short form
 ```
 
-In `ps --json` each process keeps its own keys - its `pid` is the process's, not the
+`ccwho ps` names a process's session by its name, then its purpose, or its title when
+it has none (`coo · Runs the company`). In `ps --json` each process keeps its
+own keys - its `pid` is the process's, not the
 session's - and names its session as a reference, `"session": {"sessionId": ...,
 "name": ...}`, or `null` when no session is known.
 
 The live list and the table (`ccwho ls`) say it in one dim line
-each, never louder than what needs you: `agents hold :3000 left behind · :5173 app` at the top, the
+each, never louder than what needs you: `agents hold :3000 left behind · :5173 coo` at the top (a session by its name), the
 ports on each row, and at the bottom `left behind: N processes` (sessions that have
 ended) and `codex: N processes` (processes of a Codex thread that is not open: whether
 it still runs cannot be told cheaply, so they are never called left behind). An open

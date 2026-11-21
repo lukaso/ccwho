@@ -588,10 +588,11 @@ def _cmdline_orphans(ps_output, session_ids):
 
 def _fleet(att, rows, ports_ok, procs_ok=True, sessions_ok=True):
     """What the whole machine says, for the header and the bottom lines."""
-    project = {sid: r.get("project", "?") for r in rows for sid in answers_for(r)}
+    # by the session's name (D11): "agents hold :3000 coo"
+    handle = {sid: session_handle(r) for r in rows for sid in answers_for(r)}
     held = []
     for sid, mine in att["sessions"].items():
-        held += [(port, p["pid"], project.get(sid, "?")) for p in mine
+        held += [(port, p["pid"], handle.get(sid, "?")) for p in mine
                  if not p["helper"] for port in p["ports"]]
     held += [(port, p["pid"], "left behind") for p in att["left_behind"]
              if not p["helper"] for port in p["ports"]]
@@ -5305,6 +5306,9 @@ def render(rows, fleet=None, color=True, width=None, links=False):
         # session with no window), fall back to Claude Code's own title and MARK
         # it: a title we could not read off a tab must not pretend it came from one.
         title = r.get("tab_title") or ("~" + (r["title"] or r["name"]))
+        # a role says what it is for (D10): its tab says "COO (claude)", which
+        # the name already said
+        title = _printable(r.get("purpose")) or title
         handle = handles[id(r)]
         if project := renamed(r, handle):
             title = f"{project} · {title}"      # a renamed session still says whose it is
@@ -5418,12 +5422,15 @@ def ps_listing(rows, fleet, show_all=False):
     `ccwho ps` prints and the process screen shows. Helpers (MCP servers and the
     like) only with show_all, except left behind: litter is litter."""
     fleet = fleet if isinstance(fleet, dict) else {}
-    titles = {sid: (r.get("tab_title") or r.get("title") or r.get("name") or "?")
-              for r in rows or [] for sid in answers_for(r)}
-    project = {sid: r.get("project", "?") for r in rows or [] for sid in answers_for(r)}
+    # the session's name, as `ls` and SendMessage say it (D11), then what it is
+    # for: a role's purpose, or else its title (D10)
+    said = {sid: (session_handle(r), _printable(r.get("purpose") or r.get("tab_title")
+                                                or r.get("title")))
+            for r in rows or [] for sid in answers_for(r)}
     listed = []
     for sid, mine in (fleet.get("by_session") or {}).items():
-        who = _one_line(f"{project.get(sid, '?')} · {titles.get(sid, '?')}")
+        handle, what = said.get(sid, ("?", ""))
+        who = _one_line(f"{handle} · {what}" if what and what != handle else handle)
         listed += [dict(p, group="session", who=who) for p in mine]
     # an open Codex thread's work is its row's, as a session's is: together,
     # under the row's id and words - two unnamed threads in one folder differ

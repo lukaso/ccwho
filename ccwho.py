@@ -3689,7 +3689,11 @@ def accounts(argv):
         if len(argv) != 3:
             print("usage: ccwho usage name <id> <label>", file=sys.stderr)
             return 2
-        hits = usage.matching_ids(argv[1], [r["id"] for r in rows])
+        # the name `ccwho usage` prints ("ant:work", or "work") names its one
+        # account; then an id, its prefix or its body
+        said = _account_words(rows, labels)
+        hits = ([aid for aid, tag in said.items() if argv[1] in (tag, tag.split(":", 1)[1])]
+                or usage.matching_ids(argv[1], [r["id"] for r in rows]))
         if len(hits) != 1:
             print(f"ccwho usage: {argv[1]!r} matches {len(hits)} accounts" if hits else
                   f"ccwho usage: no account matches {argv[1]!r}",
@@ -3716,9 +3720,19 @@ def accounts(argv):
         print("no usage recorded yet. Sessions record it through `ccwho statusline`,"
               " after their first reply.")
         return 0
+    said = _account_words(rows, labels)
     for row in rows:
-        print(usage.format_row(row, now))
+        print(usage.format_row(dict(row, label=said[row["id"]]), now))
     return 0
+
+
+def _account_words(rows, labels):
+    """id -> each account in the words of `ls`'s usage line and `ls --json`
+    (D11): "ant:work", "oai:codex" - the login's email named it nowhere else.
+    `ccwho usage` prints them, and `ccwho usage name` takes them back."""
+    shown = usage.short_names(rows, labels)
+    return {r["id"]: usage.account_tag(r.get("brand", "ant"), shown.get(r["id"]) or r["label"])
+            for r in rows}
 
 
 def _accounts_json(rows, labels, live, fleet, status):

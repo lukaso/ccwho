@@ -4070,7 +4070,8 @@ class TestShowVerb(unittest.TestCase):
         self._an_ended_session_said_it()
         rc, out = self._show("coo")
         self.assertEqual(rc, 2, out)
-        self.assertIn("matches 2 sessions", out)
+        self.assertIn("names 2 sessions", out)
+        self.assertIn("name one by its id: ccwho show ", out)
         self.assertNotIn("7777", out)
         self.assertNotIn("a298", out)
 
@@ -16262,3 +16263,174 @@ class TestOpenStopKillNeverTakeACodexThread(unittest.TestCase):
                  "ask": lambda prompt: True, "tty": lambda: True}
         self.run_it(runner.kill_cli, self.ROW["sessionId"], "--yes", seams=seams)
         self.assertEqual(len(self.done), 1, "kill reached its plan for the Claude session")
+
+
+class TestOneWordNamesOneSession(unittest.TestCase):
+    """Slice 6 (D12, D16): a word names a session by one of its own names - its
+    id, its exact name, the start of its id, its tty, its pid - and then it is
+    that session in `show`, `open`, `kill`, `stop` and `ls` alike; only a word
+    that names none is a search. `ccwho kill coo` refused while another title
+    said "coordinate". A word that two rules give to two sessions (a session
+    named `dead`, another whose id starts `dead`) is refused, never guessed."""
+
+    COO = {"sessionId": "c0c0aaaa-1111-4222-8333-abcdefabcdef", "name": "coo",
+           "tty": "ttys013", "pid": 4321, "title": "ops work", "project": "ops",
+           "kind": "background", "status": "idle", "attention": "stopped"}
+    WEB = {"sessionId": "dead2222-1111-4222-8333-abcdefabcdef", "name": "web",
+           "tty": "ttys015", "pid": 6000, "title": "coordinate the web", "project": "web",
+           "kind": "background", "status": "idle", "attention": "stopped"}
+    DEAD = {"sessionId": "aaaa1111-1111-4222-8333-abcdefabcdef", "name": "dead",
+            "tty": "ttys014", "pid": 5000, "title": "x", "project": "x",
+            "kind": "background", "status": "idle", "attention": "stopped"}
+    API = {"sessionId": "43210bbb-1111-4222-8333-abcdefabcdef", "name": "api",
+           "tty": "ttys016", "pid": 7000, "title": "y", "project": "y",
+           "kind": "background", "status": "idle", "attention": "stopped"}
+    WORDS = ("coo", "ttys013", "s013", "c0c0", "c0c0aaaa-1111-4222-8333-abcdefabcdef")
+
+    def setUp(self):
+        self.rows = [self.COO, self.WEB, self.DEAD, self.API]
+        self.opened, self.searched = [], []
+        e = runner.engine
+        for mod, name, fake in (
+                (e, "collect", lambda cache=None, status=None, **k: (
+                    status is not None and status.update(source_ok=True, session_files_bad=0),
+                    ([dict(r) for r in self.rows], {}))[1]),
+                (e, "read_windows", lambda sid, **kw: ([], [], 0)),
+                (runner, "usage_snapshot",
+                 lambda rows, now=None, record=True, codex_threads=(): {"state": "unknown"}),
+                (runner, "fresh_index", lambda quiet=False: {}),
+                (runner, "matches", lambda query, rows, everything=False, real=runner.matches: (
+                    self.searched.append(query) or real(query, rows, everything=everything))),
+                (runner, "_focus", lambda row: self.opened.append(row["sessionId"]) or 0)):
+            self.addCleanup(setattr, mod, name, getattr(mod, name))
+            setattr(mod, name, fake)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
+    def run_it(self, fn, *argv, **kw):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = fn(list(argv), **kw)
+        self.out, self.err = out.getvalue(), err.getvalue()
+        return rc
+
+    def seams(self):
+        def build(mine=None, status=None):
+            raise KeyboardInterrupt       # past the finder: nothing to kill here
+        return {"env": {}, "rows": lambda: [dict(r) for r in self.rows], "build": build,
+                "tty": lambda: False}
+
+    def picked(self, cmd, word):
+        """The session id `cmd` took for `word`, or (rc, what it said)."""
+        if cmd == "show":
+            rc = self.run_it(runner.show, word, "--json")
+            return json.loads(self.out)["sessionId"] if rc == 0 else (rc, self.err)
+        if cmd == "ls":
+            rc = self.run_it(runner.ls, word, "--json")
+            return [r["sessionId"] for r in json.loads(self.out)] if rc == 0 else (rc, self.err)
+        if cmd == "open":
+            self.opened = []
+            rc = self.run_it(runner.open_session, word)
+            return self.opened[0] if rc == 0 and self.opened else (rc, self.err)
+        fn = runner.kill_cli if cmd == "kill" else runner.stop_cli
+        rc = self.run_it(fn, word, "--dry-run", seams=self.seams())
+        line = next((l for l in self.out.splitlines() if l.startswith("session ")), "")
+        hit = [r["sessionId"] for r in self.rows if line and runner.engine.pick_line(r) in line]
+        return hit[0] if hit else (rc, self.err)
+
+    def test_each_name_of_a_session_is_that_session_in_every_command(self):
+        for cmd in ("show", "open", "kill", "stop"):
+            for word in self.WORDS:
+                with self.subTest(cmd=cmd, word=word):
+                    self.assertEqual(self.picked(cmd, word), self.COO["sessionId"])
+        self.assertEqual(self.searched, [], "a word that names a session is no search")
+
+    def test_ls_with_a_session_s_name_lists_that_session(self):
+        # D12: the exact name wins, as in `show` - not every title with "coo"
+        for word in self.WORDS:
+            with self.subTest(word=word):
+                self.assertEqual(self.picked("ls", word), [self.COO["sessionId"]])
+
+    def test_a_word_of_a_title_is_still_a_search(self):                # control
+        self.assertEqual(self.picked("ls", "coordinate"), [self.WEB["sessionId"]])
+
+    def test_ls_finds_a_role_by_its_purpose(self):
+        # as `ls --named` does: what a role is for is a word it is found by
+        self.rows = [dict(self.COO, purpose="filings and money"), self.WEB]
+        self.assertEqual(self.picked("ls", "filings"), [self.COO["sessionId"]])
+
+    def test_a_word_two_rules_give_to_two_sessions_is_refused(self):
+        for cmd in ("show", "open", "kill", "stop"):
+            with self.subTest(cmd=cmd):
+                got = self.picked(cmd, "dead")
+                self.assertIsInstance(got, tuple, f"{cmd} took {got}")
+                rc, said = got
+                self.assertEqual(rc, 2, said)
+                for sid in (self.DEAD["sessionId"], self.WEB["sessionId"]):
+                    self.assertIn(sid[:4], said, "both are named")
+                self.assertIn(f"name one by its id: ccwho {cmd} ", said)
+
+    def test_ls_lists_both_sessions_a_word_names(self):
+        # a listing takes nothing: it shows the two, and no search
+        got = self.picked("ls", "dead")
+        self.assertIsInstance(got, list, got)
+        self.assertEqual(sorted(got),
+                         sorted([self.DEAD["sessionId"], self.WEB["sessionId"]]))
+
+    def test_a_pid_that_starts_another_session_s_id_is_refused(self):
+        for cmd in ("show", "open"):
+            with self.subTest(cmd=cmd):
+                got = self.picked(cmd, "4321")
+                self.assertIsInstance(got, tuple, f"{cmd} took {got}")
+                rc, said = got
+                self.assertEqual(rc, 2, said)
+                self.assertIn("(its pid)", said)
+                self.assertIn("(the start of its id)", said)
+
+    def suggested(self, said, cmd):
+        line = next(l for l in said.splitlines() if l.startswith("name one by its id: "))
+        prefix = f"name one by its id: ccwho {cmd} "
+        self.assertTrue(line.startswith(prefix), line)
+        return line[len(prefix):]
+
+    def test_the_id_a_refusal_gives_names_that_session_in_the_same_command(self):
+        # two sessions of one name, ids that start with digits: kill and stop
+        # read digits as a pid, so "1234" would be refused again
+        one = dict(self.COO, sessionId="12345bbb-1111-4222-8333-abcdefabcdef", name="twin",
+                   tty="ttys021", pid=8001)
+        two = dict(self.COO, sessionId="12399ccc-1111-4222-8333-abcdefabcdef", name="twin",
+                   tty="ttys022", pid=8002)
+        self.rows = [one, two, self.WEB]
+        for cmd in ("show", "open", "kill", "stop"):
+            with self.subTest(cmd=cmd):
+                rc, said = self.picked(cmd, "twin")
+                self.assertEqual(rc, 2, said)
+                word = self.suggested(said, cmd)
+                self.assertLess(len(word), 36, "a short id, not the whole of it")
+                self.assertEqual(self.picked(cmd, word), one["sessionId"], word)
+
+    def test_an_ended_session_is_named_by_its_whole_id(self):
+        # the search reads every id's middle and every title: a short id of an
+        # ended session can find another again ("show a3f9" found c000a3f9…)
+        a = {"sessionId": "a3f91111-1111-4222-8333-abcdefabcdef", "name": "", "tty": "",
+             "title": "the gate", "project": "p", "attention": "ended", "status": "ended"}
+        b = dict(a, sessionId="b0b01111-1111-4222-8333-abcdefabcdef", title="gate work")
+        c = dict(a, sessionId="c000a3f9-1111-4222-8333-abcdefabcdef",
+                 title=f"about {a['sessionId']}")
+        ended = [a, b, c]
+        runner.matches = lambda query, rows, everything=False: ([], [
+            e for e in ended if query.lower() in (e["sessionId"] + " " + e["title"]).lower()])
+        rc, said = self.picked("show", "gate")
+        self.assertEqual(rc, 2, said)
+        word = self.suggested(said, "show")
+        self.assertEqual(self.picked("show", word), word)
+        # open, by the same words: the whole id - its own rule takes that as one
+        rc, said = self.picked("open", "gate")
+        self.assertEqual((rc, self.suggested(said, "open")), (2, a["sessionId"]), said)
+
+    def test_no_match_says_where_the_names_are(self):
+        rc, said = self.picked("show", "zzzz")
+        self.assertEqual(rc, 1)
+        self.assertIn("see the names: ccwho ls", said)

@@ -1965,6 +1965,55 @@ def match_rows(rows, query):
     return hits
 
 
+def match_purpose(rows, query):
+    """The rows whose purpose holds `query` - for a listing only (`ls`): what a
+    session wrote about itself never chooses what `kill` or `open` acts on, so
+    match_rows does not read it."""
+    q = (query or "").strip().lower()
+    return [r for r in rows or [] if q and q in str(r.get("purpose") or "").lower()]
+
+
+SHORT_ID = 4        # the start of an id that names a session: four hex, as `ls` shows it
+
+NAME_RULES = {"id": "its id", "name": "its name", "prefix": "the start of its id",
+              "tty": "its tty", "pid": "its pid"}
+
+
+def named_by(rows, word):
+    """The rows `word` names by one of a session's own names, as [(row, rule)]:
+    its full id (or a parked terminal's), its exact name, the start of its id
+    (SHORT_ID or more), its tty, its pid - a row by its first rule. A word that
+    names one row is that session in every command (D12, D16); one that names
+    several is no choice of ours, and none is a search (match_rows)."""
+    w = (word or "").strip().lower()
+    if not w:
+        return []
+    out = []
+    for r in rows or []:
+        ids = [str(s).lower() for s in answers_for(r) if s]
+        tty = str(r.get("tty") or "").lower()
+        rule = ("id" if w in ids else
+                "name" if w == str(r.get("name") or "").lower() else
+                "prefix" if len(w) >= SHORT_ID and any(i.startswith(w) for i in ids) else
+                "tty" if tty and short_tty(w) == short_tty(tty) else
+                "pid" if r.get("pid") is not None and w == str(r.get("pid")) else None)
+        if rule:
+            out.append((r, rule))
+    return out
+
+
+def unique_id(row, rows):
+    """The shortest start of `row`'s id that names it alone among `rows` - what
+    a refusal tells the reader to type - with a letter in it: `kill` and `stop`
+    read digits as a pid. The whole id when no start does."""
+    sid = str(row.get("sessionId") or "")
+    for n in range(SHORT_ID, len(sid) + 1):
+        if (re.search(r"[a-z]", sid[:n], re.I)
+                and [r for r, _ in named_by(rows, sid[:n])] == [row]):
+            return sid[:n]
+    return sid
+
+
 def match_terminal(rows, target):
     """The rows on that tty, or with that pid - and nothing else. A ccwho://jump
     link names a terminal, and any app can send one: a title word or an id's

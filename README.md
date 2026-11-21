@@ -312,7 +312,8 @@ writes one. `/purpose` there answers "Name it first".
 The purpose line also shows in the brief of a running role: `ccwho show`, and the
 list's detail pane, where a click copies it. `ccwho ls` shows it in the role's title
 column, and `ccwho ps` after the role's name (`coo · Runs the company`). `ccwho show coo` goes straight to the
-running session with that exact name. Any other word is a search.
+running session with that exact name, as `open`, `kill`, `stop` and `ls` do (see
+`ccwho open`). Any other word is a search.
 
 `ccwho setup` offers two skills, `directory` and `purpose`, for each config dir where
 you run claude. It shows them and asks. A no is not remembered, and `ccwho doctor` does not call it
@@ -645,14 +646,28 @@ ccwho open liveapp-f0     # ...by name, or a short id
 ccwho open vitest         # ...by words of its title
 ```
 
-An ambiguous query lists the candidates rather than guessing. It goes to the app
+One word names a session by one of its own names: its full id, its exact name, the
+start of its id (four characters or more), its tty or its pid (not in `kill`, where a
+number is a process, nor in `stop`, which takes none). That word is then that
+session in `show`, `open`, `kill`, `stop` and `ls` alike: `ccwho kill coo` takes what `coo`
+started, also when another session's title says "coordinate". A word that names two sessions
+this way (a session named `dead`, and another whose id starts `dead`) is refused with
+exit 2. Each one is listed with how the word names it, and the last line gives the id
+to type (`name one by its id: ccwho open dead2`; an ended session's whole id); `ls`
+lists both. In `ls --json`, a word that names a role or an open Codex thread this way
+lists that record only. Only a word that
+names no session this way is a search: words of a title or a project, and in `ls` a
+role's purpose too (`kill` and `open` never act on what a session wrote about
+itself). An ambiguous search lists the candidates rather than guessing, with the same
+last line. It goes to the app
 whose tab shows that tty: iTerm2 (`tty of session` over its windows) or Terminal.app
 (`tty` of each tab). A background session gets a window (`claude attach`). Words
 that match no running session are looked for among the ended ones, as `ccwho ls`
 finds them, and the one they find is reopened in a new window. A running session
 is matched by what the list shows of it; one found only by what was said in it is
-listed with the ended ones, never picked over them. Run by an agent, words never
-name the agent's own session (its title comes from its own conversation). A tty
+listed with the ended ones, never picked over them. Run by an agent, words of a title never
+name the agent's own session (its title comes from its own conversation); its name,
+id or tty does. A tty
 names a running session only, and an id is matched by its start, as a short id is.
 
 ### Clickable, without a new UI

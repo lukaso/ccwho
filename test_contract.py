@@ -525,6 +525,11 @@ class TestANamedRoleIsARecord(_CommandCase):
         # and words that miss it leave it out
         self.assertEqual(self.roles(self.run_cmd(self.runner.ls, ["liveapp", "--json"])), [])
 
+    def test_a_word_of_its_purpose_finds_a_role(self):
+        # as `ls --named suppliers` does: what the role is for
+        got = self.run_cmd(self.runner.ls, ["suppliers", "--json"])
+        self.assertEqual([r["name"] for r in self.roles(got)], ["coo"])
+
     def test_you_and_now(self):
         from unittest import mock
         self.store("now", SESSION["sessionId"], "the gate")

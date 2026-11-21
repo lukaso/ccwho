@@ -406,14 +406,22 @@ def show(argv):
             return 1
         entry = fresh_index().get(hits[0].get("sessionId"), {})
     else:
-        # The exact name of a running session is that session: a word that others
-        # said, or a part of a title, does not make it a question.
-        hits = [r for r in rows if (r.get("name") or "").lower() == query.lower()]
+        # One of a running session's own names - its id, its name, its tty -
+        # is that session: a word that others said, or a part of a title, does
+        # not make it a question (D12). One that names two is refused
+        row, rc = _named_one("show", query, rows)
+        if rc:
+            return rc
+        hits = [row] if row else []
         if not hits:
             # Not running is not gone: the transcript is still on disk, and so is the
             # answer to "what was that one about".
             hits, ended = matches(query, rows, everything="--all" in argv)
             hits = hits + ended
+            if engine._LINK_SESSION_ID.match(query):
+                # a whole id is that session, not another whose words hold it
+                hits = [h for h in hits if str(h.get("sessionId") or "").lower()
+                        == query.lower()]
         if hits:
             entry = fresh_index().get(hits[0].get("sessionId"), {})
     if not hits:
@@ -421,13 +429,15 @@ def show(argv):
             print(f"ccwho show: no session matches {query!r} - {hole}, so it may be running;"
                   " rerun", file=sys.stderr)
             return 4
-        print(f"ccwho show: no session matches {query!r}", file=sys.stderr)
+        print(f"ccwho show: no session matches {query!r} - see the names: ccwho ls",
+              file=sys.stderr)
         return 1
     if len(hits) > 1:
         print(f"ccwho show: {query!r} matches {len(hits)} sessions - be more specific:",
               file=sys.stderr)
         for line in engine.pick_lines(hits):
             print(f"  {line}", file=sys.stderr)
+        _name_one_by_id("show", hits[0], rows)
         return 2
     # the account it spends, as `ls --json` says it: a lookup records nothing
     snap = with_usage(rows, fleet, record=False)["usage"]
@@ -1082,10 +1092,23 @@ def ls(argv):
         if "--json" in argv and not needs_you and codex_unread(fleet) else "") if h)
     # words first, over every row: the index tells a running session from an
     # ended one by the rows it is given
-    live, ended = matches(query, rows, everything="--all" in argv) if query else (rows, [])
-    if query:
+    # one of a session's own names lists that session (D12): its id, its name,
+    # its tty - as `show` takes it. A word that names two lists the two
+    named = [[r for r, _ in engine.named_by(got, query)] for got in (rows, codex, roles)]
+    if query and any(named):
+        (live, codex, roles), ended = named, []
+    elif query:
+        live, ended = matches(query, rows, everything="--all" in argv)
         codex = engine.match_rows(codex, query)     # by the words a row is found by
-        roles = engine.match_rows(roles, query)
+        # and a role by what it is for, as `ls --named` finds it: a listing
+        # only - kill and open never read a purpose
+        live += [r for r in engine.match_purpose(rows, query) if r not in live]
+        live.sort(key=engine.sort_key)
+        roles = engine.match_rows(roles, query) + [
+            r for r in engine.match_purpose(roles, query)
+            if r not in engine.match_rows(roles, query)]
+    else:
+        live, ended = rows, []
     if query and not live and not ended and not codex and not roles:
         if listed:
             print(f"ccwho ls: no session matches {query!r} - {listed}, so it may be running;"
@@ -2607,7 +2630,11 @@ def open_session(argv, from_index=False, live_only=False):
         terminal = live_only or _TTY_WORD.match(query)
         # a terminal's name is matched as one: its tty or its pid, not a title
         named = [r for r in rows if _named_by_words(r, me, query)]
-        hits = engine.match_terminal(rows, query) if terminal else (
+        # one of a session's own names is that session (D12), the caller's too
+        one, rc = (None, None) if terminal else _named_one("open", query, rows)
+        if rc:
+            return rc
+        hits = engine.match_terminal(rows, query) if terminal else [one] if one else (
             engine.match_rows(named, query) or _named_word_by_word(named, query))
         id_word = not terminal and len(query) >= SHORT_ID and _ID_WORD.match(query)
         if not hits and not terminal:
@@ -2646,6 +2673,7 @@ def open_session(argv, from_index=False, live_only=False):
                 print(f"  {line}", file=sys.stderr)
             if len(hits) > 10:
                 print(f"  ... and {len(hits) - 10} more - more words narrow it", file=sys.stderr)
+            _name_one_by_id("open", hits[0], rows)
             return 2
         sid = hits[0].get("sessionId", "")
         if any(hits[0] is r for r in rows):
@@ -2878,6 +2906,33 @@ def _names_exactly(row, word):
                         or w in (tty.lower(), engine.short_tty(tty).lower()))
 
 
+def _named_one(cmd, word, rows):
+    """The one session `word` names by one of its own names (engine.named_by):
+    (row, None). (None, None): none - the command may search. (None, 2): it
+    names several, by one rule or by two (a name and another's id start) -
+    each listed with how the word names it, and the id to type."""
+    named = engine.named_by(rows, word)
+    if len(named) == 1:
+        return named[0][0], None
+    if not named:
+        return None, None
+    print(f"ccwho {cmd}: {word!r} names {len(named)} sessions:", file=sys.stderr)
+    lines = engine.pick_lines([r for r, _ in named])
+    w = max(len(line) for line in lines)
+    for line, (_r, rule) in zip(lines, named):
+        print(f"  {line:<{w}}   ({engine.NAME_RULES[rule]})", file=sys.stderr)
+    _name_one_by_id(cmd, named[0][0], rows)
+    return None, 2
+
+
+def _name_one_by_id(cmd, row, rows):
+    """The fix line of a refusal that found several: the id that names one. A
+    running one by the start of its id; an ended one, which no start names
+    among the running `rows`, by the whole of it - a short one is a word the
+    search finds again, in another id's middle."""
+    print(f"name one by its id: ccwho {cmd} {engine.unique_id(row, rows)}", file=sys.stderr)
+
+
 def _one_session(cmd, word, rows, exact, nothing):
     """(the one live session `word` names, None), or (None, exit code) after
     saying why: none (1), several (2), a loose word when `exact` - nobody
@@ -2885,7 +2940,7 @@ def _one_session(cmd, word, rows, exact, nothing):
     sessions not read (4, could not tell; interrupted 130). `nothing` ends each
     refusal; each line names `cmd`, the command that asked."""
     try:
-        hits = engine.match_rows(rows(), word)
+        live = rows()
     except KeyboardInterrupt:
         print(f"ccwho {cmd}: interrupted - {nothing}", file=sys.stderr)
         return None, 130
@@ -2893,6 +2948,10 @@ def _one_session(cmd, word, rows, exact, nothing):
         print(f"ccwho {cmd}: the sessions could not be read ({type(err).__name__})"
               f" - {nothing}", file=sys.stderr)
         return None, 4
+    row, rc = _named_one(cmd, word, live)
+    if rc:
+        return None, rc
+    hits = [row] if row else engine.match_rows(live, word)
     if not hits:
         print(f"ccwho {cmd}: no live session matches {word!r} - what an ended session"
               f" left: ccwho clean", file=sys.stderr)
@@ -2902,8 +2961,9 @@ def _one_session(cmd, word, rows, exact, nothing):
               file=sys.stderr)
         for line in engine.pick_lines(hits):
             print(f"  {line}", file=sys.stderr)
+        _name_one_by_id(cmd, hits[0], live)
         return None, 2
-    if exact and not _names_exactly(hits[0], word):
+    if exact and not row and not _names_exactly(hits[0], word):
         print(f"ccwho {cmd}: {word!r} found {engine.pick_line(hits[0])} - with no one to"
               f" confirm, name it exactly: its id, name or tty", file=sys.stderr)
         return None, 2

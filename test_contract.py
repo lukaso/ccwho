@@ -238,6 +238,11 @@ class TestEveryCommandGivesTheRecord(unittest.TestCase):
         assert_record(self, got, "show")
         self.assertNotIn("aka", got, "its contents are core keys")
 
+    def test_the_readme_example_has_the_keys_show_gives(self):
+        # a key show adds or drops makes the README's example stale
+        got = self.run_cmd(self.runner.show, ["liveapp-4e", "--json"])
+        self.assertEqual(sorted(json_example(readme_section(readme()))), sorted(got))
+
 
 # Keys a Codex thread's record has beside ROW_KEYS and LS_KEYS. Append only.
 CODEX_KEYS = {
@@ -706,3 +711,53 @@ class TestEveryTestFileRunsInTheScript(unittest.TestCase):
         without = script.replace(" test_terms ", " ", 1)
         self.assertNotIn("test_terms", self.modules_run(without))
         self.assertIn("test_terms", self.modules_run(script))           # control
+
+
+def readme_section(text, heading="## For scripts and agents"):
+    """The README section under `heading`, up to the next `## ` heading."""
+    start = text.index(heading + "\n")
+    end = text.find("\n## ", start + len(heading))
+    return text[start:end if end != -1 else len(text)]
+
+
+def readme():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")) as fh:
+        return fh.read()
+
+
+def unnamed(section, words):
+    """The words `section` does not name in backticks."""
+    return sorted(w for w in words if f"`{w}`" not in section)
+
+
+def json_example(section):
+    """The section's ```json block, parsed."""
+    start = section.index("```json\n") + len("```json\n")
+    return json.loads(section[start:section.index("\n```", start)])
+
+
+class TestTheReadmeSaysTheContract(unittest.TestCase):
+    """The README section "For scripts and agents" is what a script reads: every
+    key of the record and every `errors` code is named there, and its example
+    is a record (plan, slice 7). A key or a code added without a line there
+    fails here."""
+
+    def setUp(self):
+        self.section = readme_section(readme())
+
+    def test_every_key_of_the_record_is_named(self):
+        self.assertEqual(unnamed(self.section, set(SESSION_CORE) | LS_KEYS | CODEX_KEYS), [])
+
+    def test_every_errors_code_is_named(self):
+        import ccwho_usage
+        codes = set(ccwho_usage.ACCOUNT_ERRORS) | set(ccwho.RECORD_ERRORS)
+        self.assertEqual(unnamed(self.section, codes), [])
+
+    def test_a_section_without_a_key_is_caught(self):
+        # control: the check reads the section, and a missing name is reported
+        self.assertEqual(unnamed(self.section.replace("`pid`", "pid"), {"pid", "tty"}),
+                         ["pid"])
+
+    def test_the_example_is_a_record(self):
+        assert_record(self, json_example(self.section), "the README example")
+

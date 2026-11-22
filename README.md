@@ -398,59 +398,8 @@ For a script or an agent, `ccwho ls --json` and `ccwho show --json` give each se
 account: `account` (the name the usage line gives it), `accountId` (`login:<uuid>` or
 `token:<hash>`, the id `ccwho usage name` takes) and `provider` (`anthropic`, or
 `openai` for a Codex thread). `ccwho show` prints it as `account   ant:work`,
-the words the table's tag and the usage line use. An agent asks about its own session with
-`ccwho show --json` and no word: ccwho finds it from `CLAUDE_CODE_SESSION_ID`, also when it
-runs as the job its terminal parked. Outside a session, `show` with no word exits 2 and says
-to name one.
-
-Each session in `ls --json` and `show --json` is one record with the same keys:
-`sessionId`, `name`, `project`, `cwd`, `title`, `attention`, `status`, `purpose`, `kind`,
-`configDir`, `account`, `accountId`, `provider`, `tty`, `pid`, `since`, `ended`, `errors`,
-`now`, `you` and `running`
-(`show` adds the brief: `recap`, `goal`, `you_said`, `progress`, `closing`). `ended` is
-`false` for a running session, `true` for one the index found that no longer runs, and
-`null` when ccwho could not read every source of sessions and so cannot say, or for a
-named role with no session. `errors`
-says why a field is `null`: `{"account": {"code": "...", "fix": "..."}}`, and `{}` when
-nothing is missing.
-
-An open Codex thread is a record in `ls --json` too, after the running Claude Code
-sessions and before the ended ones:
-`kind` is `codex`, `provider` is `openai`, `pid` is the process that holds the thread,
-and it adds `where` (where the thread runs: VS Code, the codex CLI, the ChatGPT app) and
-`pids` (its processes). `ls --needs-you`, the table and `show` list Claude Code sessions
-only. A thread is never a session to `open`, `stop`, `kill` or `save`: they find no
-session by its id or its title, and a save never holds it.
-
-The codes for `account`:
-
-- `no-reading-yet`: the session has not replied since it started. It replies once; then ask again.
-- `stale-process`: the reading is from an earlier claude of this session, as after a
-  `--resume`, maybe on another account (the table shows no tag for it then either). It
-  replies once; then ask again.
-- `unsure`: the login changed under the session, or its claude could not be read. Ask
-  the person which account it spends.
-- `unreadable`: its usage reading could not be read. Report it, then rerun.
-- `usage-off`: ccwho reads no usage on this machine. Ask the person (`ccwho setup --usage`).
-- `codex-unknown`: a Codex thread. Codex's usage names a limit, not an account, so ccwho
-  cannot tell which ChatGPT login the thread spends. Ask the person.
-- `ended`: the session does not run, so it spends no account.
-- `not-running` (also under `errors.sessionId`): a named role that no session runs under
-  now. ccwho starts nothing; tell the person.
-- `not-read-whole`: a source of sessions could not be read, so a session that is not
-  seen may still be running (also under `errors.ended`). Rerun.
-
-When `claude agents --json`, a session file or (for `ls --json`) the open Codex threads
-could not be read, `ls` still prints the
-sessions it has, writes one line that names what it could not read to stderr, and exits
-4 ("could not tell"). `ls <word>` and `show` exit 4, not 1, when they find nothing then.
-`show --json` has no `aka` any more: its names are the keys above.
-
-Do not use
-`configDir` to find the account: `""` means only that the session runs in the default
-config dir (`CLAUDE_CONFIG_DIR` is not set). A session started with a token
-(`claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`) also runs there, and spends the token's
-account, not the login's.
+the words the table's tag and the usage line use. When `account` is `null`, `errors.account`
+says why and what to do: see [For scripts and agents](#for-scripts-and-agents).
 
 Codex has an entry too, after the Claude accounts, named by its limit:
 `oai:codex 7d 69%↑/60% ↻Sun08:00 (42m ago)`. It is kept two weeks after its last reading, the same
@@ -954,6 +903,131 @@ a `{"sessionId", "name"}` reference).
 | 3 | needs `--yes` (kill, clean, stop) |
 | 4 | could not tell: a source could not be read (`claude agents`, ps, lsof, a manifest) |
 | 130 | interrupted |
+
+## For scripts and agents
+
+Every command that lists sessions takes `--json`, and each session in it is one record
+with the same keys. A key is never renamed or removed; a new one can be added.
+
+Start with your own session: an agent runs `ccwho show --json` with no word. ccwho finds
+the session from `CLAUDE_CODE_SESSION_ID`, also when it runs as the job its terminal
+parked. Outside a session, `show` with no word exits 2 and says to name one. To read
+another session, give one word that names it: its id, its name, the start of its id, its
+tty or its pid ([Finding the window](#finding-the-window)). `ccwho ls --json` lists every
+session; `ccwho ls --named` lists the named roles to ask.
+
+This is `ccwho show --json` from inside a session (a real run; the conversation, the ids
+and the folder are replaced):
+
+```json
+{
+  "title": "fix the parser's dates",
+  "goal": "Dates in the import parse as US dates. Make them ISO 8601.",
+  "you_said": "run the tests",
+  "recap": "The parser now reads ISO dates; two tests still fail on time zones.",
+  "recap_ts": "2026-11-21T13:10:38.603Z",
+  "recap_age": "10m",
+  "turns_since_recap": 1,
+  "progress": ["Edit: parser.py", "Bash: Run the parser tests"],
+  "closing": "Two tests fail on time zones. Next I fix the offset.",
+  "sessionId": "4f2b91ac-1111-4222-8333-444455556666",
+  "name": "parser",
+  "project": "parser",
+  "cwd": "/Users/you/projects/parser",
+  "attention": "busy",
+  "status": "busy",
+  "purpose": "",
+  "tty": "ttys012",
+  "since": "6s",
+  "kind": "interactive",
+  "configDir": "",
+  "account": "work",
+  "accountId": "login:1b3d0000-0000-4000-8000-000000000000",
+  "provider": "anthropic",
+  "pid": 5285,
+  "ended": false,
+  "errors": {},
+  "now": "the date parser",
+  "you": true,
+  "running": true
+}
+```
+
+The keys of every record:
+
+- `sessionId`: the session's id; `null` for a named role that no session runs under.
+- `name`: its name (`/name`), `""` when it has none. `project` and `cwd`: the folder it
+  runs in. `title`: its title.
+- `attention`: the state the live list gives it ([Columns](#columns)). `status`: Claude
+  Code's own status.
+- `purpose`: what a named role is for (`ccwho purpose`), `""` for any other session.
+  `now`: its `ccwho now` line, `""` when it has none.
+- `kind`: `interactive`, `background` for a background session, `codex` for an open Codex
+  thread, `role` for a named role with no session, or `null` for an ended session.
+- `configDir`: its `CLAUDE_CONFIG_DIR`, `""` for the default config dir; `null` for an
+  ended session, a named role with no session, or a Codex thread.
+- `account`, `accountId` and `provider`: the account it spends, as the usage line names
+  it; its id (`login:<uuid>` or `token:<hash>`, what `ccwho usage name` takes); and who
+  sells it (`anthropic`, `openai`).
+- `tty` and `pid`: its terminal and its claude process (for a Codex thread, the process
+  that holds the thread). `pid` is `null` for an ended session or a named role with no
+  session.
+- `since`: how long it has been in its state.
+- `ended`: `false` for a running session, `true` for one the index found that no longer
+  runs, `null` for a named role with no session, or when ccwho could not read every
+  source of sessions and so cannot say.
+- `you`: `true` on the caller's own session. `running`: `true` for a running session or an
+  open Codex thread, `false` for an ended session or a named role that no session runs
+  under, `null` when ccwho cannot say.
+- `errors`: why `sessionId`, `account` or `ended` is `null`, as
+  `{"account": {"code": "...", "fix": "..."}}`; `{}` when none of them is. The codes are
+  below.
+
+`show` adds the brief: `recap` (with `recap_ts`, `recap_age` and `turns_since_recap`),
+`goal`, `you_said`, `progress` and `closing`. `ls --json` adds the table's own fields
+(`waitingFor`, `doing`, `procs`, `ports`, `ctx` and more), and an open Codex thread adds
+`where` (where it runs: VS Code, the codex CLI, the ChatGPT app) and `pids` (its
+processes). `ps --json` and `usage --json` name a session by reference,
+`{"sessionId": ..., "name": ...}`: a process's `session`, and an account's `sessions`.
+
+An open Codex thread is a record in `ls --json` too, after the running Claude Code
+sessions and before the ended ones: `kind` is `codex`, `provider` is `openai`, and `pid`
+is the process that holds the thread. `ls --needs-you`, the table and `show` list Claude Code sessions
+only. A thread is never a session to `open`, `stop`, `kill` or `save`: they find no
+session by its id or its title, and a save never holds it.
+
+The `errors` codes:
+
+- `no-reading-yet`: the session has not replied since it started. It replies once; then ask again.
+- `stale-process`: the reading is from an earlier claude of this session, as after a
+  `--resume`, maybe on another account (the table shows no tag for it then either). It
+  replies once; then ask again.
+- `unsure`: the login changed under the session, or its claude could not be read. Ask
+  the person which account it spends.
+- `unreadable`: its usage reading could not be read. Report it, then rerun.
+- `usage-off`: ccwho reads no usage on this machine. Ask the person (`ccwho setup --usage`).
+- `codex-unknown`: a Codex thread. Codex's usage names a limit, not an account, so ccwho
+  cannot tell which ChatGPT login the thread spends. Ask the person.
+- `ended`: the session does not run, so it spends no account.
+- `not-running` (also under `errors.sessionId`): a named role that no session runs under
+  now. ccwho starts nothing; tell the person.
+- `not-read-whole`: a source of sessions could not be read, so a session that is not
+  seen may still be running (also under `errors.ended`). Rerun.
+
+When `claude agents --json`, a session file or (for `ls --json`) the open Codex threads
+could not be read, `ls` still prints the
+sessions it has, writes one line that names what it could not read to stderr, and exits
+4 ("could not tell"). `ls <word>` and `show` exit 4, not 1, when they find nothing then.
+
+Do not use
+`configDir` to find the account: `""` means only that the session runs in the default
+config dir (`CLAUDE_CONFIG_DIR` is not set). A session started with a token
+(`claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`) also runs there, and spends the token's
+account, not the login's.
+
+A listing exits 0 when done, 1 when it finds nothing, 2 on a usage error or when a word
+names several sessions (the last line gives the id to type), and 4 when it could not tell
+([all the exit codes](#use)).
 
 ## Columns
 

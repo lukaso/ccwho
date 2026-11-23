@@ -1154,5 +1154,111 @@ class TestTheBookOnDisk(AskBook):
         self.assertEqual(set(os.listdir(self.dir)) - before, {"asks.json"})
 
 
+class TestAListWaitingForYourReplyIsAnAsk(unittest.TestCase):
+    """A session listed five questions as recommendations, with no question mark,
+    and its last line was a step it would take "after your reply". The row said
+    running (2026-11-23). A line that says how to answer them all, or what the
+    session will do after your reply, asks you."""
+
+    REPORTED = (
+        "S2 is ready except for your answers on its wording.\n\n"
+        "**Checks before release:** 35 entries, 0 about a pull request.\n\n"
+        "**Questions** (one reply answers all; a number you do not mention takes my "
+        "recommendation):\n"
+        "1. Leave out \"from issue #N\" on an answer row.\n"
+        "2. Use three short sentences under \"Your answers…\".\n"
+        "5. Land S2.\n\n"
+        "After your reply I will:\n"
+        "1. Make the wording edits.\n"
+        "4. Land S2 with \"refs #1244\".")
+
+    def test_the_message_that_was_reported(self):
+        self.assertEqual(ccwho.ask_line(self.REPORTED),
+                         "Questions (one reply answers all; a number you do not mention "
+                         "takes my recommendation):")
+
+    def test_its_row_asks_while_work_runs(self):
+        tail = [human("go"), said(self.REPORTED), END]
+        row = ccwho.build_row({"sessionId": "a", "status": "busy", "pid": 1}, "", tail,
+                              None, work=2)
+        self.assertEqual(row["attention"], "asks")
+
+    def test_other_lines_that_wait_for_your_reply(self):
+        for text, ask in (
+                ("1. Wait.\n9. B.\n\nThat makes nine open questions. You can answer them "
+                 "all in one line, for example: `1 wait, 9 B`.",
+                 "That makes nine open questions. You can answer them all in one line, "
+                 "for example: 1 wait, 9 B."),
+                ("E3: your choice.\n\nAfter your answers, I will start the plan review.\n\n"
+                 "Plan: /x/p.md",
+                 "After your answers, I will start the plan review."),
+                ("After your reply I will:\n1. Make the edits.", "After your reply I will:"),
+                ("Done. After you answer, I'll land it.\n\nCommit: 58bf966.",
+                 "Done. After you answer, I'll land it."),
+                ("- After your reply, I will land it.\n\nDone.", "- After your reply, I will land it."),
+                ("2) After your answers I'll start.\n\nDone.", "2) After your answers I'll start."),
+                ("1. Wait.\n\nYou can answer all nine in one line, for example: `1 wait, 9 B`.",
+                 "You can answer all nine in one line, for example: 1 wait, 9 B."),
+                ("You can answer in one line, for example: `1 wait, 2 A`.\n\n"
+                 "Since my last message: CI is green.",
+                 "You can answer in one line, for example: 1 wait, 2 A."),
+                ("After you answer, I start both pilots one at a time.\n\n- /x/a.md",
+                 "After you answer, I start both pilots one at a time."),
+                ("Reply here with one line. When you reply, I put the batch on the desk at "
+                 "once.\n\nThe 13:03 check runs next.",
+                 "Reply here with one line. When you reply, I put the batch on the desk at once."),
+                ("Once you reply, I will land it.\n\nDone.", "Once you reply, I will land it."),
+                ("After your answers, I run one more review round.\n\nDone.",
+                 "After your answers, I run one more review round."),
+                # a verb now that ends in "ed" (review r2)
+                ("After your answer, I need one more run.\n\nDone.",
+                 "After your answer, I need one more run."),
+                ("After your answers, I proceed with the build.\n\nDone.",
+                 "After your answers, I proceed with the build.")):
+            with self.subTest(ask):
+                self.assertEqual(ccwho.ask_line(text), ask)
+
+    def test_a_new_list_above_a_reminder_is_the_ask(self):
+        text = "Questions (one reply answers all):\n1. A.\n\nMy earlier question 3 is still open."
+        self.assertEqual(ccwho.ask_line(text), "Questions (one reply answers all):")
+
+    def test_the_same_list_again_keeps_its_time(self):
+        a, b = ("Round %d is clean. You can answer them all in one line, for example: 1 A, 2 B."
+                % n for n in (3, 4))
+        self.assertEqual(ccwho._carry_on(ccwho.ask_line(a), 100, ccwho.ask_line(b), 200)[1], 100)
+
+    def test_a_question_mark_above_goes_first(self):                    # control
+        self.assertEqual(ccwho.ask_line("Is it A?\n\nAfter your reply I will:\n1. Land."),
+                         "Is it A?")
+
+    def test_what_does_not_wait_for_your_reply(self):                   # control
+        for line in ("- Find out why #1244 is still open after your answer on 11-09.",
+                     "The plan is ready to build after your go.",
+                     "After your reply on Friday, I landed it.",
+                     # in the middle of a sentence, and in the past
+                     "- #1244 is still open after your answer on 11-09, so I will find out why.",
+                     "> After your reply I will land it.",
+                     "| Next | Done. After your reply I will land it. |",
+                     "After your answer, I wrote the plan.",
+                     "After your answers, I added the tests.",
+                     # what was done, after a small word or in a verb not ending in "ed"
+                     # (review r2)
+                     "After your answer on 11-09, I also added the tests.",
+                     "After your answer on 11-09, I have updated the plan.",
+                     "After your reply, I re-ran the gate.",
+                     "After your answer, I then landed it.",
+                     "After your reply, I chose A.",
+                     "After your reply, I began the build.",
+                     "After your reply, I went with B.",
+                     "After your reply, I gave cpo the plan.",
+                     # no "I": it says what happened, not what the session does
+                     "After your reply on Friday, CI went green.",
+                     "The script answers in one line.",
+                     "The review answers them all in one pass.",
+                     "One reply answers nothing here."):
+            with self.subTest(line):
+                self.assertEqual(ccwho.ask_line(f"{line}\n\nDone."), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1172,6 +1172,26 @@ text in quotation marks, a blockquote, a table, code, and a "no" or an "if" befo
 wait ("Nothing needs your input yet"). Only a turn's last message counts: a question
 inside a turn is one the session goes on to answer.
 
+**Questions with no question mark** ask you too. A session can list its questions as
+recommendations ("1. Skip the counts. 2. Land S2.") and end on a step it takes later.
+Such a list sat in RUNNING while it waited for your reply (2026-11-23). So a line that
+says how to answer them all ("one reply answers all", "You can answer them all in one
+line") asks you. So does a sentence that starts "After your reply", "After you
+answer", "When you reply" or "Once you reply" and says what the session then does:
+"I will", "I'll" or a verb now ("After your reply I will:", "After you answer, I start
+both pilots"). The row shows the line that says how to answer, else the "after your
+reply" line. A question mark above them goes first. Measured over 14 days: this found
+9 asks that were missed before, all 9 real, and changed no other ask. Not counted: a
+verb in the past or after "have" ("After your answer, I wrote the plan", "I have
+updated it", "I re-ran the gate"), and "after your answer on 11-09" in the middle of a
+sentence.
+
+**A request for later stays an ask.** "When a reply comes in, tell me" waits for
+someone else, but ccwho shows it as ASKED YOU: park it with `z`. A rule for it was
+measured over 14 days and not used: of 17 such lines, 11 waited for you to do a step
+("When the rebuild ends, tell me", "After step 6, tell me"), and those would have left
+ASKED YOU.
+
 **The ask stays open until you type in the session**, also while a turn runs, or
 answer its question box. A turn that a peer, a finished task or a subagent started
 does not answer it, and neither do `/compact`, an interrupt or a `!` command at the
@@ -1403,8 +1423,10 @@ from old code..." sat 17 hours in ASKED YOU (2026-10-08). Measured that day over
 7380 ended turns, the two rules took 6 lines out of ASKED YOU and put none in. One
 of the 6 did wait for you - "272 still waits for your answer on whether usernames
 should ignore upper and lower case" - and was found only because "should i" was in
-"should ignore". A line that says it waits for your answer or your go is the
-announced-then-stopped shape above, and is not found.
+"should ignore". A line that says it waits for your answer or your go ("Phase 1 waits
+for your go") is found when it is the last line, and not when it is above it. A line
+that says how to answer, or what comes after your reply, is found anywhere in the
+message (see [questions with no question mark](#an-ask-stands-until-you-speak)).
 
 ### The older NEEDS YOU vs ready split
 

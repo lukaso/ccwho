@@ -663,6 +663,66 @@ def _question_above(text):
     return ""
 
 
+# Questions with no "?" in them: a list of recommendations, and a line that
+# says how to answer them all or what the session does after your reply.
+# A real list (2026-11-23) sat in RUNNING while it waited for that reply.
+_ANSWER_ALL = re.compile(r"(?<!\w)(?:answer (?:\w+ ){0,3}in one (?:line|reply|message)"
+                         r"|one reply answers (?:all|them|every))(?!\w)")
+# It starts a sentence, or a list item: "after your answer on 11-09" in the
+# middle of one is about the past. The rest of its sentence is group 1.
+_AFTER_REPLY = re.compile(r"(?:^[-•+\d.)\s]*|[.!:;]\s+)(?:after|when|once) (?:your "
+                          r"(?:reply|replies|answers?)|you (?:reply|answer))\b([^.!?]*)")
+# What the session then does is "I will", "I'll" or a verb now ("I start"), never
+# what it did: a verb in the past ("I landed", "I wrote", "I re-ran") or after
+# "have" ("I have updated"). Small words before the verb are skipped.
+_NOT_NOW = {"was", "were", "did", "had", "have", "has", "made", "wrote", "sent", "ran",
+            "found", "kept", "left", "took", "got", "saw", "said", "told", "built",
+            "chose", "began", "went", "gave", "came", "thought", "knew", "brought",
+            "spent", "felt", "meant", "led", "won", "lost"}
+# not "put", "set" or "read": the same word now ("When you reply, I put the batch on
+# the desk")
+_ED_NOW = {"need", "proceed", "succeed", "exceed", "embed", "feed"}
+_BEFORE_VERB = {"also", "then", "just", "already", "now", "first", "still", "only"}
+
+
+def _does_next(rest):
+    """Does `rest`, the lower-case text after an "I", say what it does next?"""
+    if re.match(r"['’]ll(?!\w)", rest):
+        return True
+    words = [w.strip(",;:()") for w in rest.split()]
+    while words and words[0] in _BEFORE_VERB:
+        words.pop(0)
+    if not words:
+        return False
+    verb = words[0]
+    return bool(re.fullmatch(r"[a-z]+", verb) and verb not in _NOT_NOW
+                and (not verb.endswith("ed") or verb in _ED_NOW))
+
+
+def _after_your_reply(spoken):
+    """Does this lower-case line say what the session does after your reply?"""
+    for m in _AFTER_REPLY.finditer(spoken):
+        i = re.search(r"\bi\b", m.group(1))
+        if i and _does_next(m.group(1)[i.end():]):
+            return True
+    return False
+
+
+def _reply_awaited(text):
+    """The last line that says how to answer them all ("one reply answers all"),
+    else the last that says what comes after your reply ("After your reply I
+    will:"), or "". Skipped as in _question_above: code, quotes, a blockquote,
+    a table."""
+    lines = [ln.strip() for ln in _FENCED.sub("", text or "").splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not ln.startswith((">", "|"))]
+    for says in (_ANSWER_ALL.search, _after_your_reply):
+        for line in reversed(lines):
+            spoken = _QUOTED.sub(_quoted_word, _plain(_INLINE_CODE.sub(" code ", line)))
+            if says(spoken.lower()):
+                return _plain(line)
+    return ""
+
+
 def _waits_on_you(text):
     """Does this lower-case text say it waits for you: "1195 still waits for
     your choice", "until you answer", "the choice is still open"?"""
@@ -690,11 +750,12 @@ def ask_line(text):
     """
     closing = _closing_line(text)
     if not _closing_asks(closing):
-        return _question_above(text)
+        return _question_above(text) or _reply_awaited(text)
     # a question above a line that only reminds of an earlier one is the news:
     # "New question for you: Is X SQE?" then "My earlier questions are still
     # open." (review 5, 2026-11-09)
-    return (_question_above(text) or closing) if _reminds(closing) else closing
+    return ((_question_above(text) or _reply_awaited(text) or closing) if _reminds(closing)
+            else closing)
 
 
 def asks_user(text):
@@ -794,7 +855,7 @@ def _same_ask(old, new):
     while n < min(len(a), len(b)) and a[-1 - n] == b[-1 - n]:
         n += 1
     shared = " ".join(a[-n:]) if n else ""
-    return len(shared) >= SAME_ASK_MIN and _closing_asks(shared)
+    return len(shared) >= SAME_ASK_MIN and (_closing_asks(shared) or bool(_reply_awaited(shared)))
 
 
 _STILL = re.compile(r"\bstill\b")

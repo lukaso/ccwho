@@ -1660,8 +1660,9 @@ def work_descendants(ps_output, pid, servers=()):
     again without you. Non-zero means it is waiting on a machine, not on a human.
     An MCP server is a direct child of the claude - by its name, or by a command
     line in `servers` (mcp_server_commands) - and what it starts is its own: the
-    Chrome that chrome-devtools-mcp runs is not work (measured 2026-11-23). The
-    same command under a Bash command's shell is work.
+    Chrome that chrome-devtools-mcp runs is not work (measured 2026-11-23), nor
+    is the claude's own keep-awake `caffeinate -i -t N`. The same command under
+    a Bash command's shell is work.
     """
     if not pid:
         return 0
@@ -1683,7 +1684,9 @@ def work_descendants(ps_output, pid, servers=()):
             # a Bash command's shell holds the command's text, which may name
             # "mcp" (cd .../ccwho-mcp-not-work && make): never a server by name
             # (review 1)
-            if parent == int(pid) and (line in known or (
+            # nor is the claude's own keep-awake work: it can outlive the turn
+            # (measured 2026-11-24)
+            if parent == int(pid) and (line in known or procs.keeps_awake(cmd) or (
                     _INFRA.search(cmd) and line.split(" ", 1)[0] not in _SHELLS)):
                 continue
             stack.append(cpid)

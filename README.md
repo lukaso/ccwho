@@ -1342,7 +1342,8 @@ real ones. Counting MCP servers would make every session look busy forever.
 An MCP server is known by its name, or as a stdio server in the files its claude reads:
 its `--mcp-config` files, the project's `.mcp.json` and `.claude.json`. What a server
 starts is part of it: the Chrome that `chrome-devtools-mcp` runs is not work. A plugin's
-server is known by its name only.
+server is known by its name only. The `caffeinate -i -t N` that a claude runs as its own
+child to keep the Mac awake is not work either: it can outlive the turn.
 
 STOPPED outranks busy, because a stopped session is the one that needs a human.
 

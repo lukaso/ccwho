@@ -634,6 +634,14 @@ _HELPER = re.compile(r"(?:^|[\s/])(?:[\w.-]*-mcp(?:-server)?|mcp-server[\w.-]*|m
 # what every claude runs as its own child to keep the Mac awake (measured
 # 2026-09-27): a helper there, and work anywhere else (`caffeinate -i make`)
 _KEEP_AWAKE = re.compile(r"^(?:/usr/bin/)?caffeinate -i -t \d+\Z")
+
+
+def keeps_awake(cmd):
+    """Is this the `caffeinate -i -t N` a claude runs as its own child? Only as
+    the claude's child: under a command it is that command's work."""
+    return bool(_KEEP_AWAKE.match(cmd or ""))
+
+
 # an exited child nobody reaped yet: ps shows its name in brackets when it has
 # only just exited, and `<defunct>` when it is left that way (macOS 27, review
 # 5 of the stuck-reader slice). By text, not state (the table has none): a live
@@ -862,7 +870,7 @@ def attribute(table, marks, ports, sessions, sessions_known=True, own=None, name
         p = {"pid": pid, "ppid": ppid, "start": start, "command": safe_command(cmd),
              "command_full": redact_command(cmd),
              "ports": list((ports or {}).get(pid, [])), "orphan": ppid == 1,
-             "helper": is_helper(cmd) or bool(ppid in session_pids and _KEEP_AWAKE.match(cmd)),
+             "helper": is_helper(cmd) or (ppid in session_pids and keeps_awake(cmd)),
              "harness": harness,
              "session": sid, "marked": marked}
         if _is_app(cmd):

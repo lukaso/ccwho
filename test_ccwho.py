@@ -1832,6 +1832,31 @@ class TestWorkDescendants(unittest.TestCase):
         self.assertEqual(self._one(line, {"python3 -m notes_srv"}), 0)
         self.assertEqual(self._one(line, {"python3 -m other"}), 1)
 
+    # Claude Code keeps the Mac awake with its own `caffeinate -i -t 300`, which
+    # can outlive the turn: cpo showed running, not done (measured 2026-11-24)
+    def test_the_keep_awake_of_the_claude_is_not_work(self):
+        self.assertEqual(self._one("caffeinate -i -t 300", ()), 0)
+        self.assertEqual(self._one("/usr/bin/caffeinate -i -t 300", ()), 0)
+
+    def test_a_keep_awake_with_more_words_is_work(self):
+        # control (review 3): only the exact line is the claude's own
+        self.assertEqual(self._one("caffeinate -i -t 300 make", ()), 1)
+        self.assertEqual(self._one("caffeinate -i -t 300 -w 5", ()), 1)
+
+    def test_a_caffeinate_that_runs_a_command_is_work(self):
+        # control: `caffeinate -is pnpm exec tsx ...` holds the Mac for its command
+        ps = "\n".join(["  PID  PPID COMMAND", " 920     1 claude",
+                        " 921   920 caffeinate -is pnpm exec tsx bin/gate.ts",
+                        " 922   921 node tsx bin/gate.ts"])
+        self.assertEqual(ccwho.work_descendants(ps, 920), 2)
+
+    def test_a_keep_awake_a_command_runs_is_work(self):
+        # control: the same line under a Bash command's shell
+        ps = "\n".join(["  PID  PPID COMMAND", " 930     1 claude",
+                        " 931   930 /bin/zsh -c source /Users/me/.claude/shell-snapshots/x",
+                        " 932   931 caffeinate -i -t 300"])
+        self.assertEqual(ccwho.work_descendants(ps, 930), 2)
+
 
 class TestMcpServerCommands(unittest.TestCase):
     """The command lines of the stdio MCP servers a claude starts: from its

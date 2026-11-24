@@ -140,6 +140,9 @@ class MachinelessCollect(unittest.TestCase):
         testkit.patch(self, ccwho, "asks_path", lambda: os.path.join(tmp, "asks.json"))
         # and the directory's lines are the person's own
         testkit.patch(self, ccwho, "directory_dir", lambda: os.path.join(tmp, "directory"))
+        # the MCP servers this machine's claude is set up with
+        testkit.patch(self, ccwho, "claude_json_path",
+                      lambda config_dir: os.path.join(tmp, ".claude.json"))
 
     def tearDown(self):
         (ccwho.ps_snapshot, ccwho.tty_snapshot,
@@ -209,6 +212,48 @@ class TestAScanKeepsAnAskTheTailCannotSee(MachinelessCollect):
         ccwho.save_asks({"gone": {"ask": "A?", "size": 1, "ts": None}})
         ccwho.collect(cache={})
         self.assertEqual(list(ccwho.load_asks()), [self.SID])
+
+
+class TestAScanKnowsTheConfiguredServers(MachinelessCollect):
+    """A session whose turn ended, with only its --mcp-config server running,
+    has stopped: it will not move without you (cpo, 2026-11-23)."""
+
+    SID = "bbbbbbbb-0000-0000-0000-000000000000"
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp(prefix="ccwho-test-mcpscan-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "t.jsonl")
+        with open(self.path, "w") as fh:
+            for record in ({"type": "assistant", "timestamp": "2026-11-23T16:04:00Z",
+                            "message": {"content": [{"type": "text", "text": "Here is the draft."}]}},
+                           {"type": "system", "subtype": "turn_duration"}):
+                fh.write(json.dumps(record) + "\n")
+        self.config = os.path.join(self.dir, "cpo.mcp.json")
+        with open(self.config, "w") as fh:
+            json.dump({"mcpServers": {"desk": {"command": "node",
+                                               "args": ["/x/channel/server.mjs"]}}}, fh)
+        testkit.patch(self, ccwho, "transcript_path", lambda sid, roots=None: self.path)
+        testkit.patch(self, ccwho, "agents_json", lambda: json.dumps(
+            [{"sessionId": self.SID, "pid": 900, "cwd": self.dir, "status": "idle"}]))
+
+    def _ps(self, config):
+        ccwho.ps_snapshot = lambda: "\n".join([
+            "  PID  PPID COMMAND",
+            " 900     1 claude --mcp-config %s --resume cpo" % config,
+            " 901   900 node /x/channel/server.mjs"])
+
+    def test_it_has_stopped(self):
+        self._ps(self.config)
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["attention"], "stopped")
+
+    def test_a_server_no_config_names_is_work(self):
+        # control: the same process, and a config file that is not there
+        self._ps(os.path.join(self.dir, "none.json"))
+        rows, _ = ccwho.collect(cache={})
+        self.assertEqual(rows[0]["attention"], "running")
 
 
 class TestParseSessions(unittest.TestCase):
@@ -1704,6 +1749,181 @@ class TestWorkDescendants(unittest.TestCase):
     def test_a_parent_cycle_terminates(self):
         ps = "\n".join(["  PID  PPID COMMAND", " 400   401 a", " 401   400 b"])
         self.assertEqual(ccwho.work_descendants(ps, 400), 1)
+
+    # measured 2026-11-23: chrome-devtools-mcp starts Chrome and its helpers,
+    # and two sessions sat in BUSY after their turns ended
+    CHROME = "\n".join([
+        "  PID  PPID COMMAND",
+        " 500     1 claude",
+        " 501   500 npm exec chrome-devtools-mcp@latest --isolated   ",
+        " 502   501 chrome-devtools-mcp  ",
+        " 503   502 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --allow-pre-commit-input",
+        " 504   503 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper --type=gpu",
+        " 600     1 claude",
+        " 601   600 /bin/zsh -c source /Users/me/.claude/shell-snapshots/x",
+        " 602   601 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless",
+    ])
+
+    def test_what_an_mcp_server_starts_is_not_work(self):
+        self.assertEqual(ccwho.work_descendants(self.CHROME, 500), 0)
+
+    def test_chrome_a_command_starts_is_work(self):
+        # control: the same program under a Bash command's shell
+        self.assertEqual(ccwho.work_descendants(self.CHROME, 600), 2)
+
+    # a server from --mcp-config whose name says nothing of MCP (the desk
+    # channel server, measured 2026-11-23)
+    CHANNEL = "\n".join([
+        "  PID  PPID COMMAND",
+        " 700     1 claude --mcp-config /x/cpo.mcp.json",
+        " 701   700 node /x/channel/server.mjs",
+        " 702   701 node /x/channel/worker.mjs",
+        " 703   700 /bin/zsh -c source /Users/me/.claude/shell-snapshots/x",
+        " 704   703 node /x/channel/server.mjs",
+    ])
+
+    def test_a_configured_server_is_not_work(self):
+        # 703 and 704: a Bash command that runs the same server is still work
+        self.assertEqual(ccwho.work_descendants(
+            self.CHANNEL, 700, servers={"node /x/channel/server.mjs"}), 2)
+
+    def test_an_unconfigured_server_is_work(self):
+        # control: with no config, the channel server and its child count
+        self.assertEqual(ccwho.work_descendants(self.CHANNEL, 700), 4)
+
+    def test_a_configured_command_by_its_full_path(self):
+        ps = "\n".join(["  PID  PPID COMMAND", " 800     1 claude",
+                        " 801   800 /opt/homebrew/bin/node /x/s.mjs"])
+        self.assertEqual(ccwho.work_descendants(ps, 800, servers={"node /x/s.mjs"}), 0)
+        # control: other arguments are another program
+        self.assertEqual(ccwho.work_descendants(ps, 800, servers={"node /x/t.mjs"}), 1)
+
+    def test_a_bash_command_that_names_mcp_is_work(self):
+        # review 1: a Bash tool's shell holds the command's text, and a path
+        # like ccwho-mcp-not-work matches the MCP name - its make still counts
+        ps = "\n".join([
+            "  PID  PPID COMMAND", " 900     1 claude",
+            " 901   900 /bin/zsh -c source /Users/me/.claude/shell-snapshots/x && "
+            "eval 'cd /x/ccwho-mcp-not-work && make' < /dev/null && pwd -P >| /tmp/c-cwd",
+            " 902   901 make", " 903   902 cc"])
+        self.assertEqual(ccwho.work_descendants(ps, 900), 2)
+
+    # what npx, uvx and a framework python show in ps, for what a config says
+    # (measured 2026-11-24 on this Mac)
+    def _one(self, line, servers):
+        ps = "\n".join(["  PID  PPID COMMAND", " 910     1 claude", " 911   910 " + line])
+        return ccwho.work_descendants(ps, 910, servers=servers)
+
+    def test_npx_runs_as_npm_exec(self):
+        self.assertEqual(self._one("npm exec @modelcontextprotocol/server-filesystem /x   ",
+                                   {"npx -y @modelcontextprotocol/server-filesystem /x"}), 0)
+        self.assertEqual(self._one("npm exec notes-srv --a", {"npx notes-srv --a"}), 0)
+        # control: another package
+        self.assertEqual(self._one("npm exec other-pkg", {"npx -y notes-srv"}), 1)
+
+    def test_uvx_runs_as_uv_tool_uvx(self):
+        self.assertEqual(self._one("/opt/homebrew/bin/uv tool uvx notes-server --x",
+                                   {"uvx notes-server --x"}), 0)
+        self.assertEqual(self._one("/opt/homebrew/bin/uv tool uvx other", {"uvx notes-server"}), 1)
+
+    def test_a_framework_python_is_python(self):
+        line = ("/opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/"
+                "Versions/3.13/Resources/Python.app/Contents/MacOS/Python -m notes_srv")
+        self.assertEqual(self._one(line, {"python3 -m notes_srv"}), 0)
+        self.assertEqual(self._one(line, {"python3 -m other"}), 1)
+
+
+class TestMcpServerCommands(unittest.TestCase):
+    """The command lines of the stdio MCP servers a claude starts: from its
+    --mcp-config files, the project's .mcp.json, and .claude.json (user scope,
+    and the project's entry)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ccwho-test-mcp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.proj = os.path.join(self.tmp, "proj")
+        os.mkdir(self.proj)
+        self.claude_json = os.path.join(self.tmp, ".claude.json")
+
+    def _write(self, path, data):
+        with open(path, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    @staticmethod
+    def _servers(**named):
+        return {"mcpServers": {k: dict(zip(("command", "args"), v)) for k, v in named.items()}}
+
+    def test_each_source(self):
+        a = self._write(os.path.join(self.tmp, "a.json"),
+                        self._servers(desk=("node", ["/x/server.mjs"])))
+        b = self._write(os.path.join(self.tmp, "b.json"), self._servers(b=("b-srv", [])))
+        self._write(os.path.join(self.proj, ".mcp.json"),
+                    self._servers(p=("python3", ["-m", "proj_srv"])))
+        self._write(self.claude_json, {
+            "mcpServers": {"u": {"command": "uvx", "args": ["user-srv"]},
+                           "web": {"type": "http", "url": "https://x"}},
+            "projects": {self.proj: self._servers(pp=("pp", ["--x"])),
+                         "/other": self._servers(o=("other", []))}})
+        got = ccwho.mcp_server_commands(
+            "claude --mcp-config %s %s --resume cpo" % (a, b), self.proj, self.claude_json)
+        self.assertEqual(got, {"node /x/server.mjs", "b-srv", "python3 -m proj_srv",
+                               "uvx user-srv", "pp --x"})
+
+    def test_the_equals_form(self):
+        a = self._write(os.path.join(self.tmp, "a.json"), self._servers(s=("s", ["1"])))
+        self.assertEqual(ccwho.mcp_server_commands(
+            "claude --mcp-config=%s" % a, self.proj, self.claude_json), {"s 1"})
+
+    def test_bad_files_give_nothing(self):
+        bad = self._write(os.path.join(self.tmp, "bad.json"), "{not json")
+        self._write(self.claude_json, ["a list"])
+        self._write(os.path.join(self.proj, ".mcp.json"), {"mcpServers": {"x": "text",
+                                                                           "y": {"command": 5}}})
+        self.assertEqual(ccwho.mcp_server_commands(
+            "claude --mcp-config %s /no/such.json" % bad, self.proj, self.claude_json), set())
+
+    def test_no_claude_command(self):
+        self.assertEqual(ccwho.mcp_server_commands(None, None, self.claude_json), set())
+
+    def test_a_deep_file_gives_nothing(self):
+        # review 1: RecursionError out of collect
+        self._write(os.path.join(self.proj, ".mcp.json"), "[" * 200000)
+        self.assertEqual(ccwho.mcp_server_commands("claude", self.proj, self.claude_json), set())
+
+    def test_a_linked_file_is_read(self):
+        # a config kept in a dotfiles repo: claude follows the link, so ccwho does
+        real = self._write(os.path.join(self.tmp, "real.json"), self._servers(s=("s", [])))
+        link = os.path.join(self.tmp, "link.json")
+        os.symlink(real, link)
+        self.assertEqual(ccwho.mcp_server_commands(
+            "claude --mcp-config %s" % link, self.proj, self.claude_json), {"s"})
+
+    def test_a_big_claude_json_is_read(self):
+        # the live one is 311 KB (2026-11-24), more than a session file may be
+        self._write(self.claude_json, dict(self._servers(s=("s", [])), pad="x" * 400000))
+        self.assertEqual(ccwho.mcp_server_commands("claude", self.proj, self.claude_json), {"s"})
+
+    def test_a_fifo_gives_nothing_at_once(self):
+        # review 1: open() on a FIFO waits for a writer that never comes
+        fifo = os.path.join(self.tmp, "pipe.json")
+        os.mkfifo(fifo)
+        self.assertEqual(ccwho.mcp_server_commands(
+            "claude --mcp-config %s" % fifo, self.proj, self.claude_json), set())
+
+    def test_a_cache_keeps_a_parse_until_the_file_changes(self):
+        a = self._write(os.path.join(self.tmp, "a.json"), self._servers(s=("s", [])))
+        cache = {}
+        cmd = "claude --mcp-config %s" % a
+        self.assertEqual(ccwho.mcp_server_commands(cmd, self.proj, self.claude_json, cache), {"s"})
+        self._write(a, self._servers(t=("t2", [])))
+        os.utime(a, ns=(1, 1))
+        self.assertEqual(ccwho.mcp_server_commands(cmd, self.proj, self.claude_json, cache),
+                         {"t2"})
+
+    def test_claude_json_of_a_config_dir(self):
+        self.assertEqual(ccwho.claude_json_path("/c/acct"), "/c/acct/.claude.json")
+        self.assertEqual(ccwho.claude_json_path(""), os.path.expanduser("~/.claude.json"))
 
 
 class TestBusyWithTheTurnOver(unittest.TestCase):

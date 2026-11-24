@@ -1625,11 +1625,43 @@ def find_dead_readers(pid, ptable, unix=None, now=None, grace=DEAD_LOOP_GRACE, c
     return found
 
 
-def work_descendants(ps_output, pid):
+MCP_FILE_MAX = 32 * 1024 * 1024    # .claude.json was 311 KB on 2026-11-24
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+_PYTHON = re.compile(r"python[\d.]*\Z", re.I)
+_NPX_YES = {"-y", "--yes"}
+
+
+def _server_line(cmd):
+    """A command line as a config and ps both say it: its program by name only
+    (`/opt/homebrew/bin/node x` is `node x`), any python as `python` (a
+    framework one runs as .../Python.app/Contents/MacOS/Python), `npx -y X` as
+    the `npm exec X` it runs as, and `uv tool uvx X` as `uvx X` (measured
+    2026-11-24)."""
+    words = (cmd or "").split()
+    if not words:
+        return ""
+    words[0] = os.path.basename(words[0])
+    if _PYTHON.match(words[0]):
+        words[0] = "python"
+    if words[0] == "npx":
+        rest = words[1:]
+        while rest and rest[0] in _NPX_YES:
+            rest = rest[1:]
+        words = ["npm", "exec"] + rest
+    if words[:3] == ["uv", "tool", "uvx"]:
+        words = words[2:]
+    return " ".join(words)
+
+
+def work_descendants(ps_output, pid, servers=()):
     """How many non-infrastructure processes this session has running under it.
 
     Zero means the session has stopped: nothing is in flight, so it will not move
     again without you. Non-zero means it is waiting on a machine, not on a human.
+    An MCP server is a direct child of the claude - by its name, or by a command
+    line in `servers` (mcp_server_commands) - and what it starts is its own: the
+    Chrome that chrome-devtools-mcp runs is not work (measured 2026-11-23). The
+    same command under a Bash command's shell is work.
     """
     if not pid:
         return 0
@@ -1639,16 +1671,109 @@ def work_descendants(ps_output, pid):
             kids.setdefault(ppid, []).append((int(cpid), cmd))
         except (TypeError, ValueError):
             continue
+    known = {_server_line(s) for s in servers}
     count, stack, seen = 0, [int(pid)], {int(pid)}
     while stack:
-        for cpid, cmd in kids.get(stack.pop(), []):
+        parent = stack.pop()
+        for cpid, cmd in kids.get(parent, []):
             if cpid in seen:
                 continue
             seen.add(cpid)
+            line = _server_line(cmd)
+            # a Bash command's shell holds the command's text, which may name
+            # "mcp" (cd .../ccwho-mcp-not-work && make): never a server by name
+            # (review 1)
+            if parent == int(pid) and (line in known or (
+                    _INFRA.search(cmd) and line.split(" ", 1)[0] not in _SHELLS)):
+                continue
             stack.append(cpid)
             if not _INFRA.search(cmd):
                 count += 1
     return count
+
+
+def claude_json_path(config_dir):
+    """Where a claude keeps its .claude.json: in its CLAUDE_CONFIG_DIR, or in
+    the home folder for the default one."""
+    return (os.path.join(config_dir, ".claude.json") if config_dir
+            else os.path.expanduser("~/.claude.json"))
+
+
+def _json_doc(path, cache):
+    """A JSON file's content, or None. Kept in `cache` until its mtime or size
+    changes: .claude.json is read for each session on each scan."""
+    try:
+        st = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return None
+    stamp = (st.st_mtime_ns, st.st_size)
+    docs = cache.setdefault("_mcp_docs", {}) if cache is not None else {}
+    held = docs.get(path)
+    if held and held[0] == stamp:
+        return held[1]
+    # a FIFO given as --mcp-config never blocks the scan, nor a file nested
+    # deep enough to exhaust the parser crashes it (review 1)
+    try:
+        data = _read_small_file(path, limit=MCP_FILE_MAX, follow=True)
+        doc = json.loads(data) if data is not None else None
+    except (OSError, ValueError, RecursionError):
+        doc = None
+    docs[path] = (stamp, doc)
+    return doc
+
+
+def _stdio_commands(doc):
+    """`command args...` of each stdio server in a {"mcpServers": {...}} block."""
+    block = doc.get("mcpServers") if isinstance(doc, dict) else None
+    out = set()
+    for entry in (block.values() if isinstance(block, dict) else ()):
+        command = entry.get("command") if isinstance(entry, dict) else None
+        if not isinstance(command, str) or not command.strip():
+            continue
+        args = entry.get("args")
+        args = [a for a in args if isinstance(a, str)] if isinstance(args, list) else []
+        out.add(" ".join([command] + args))
+    return out
+
+
+def _mcp_config_args(claude_cmd):
+    """The files after --mcp-config on a claude's command line: one or more,
+    up to the next flag. A JSON text there is split by ps and is not read."""
+    words, out, taking = (claude_cmd or "").split(), [], False
+    for w in words:
+        if w.startswith("--mcp-config="):
+            out.append(w.split("=", 1)[1])
+            taking = False
+        elif w == "--mcp-config":
+            taking = True
+        elif taking and not w.startswith("-"):
+            out.append(w)
+        else:
+            taking = False
+    return [w for w in out if w and not w.startswith("{")]
+
+
+def mcp_server_commands(claude_cmd, cwd, claude_json, cache=None):
+    """The command lines of the stdio MCP servers a claude starts, from the
+    places it reads them: its --mcp-config files, the project's .mcp.json, and
+    its .claude.json (user scope, and the entry for its project). Not plugins'
+    servers. A file that cannot be read gives nothing."""
+    if not claude_cmd:
+        return set()
+    out = set()
+    for path in _mcp_config_args(claude_cmd):
+        if cwd and not os.path.isabs(path):
+            path = os.path.join(cwd, path)
+        out |= _stdio_commands(_json_doc(path, cache))
+    if cwd:
+        out |= _stdio_commands(_json_doc(os.path.join(cwd, ".mcp.json"), cache))
+    doc = _json_doc(claude_json, cache)
+    if isinstance(doc, dict):
+        out |= _stdio_commands(doc)
+        projects = doc.get("projects")
+        if cwd and isinstance(projects, dict):
+            out |= _stdio_commands(projects.get(cwd))
+    return out
 
 
 def sort_key(row):
@@ -2223,17 +2348,18 @@ def procargs_buffer(pid):
 SESSION_FILE_MAX = 64 * 1024        # a session file is a few hundred bytes
 
 
-def _read_small_file(path):
-    """The bytes of a small regular file, or None. One open that neither follows a
-    symlink nor blocks on a FIFO, and every check made on THAT handle - checking a
-    path and then opening it again leaves room for the file to be swapped."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+def _read_small_file(path, limit=SESSION_FILE_MAX, follow=False):
+    """The bytes of a small regular file, or None. One open that does not block
+    on a FIFO - nor follow a symlink, unless `follow` - and every check made on
+    THAT handle - checking a path and then opening it again leaves room for the
+    file to be swapped."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | (0 if follow else os.O_NOFOLLOW))
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > SESSION_FILE_MAX:
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
             return None
-        data = os.read(fd, SESSION_FILE_MAX + 1)
-        return None if len(data) > SESSION_FILE_MAX else data
+        data = os.read(fd, limit + 1)
+        return None if len(data) > limit else data
     finally:
         os.close(fd)
 
@@ -4479,8 +4605,10 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
                 + find_dead_readers(s.get("pid"), ptable, unix=stdin_sockets, cache=cache,
                                     names=comms))
         carried, carried_ts = carried_ask(sid, tail, asks, cache=cache)
+        servers = mcp_server_commands(commands.get(s.get("pid")), s.get("cwd"),
+                                      claude_json_path(s.get("configDir", "")), cache)
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
-                              work=work_descendants(ps_out, s.get("pid")),
+                              work=work_descendants(ps_out, s.get("pid"), servers),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
                               reviewed=reviewed, parks=parks,
                               carried=carried, carried_ts=carried_ts,

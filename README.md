@@ -1339,6 +1339,10 @@ on a machine, not on a human, so it sorts last and shows its count as `[3 bg]`.
 infrastructure. Measured on a live fleet: every non-busy session had exactly three
 descendants and all three were `chrome-devtools-mcp`; every busy session had 4-21
 real ones. Counting MCP servers would make every session look busy forever.
+An MCP server is known by its name, or as a stdio server in the files its claude reads:
+its `--mcp-config` files, the project's `.mcp.json` and `.claude.json`. What a server
+starts is part of it: the Chrome that `chrome-devtools-mcp` runs is not work. A plugin's
+server is known by its name only.
 
 STOPPED outranks busy, because a stopped session is the one that needs a human.
 

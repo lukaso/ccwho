@@ -47,6 +47,25 @@ import ccwho_terms as terms
 RELOAD_FIRST = ("ccwho_text", "ccwho_procs", "ccwho_directory", "ccwho_terms", "ccwho_brief",
                 "ccwho_index", "ccwho_usage")
 
+
+def _code_key():
+    """The engine's code and its rule modules', as one value. What a scan keeps
+    from one look to the next (told_of) is kept for this code only: the list
+    reloads the engine every scan, and a fixed rule must not wait for each
+    session to write before it shows. ~1 ms."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    digest = hashlib.sha1()
+    for name in ("ccwho_engine", *RELOAD_FIRST):
+        try:
+            with open(os.path.join(here, name + ".py"), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(name.encode())
+    return digest.hexdigest()
+
+
+_CODE_KEY = _code_key()
+
 # Status order: what needs you first, what is working next, what is parked last.
 # stopped outranks busy: a stopped session will not progress without you, while a
 # busy one is fine. `running` is not busy but has background work in flight - it is
@@ -944,7 +963,7 @@ def _asks_of(lines):
     return spoke, kept, text, error, kept_ts, text_ts
 
 
-def standing_ask(lines):
+def standing_ask(lines, told=None):
     """(did you speak here, the ask that stands or "", when it was first made,
     is it the newest message's limit line).
 
@@ -956,11 +975,26 @@ def standing_ask(lines):
     answer. A usage-limit line reads as an ask for the "?" of its URL, and does not
     stand after a later turn: the session recovers by itself.
     """
-    spoke, kept, text, error, kept_ts, text_ts = _asks_of(lines)
+    spoke, kept, text, error, kept_ts, text_ts = told if told is not None else _asks_of(lines)
     newest = ask_line(text)
     if (error and kept) or not newest:
         return spoke, kept, kept_ts, False
     return (spoke, *_carry_on(kept, kept_ts, newest, text_ts), error)
+
+
+def told_of(session_id, tail, cache=None):
+    """_asks_of(tail), kept on the transcript's window in `cache` (read_windows)
+    until the transcript or the code changes. Read twice a scan for every
+    session, every scan, it was 0.4 s a scan on 35 sessions (2026-11-25)."""
+    entry = cache.get(session_id) if cache else None
+    if not isinstance(entry, dict) or entry.get("tail") is not tail:
+        return _asks_of(tail)
+    kept = entry.get("_asks")
+    if kept and kept[0] == _CODE_KEY:
+        return kept[1]
+    told = _asks_of(tail)
+    entry["_asks"] = (_CODE_KEY, told)
+    return told
 
 
 def open_ask(lines):
@@ -2276,14 +2310,57 @@ def idle_ttys(ps_output):
     return seen - busy
 
 
-def idle_snapshot():
-    out = _ps(["-eo", "pid,tty,command"])
+def tty_names(dev="/dev"):
+    """A terminal's device number as ps prints it ("16/5") -> its name
+    ("ttys005"). 194 stats, 1 ms."""
+    out = {}
+    try:
+        entries = os.listdir(dev)
+    except OSError:
+        return out
+    for name in entries:
+        if not (name.startswith("tty") or name == "console"):
+            continue
+        try:
+            st = os.stat(os.path.join(dev, name))
+        except OSError:
+            continue
+        if stat.S_ISCHR(st.st_mode):
+            out[f"{os.major(st.st_rdev)}/{os.minor(st.st_rdev)}"] = name
+    return out
+
+
+def _ps_named(columns, names=None):
+    """ps's table with the terminal's name in the second column, the way the
+    `tty` column gives it - from `tdev`. ps names each terminal in /dev for the
+    `tty` column: measured 2026-11-25 on 1,233 processes, 0.5 s of kernel time
+    a table against 0.04 s for the number, and the list read one every scan.
+
+    /dev is read after ps: a terminal that ps saw is still there unless it
+    closed since, and one that /dev does not name is "??", as ps says it."""
+    out = _ps(["-eo", "pid,tdev," + columns])
+    if out is None:
+        return None
+    names = tty_names() if names is None else names
+    lines = []
+    for n, line in enumerate(out.splitlines()):
+        f = line.split(None, 2)
+        if n == 0 and len(f) > 1:
+            f[1] = "TTY"
+        elif len(f) > 1 and f[0].isdigit():
+            f[1] = names.get(f[1], "??")
+        lines.append(" ".join(f))
+    return "\n".join(lines) + "\n"
+
+
+def idle_snapshot(names=None):
+    out = _ps_named("command", names)
     return set() if out is None else idle_ttys(out)
 
 
-def tty_snapshot():
+def tty_snapshot(names=None):
     # the executable last: it may hold spaces ("Application Support")
-    return _ps(["-eo", "pid,tty,uid,ucomm"]) or ""
+    return _ps_named("uid,ucomm", names) or ""
 
 
 def ps_snapshot():
@@ -2345,13 +2422,16 @@ def read_iterm_pane(pid):
     return procs.parse_iterm_pane(procargs_buffer(pid))
 
 
-def procargs_buffer(pid):
-    """The raw KERN_PROCARGS2 answer for a pid, or None. It holds every secret in
-    that environment: only procs.parse_procargs, procs.parse_auth and
-    procs.parse_iterm_pane read it."""
+_LIBC = []
+
+
+def _sysctl_libc():
+    """libc with sysctl declared, found once: find_library walks the dyld
+    cache, and a scan reads 933 environments (0.1 s, 2026-11-25). A reload
+    finds it again, once."""
     import ctypes
     import ctypes.util
-    try:
+    if not _LIBC:
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
         # declared, not guessed: newlen is a size_t, and an undeclared 0 goes
         # over as a 32-bit int with whatever sits in the register's upper half
@@ -2359,6 +2439,17 @@ def procargs_buffer(pid):
                                 ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
                                 ctypes.c_void_p, ctypes.c_size_t]
         libc.sysctl.restype = ctypes.c_int
+        _LIBC.append(libc)
+    return _LIBC[0]
+
+
+def procargs_buffer(pid):
+    """The raw KERN_PROCARGS2 answer for a pid, or None. It holds every secret in
+    that environment: only procs.parse_procargs, procs.parse_auth and
+    procs.parse_iterm_pane read it."""
+    import ctypes
+    try:
+        libc = _sysctl_libc()
         mib = (ctypes.c_int * 3)(1, 49, int(pid))          # CTL_KERN, KERN_PROCARGS2
         size = ctypes.c_size_t(0)
         if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
@@ -3963,8 +4054,11 @@ def attached_ttys(session_id, ttys, commands, sessions=None):
     """
     if not session_id:
         return []
+    # only a command with "attach" in it can be one (is_attach_to): every
+    # process for every row was 43,472 regex builds a scan (2026-11-25)
     return [ttys[pid] for pid, cmd in (commands or {}).items()
-            if is_attach_to(cmd, session_id, sessions) and ttys.get(pid)]
+            if "attach" in (cmd or "") and is_attach_to(cmd, session_id, sessions)
+            and ttys.get(pid)]
 
 
 def owning_tty(pid, parents, ttys, titles, depth=12, commands=None,
@@ -4089,10 +4183,11 @@ def _park_holds(parked_at, ts):
 
 def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty="",
               tab_title="", reviewed=None, windowed=None, dead_loops=(), terminal="",
-              parks=None, carried="", carried_ts=None):
+              parks=None, carried="", carried_ts=None, told=None):
     """One display row from one session's data. Pure: no disk, no subprocess.
     `carried`: the ask that stands, when the tail is too short to show it, and
-    `carried_ts` when it was first made (carried_ask).
+    `carried_ts` when it was first made (carried_ask). `told`: what _asks_of
+    said of this tail (told_of), or None to read it here.
 
     collect() used to inline this, which hid the wiring - notably which clock
     `since` reads from - behind functions that only run against a live machine.
@@ -4106,7 +4201,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
     # about 2.1.325 it writes no turn end after it, so a background command
     # kept it in BUSY (public wifi, 2026-11-24): the error ends the turn
     failed = api_error(tail)
-    spoke, ask, ask_ts, limit = standing_ask(tail)
+    spoke, ask, ask_ts, limit = standing_ask(tail, told)
     if carried and not spoke:
         # the book saw it first, and a limit line does not stand in for it
         # (review, 2026-11-09)
@@ -4374,7 +4469,7 @@ def _records_further_back(path, size):
     return as_records(data.decode("utf-8", "ignore").splitlines()[1:])
 
 
-def carried_ask(session_id, tail, book, cache=None):
+def carried_ask(session_id, tail, book, cache=None, told=None):
     """The ask of an ended turn that stands for this session, from its tail and
     what `book` knows: never a line of a turn still running, nor a limit line - a
     scan sees those, and the book would carry them on (review, 2026-11-05). The
@@ -4385,7 +4480,7 @@ def carried_ask(session_id, tail, book, cache=None):
 
     Answers (the ask, when it was first made): the time stays over the same ask
     made again, so a park on it holds (issue #54)."""
-    spoke, ask, _text, _error, ts = _asks_of(tail)[:5]
+    spoke, ask, _text, _error, ts = (told if told is not None else _asks_of(tail))[:5]
     path = transcript_path_cached(session_id, cache)
     try:
         size = os.path.getsize(path) if path else None
@@ -4642,14 +4737,15 @@ def collect(cache=None, status=None, session_apps=True, samples=STACK_PER_SCAN):
         dead = (find_dead_loops(s.get("pid"), ptable, cache=cache)
                 + find_dead_readers(s.get("pid"), ptable, unix=stdin_sockets, cache=cache,
                                     names=comms))
-        carried, carried_ts = carried_ask(sid, tail, asks, cache=cache)
+        told = told_of(sid, tail, cache)
+        carried, carried_ts = carried_ask(sid, tail, asks, cache=cache, told=told)
         servers = mcp_server_commands(commands.get(s.get("pid")), s.get("cwd"),
                                       claude_json_path(s.get("configDir", "")), cache)
         rows.append(build_row(s, head, tail, mtime, orphan_count=summary["detached"],
                               work=work_descendants(ps_out, s.get("pid"), servers),
                               tty=tty, tab_title=titles.get(terms.short_tty_full(tty), ""),
                               reviewed=reviewed, parks=parks,
-                              carried=carried, carried_ts=carried_ts,
+                              carried=carried, carried_ts=carried_ts, told=told,
                               windowed=windowed(tty, shown, blind=blind),
                               terminal=app_of_tty.get(terms.short_tty_full(tty), "") if tty else "",
                               dead_loops=dead))

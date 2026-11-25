@@ -11845,7 +11845,10 @@ class TestNoPsReaderTrustsAPsThatFailed(unittest.TestCase):
         self.assertEqual(self.run_ps(REAL["ps_table"], 1, "  1 Tue Sep 22 14:45:15 2026 /sbin/launchd\n"), {})
 
     def test_a_clean_exit(self):                                                # control
-        self.assertEqual(self.run_ps(ccwho.tty_snapshot, 0, self.ROWS), self.ROWS)
+        # ps gives the device number, and the table comes back named
+        table = self.run_ps(lambda: ccwho.tty_snapshot(names={"16/1": "ttys001"}), 0,
+                            "  PID TDEV UID UCOMM\n  100 16/1 501 iTerm2\n")
+        self.assertEqual(ccwho.terms.parse_procs(table), ccwho.terms.parse_procs(self.ROWS))
 
 
 class TestTheGateSaysAnUnreadableTableAsOne(unittest.TestCase):
@@ -12207,3 +12210,179 @@ class TestTheListsSearchFindsEndedSessions(unittest.TestCase):
         self.assertIn("2h · Claude: it hasn't woken", ccwho.ui_row_lines(row, width=120)[1])
         plain = self.ended(idx, "10fe")[0]["rows"][0]                          # control
         self.assertIn("the CI flake", ccwho.ui_row_lines(plain, width=120)[1])
+
+
+# ---------------------------------------------------------- what a scan costs
+#
+# Measured 2026-11-25 on 35 sessions and 1,233 processes: one scan cost 3-4 s of
+# CPU, and the list scanned almost back to back. These pin the four cuts.
+
+def _tdev(*rows, last="UCOMM"):
+    """`ps -eo pid,tdev,uid,ucomm` (or `pid,tdev,command`): the terminal as its
+    device number. ps names each one in /dev for the `tty` column: 0.5 s of
+    kernel time a table, against 0.04 s for the number."""
+    return f"  PID TDEV {'UID ' if last == 'UCOMM' else ''}{last}\n" + "\n".join(
+        " ".join(str(f) for f in row) for row in rows) + "\n"
+
+
+class TestTheTerminalIsTheDeviceNumber(unittest.TestCase):
+    NAMES = {"16/1": "ttys001", "16/2": "ttys002"}
+
+    def asked(self, fn, out):
+        seen = []
+        testkit.patch(self, ccwho, "_ps", lambda args, env=None: seen.append(args) or out)
+        result = fn()
+        return seen, result
+
+    def test_ps_is_never_asked_for_the_name(self):
+        for fn in (ccwho.tty_snapshot, ccwho.idle_snapshot):
+            seen, _ = self.asked(lambda: fn(names=self.NAMES), "")
+            columns = {c.rstrip("=") for args in seen for a in args for c in a.split(",")}
+            self.assertTrue(seen, fn.__name__)
+            self.assertFalse(columns & {"tty", "tt", "tname"}, (fn.__name__, seen))
+
+    def test_the_device_becomes_the_name(self):
+        out = _tdev((100, "16/1", 501, "iTerm2"), (1, "??", 0, "launchd"),
+                    (7, "16/99", 501, "zsh"), (8, "16/2", 501, "Some App"))
+        _, table = self.asked(lambda: ccwho.tty_snapshot(names=self.NAMES), out)
+        self.assertEqual(ccwho.parse_tty_map(table), {100: "ttys001", 8: "ttys002"})
+        procs_ = ccwho.terms.parse_procs(table)
+        self.assertEqual(procs_[100], ("ttys001", 501, "iTerm2"))
+        self.assertEqual(procs_[8], ("ttys002", 501, "Some App"))
+        # a device /dev no longer names: closed since - ps would say ??
+        self.assertEqual(procs_[7], ("", 501, "zsh"))
+        self.assertEqual(procs_[1], ("", 0, "launchd"))
+
+    def test_an_idle_terminal_from_the_number(self):
+        out = _tdev((1, "16/1", "-zsh"), (2, "16/2", "-zsh"), (3, "16/2", "vim", "x"),
+                    last="COMMAND")
+        _, idle = self.asked(lambda: ccwho.idle_snapshot(names=self.NAMES), out)
+        self.assertEqual(idle, {"ttys001"})
+
+    def test_a_ps_that_failed_is_still_no_table(self):                      # control
+        _, table = self.asked(lambda: ccwho.tty_snapshot(names=self.NAMES), None)
+        self.assertEqual(table, "")
+
+    @unittest.skipUnless(os.uname().sysname == "Darwin", "tdev is the BSD ps")
+    def test_the_names_are_the_ones_ps_gives(self):
+        # the real ps, both ways: the map must say what the tty column says
+        named = ccwho.parse_tty_map(REAL_TTY_SNAPSHOT())
+        out = subprocess.run(["ps", "-eo", "pid,tty"], capture_output=True, text=True).stdout
+        truth = ccwho.parse_tty_map(out)
+        both = set(named) & set(truth)
+        if not truth:
+            self.skipTest("no process on this machine has a terminal")
+        self.assertTrue(any(pid in named for pid in truth), "no terminal named at all")
+        self.assertEqual({p: named[p] for p in both}, {p: truth[p] for p in both})
+
+
+class TestAnAttachIsLookedForInAttaches(unittest.TestCase):
+    """attached_ttys looks at every process for every row: 43,472 regex
+    builds a scan. Only a command with "attach" in it can be one."""
+
+    SID = "abcd1234-0000-0000-0000-000000000000"
+
+    def test_only_an_attach_is_parsed(self):
+        calls = []
+        real = ccwho.is_attach_to
+        testkit.patch(self, ccwho, "is_attach_to",
+                      lambda *a, **k: calls.append(a) or real(*a, **k))
+        commands = {i: f"/bin/zsh -c 'make thing{i}'" for i in range(1, 500)}
+        commands[900] = f"claude attach {self.SID}"
+        ttys = {i: "ttys003" for i in commands}
+        ttys[900] = "ttys009"
+        self.assertEqual(ccwho.attached_ttys(self.SID, ttys, commands), ["ttys009"])
+        self.assertEqual(len(calls), 1)
+
+    def test_an_attach_by_name_is_still_found(self):                         # control
+        sessions = [{"sessionId": self.SID, "kind": "background", "name": "my ci"}]
+        commands = {5: "/usr/bin/vim notes", 6: "claude attach my ci"}
+        self.assertEqual(ccwho.attached_ttys(self.SID, {5: "ttys001", 6: "ttys002"},
+                                             commands, sessions), ["ttys002"])
+
+
+class TestTheAsksAreReadOnceATranscript(MachinelessCollect):
+    """A row's asks are read from its tail twice a scan (the row and the ask
+    book), and again every scan while the transcript sits still: 0.4 s a scan
+    on 35 sessions."""
+
+    SID = "cccccccc-0000-0000-0000-000000000000"
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp(prefix="ccwho-test-asksonce-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "t.jsonl")
+        self.write("A or B?")
+        testkit.patch(self, ccwho, "transcript_path", lambda sid, roots=None: self.path)
+        testkit.patch(self, ccwho, "agents_json", lambda: json.dumps(
+            [{"sessionId": self.SID, "pid": 1, "cwd": "/x", "status": "idle"}]))
+        self.calls = []
+        real = ccwho._asks_of
+        testkit.patch(self, ccwho, "_asks_of",
+                      lambda lines: self.calls.append(1) or real(lines))
+        self.cache = {}
+
+    def write(self, text, mode="w", at="2026-11-25T12:00:00Z"):
+        with open(self.path, mode) as fh:
+            if mode == "w":                 # the tail's first line is cut: a filler
+                fh.write(json.dumps({"type": "permission-mode"}) + "\n")
+            for record in ({"type": "assistant", "timestamp": at,
+                            "message": {"content": [{"type": "text", "text": text}]}},
+                           {"type": "system", "subtype": "turn_duration"}):
+                fh.write(json.dumps(record) + "\n")
+
+    def scan(self):
+        self.calls.clear()
+        rows, _ = ccwho.collect(cache=self.cache)
+        return rows[0]
+
+    def test_once_a_scan(self):
+        self.assertEqual(self.scan()["ask"], "A or B?")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_not_again_while_it_sits_still(self):
+        self.scan()
+        self.assertEqual(self.scan()["ask"], "A or B?")
+        self.assertEqual(self.calls, [])
+
+    def test_a_write_reads_it_again(self):                                  # control
+        self.scan()
+        self.write("C or D?", mode="a", at="2026-11-25T12:05:00Z")
+        st = os.stat(self.path)
+        os.utime(self.path, (st.st_atime, st.st_mtime + 5))
+        self.assertEqual(self.scan()["ask"], "C or D?")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_new_code_reads_it_again(self):
+        # the list reloads the engine every scan: a fixed rule must not wait
+        # for the session to write
+        self.scan()
+        testkit.patch(self, ccwho, "_CODE_KEY", "another engine")
+        self.scan()
+        self.assertEqual(len(self.calls), 1)
+
+
+class TestToldOfKeepsOnlyItsOwnTail(unittest.TestCase):
+    def test_another_tail_is_read(self):
+        said = lambda text: [{"type": "assistant", "message": {"content": [
+            {"type": "text", "text": text}]}}, {"type": "system", "subtype": "turn_duration"}]
+        kept = said("A or B?")
+        cache = {"s": {"tail": kept}}
+        self.assertEqual(ccwho.told_of("s", kept, cache)[1], "A or B?")
+        self.assertEqual(ccwho.told_of("s", said("C or D?"), cache)[1], "C or D?")
+
+
+@unittest.skipUnless(os.uname().sysname == "Darwin", "KERN_PROCARGS2 is macOS")
+class TestTheCLibraryIsFoundOnce(unittest.TestCase):
+    """find_library walks the dyld cache: 933 times a scan, 0.1 s."""
+
+    def test_once(self):
+        import ctypes.util
+        self.assertIsNotNone(ccwho.procargs_buffer(os.getpid()))
+        calls = []
+        real = ctypes.util.find_library
+        testkit.patch(self, ctypes.util, "find_library", lambda n: calls.append(n) or real(n))
+        for _ in range(3):
+            self.assertIsNotNone(ccwho.procargs_buffer(os.getpid()))
+        self.assertEqual(calls, [])

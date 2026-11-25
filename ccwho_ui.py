@@ -104,6 +104,11 @@ WINDOW_NAME = "ccwho"
 # at all, or it would cost more than the scans it saves.
 WATCH_EVERY = 1.0              # "has anything changed?" - 0.5ms to answer
 REFRESH_EVERY = 20.0           # a full scan even when nothing moved
+# A change seen this soon after a scan ended waits for the rest of it. On 35
+# sessions a write came every 2 s, and each started a scan of 3-4 s of CPU, back
+# to back: 35% of a core in the list, as much again in the programs it starts
+# (2026-11-25). In a list that sat still, a change is still seen within 1 s.
+SCAN_GAP = 5.0
 # no scan has landed for this long: the list says since when (stale_line). Scans
 # on time can be 70 s apart: a tick a little early is skipped (Collector.due),
 # so two periods pass, and `claude agents` may take all of its 30 s timeout
@@ -3578,6 +3583,10 @@ class Collector:
         self.last = 0.0
         self.reload_error = ""
         self.digest = None      # what the files said at the last look
+        self.clock = time.monotonic
+        # no change is acted on before this, on self.clock: while a scan runs,
+        # and for SCAN_GAP after it ends
+        self.hold_until = float("-inf")
         self.rows = []          # the ids the check watches, from the last scan
         self.doctor_state = {}  # doctor's answer and when (ccwho.doctor_banner_cached)
         self.doctor_line = ""   # its last answer in
@@ -3591,7 +3600,14 @@ class Collector:
         False when we could not ask: "the source is unreachable" is not "a
         session started needing you", and firing a full scan on every failed
         call is how a broken `claude` turns into a busy loop.
+
+        False, too, while a scan runs and until SCAN_GAP after it ends: the
+        digest is not taken, so the change is seen at the first check after it.
+        From the end, not the start: a scan slower than the gap started the
+        next the moment it was done (review 1).
         """
+        if self.clock() < self.hold_until:
+            return False
         ids = [row.get("sessionId", "") for row in self.rows]
         now = engine.watch_digest(ids, cache=self.cache)
         if now == self.digest:
@@ -3628,6 +3644,13 @@ class Collector:
             self.reload_error = f"engine reload failed ({type(ex).__name__})"
 
     def fleet(self):
+        self.hold_until = float("inf")
+        try:
+            return self._fleet()
+        finally:
+            self.hold_until = self.clock() + SCAN_GAP
+
+    def _fleet(self):
         import time
         self.reload()
         try:            # the clock release_claims reads the scan's start by

@@ -206,6 +206,9 @@ nothing.
 
 It notices a session start needing you within a second, by stat-ing transcript
 files - no program is started for that - and does a full scan every 20 seconds.
+While sessions write, a change waits until 5 seconds after the last scan ended:
+on a busy fleet the writes come every second or two, and a scan for each kept
+most of a core busy.
 When no scan has read the fleet for a minute and a half, an amber line at the top
 says since when: `not updated since 14:02 (3 min)`.
 Collection runs in a worker thread, because `claude agents --json` can take 30

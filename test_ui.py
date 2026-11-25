@@ -2560,6 +2560,77 @@ class TestItNoticesQuicklyWhenSomethingNeedsYou(UiTest):
             self.assertGreater(collector.looks, before)
 
 
+class TestABusyListScansAtMostEveryFiveSeconds(unittest.TestCase):
+    """The cheap check started a full scan on every write it saw: with 35
+    sessions that was a scan every 2.3 s, back to back - 3-4 s of CPU each
+    (2026-11-25). A change seen while a scan runs, or less than five seconds
+    after one ended, waits for the five; one in a list that sat still is
+    scanned at once. From the END of a scan: one that takes longer must not
+    start the next the moment it is done (review 1)."""
+
+    def setUp(self):
+        self.now, self.world, self.takes, self.during = [100.0], [0], 0.0, []
+        self.seen = []          # what a check said while the scan ran: asserted after
+        c = self.collector = ui.Collector()
+        c.clock = lambda: self.now[0]
+        for name, fake in (("reload", lambda: None), ("release", lambda *a, **k: None),
+                           ("usage", lambda *a, **k: None), ("doctor", lambda: ""),
+                           ("secure_input", lambda: False), ("compact_at_limit", lambda: False)):
+            setattr(c, name, fake)
+
+        def collect(cache=None, status=None):
+            status["source_ok"], status["watch"] = True, ("w", self.world[0])
+            self.now[0] += self.takes
+            for t, world in self.during:
+                self.during = []
+                self.seen.append(self.at(t, world=world))
+                self.now[0] = 100.0 + self.takes
+            return [], 0
+        for name, fake in (("collect", collect),
+                           ("watch_digest", lambda ids, cache=None: ("w", self.world[0]))):
+            patcher = mock.patch.object(ui.engine, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def at(self, t, world=None):
+        self.now[0] = t
+        if world is not None:
+            self.world[0] = world
+        return self.collector.changed()
+
+    def test_a_change_just_after_a_scan_waits_for_five_seconds(self):
+        self.collector.fleet()                          # began at 100
+        self.assertFalse(self.at(101.0, world=1))
+        self.assertFalse(self.at(104.9))
+        self.assertTrue(self.at(105.1), "the change was not lost, only held")
+
+    def test_a_slow_scan_holds_for_five_seconds_after_it_ends(self):
+        self.takes, self.during = 7.0, [(106.0, 1)]
+        self.collector.fleet()                          # 100 to 107
+        self.assertEqual(self.seen, [False], "a check while a scan runs")
+        self.assertFalse(self.at(111.9))
+        self.assertTrue(self.at(112.1))
+
+    def test_a_scan_that_raised_holds_too(self):
+        # the worker goes on past a scan that raised (CcwhoUi.collect)
+        def boom(*a, **k):
+            self.now[0] += 7.0
+            raise OSError
+        self.collector.usage = boom
+        with self.assertRaises(OSError):
+            self.collector.fleet()                      # 100 to 107, and raised
+        self.assertFalse(self.at(111.0, world=1))
+        self.assertTrue(self.at(112.1))
+
+    def test_a_change_in_a_list_that_sat_still_is_seen_at_once(self):    # control
+        self.collector.fleet()
+        self.assertTrue(self.at(130.0, world=1))
+
+    def test_no_change_is_still_no_scan(self):                           # control
+        self.collector.fleet()
+        self.assertFalse(self.at(106.0))
+
+
 class TestTheCheapCheckIsCheap(unittest.TestCase):
     def test_a_scan_records_the_digest_so_the_check_does_not_refire(self):
         collector = ui.Collector()

@@ -46,6 +46,8 @@ ROW_KEYS = {
     "ctx", "cache_at", "compact_typed",  # added 2026-10-22: the context in tokens,
                           # when its cache's hour started, and whether a /compact was
                           # typed since (Compact at limit)
+    "api_error",          # added 2026-11-24: the error it stopped on ("API Error:
+                          # ..."), "" when none
 }
 
 # Every key a manifest session entry has ever carried. Append only.

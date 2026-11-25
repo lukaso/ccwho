@@ -797,6 +797,31 @@ def _said_in(record):
     return said
 
 
+# What Claude Code writes in the model's place at a usage limit: it has rules
+# of its own (standing_ask). Every limit line measured on 2026-11-24 starts so.
+_LIMIT_LINE = "You've hit your "
+
+
+def api_error(lines):
+    """The error the session stopped on, on one line, or "": an error Claude
+    Code wrote in the model's place (`API Error: ...`, `Request timed out`,
+    `Prompt is too long`, `Not logged in`), not a usage limit, with no message
+    of a turn since. Claude Code tries again a few times before it writes one;
+    after it, only a new turn goes on - yours, or a task notification's
+    (measured 2026-11-24). An error in the middle of a tool call is followed
+    within a second by the call's result, which ends it here."""
+    records = as_records(lines)
+    turns = _turn_ids(records)
+    failed = ""
+    for d in records:
+        if id(d) not in turns:
+            continue
+        said = _said_in(d) if d.get("type") == "assistant" else ""
+        failed = (said if said and d.get("isApiErrorMessage") is True
+                  and not said.startswith(_LIMIT_LINE) else "")
+    return " ".join(failed.split())
+
+
 def _a_person_said(record):
     """Is this "user" record a person's words? Measured 2026-11-05 over 21 days:
     each one has origin.kind "human". A peer, a finished task and the limit's
@@ -4077,6 +4102,10 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
             or extract_topic(head, strict=True)["last"] or first
             or extract_topic(tail)["last"])
     status = session.get("status", "?")
+    # An error it stopped on. Claude Code tries again a few times first; from
+    # about 2.1.325 it writes no turn end after it, so a background command
+    # kept it in BUSY (public wifi, 2026-11-24): the error ends the turn
+    failed = api_error(tail)
     spoke, ask, ask_ts, limit = standing_ask(tail)
     if carried and not spoke:
         # the book saw it first, and a limit line does not stand in for it
@@ -4096,12 +4125,12 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
                                             "running" if work else "stopped")
     elif status != "busy" and ask:
         attention = "asks"
-    elif status == "busy" and turn_ended(tail):
+    elif status == "busy" and (failed or turn_ended(tail)):
         # The turn is over and a background task keeps the feed on `busy`. The
         # task will wake the session, so an ended turn alone is not news - only
         # a question is. Found on a wait loop that could never end, hiding a
         # question in BUSY for 26 hours. A loop that cannot end will never wake
-        # it: then it is stuck, not running.
+        # it: then it is stuck, not running. An error ends a turn too.
         attention = "asks" if ask else ("stuck" if dead_loops else "running")
     elif status == "busy":
         attention = "busy"
@@ -4109,6 +4138,11 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         # Not busy and not asking: either it stopped, or it is waiting on work -
         # work that can never end is stuck, whatever the feed says between turns
         attention = "stuck" if dead_loops else ("running" if work else "stopped")
+    # The work under it may wake it later, with a task notification, but the
+    # turn it was on is lost: you want to know now (public wifi, 2026-11-24).
+    # "running" is only ever reached with no ask and no loop that cannot end.
+    if failed and attention == "running":
+        attention = "stopped"
     # busy before a program or a park names it otherwise: each request renews
     # its cache, so its cache mark says its size only (cache_mark)
     working = attention == "busy"
@@ -4156,6 +4190,7 @@ def build_row(session, head, tail, mtime, now=None, orphan_count=0, work=0, tty=
         "title": extract_title(tail) or extract_title(head),
         "doing": extract_doing(tail),
         "ask": ask,
+        "api_error": failed,
         "since": since(ts if ts is not None else mtime, now=now),
         "ts": ts,
         "topic": last,
@@ -5124,6 +5159,10 @@ def ui_row_cells(row, width=100, tag=""):
         # why you kept it, in your words: the reason it is here
         mark = "parked · "
         body = row["park_note"]
+    elif row.get("api_error"):
+        # the error it stopped on: why it is here, and older than no recap
+        mark = f"{row.get('since') or '?'} · "
+        body = row["api_error"]
     elif row.get("recap"):
         age = row.get("recap_age") or "?"
         turns = row.get("turns_since_recap") or 0

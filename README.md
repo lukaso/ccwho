@@ -1153,7 +1153,7 @@ So `ccwho` derives the state instead:
 | asks | an **ended** turn asked you, and you have not spoken since - even while the harness says busy. See [an ask stands until you speak](#an-ask-stands-until-you-speak) | ASKED YOU |
 | stuck | not asking you, not mid-turn, and a wait loop or stdin reader under it can never end | STUCK |
 | review | stopped, its turn ended, and you have not gone to it from the list since | FINISHED |
-| stopped | not busy, and **nothing running under it** | STOPPED |
+| stopped | not busy, and **nothing running under it**; or it stopped on an API error (see below) | STOPPED |
 | busy | harness says busy, mid-turn | busy |
 | running | background work is in flight: not busy, or busy with the turn over | running |
 | program | a program started it (see [Started by a program](#started-by-a-program)), and it is not stuck | program |
@@ -1161,6 +1161,16 @@ So `ccwho` derives the state instead:
 
 `waiting` with nothing pending is not a state of its own - it is decided the same
 way as any other non-busy session, by what is in flight.
+
+**An API error.** Claude Code tries a few times, then writes the error in the model's
+place (`API Error: Can't reach the API server`, `Request timed out`, `Prompt is too
+long`) and stops the turn; only a new turn goes on, yours or a task notification's. Newer
+versions write no turn end after it. When that error is the last message of a turn, the
+turn has ended and the session has stopped, also while the harness says busy or a
+background command runs: it is in NEEDS YOU until you go to it, its second line is the
+error, and `--json` gives it as `api_error`. A question that still waits for you keeps
+it in ASKED YOU, and a loop that cannot end in STUCK. A usage limit line keeps its own
+rules ([an ask stands until you speak](#an-ask-stands-until-you-speak)).
 
 ### An ask stands until you speak
 

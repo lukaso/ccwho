@@ -2037,6 +2037,112 @@ class TestBusyWithTheTurnOver(unittest.TestCase):
         self.assertEqual(self._attention(tail), "busy")
 
 
+class TestAnApiErrorNeedsYou(unittest.TestCase):
+    """Claude Code tries again a few times, then writes the error and stops the
+    turn; newer versions write no turn_duration after it. A session with a
+    background command stayed in BUSY (three sessions on public wifi,
+    2026-11-24). An error the session stopped on needs you."""
+
+    SESSION = {"sessionId": "s1", "cwd": "/Users/x/projects/liveapp",
+               "status": "busy", "name": "n", "startedAt": 1788000000000}
+    T = "2026-11-24T17:26:52.712Z"
+    WIFI = ("API Error: Unable to connect to API: SSL certificate verification failed "
+            "(UNABLE_TO_VERIFY_LEAF_SIGNATURE).")
+
+    def _you(self, text):
+        return {"type": "user", "timestamp": self.T,
+                "message": {"role": "user", "content": text}}
+
+    def _error(self, text):
+        # the record as measured: Claude Code writes it in the model's place
+        return {"type": "assistant", "timestamp": self.T, "isApiErrorMessage": True,
+                "error": "unknown", "apiError": "unknown",
+                "message": {"model": "<synthetic>", "role": "assistant",
+                            "stop_reason": "stop_sequence",
+                            "content": [{"type": "text", "text": text}]}}
+
+    def _said(self, text):
+        return {"type": "assistant", "timestamp": self.T,
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    AFTER = [{"type": "data-flow-records", "records": [], "v": 1},
+             {"type": "system", "subtype": "away_summary", "timestamp": T}]
+
+    def _row(self, tail, status="busy", work=1, reviewed=None):
+        return ccwho.build_row(dict(self.SESSION, status=status), [], tail, mtime=0,
+                               now=1795541600.0, work=work, reviewed=reviewed)
+
+    def test_the_error_it_stopped_on(self):
+        self.assertEqual(ccwho.api_error([self._you("yes"), self._error(self.WIFI)]
+                                         + self.AFTER), self.WIFI)
+
+    def test_a_usage_limit_is_not_one(self):
+        # a limit line has rules of its own (standing_ask)
+        line = "You've hit your session limit · resets 3:20pm (Europe/London)"
+        self.assertEqual(ccwho.api_error([self._you("go"), self._error(line)]), "")
+
+    def test_a_new_turn_ends_it(self):
+        self.assertEqual(ccwho.api_error([self._error(self.WIFI), self._you("try again")]), "")
+        self.assertEqual(ccwho.api_error([self._error(self.WIFI), self._said("Done.")]), "")
+
+    def test_a_busy_session_that_stopped_on_it_needs_you(self):
+        row = self._row([self._you("yes"), self._error(self.WIFI)] + self.AFTER)
+        self.assertEqual(row["attention"], "review")
+        self.assertEqual(row["api_error"], self.WIFI)
+
+    def test_a_busy_session_mid_turn_is_busy(self):                      # control
+        row = self._row([self._you("yes"), self._said("Reading the logs.")])
+        self.assertEqual((row["attention"], row["api_error"]), ("busy", ""))
+
+    def test_with_background_work_it_still_needs_you(self):
+        # the feed says idle, and a background command runs
+        row = self._row([self._you("yes"), self._error(self.WIFI)], status="idle", work=2)
+        self.assertEqual(row["attention"], "review")
+
+    def test_once_you_looked_it_is_stopped(self):
+        tail = [self._you("yes"), self._error(self.WIFI)]
+        seen = {"s1": ccwho.last_turn_ts(tail)}
+        self.assertEqual(self._row(tail, reviewed=seen)["attention"], "stopped")
+
+    def test_a_limit_while_busy_is_as_before(self):                      # control
+        line = "You've hit your session limit · resets 3:20pm (Europe/London)"
+        self.assertEqual(self._row([self._you("go"), self._error(line)])["attention"], "busy")
+
+    # review 4: a question asked before a machine turn that failed still stands
+    ASKED = [{"type": "assistant", "timestamp": T,
+              "message": {"content": [{"type": "text", "text": "Should I merge it?"}]}},
+             {"type": "system", "subtype": "turn_duration", "timestamp": T},
+             {"type": "user", "timestamp": T, "message": {"role": "user", "content":
+              "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}}]
+
+    def test_a_question_that_stands_still_asks(self):
+        tail = self.ASKED + [self._error(self.WIFI)]
+        for status in ("busy", "idle"):
+            self.assertEqual(self._row(tail, status=status)["attention"], "asks", status)
+        seen = {"s1": ccwho.last_turn_ts(tail)}
+        self.assertEqual(self._row(tail, reviewed=seen)["attention"], "asks")
+
+    def test_a_loop_that_cannot_end_is_stuck(self):
+        tail = [self._you("yes"), self._error(self.WIFI)]
+        row = ccwho.build_row(self.SESSION, [], tail, mtime=0, now=1795541600.0, work=1,
+                              dead_loops=[{"pid": 5, "tasks": []}])
+        self.assertEqual(row["attention"], "stuck")
+
+    def test_an_error_of_many_lines_is_one(self):
+        # 19 "safeguards flagged" errors had line breaks (review 4)
+        row = self._row([self._you("yes"), self._error("API Error: flagged.\n\nTry again.")])
+        self.assertEqual(row["api_error"], "API Error: flagged. Try again.")
+
+    def test_its_second_line_says_the_error(self):
+        row = self._row([self._you("yes"), self._error(self.WIFI)] + self.AFTER)
+        second = "".join(text for text, _style in ccwho.ui_row_cells(row, width=200)[1])
+        self.assertIn("API Error: Unable to connect to API", second)
+        # control: a row with no error says no error
+        calm = self._row([self._you("yes"), self._said("Reading the logs.")])
+        second = "".join(text for text, _style in ccwho.ui_row_cells(calm, width=200)[1])
+        self.assertNotIn("API Error", second)
+
+
 class TestStuckOnALoopThatCannotEnd(unittest.TestCase):
     """The case 8cc8093 left in BUSY: the turn ended without a question, and the
     only thing keeping the feed on `busy` is a wait loop that can never stop.
